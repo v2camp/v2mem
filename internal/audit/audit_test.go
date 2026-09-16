@@ -94,3 +94,37 @@ func TestSummarizeOnEmptyInput(t *testing.T) {
 		t.Errorf("空输入应得零值，got %+v", s)
 	}
 }
+
+// 读/写两侧必须分开计数：只记不查（写了一堆但从不检索）或只查不记（检索但从不沉淀）
+// 都会体现在这两个数上，看总次数是看不出来的。
+func TestSummarizeSeparatesReadAndWriteSides(t *testing.T) {
+	rs := []Record{
+		{Event: "session-start"}, {Event: "prompt-submit", Query: "q"},
+		{Event: "manual-search", Query: "q2"},
+		{Event: "manual-add", Mode: "create"},
+		{Event: "manual-add", Mode: "overwrite"},
+		{Event: "manual-add", Mode: "create"},
+	}
+	s := Summarize(rs)
+	if s.Retrievals != 3 {
+		t.Errorf("读侧应为 3，got %d", s.Retrievals)
+	}
+	if s.Writes != 3 {
+		t.Errorf("写侧应为 3，got %d", s.Writes)
+	}
+	if s.Creates != 2 || s.Overwrites != 1 {
+		t.Errorf("写侧构成应为 新增2/覆盖1，got %d/%d", s.Creates, s.Overwrites)
+	}
+	// 写侧没有 query，不应污染「可评测样本」（那是读侧口径）
+	if s.WithQuery != 2 {
+		t.Errorf("可评测样本应只算读侧带 query 的 2 条，got %d", s.WithQuery)
+	}
+}
+
+// 写侧不应计入「空注入率」—— 它没有「注入」这个概念。
+func TestWriteOnlyLogHasNoEmptyInjectionRate(t *testing.T) {
+	s := Summarize([]Record{{Event: "manual-add", Mode: "create"}})
+	if s.EmptyRate != 0 {
+		t.Errorf("纯写日志的空注入率应为 0，got %v", s.EmptyRate)
+	}
+}

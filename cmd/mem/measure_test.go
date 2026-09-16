@@ -492,3 +492,97 @@ func TestGuidanceNamesRealSubcommands(t *testing.T) {
 		}
 	}
 }
+
+// ---------- 写侧审计（「用户会话 → mem 记录」要可观测） ----------
+
+// 此前只有读侧写审计，于是「模型到底记了什么」不可观测 —— 写侧评测方向因此悬空。
+func TestCmdAddWritesAuditRecord(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := cmdAdd([]string{"--db", db, "--project", "demo", "--kind", "pitfall",
+		"--audit-file", ap, "活库不能放进同步目录"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	rs, err := audit.Read(ap, 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(rs) != 1 {
+		t.Fatalf("应写入 1 条审计，got %d", len(rs))
+	}
+	r := rs[0]
+	if r.Event != "manual-add" {
+		t.Errorf("事件应为 manual-add，got %q", r.Event)
+	}
+	if r.Mode != "create" {
+		t.Errorf("首次写入 mode 应为 create，got %q", r.Mode)
+	}
+	if len(r.Hashes) != 1 || len(r.Hashes[0]) < 16 {
+		t.Errorf("应记录写入内容的 content_hash（而不是本地随机 id），got %v", r.Hashes)
+	}
+	if len(r.Kinds) != 1 || r.Kinds[0] != "pitfall" || r.Project != "demo" {
+		t.Errorf("应记录类型与工程，got %+v", r)
+	}
+}
+
+// 覆盖（相同知识）要能与新增区分开 —— 这是「去重是否在起作用」的唯一观测点。
+func TestCmdAddAuditDistinguishesOverwrite(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	for i := 0; i < 2; i++ {
+		if err := cmdAdd([]string{"--db", db, "--audit-file", ap, "同一条事实内容"}); err != nil {
+			t.Fatalf("cmdAdd #%d: %v", i+1, err)
+		}
+	}
+	rs, _ := audit.Read(ap, 0)
+	if len(rs) != 2 {
+		t.Fatalf("应写入 2 条审计，got %d", len(rs))
+	}
+	if rs[0].Mode != "create" || rs[1].Mode != "overwrite" {
+		t.Errorf("第二次应为 overwrite，got %q → %q", rs[0].Mode, rs[1].Mode)
+	}
+}
+
+func TestCmdAddAuditCanBeDisabled(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := cmdAdd([]string{"--db", db, "--audit-file", ap, "--no-audit", "不该留痕的内容"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if _, err := os.Stat(ap); !os.IsNotExist(err) {
+		t.Error("--no-audit 不应写审计")
+	}
+}
+
+// 审计失败不能让写入失败 —— 观测不是功能。
+func TestCmdAddSucceedsWhenAuditFails(t *testing.T) {
+	db := testDB(t)
+	bad := filepath.Join(t.TempDir(), "afile")
+	if err := os.WriteFile(bad, []byte("x"), 0o444); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := cmdAdd([]string{"--db", db, "--audit-file", filepath.Join(bad, "a.jsonl"), "审计失败也要写进去"}); err != nil {
+		t.Errorf("审计失败不应让写入报错: %v", err)
+	}
+	if n := countMemories(t, db); n != 1 {
+		t.Errorf("应仍写入 1 条记忆，got %d", n)
+	}
+}
+
+// Summarize 要能分辨读侧与写侧，否则「模型记了多少」看不出来。
+func TestAuditSummarySeparatesReadAndWrite(t *testing.T) {
+	rs := []audit.Record{
+		{Event: "manual-search", Query: "查", Hashes: []string{"a"}},
+		{Event: "manual-add", Mode: "create", Hashes: []string{"h1"}},
+		{Event: "manual-add", Mode: "create", Hashes: []string{"h2"}},
+		{Event: "manual-add", Mode: "overwrite", Hashes: []string{"h1"}},
+	}
+	s := audit.Summarize(rs)
+	if s.ByEvent["manual-search"] != 1 || s.ByEvent["manual-add"] != 3 {
+		t.Errorf("应能分辨读写事件，got %+v", s.ByEvent)
+	}
+	// 空注入率只应由读侧决定（写侧没有「空注入」概念）
+	if s.Empty != 0 || s.EmptyRate != 0 {
+		t.Errorf("写侧不应计入空注入率，got empty=%d rate=%v", s.Empty, s.EmptyRate)
+	}
+}
