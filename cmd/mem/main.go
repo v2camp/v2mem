@@ -85,6 +85,17 @@ hook 选项:
   mem stats --json
 `
 
+// knownSubcommands 是子命令的**唯一清单**。
+//
+// 单一出处：usage 文本、指引护栏、以及任何需要枚举子命令的地方都从这里取。
+// 起因：新增 `mem report` 时漏了同步测试里的清单，护栏立刻报警 ——
+// 清单有两个出处就一定会漂移，所以把它抽成一处。
+var knownSubcommands = []string{
+	"add", "search", "stats", "touch", "forget", "gc", "consolidate",
+	"export", "import", "hook", "harness", "init", "ingest", "budget",
+	"audit", "eval", "report", "help",
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usageText)
