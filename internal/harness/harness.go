@@ -263,14 +263,22 @@ var registry = []Harness{
 		Label:   "WorkBuddy",
 		Tier:    TierInstruction,
 		// WorkBuddy 的公开扩展机制是项目记忆文件 + 技能 + 自动化，未见 shell hook 配置文档。
+		//
+		// 默认落点选 AGENTS.md 而不是 .workbuddy/memory/MEMORY.md：
+		//   - 两者每轮都会注入，但 MEMORY.md 是「记忆」文件，自带严格注入预算
+		//     （本机实测约 7800 字符上限），再塞说明会挤占真正的记忆；
+		//   - AGENTS.md 语义上就是「在这个仓库怎么做事」，钩子说明天然属于它；
+		//   - 实测本机仓库根没有 CODEBUDDY.md，故 AGENTS.md 未被遮蔽
+		//     （同层存在 CODEBUDDY.md 时后者优先、AGENTS.md 会被忽略）。
 		ProjectEnv:  []string{},
-		Instruction: []string{".workbuddy/memory/MEMORY.md"},
+		Instruction: []string{"AGENTS.md"},
 		Verify:      "新会话中问它「个人记忆库里有什么关于 X 的记录」",
 		Docs:        "https://www.workbuddy.cn/docs/workbuddy/Overview",
 		Notes: []string{
 			"🔴 官方文档面向办公场景，未发布 shell hook 配置，故按指令级钩子接入",
 			"已发布的扩展机制：项目记忆文件（.workbuddy/memory/）、技能（skills/）、自动化任务",
-			"指令块写入 .workbuddy/memory/MEMORY.md —— 该文件每轮注入，是唯一可控的「会话级钩子」位点",
+			"🔴 落点选 AGENTS.md：它每轮注入且语义上就是仓库工作规则；MEMORY.md 有严格注入预算，不宜占用",
+			"⚠️ 若项目根同时存在 CODEBUDDY.md，AGENTS.md 会被忽略 —— 此时用 --file 指向 CODEBUDDY.md",
 		},
 	},
 }
