@@ -72,6 +72,13 @@ func Append(path string, r Record) error {
 // Read 读最近 limit 条（limit<=0 表示全部）。坏行跳过而不是整体失败 ——
 // 一行坏数据不该让整个审计不可读。
 func Read(path string, limit int) ([]Record, error) {
+	// 与 Append 保持对称：空路径取默认位置。
+	// 此前不兜底 ⇒ os.Open("") 报 ENOENT ⇒ 被 isNotExist 分支吞成「空日志」，
+	// 调用方会把「没读到」误当成「没有数据」（实测：mem report 因此报出
+	// 「未使用记忆库」这个错误结论）。
+	if path == "" {
+		path = Path()
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -102,6 +109,18 @@ func Read(path string, limit int) ([]Record, error) {
 		all = all[len(all)-limit:]
 	}
 	return all, nil
+}
+
+// Exists 判断审计日志是否已存在。
+//
+// 用途：把「读不到日志」与「日志里没有匹配记录」分开 ——
+// 前者是环境/路径问题，后者是「真的没用过」。两者混为一谈会给出错误结论。
+func Exists(path string) bool {
+	if path == "" {
+		path = Path()
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // Summary 是审计日志的汇总。

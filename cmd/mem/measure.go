@@ -538,7 +538,23 @@ func cmdReport(args []string) error {
 	}
 	cutoff := time.Now().Add(-d).Unix()
 
-	all, err := audit.Read(*auditFile, 0)
+	// 与 cmdAudit 保持一致：未指定时取默认审计日志位置。
+	p := *auditFile
+	if p == "" {
+		p = audit.Path()
+	}
+	// 🔴 「读不到日志」与「窗口内无活动」是两回事，不能都报「未使用记忆库」。
+	// 前者是环境/路径问题（比如路径写错、日志被清），后者才是真实结论。
+	if !audit.Exists(p) {
+		if c.json {
+			return printJSON(map[string]any{"audit_file": p, "exists": false})
+		}
+		fmt.Printf("⚠️ 审计日志不存在：%s\n", p)
+		fmt.Println("   这不是「未使用记忆库」，而是读不到日志 —— 请确认路径，或先用一次带钩子的工具生成记录。")
+		return nil
+	}
+
+	all, err := audit.Read(p, 0)
 	if err != nil {
 		return err
 	}
@@ -559,6 +575,9 @@ func cmdReport(args []string) error {
 
 	if c.json {
 		return printJSON(map[string]any{
+			// 带上读的是哪个日志：本次 bug 难发现的根因之一就是「报告没说它读了哪」，
+			// 空路径被静默当成空日志，从输出上看不出任何异常。
+			"audit_file": p, "exists": true,
 			"since": *since, "project": *project, "session": *session,
 			"summary": s, "verdict": reportVerdict(s), "empty_queries": emptyQueries(rs, *topN),
 		})
@@ -568,7 +587,8 @@ func cmdReport(args []string) error {
 	if *project != "" {
 		fmt.Printf("，工程 %s", *project)
 	}
-	fmt.Printf("）\n\n")
+	fmt.Printf("）\n")
+	fmt.Printf("日志      : %s\n\n", p)
 	fmt.Printf("活动      : 读侧 %d 次 / 写侧 %d 次\n", s.Retrievals, s.Writes)
 	fmt.Printf("空命中    : %d 次（%.1f%%）\n", s.Empty, s.EmptyRate*100)
 	fmt.Printf("平均耗时  : %.1f ms\n", s.AvgMS)

@@ -1071,3 +1071,79 @@ func TestCmdSearchRejectsContradictoryScopeAndProject(t *testing.T) {
 		t.Errorf("未指定 --scope 时 --project 应可用：%v", err)
 	}
 }
+
+// 🔴 「读不到日志」与「窗口内无活动」必须给出不同结论。
+//
+// 起因：`mem report` 未兜底 --audit-file，把空路径传给 audit.Read，
+// 而 os.Open("") 的 ENOENT 被 isNotExist 分支吞成「空日志」⇒
+// 明明有 27 条记录，却报出「本次任务未使用记忆库」这个**错误结论**。
+func TestCmdReportSaysLogMissingInsteadOfNoActivity(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope.jsonl")
+	out, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--audit-file", missing, "--since", "8h"})
+	})
+	if err != nil {
+		t.Fatalf("cmdReport: %v", err)
+	}
+	if !strings.Contains(out, "审计日志不存在") {
+		t.Errorf("日志不存在时应明确说读不到，got:\n%s", out)
+	}
+	// 精确断言「结论行」而不是全文：说明文字里本身会引用「未使用记忆库」这个词，
+	// 对全文做 Contains 会把正确的提示误判为失败（实测踩过）。
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "结论") && strings.Contains(line, "未使用记忆库") {
+			t.Errorf("不得把「读不到日志」说成「未使用记忆库」——那是错误结论，got:\n%s", out)
+		}
+	}
+	// 日志存在但窗口内确实没活动时，才应给「未使用记忆库」
+	p := filepath.Join(t.TempDir(), "a.jsonl")
+	if err := audit.Append(p, audit.Record{TS: time.Now().Add(-48 * time.Hour).Unix(), Event: "manual-search", Query: "很久以前"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	out2, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+	})
+	if err != nil {
+		t.Fatalf("cmdReport: %v", err)
+	}
+	if !strings.Contains(out2, "未使用记忆库") {
+		t.Errorf("日志存在但窗口内无活动时，才应给「未使用记忆库」，got:\n%s", out2)
+	}
+}
+
+// 不指定 --audit-file 时必须读默认位置（与 cmdAudit 一致）。
+func TestCmdReportUsesDefaultAuditPath(t *testing.T) {
+	def := audit.Path()
+	if err := audit.Append(def, audit.Record{
+		TS: time.Now().Unix(), Event: "manual-search", Query: "默认路径里的查询", Hashes: []string{"x"},
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	// 用 --json 精确断言：默认审计路径在整个测试二进制里是**共享**的，
+	// 其它用例也会往里写，所以不能卡「恰好 1 次」（实测因此抖动过）。
+	out, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--since", "1h", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("cmdReport: %v", err)
+	}
+	var got struct {
+		AuditFile string `json:"audit_file"`
+		Exists    *bool  `json:"exists"`
+		Summary   struct {
+			Retrievals int `json:"retrievals"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("--json 输出应可解析，got %q: %v", out, err)
+	}
+	if got.AuditFile != def {
+		t.Errorf("应读默认审计路径 %s，got %s", def, got.AuditFile)
+	}
+	if got.Exists != nil && !*got.Exists {
+		t.Fatalf("默认路径 %s 已写入记录，不应报「不存在」", def)
+	}
+	if got.Summary.Retrievals < 1 {
+		t.Errorf("应至少统计到刚写入的那条读侧记录，got %d", got.Summary.Retrievals)
+	}
+}
