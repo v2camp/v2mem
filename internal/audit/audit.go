@@ -15,14 +15,17 @@ import (
 
 // Record 是一次钩子激活的记录。
 type Record struct {
-	TS      int64    `json:"ts"`
-	Event   string   `json:"event"` // session-start | prompt-submit | manual-search | manual-add
-	Harness string   `json:"harness,omitempty"`
-	Project string   `json:"project,omitempty"`
-	Query   string   `json:"query,omitempty"`  // 读侧才有（prompt-submit 的用户提问）
-	Hashes  []string `json:"hashes,omitempty"` // 读侧＝实际注入的记忆 id；写侧＝写入的 content_hash
-	Kinds   []string `json:"kinds,omitempty"`
-	Empty   bool     `json:"empty"` // 注入内容为空
+	TS      int64  `json:"ts"`
+	Event   string `json:"event"` // session-start | prompt-submit | manual-search | manual-add
+	Harness string `json:"harness,omitempty"`
+	Project string `json:"project,omitempty"`
+	// SessionID 由钩子传入（stdin 的 session_id）。有了它才能按「本次会话」切分，
+	// 而不只按时间窗粗略估计。
+	SessionID string   `json:"session_id,omitempty"`
+	Query     string   `json:"query,omitempty"`  // 读侧才有（prompt-submit 的用户提问）
+	Hashes    []string `json:"hashes,omitempty"` // 读侧＝实际注入的记忆 id；写侧＝写入的 content_hash
+	Kinds     []string `json:"kinds,omitempty"`
+	Empty     bool     `json:"empty"` // 注入内容为空
 	// Mode 仅写侧使用：create=新增，overwrite=命中「相同知识覆盖」。
 	// 用它可算「模型重复记录率」——去重是否在起作用。
 	Mode string `json:"mode,omitempty"`

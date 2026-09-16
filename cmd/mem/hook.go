@@ -93,7 +93,7 @@ func cmdHook(args []string) error {
 	if *auditPath != "-" {
 		rec := audit.Record{
 			TS: started.Unix(), Event: string(event), Harness: harnessName(*harnessFlag, in),
-			Project: project, Query: strings.TrimSpace(in.Prompt),
+			Project: project, SessionID: in.SessionID, Query: strings.TrimSpace(in.Prompt),
 			Empty: strings.TrimSpace(text) == "", MS: time.Since(started).Milliseconds(),
 		}
 		for _, h := range injected {

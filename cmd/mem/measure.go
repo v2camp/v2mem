@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/wanghui/v2mem/internal/audit"
 	"github.com/wanghui/v2mem/internal/eval"
@@ -456,4 +457,114 @@ func hashOrEmpty(st *store.Store, id string) string {
 		return ""
 	}
 	return h
+}
+
+// ---------- mem report：任务收尾的 mem 评测结论 ----------
+
+// cmdReport 给「每次任务结束输出 mem 评测结论」提供参数支持。
+//
+// 按时间窗（或会话）切出本次任务期间的读、写两侧活动，并直接给出结论 ——
+// 目的是让「mem 到底起没起作用」在任务收尾时就有一个可写进交付物的判据，
+// 而不是等攒够样本再回头分析。
+func cmdReport(args []string) error {
+	var c common
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	c.register(fs)
+	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
+	project := fs.String("project", "", "限定工程（默认不限）")
+	since := fs.String("since", "8h", "时间窗，如 30m / 2h / 24h")
+	session := fs.String("session", "", "限定会话 id（取钩子 stdin 的 session_id）")
+	topN := fs.Int("top", 5, "空命中查询最多列几条")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	d, err := time.ParseDuration(*since)
+	if err != nil || d <= 0 {
+		return fmt.Errorf("非法 --since: %q（需为 30m / 2h / 24h 这类正时长）", *since)
+	}
+	cutoff := time.Now().Add(-d).Unix()
+
+	all, err := audit.Read(*auditFile, 0)
+	if err != nil {
+		return err
+	}
+	var rs []audit.Record
+	for _, r := range all {
+		if r.TS < cutoff {
+			continue
+		}
+		if *project != "" && r.Project != *project {
+			continue
+		}
+		if *session != "" && r.SessionID != *session {
+			continue
+		}
+		rs = append(rs, r)
+	}
+	s := audit.Summarize(rs)
+
+	if c.json {
+		return printJSON(map[string]any{
+			"since": *since, "project": *project, "session": *session,
+			"summary": s, "verdict": reportVerdict(s), "empty_queries": emptyQueries(rs, *topN),
+		})
+	}
+
+	fmt.Printf("mem 评测结论（窗口 %s", *since)
+	if *project != "" {
+		fmt.Printf("，工程 %s", *project)
+	}
+	fmt.Printf("）\n\n")
+	fmt.Printf("活动      : 读侧 %d 次 / 写侧 %d 次\n", s.Retrievals, s.Writes)
+	fmt.Printf("空命中    : %d 次（%.1f%%）\n", s.Empty, s.EmptyRate*100)
+	fmt.Printf("平均耗时  : %.1f ms\n", s.AvgMS)
+	if s.Writes > 0 {
+		fmt.Printf("写侧构成  : 新增 %d，命中覆盖 %d（重复记录率 %.0f%%）\n",
+			s.Creates, s.Overwrites, float64(s.Overwrites)/float64(s.Writes)*100)
+	}
+	if eq := emptyQueries(rs, *topN); len(eq) > 0 {
+		fmt.Println("空命中查询（标注金标准的候选样本）：")
+		for _, q := range eq {
+			fmt.Printf("  - %s\n", truncateRunes(q, 60))
+		}
+	}
+	fmt.Printf("结论      : %s\n", reportVerdict(s))
+	return nil
+}
+
+// reportVerdict 给出可直接写进交付物的一句话结论。
+// 「只查未记」与「只记未查」是两种不同的故障，必须分开说。
+func reportVerdict(s audit.Summary) string {
+	switch {
+	case s.Total == 0:
+		return "本次任务未使用记忆库（窗口内既无检索也无记录活动）"
+	case s.Retrievals == 0:
+		return fmt.Sprintf("只记未查：记录 %d 条但一次未检索 —— 记忆被写入却没被用上", s.Writes)
+	case s.Writes == 0:
+		return fmt.Sprintf("只查未记：检索 %d 次但未沉淀任何新事实 —— 这次任务没有留下可复用的东西", s.Retrievals)
+	}
+	v := fmt.Sprintf("读 %d / 写 %d，两侧都有活动", s.Retrievals, s.Writes)
+	if s.EmptyRate > 0.5 {
+		v += fmt.Sprintf("；但空命中率 %.0f%% 偏高，检索质量可疑，建议把上面的空命中查询标注成金标准后跑 mem eval recall --gold",
+			s.EmptyRate*100)
+	}
+	return v
+}
+
+// emptyQueries 列出空命中的查询原文（去重保序）。
+func emptyQueries(rs []audit.Record, limit int) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, r := range rs {
+		q := strings.TrimSpace(r.Query)
+		if q == "" || !r.Empty || seen[q] {
+			continue
+		}
+		seen[q] = true
+		out = append(out, q)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
 }

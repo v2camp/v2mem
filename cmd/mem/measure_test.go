@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wanghui/v2mem/internal/audit"
 	"github.com/wanghui/v2mem/internal/store"
@@ -584,5 +585,134 @@ func TestAuditSummarySeparatesReadAndWrite(t *testing.T) {
 	// 空注入率只应由读侧决定（写侧没有「空注入」概念）
 	if s.Empty != 0 || s.EmptyRate != 0 {
 		t.Errorf("写侧不应计入空注入率，got empty=%d rate=%v", s.Empty, s.EmptyRate)
+	}
+}
+
+// ---------- mem report：任务收尾的 mem 评测结论 ----------
+
+// 给「每次任务结束输出 mem 评测结论」这条临时约定提供参数支持：
+// 按时间窗/会话切出本次任务的读、写两侧活动，直接给出结论与建议。
+func TestCmdReportProducesVerdict(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	now := time.Now().Unix()
+	rs := []audit.Record{
+		{TS: now, Event: "session-start"},
+		{TS: now, Event: "prompt-submit", Harness: "claude", Query: "记忆库放哪", Hashes: []string{"a"}},
+		{TS: now, Event: "manual-search", Query: "日志怎么搬", Hashes: []string{"b"}, MS: 2},
+		{TS: now, Event: "manual-add", Mode: "create", Hashes: []string{"h1"}},
+	}
+	for _, r := range rs {
+		if err := audit.Append(p, r); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+	})
+	if err != nil {
+		t.Fatalf("cmdReport: %v", err)
+	}
+	for _, want := range []string{"读侧", "写侧", "结论"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("报告应含 %q，got:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "3") || !strings.Contains(out, "1") {
+		t.Errorf("应报出读 3 / 写 1，got:\n%s", out)
+	}
+}
+
+// 「只查不记」与「只记不查」必须给出不同结论 —— 这是判断 mem 是否起作用的落点。
+func TestCmdReportDistinguishesReadOnlyAndWriteOnly(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().Unix()
+
+	readOnly := filepath.Join(dir, "r.jsonl")
+	_ = audit.Append(readOnly, audit.Record{TS: now, Event: "manual-search", Query: "q", Hashes: []string{"a"}})
+	out1, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--audit-file", readOnly, "--since", "1h"})
+	})
+	if err != nil {
+		t.Fatalf("cmdReport: %v", err)
+	}
+	if !strings.Contains(out1, "只查未记") {
+		t.Errorf("只读侧活动应判为「只查未记」，got:\n%s", out1)
+	}
+
+	writeOnly := filepath.Join(dir, "w.jsonl")
+	_ = audit.Append(writeOnly, audit.Record{TS: now, Event: "manual-add", Mode: "create", Hashes: []string{"h"}})
+	out2, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--audit-file", writeOnly, "--since", "1h"})
+	})
+	if err != nil {
+		t.Fatalf("cmdReport: %v", err)
+	}
+	if !strings.Contains(out2, "只记未查") {
+		t.Errorf("只写侧活动应判为「只记未查」，got:\n%s", out2)
+	}
+}
+
+// 空命中的查询原文必须列出来 —— 它们正是标注金标准的候选样本。
+func TestCmdReportListsEmptyHitQueries(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	now := time.Now().Unix()
+	for _, q := range []string{"查得到的问题", "查不到的问题甲", "查不到的问题乙"} {
+		empty := strings.HasPrefix(q, "查不到")
+		_ = audit.Append(p, audit.Record{TS: now, Event: "manual-search", Query: q, Empty: empty})
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+	})
+	if err != nil {
+		t.Fatalf("cmdReport: %v", err)
+	}
+	for _, want := range []string{"查不到的问题甲", "查不到的问题乙"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("应列出空命中查询原文 %q（金标准候选），got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "查得到的问题") {
+		t.Errorf("不应把有命中的查询列进空命中清单，got:\n%s", out)
+	}
+}
+
+// 时间窗必须真的生效：窗外的事件不能计入。
+func TestCmdReportHonoursSinceWindow(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	now := time.Now().Unix()
+	// 两条都标 Empty：报告只列「空命中查询」，用它们做时间窗的判据才成立
+	_ = audit.Append(p, audit.Record{TS: now - 7200, Event: "manual-search", Query: "两小时前", Empty: true})
+	_ = audit.Append(p, audit.Record{TS: now, Event: "manual-search", Query: "刚刚", Empty: true})
+
+	out, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+	})
+	if err != nil {
+		t.Fatalf("cmdReport: %v", err)
+	}
+	if strings.Contains(out, "两小时前") {
+		t.Errorf("--since 1h 不应计入 2 小时前的事件，got:\n%s", out)
+	}
+	if !strings.Contains(out, "刚刚") {
+		t.Errorf("窗内事件应计入，got:\n%s", out)
+	}
+}
+
+func TestCmdReportOnEmptyLogSaysSo(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	out, err := captureStdout(t, func() error {
+		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+	})
+	if err != nil {
+		t.Fatalf("空审计不应报错: %v", err)
+	}
+	if !strings.Contains(out, "未使用记忆库") {
+		t.Errorf("窗口内无活动应明确说未使用，got:\n%s", out)
+	}
+}
+
+func TestCmdReportRejectsBadSince(t *testing.T) {
+	if err := cmdReport([]string{"--since", "not-a-duration"}); err == nil {
+		t.Error("非法 --since 应报错")
 	}
 }
