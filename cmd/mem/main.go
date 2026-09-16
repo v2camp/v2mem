@@ -35,6 +35,8 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
   mem harness [--json]              列出各工具的接入方式与检测结果
   mem init   --harness <名字>       把钩子写入该工具的配置（幂等、合并、带备份）
+  mem ingest <文件.md>              把既有 md 文件里的条目机械化搬进记忆库
+  mem budget --file <文件>          检查 Level 1 文件是否超出注入预算
   mem stats  [选项]                 库概览
   mem help
 
@@ -111,6 +113,10 @@ func main() {
 		err = cmdHarness(os.Args[2:])
 	case "init":
 		err = cmdInit(os.Args[2:])
+	case "ingest":
+		err = cmdIngest(os.Args[2:])
+	case "budget":
+		err = cmdBudget(os.Args[2:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
 		return
