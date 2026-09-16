@@ -128,3 +128,47 @@ func TestWriteOnlyLogHasNoEmptyInjectionRate(t *testing.T) {
 		t.Errorf("纯写日志的空注入率应为 0，got %v", s.EmptyRate)
 	}
 }
+
+// Read 与 Append 必须对空路径保持一致：都取默认位置。
+// 此前 Read 不兜底 ⇒ os.Open("") 的 ENOENT 被 isNotExist 分支吞掉，
+// 调用方拿到「空日志」而非「路径错了」，进而得出错误结论。
+func TestReadDefaultsEmptyPathLikeAppend(t *testing.T) {
+	// 测试 HOME 已隔离到临时目录，默认路径落在其中
+	def := Path()
+	if err := Append("", Record{Event: "manual-search", Query: "写默认路径"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if !Exists("") {
+		t.Fatal("Append 空路径后，Exists 应看到默认位置的日志")
+	}
+	rs, err := Read("", 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	// 默认路径在整个测试二进制里共享，`-count=2` 时记录会累积 ⇒
+	// 断言「至少包含」而不是精确条数（卡条数会在重复运行时误报）。
+	found := false
+	for _, r := range rs {
+		if r.Query == "写默认路径" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Read 空路径应读到默认位置的内容，got %+v（默认路径 %s）", rs, def)
+	}
+}
+
+// Exists 要能区分「日志不存在」与「日志存在但为空」。
+func TestExistsDistinguishesMissingFromEmpty(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	if Exists(p) {
+		t.Error("文件尚未创建时 Exists 应为 false")
+	}
+	if err := Append(p, Record{Event: "manual-add"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if !Exists(p) {
+		t.Error("文件创建后 Exists 应为 true")
+	}
+}
