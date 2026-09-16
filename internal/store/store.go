@@ -328,26 +328,28 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 	}
 
 	now := time.Now().Unix()
-	where := []string{
-		"fts_mem MATCH ?",
-		"(m.expires_at IS NULL OR m.expires_at > ?)",
-		// 已被相似归并取代的记忆不再出现：否则用户会同时看到两条互相矛盾的答案。
-		// 它们仍留在库里（可由 export 带走、可追溯），只是不参与检索。
-		"m.superseded_by IS NULL",
-	}
+	// 可见性判据与 List 共用同一函数，避免两处各写一遍后漂移
+	where := append([]string{"fts_mem MATCH ?"}, visibilityWhere()...)
 	args := []any{expr, now}
 
-	switch {
-	case q.Scope == "current":
+	// 作用域用显式 switch：写成一串布尔判断时「all + 非空 Project」
+	// 会落进 Project 分支，使 --scope all 静默失效。
+	switch q.Scope {
+	case "current":
 		// project 为空的记忆视为全局，对所有工程生效
 		where = append(where, "(m.project = ? OR m.project = '')")
 		args = append(args, q.Project)
-	case q.Scope == "global":
+	case "global":
 		// 只看全局记忆：跨工程硬规则需要能被单独列出，不被工程噪声淹没
 		where = append(where, "m.project = ''")
-	case q.Project != "":
-		where = append(where, "m.project = ?")
-		args = append(args, q.Project)
+	case "all":
+		// 显式跨工程：忽略 Project。CLI 侧会把「--scope all + --project」判为矛盾用法，
+		// 以免用户以为过滤生效了而实际没有。
+	default:
+		if q.Project != "" {
+			where = append(where, "m.project = ?")
+			args = append(args, q.Project)
+		}
 	}
 	if q.Kind != "" {
 		where = append(where, "m.kind = ?")
@@ -516,6 +518,72 @@ type Stats struct {
 	ByKind      map[string]int `json:"by_kind"`
 	ByProject   map[string]int `json:"by_project"`
 	ExpiredLive int            `json:"expired_pending_gc"`
+}
+
+// visibilityWhere 返回「一条记忆是否对检索可见」的条件。
+//
+// Search 与 List 必须共用同一份判据：两处各写一遍迟早会漂移，
+// 而漂移的表现是「搜得到但列不出」或反之，极难察觉。
+func visibilityWhere() []string {
+	return []string{
+		"(m.expires_at IS NULL OR m.expires_at > ?)",
+		// 已被相似归并取代的记忆不再出现：否则用户会同时看到两条互相矛盾的答案。
+		// 它们仍留在库里（可由 export 带走、可追溯），只是不参与检索。
+		"m.superseded_by IS NULL",
+	}
+}
+
+// ListQuery 是「不依赖全文检索」的列举条件。
+//
+// 与 SearchQuery 的分工：Search 要匹配词，List 只要「最重要 / 最近的」。
+// 会话起始注入需要的是后者 —— 那时还没有用户提问，没有关键词可用。
+type ListQuery struct {
+	Scope   string // "current" = 本工程 + 全局；"project" = 只本工程；"global" = 只要全局；其他 → 不限
+	Project string
+	Limit   int
+}
+
+// List 按重要性降序列出可见记忆（同 salience 时取最近命中的在前）。
+func (s *Store) List(q ListQuery) ([]Hit, error) {
+	if q.Limit <= 0 {
+		q.Limit = 10
+	}
+	args := []any{time.Now().Unix()}
+	where := visibilityWhere()
+
+	switch q.Scope {
+	case "current":
+		where = append(where, "(m.project = ? OR m.project = '')")
+		args = append(args, q.Project)
+	case "project":
+		// 只取本工程，不含全局 —— 供「硬规则」与「本工程记忆」分段注入时去重
+		where = append(where, "m.project = ?")
+		args = append(args, q.Project)
+	case "global":
+		where = append(where, "m.project = ''")
+	}
+	args = append(args, q.Limit)
+
+	rows, err := s.db.Query(
+		`SELECT m.id, m.content, m.kind, m.project, m.salience, m.updated_at, 0.0 AS rank
+		   FROM memories m
+		  WHERE `+strings.Join(where, " AND ")+`
+		  ORDER BY m.salience DESC, m.last_seen_at DESC, m.updated_at DESC, m.id ASC
+		  LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Hit
+	for rows.Next() {
+		var h Hit
+		if err := rows.Scan(&h.ID, &h.Content, &h.Kind, &h.Project, &h.Salience, &h.UpdatedAt, &h.Rank); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) Stats() (*Stats, error) {

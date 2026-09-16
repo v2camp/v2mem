@@ -151,7 +151,10 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 
 要点：**钩子必须写清「什么时候查」（触发条件），而非只说「你有记忆库」**；并给出 `mem` 缺失时的降级路径。
 
-**Harness 钩子增强（可选）**：Claude Code 的 `SessionStart` / `UserPromptSubmit` / `Stop`、WorkBuddy 的自动化与 `.githooks`，可做到会话开始自动预检索、会话结束自动回写。文本钩子做可移植兜底，原生钩子做自动化增强，两者并存。
+**Harness 原生钩子（已落地，见 §12）**：不再依赖「提醒模型记得查」——`mem init` 把
+`SessionStart` / `UserPromptSubmit` 钩子写进各工具的原生配置，由 harness 在事件点执行
+`mem hook`，确定性注入。文本钩子仍保留为可移植兜底（也是 WorkBuddy / TraeWork 这类
+无原生钩子的工具的唯一接入方式）。
 
 ## 7. 跨设备归集
 
@@ -197,6 +200,11 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 共享事实在 A 库记 `mini`、在 B 库记 `laptop`，两边都对——这是本地视角字段。
 收敛判据因此排除 `id` 与 `origin_device`，只对内容相关字段断言一致。
 
+### 7.4 导出可复现
+
+`Export()` 按 `(content_hash, project)` 排序，标记按 `(key, value)` 排序。
+否则每次导出的 JSONL 都会无谓 diff，跨设备比对失去意义。
+
 ### 7.5 取代关系的跨设备重建（M4.1）
 
 **问题**：`superseded_by` 存的是本地随机 id。直接搬过去就是**悬挂引用**；完全不搬，
@@ -230,11 +238,6 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 **仍未实现**：`edges` 表的跨设备重映射。当前无写入路径（相似归并不建边），故无实际影响；
 一旦 M5b 或后续引入边关系，需按同样方式处理。
 
-### 7.4 导出可复现
-
-`Export()` 按 `(content_hash, project)` 排序，标记按 `(key, value)` 排序。
-否则每次导出的 JSONL 都会无谓 diff，跨设备比对失去意义。
-
 ## 8. CLI 设计（`mem`）
 
 ```
@@ -246,6 +249,11 @@ mem gc                             # 过期清理 + 衰减淘汰
 mem consolidate [--threshold 0.7]  # 相似归并：近重复聚簇，留 1 条、其余置 superseded_by
 mem export   [out.jsonl]
 mem import   <in.jsonl>            # 跨设备归并
+mem hook     [--event e] [--harness h] [--limit n] [--max-chars n]
+                                   # harness 钩子入口：读 stdin JSON，注入内容写 stdout
+mem init     --harness <名字> [--project <目录>] [--scope ...] [--file <路径>] [--dry-run]
+                                   # 把钩子写进该工具的配置（合并、幂等、带备份）
+mem harness  [--json]              # 列出各工具的接入方式、等级与本机检测结果
 mem stats                          # 条数 / 分布 / 库大小
 ```
 
@@ -254,6 +262,7 @@ mem stats                          # 条数 / 分布 / 库大小
 `--json` 输出供 LLM 解析；默认输出为紧凑纯文本，省 token。
 `--scope`：`current` = 当前工程 + 全局；`global` = 只要全局；`all`/省略 = 跨工程（默认）。
 `--global` 与 `--project` **互斥**——这是唯一能写入「空工程」记忆的入口，缺了它全局记忆在 CLI 上不可达。
+`mem hook` 的 stdout 只放注入内容、诊断走 stderr，且**任何异常都返回 0**（见 §12.4）。
 
 ## 9. 已知坑
 
@@ -272,46 +281,11 @@ mem stats                          # 条数 / 分布 / 库大小
 - [x] **M4.1 取代关系跨设备重建**：取代引用改为身份键表达，导入端两遍解析（§7.5）
 - [x] **M5a 相似归并（纯 Go，无模型）**：字符 n-gram MinHash + 四条护栏 + `consolidate`
 - [ ] M5b 增强（可选）：sqlite-vec 向量 + RRF 融合（**不再是相似归并的前置**，只是检索召回的另一路）
-- [ ] M6 Harness 集成：Level 1 钩子模板 + 原生钩子（自动预检索 / 自动回写）
+- [x] **M6 Harness 集成**：`mem hook` 统一事件入口 + `mem init` 配置生成（11 个工具入口，见 §12）
 
 > M5 拆成两半是本次实现中的结论：相似归并属**近重复检测**（经典算法问题），
 > MinHash 几十行、微秒级、零依赖即可胜任，不必引入模型与 CGO。
 > 于是 M5b 的向量化从「相似归并的前置」降级为「检索召回的另一路」。
-
-### 11.9 M4 已完成能力（跨设备归集）
-
-- `mem export [路径.jsonl]`：全部记忆导出为 JSONL（省略路径则写标准输出）；给路径时把摘要打到标准输出
-- `mem import <路径.jsonl>`：按 `(content_hash, project)` 归并，报告 `新增/合并/跳过`
-- 归并规则与边界见 §7.2 / §7.3
-
-**测试**：共 **39 个用例**（`go test ./... -v` 实测；M3 时点为 23，M4 新增 16）：
-
-| 范围 | 用例 |
-|:---|:---|
-| 导出 | 每条记忆一行且必带 `content_hash` / `tags` / `origin_device`；两次导出完全一致（可复现）；省略路径走标准输出 |
-| 导入 · 基础 | 新记录插入并保留远端 `origin_device`；按 hash+project 归并而非按 id 新插；同事实跨工程保持独立 |
-| 导入 · 幂等 | 重复导入不改变状态、不产生重复行；`access_count` 取 max 不随重复导入增长；CLI 二次导入报告 `新增=0 合并=1` |
-| 导入 · 字段规则 | 标记取并集；`created_at` 取最早、`last_seen_at` 取较晚；`expires_at` NULL 优先（永不过期）与取较晚者两路 |
-| 导入 · 收敛 | 双向导入后两侧内容投影完全一致；`origin_device` 保持本地视角（固化 7.3 边界） |
-
-**变异测试（验证断言真有咬合力）**：把 `access_count = MAX(...)` 改成求和后重跑。
-
-- `TestImportTakesMaxAccessCountNotSum` 报警（`got 31`）✅
-- `TestImportIsIdempotent` **首次未报警** ❌ —— 该用例两侧计数均为 0，求和与取 max 结果相同，属巧合性通过。
-  已修：给两侧预设非零 `access_count` 与 `last_seen_at`，再变异时该用例正确报警。
-  **教训**：幂等类断言必须让被测字段取非零值，否则「恒等」会掩盖实现错误。
-
-**e2e 双设备仿真**（A=mini / B=laptop，各 2 条含 1 条共享事实）：
-
-| 判据 | 结果 |
-|:---|:---|
-| 交叉导入后两侧内容投影一致（排除 `id` / `origin_device`） | 3 条 vs 3 条，完全收敛 ✅ |
-| 共享事实字段归并：`salience`、`tags`、`kind` | `0.9`、`{machine:[laptop,mini]}`、`fact` ✅（取 max / 并集） |
-| 重复导入后导出逐字节不变 | ✅ |
-| 连续 5 次重复导入后状态稳定 | ✅ |
-| `origin_device` 本地视角（A 见 `mini`、B 见 `laptop`） | 符合 7.3 设计 ✅ |
-
-> 度量教训（第二次）：首次 e2e 把「导入**前**的导出」与「导入**后**的导出」做字节 diff，误报为幂等失败 —— 对照组本身就不该相等。**幂等必须用「同一状态下的前后对照」，不能拿跨越状态变更的两个快照比。**
 
 ## 11. 技术选型（已定：Go）
 
@@ -430,6 +404,41 @@ make build-onnx  # M5 可选分支：-tags local_onnx，需 CGO + libonnxruntime
 
 > 度量教训：首版 e2e 用 `wc -l` 计数，而空结果会打印一行 `（无结果）`，导致负对照恒为 1 —— **负对照抓出的是度量工具失准，不是代码缺陷**。最终改用 `--json` + 长度统计，并先自检仪器（`--limit 1` 应得 1）。
 
+### 11.9 M4 已完成能力（跨设备归集）
+
+- `mem export [路径.jsonl]`：全部记忆导出为 JSONL（省略路径则写标准输出）；给路径时把摘要打到标准输出
+- `mem import <路径.jsonl>`：按 `(content_hash, project)` 归并，报告 `新增/合并/跳过`
+- 归并规则与边界见 §7.2 / §7.3
+
+**测试**：共 **39 个用例**（`go test ./... -v` 实测；M3 时点为 23，M4 新增 16）：
+
+| 范围 | 用例 |
+|:---|:---|
+| 导出 | 每条记忆一行且必带 `content_hash` / `tags` / `origin_device`；两次导出完全一致（可复现）；省略路径走标准输出 |
+| 导入 · 基础 | 新记录插入并保留远端 `origin_device`；按 hash+project 归并而非按 id 新插；同事实跨工程保持独立 |
+| 导入 · 幂等 | 重复导入不改变状态、不产生重复行；`access_count` 取 max 不随重复导入增长；CLI 二次导入报告 `新增=0 合并=1` |
+| 导入 · 字段规则 | 标记取并集；`created_at` 取最早、`last_seen_at` 取较晚；`expires_at` NULL 优先（永不过期）与取较晚者两路 |
+| 导入 · 收敛 | 双向导入后两侧内容投影完全一致；`origin_device` 保持本地视角（固化 7.3 边界） |
+
+**变异测试（验证断言真有咬合力）**：把 `access_count = MAX(...)` 改成求和后重跑。
+
+- `TestImportTakesMaxAccessCountNotSum` 报警（`got 31`）✅
+- `TestImportIsIdempotent` **首次未报警** ❌ —— 该用例两侧计数均为 0，求和与取 max 结果相同，属巧合性通过。
+  已修：给两侧预设非零 `access_count` 与 `last_seen_at`，再变异时该用例正确报警。
+  **教训**：幂等类断言必须让被测字段取非零值，否则「恒等」会掩盖实现错误。
+
+**e2e 双设备仿真**（A=mini / B=laptop，各 2 条含 1 条共享事实）：
+
+| 判据 | 结果 |
+|:---|:---|
+| 交叉导入后两侧内容投影一致（排除 `id` / `origin_device`） | 3 条 vs 3 条，完全收敛 ✅ |
+| 共享事实字段归并：`salience`、`tags`、`kind` | `0.9`、`{machine:[laptop,mini]}`、`fact` ✅（取 max / 并集） |
+| 重复导入后导出逐字节不变 | ✅ |
+| 连续 5 次重复导入后状态稳定 | ✅ |
+| `origin_device` 本地视角（A 见 `mini`、B 见 `laptop`） | 符合 7.3 设计 ✅ |
+
+> 度量教训（第二次）：首次 e2e 把「导入**前**的导出」与「导入**后**的导出」做字节 diff，误报为幂等失败 —— 对照组本身就不该相等。**幂等必须用「同一状态下的前后对照」，不能拿跨越状态变更的两个快照比。**
+
 ### 11.10 M5a 相似归并：为什么单靠阈值不够
 
 用字符 3-gram + MinHash 估 Jaccard（`internal/similarity`）。选择这条路而非 embedding，是为守住
@@ -546,3 +555,167 @@ M4 时代没有 `superseded_by`，故限制无影响；M5a 一旦产生取代关
 | 取代关系（按身份键） | 两侧均为 `6162dd51/v2mem -> ee30b73c/v2mem` ✅ |
 | 检索可见性 | 两侧 `总4 / 可见3 / 已归并1`，检索「隐藏目录」各 1 条 ✅ |
 | 幂等 | 再各导入一次 `新增=0`，取代关系不变 ✅ |
+
+## 12. Harness 集成（M6）
+
+目标：把 Level 2 接进用户实际在用的工具，且**用能确定性执行的方式**——不靠「提醒模型记得查」。
+
+### 12.1 事实核实表（2026-09-17 逐家核对官方文档）
+
+不做推测性填写：配置写进不生效的路径是**静默失败**，比不写更糟。
+
+| 工具 | 接入方式 | 事件名 | 项目目录来源 | 用户级配置 | 官方文档 |
+|:---|:---|:---|:---|:---|:---|
+| Claude Code | native | 同名 6+ 事件 | `CLAUDE_PROJECT_DIR` | `~/.claude/settings.json` | docs.claude.com/…/hooks |
+| TraeCode（Trae IDE / SOLO） | native | SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / Notification | `TRAE_PROJECT_DIR`、`CLAUDE_PROJECT_DIR` | `~/.trae-cn/hooks.json` | docs.trae.cn/ide_hook-configuration-reference |
+| CodeBuddy Code | native | 27+ 事件 | `CODEBUDDY_PROJECT_DIR` | `~/.codebuddy/settings.json` | codebuddy.cn/docs/cli/hooks |
+| Qoder（IDE / JB / CLI） | native | 12 事件 | `QODER_PROJECT_DIR` | `~/.qoder/settings.json` | docs.qoder.com/en/cli/hooks |
+| Qoder CN | native | 同上 | `QODERCN_PROJECT_DIR` | `~/.qoder-cn/settings.json` | help.aliyun.com/zh/lingma/hook |
+| QoderWork | native | SessionStart / SessionEnd / UserPromptSubmit / PreToolUse / PostToolUse … | **无（只走 stdin `cwd`）** | `~/.qoderwork/settings.json`（**仅用户级**） | docs.qoder.com/zh/qoderwork/hooks |
+| QoderWork CN | native | 同上 | **无** | `~/.qoderworkcn/settings.json` | alibabacloud.com/help/zh/lingma/hook |
+| Codex CLI | native | SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PermissionRequest / PreCompact / PostCompact / SubagentStart / SubagentStop / Stop | **无（只走 stdin `cwd`）** | `~/.codex/hooks.json`（或 config.toml 的 `[hooks]`） | developers.openai.com/codex/hooks |
+| DeepSeek Harness (dsh) | **bridge** | Cordis 扩展点：`agent/session-start`、`agent/pre-step`、`tools/pre-execute`、`tools/post-execute`、`session/event` | 插件内 `ctx` | 无 hooks.json；桥接包读 `~/.claude/settings.json` | dsh 官方文档 |
+| TraeWork | **instruction** | — | `TRAE_PROJECT_DIR` / `CLAUDE_PROJECT_DIR` | 无公开 hook 文档 | docs.trae.cn/traework/ |
+| WorkBuddy | **instruction** | — | — | 无公开 hook 文档 | workbuddy.cn/docs/workbuddy/Overview |
+
+用户点名的 8 个入口 → 注册表名的映射（有测试固化）：
+`trae work→traework`、`trae code→traecode`、`work buddy→workbuddy`、`code buddy→codebuddy`、
+`qoder→qoder`、`qoder work→qoderwork`、`deepseek harness→dsh`、`codex→codex`。
+
+### 12.2 三个核心设计结论
+
+**① 一条命令通吃。** 六家原生 shell hook 的注入通道在 `SessionStart` / `UserPromptSubmit`
+两个事件上是重合的：**stdout 纯文本即被当作附加上下文**（Claude Code、TraeCode、CodeBuddy、
+Qoder、QoderWork、Codex 的文档均如此记载）。因此 `mem hook` 输出纯文本，
+不按 harness 分支渲染格式 —— 少一层分支就少一类静默失败。
+
+`--harness` 只决定两件事：**从哪个环境变量取项目目录**、**配置写到哪里**。
+
+**② 写一份 Claude 格式，顺带覆盖三家。** TraeCode 官方明确会额外读取
+`~/.claude/settings.json` 并**合并执行**；dsh 有官方桥接包
+`dsh-hooks-claude-code` 把同一协议翻译到自己的扩展点。故给 `claude` 装一次，
+TraeCode 与 dsh 一并受益。
+
+**③ 三级确定性必须对用户可见。** `native`（事件触发即执行，代码强制）→
+`bridge`（复用他家协议）→ `instruction`（写指令块靠模型遵守）。
+`mem harness` 与 `mem init` 都显式打印等级，并标注「指令级没有代码强制，可靠性低一档」。
+
+### 12.3 注入通道差异（决定输出格式的取舍）
+
+| 工具 | 纯文本 stdout | `hookSpecificOutput.additionalContext` | 备注 |
+|:---|:---|:---|:---|
+| Claude Code / TraeCode / CodeBuddy | ✅（仅 SessionStart & UserPromptSubmit） | ✅ | 我们只用前一类事件 |
+| Qoder / QoderWork | ✅（仅这两个事件） | ✅ | 🔴 JSON 带 `hookSpecificOutput` 时必须同时给 `hookEventName`，否则**整份被拒** |
+| Codex | ✅（仅这两个事件） | ✅ | 无环境变量，项目目录取 stdin `cwd` |
+
+退出码语义各家一致：`0` 成功（stdout 按上述规则解析）、`2` 阻断、其他为非阻断错误。
+**本实现永远返回 0**：记忆系统不可用不该让用户的会话中断。
+
+### 12.4 `mem hook` 的四条纪律
+
+1. **绝不阻断宿主。** 所有分支返回 nil；解析失败、stdin 是垃圾、库打不开都静默放过。
+   这条有专门的用例矩阵（空输入 / 非 JSON / 截断 JSON / 未知事件 / `cwd` 不存在 / 字段类型不符）。
+2. **stdout 只放注入内容，诊断走 stderr。** CodeBuddy 文档明确「stderr 仅作为 fallback，
+   调试日志可安全写入 stderr，不会污染给 Agent 的反馈」；其余各家在退出码 0 时也只展示 stderr。
+3. **每轮注入有字符预算**（默认 1200 字符），且**用法提示预留预算**——它的作用正是告诉模型
+   「还有多级记忆可查」，被截断就失去了钩子的意义。
+4. **无命中即静默。** `UserPromptSubmit` 检索不到相关内容时不输出任何东西，避免每轮注入噪声。
+
+`SessionStart` 的注入顺序：跨工程硬规则 → 本工程记忆 → 用法提示。
+工程推断优先级：指定 harness 的环境变量 → stdin `cwd` → `workspace_roots` → 进程工作目录。
+**指定了 harness 就不再兜到别家**——否则在 Trae 里启动的终端会把 `CLAUDE_PROJECT_DIR`
+带进 QoderWork 的钩子，工程判断就错了。
+
+### 12.5 `mem init` 的配置生成纪律
+
+| 纪律 | 做法 |
+|:---|:---|
+| 合并而非覆盖 | 只读写 `hooks` 段；已有的其它 hook 组与无关配置键原样保留；**解析不了就报错退出**，绝不拿默认值盖用户文件 |
+| 幂等 | 写入前先摘掉自己上次写的条目（按命令里的 `# v2mem` 标记识别），重复执行不累积 |
+| 备份 | `<文件>.v2mem.bak`，**只写一次**，保证它永远是「首次触碰前」的干净状态 |
+| 绝对路径 | 命令用当前二进制的绝对路径而非裸 `mem`：harness 拉起钩子时环境往往很干净，没有用户 shell 的 PATH，裸命令会静默失效 |
+| 可验证 | 写入后打印该工具的**生效验证方法**（如 Claude 用 `/hooks`、Codex 需 `/hooks` 里 trust）、额外前置条件与已知注意事项 |
+
+**为什么用 `# v2mem` 注释做标记**：最初靠「可执行文件名 == `mem`」识别，测试二进制叫 `mem.test`
+就认不出，重复 init 累积了 3 条（被幂等用例抓到）。任何改名都会破坏它。
+写成 shell 注释是安全的——各家文档的 command 都经 shell 执行（bash/zsh/sh/powershell 皆以 `#` 为注释），
+且不污染实际参数。
+
+### 12.6 本机安装状态与端到端验证
+
+`mem harness` 检测到本机已装并已写入：
+
+| 工具 | 文件 | 结果 |
+|:---|:---|:---|
+| Claude Code + dsh（桥接） | `~/.claude/settings.json` | 已写入 |
+| TraeCode（Trae CN / SOLO CN） | `~/.trae-cn/hooks.json` | 已写入 |
+| CodeBuddy Code | `~/.codebuddy/settings.json` | 已写入 |
+| Codex CLI | `~/.codex/hooks.json` | 已写入 |
+| QoderWork CN | `~/.qoderworkcn/settings.json` | 已写入 |
+
+**端到端验证方式**：从 `~/.claude/settings.json` 里**取出真实命令**并执行（而不是跑一份等价命令），
+证明写进配置的那条命令确实可用：
+
+- `SessionStart`（模拟 `cwd` = 真实工程）→ 注入 494 字符，含 3 条硬规则 + 1 条本工程记忆 + 用法提示
+- `UserPromptSubmit`（提问含「同步目录」）→ 只注入命中的那 1 条 pitfall
+
+**延迟**（钩子在会话关键路径上，不能有可观开销，`/usr/bin/time -p` 实测）：
+`session-start` 0.01s、`prompt-submit` 0.01s、空事件 0.01s、库不存在 0.01s。
+
+### 12.7 测试（M6 新增 39 个用例，累计 112）
+
+`go test ./... -v` 实测：harness 11 + similarity 16 + store 49 + cmd 36 = **112**（M5a 时点为 73）。
+
+| 范围 | 用例 |
+|:---|:---|
+| harness 注册表 | 名字/别名解析、未知名报错带候选、**用户点名的 8 个入口全覆盖**、条目自洽（native 有配置路径 / instruction 有指令文件）、名字与别名全局唯一、事件名归一化容忍大小写与下划线、多候选配置路径选择、环境变量优先级、不注入环境变量的工具被正确标注 |
+| `mem hook` | SessionStart 注入硬规则与本工程记忆、教会检索命令、prompt-submit 只注入相关且排除他工程、无命中静默、**异常输入矩阵（8 种）不报错**、库不存在可用、`--limit` 生效、**字符预算生效**、stdin cwd 回退、环境变量优先、显式 `--event` |
+| `mem init` / `harness` | 列表含用户工具与等级标注、写出两个事件、绝对路径、**合并不覆盖**、**幂等**、`--dry-run` 不落盘、备份不被二次 init 覆盖、指令级标记块就地替换、`--file` 覆盖、未知 harness 与非法 scope 报错 |
+
+**变异测试**（逐个把实现改坏，确认有断言报警）：
+
+| 变异 | 捕获用例 |
+|:---|:---|
+| prompt-submit 去掉工程过滤 | `TestCmdHookPromptSubmitExcludesOtherProjects` ✅ |
+| 取消字符预算 | `TestCmdHookRespectsCharBudget` ✅ |
+| 不预留用法提示的预算 | `TestCmdHookRespectsCharBudget` ✅ |
+| 去掉幂等去重（`withoutOurs`） | `TestCmdInitIsIdempotent`（`got 3`）✅ |
+| 备份每次覆盖 | `TestCmdInitBacksUpExistingFile` ✅ |
+| 不合并、直接覆盖用户配置 | `TestCmdInitMergesWithoutClobberingExistingConfig` ✅ |
+
+**三处「假通过」的排查记录**（都是断言或数据的问题，不是实现的）：
+
+1. **工程名不对齐** → 一批 prompt-submit 用例返回空，但不是「无命中」而是被工程过滤掉了。
+   修法：造带 `.git` 的临时工程，且记忆的 `project` 与钩子推断一致；断言一律要求**有内容**。
+2. **宿主环境变量污染** → 工作环境里已设 `CLAUDE_PROJECT_DIR`，钩子优先采纳它，
+   测试实际在验证宿主环境。修法：让测试数据构造函数**显式清空**各家环境变量。
+   （这一点是靠 `mem hook` 打到 stderr 的诊断行 `project=… dir=…` 定位的 —— 诊断信息的价值。）
+3. **预算未成为约束** → 先写 40 条记忆、断言 `--max-chars 800` 生效，但 `--limit 3`
+   先把量兜住了，把预算逻辑整段删掉测试也不失败。修法：同时放开 `--limit`，
+   并加前置断言「放开采纳量后输出确实远超预算」。
+   另：最初 40 条写的是同一个字符串，被「相同知识覆盖」收敛成 1 条 —— 数据必须逐条互异。
+
+### 12.8 不确定项（已知的未知，不做推测）
+
+1. **TraeWork 是否有 shell hook 未经验证。** 官方文档未发布；其 Code 模式构建于 TraeCode SOLO
+   之上，若与 TraeCode 共用运行时，则 `~/.trae-cn/hooks.json` 可能同样生效。
+   本工具因此按指令级接入，**不据此写入**。
+2. **WorkBuddy 无公开 hook 配置。** 其已发布扩展机制是项目记忆文件、技能、自动化任务，
+   故走指令级接入。
+3. **TraeCode 国际版的全局路径未从文档确认**（文档记 CN 版为 `~/.trae-cn/hooks.json`）。
+   注册表同时列 `~/.trae/hooks.json` 作为候选，优先选父目录已存在的那个。
+4. **dsh 的桥接包未安装。** 本次只写好 Claude 侧配置；
+   需执行 `dsh plugin --profile add dsh-hooks-claude-code` 才生效。
+5. **Codex 的 hook 需要信任。** 非托管 hook 首次执行前要在 `/hooks` 里审核，
+   信任按 hook 哈希持久化 —— 改动命令后需重新审核。已写入 `~/.codex/hooks.json`，
+   但需用户首次确认。
+6. **`/hooks` 面板式审核的工具**（CodeBuddy）在面板外的手工改动可能需在面板内确认后才生效。
+
+### 12.9 指令级接入的落点问题
+
+WorkBuddy 与 TraeWork 走指令级接入时，默认落点是它们各自的会话级文件
+（`.workbuddy/memory/MEMORY.md`、`AGENTS.md`）。但这类文件常**自带注入预算**
+（本仓库的 `MEMORY.md` 就按约 7800 字符控制），把 v2mem 的说明塞进去会挤占预算。
+
+因此 `mem init` 提供 `--file <路径>` 覆盖落点，让用户把它放到不挤占预算的位置。
+默认落点是否合适属于用户的项目约定，**本工具不替用户决定**。

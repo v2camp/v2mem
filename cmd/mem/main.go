@@ -32,6 +32,9 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem consolidate [选项]           相似知识归并（近重复聚簇，留 1 条）
   mem export [路径.jsonl]          导出为 JSONL（省略路径则写标准输出）
   mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
+  mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
+  mem harness [--json]              列出各工具的接入方式与检测结果
+  mem init   --harness <名字>       把钩子写入该工具的配置（幂等、合并、带备份）
   mem stats  [选项]                 库概览
   mem help
 
@@ -63,6 +66,12 @@ gc 选项:
 consolidate 选项:
   --threshold <f>       相似度阈值 0..1（默认 0.7）
                         准确性由护栏保证（数字/否定/长度/短文本），阈值只影响召回
+
+hook 选项:
+  --event <e>           session-start|prompt-submit|stop|session-end（默认从 stdin 推断）
+  --harness <h>         指定工具，项目目录按其注入的环境变量取（默认依次尝试）
+  --limit <n>           注入记忆条数上限（默认 3）
+  --max-chars <n>       注入字符预算（默认 1200）
 
 示例:
   mem add --kind decision "记忆库数据必须放在 ~/.v2mem，不放代码目录"
@@ -96,6 +105,12 @@ func main() {
 		err = cmdExport(os.Args[2:])
 	case "import":
 		err = cmdImport(os.Args[2:])
+	case "hook":
+		err = cmdHook(os.Args[2:])
+	case "harness":
+		err = cmdHarness(os.Args[2:])
+	case "init":
+		err = cmdInit(os.Args[2:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
 		return
@@ -142,6 +157,13 @@ func detectProject() string {
 	if err != nil {
 		return ""
 	}
+	return detectProjectAt(wd)
+}
+
+// detectProjectAt 是 detectProject 的显式目录版本。
+// 钩子场景必须用它：harness 通过环境变量或 stdin 给出的项目目录
+// 未必等于进程的工作目录。
+func detectProjectAt(wd string) string {
 	dir := wd
 	for i := 0; i < 32; i++ {
 		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
