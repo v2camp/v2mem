@@ -290,3 +290,73 @@ func TestCmdSearchRejectsFlagAfterQuery(t *testing.T) {
 		t.Errorf("正文含 --global 是合法查询，不该被拦：%v", err)
 	}
 }
+
+// 🔴 关键缺口：`mem search` 必须也写审计。
+//
+// 为什么这是关键：WorkBuddy / TraeWork 是**指令级**接入（无原生钩子），
+// 模型只能靠手工调 `mem search` 来用记忆库。如果只有 `mem hook` 写审计，
+// 那么在这两个工具里用再久，审计日志都不增长 —— 回来也无样本可标注。
+func TestCmdSearchWritesAuditRecord(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := cmdAdd([]string{"--db", db, "记忆库不能放进 iCloud 同步目录"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if _, err := captureStdout(t, func() error {
+		return cmdSearch([]string{"--db", db, "--audit-file", ap, "iCloud 同步目录"})
+	}); err != nil {
+		t.Fatalf("cmdSearch: %v", err)
+	}
+
+	rs, err := audit.Read(ap, 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(rs) != 1 {
+		t.Fatalf("应写入 1 条审计，got %d", len(rs))
+	}
+	r := rs[0]
+	if r.Event != "manual-search" {
+		t.Errorf("事件应标为 manual-search 以便与钩子区分，got %q", r.Event)
+	}
+	if r.Query == "" || len(r.Hashes) == 0 {
+		t.Errorf("应记录 query 与命中的记忆，got %+v", r)
+	}
+}
+
+func TestCmdSearchAuditCanBeDisabled(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := cmdAdd([]string{"--db", db, "一条用于测试的记忆内容"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if _, err := captureStdout(t, func() error {
+		return cmdSearch([]string{"--db", db, "--audit-file", ap, "--no-audit", "测试记忆"})
+	}); err != nil {
+		t.Fatalf("cmdSearch: %v", err)
+	}
+	if _, err := os.Stat(ap); !os.IsNotExist(err) {
+		t.Error("--no-audit 不应写审计")
+	}
+}
+
+// 审计失败不得影响检索结果 —— 它只是观测，不是功能。
+func TestCmdSearchStillReturnsHitsWhenAuditFails(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "审计失败也要能搜到的记忆内容"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	bad := filepath.Join(t.TempDir(), "afile")
+	if err := os.WriteFile(bad, []byte("x"), 0o444); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdSearch([]string{"--db", db, "--audit-file", filepath.Join(bad, "a.jsonl"), "审计失败"})
+	})
+	if err != nil {
+		t.Errorf("审计失败不应让检索报错: %v", err)
+	}
+	if !strings.Contains(out, "审计失败也要能搜到") {
+		t.Errorf("审计失败时仍必须返回命中，got:\n%s", out)
+	}
+}

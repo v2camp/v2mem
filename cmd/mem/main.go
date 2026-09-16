@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wanghui/v2mem/internal/audit"
 	"github.com/wanghui/v2mem/internal/store"
 )
 
@@ -301,6 +302,8 @@ func cmdSearch(args []string) error {
 	project := fs.String("project", "", "限定工程")
 	kind := fs.String("kind", "", "限定类型")
 	scope := fs.String("scope", "", "作用域: current=当前工程+全局，global=只要全局，all=跨工程（默认）")
+	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
+	noAudit := fs.Bool("no-audit", false, "不写审计日志")
 	var tags stringSlice
 	fs.Var(&tags, "tag", "标记 k=v，可重复")
 	if err := fs.Parse(args); err != nil {
@@ -336,6 +339,7 @@ func cmdSearch(args []string) error {
 	}
 	defer st.Close()
 
+	started := time.Now()
 	hits, err := st.Search(store.SearchQuery{
 		Query:   q,
 		Project: proj,
@@ -346,6 +350,23 @@ func cmdSearch(args []string) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// 审计：手工检索也要留样本。
+	//
+	// 🔴 这条路径对 WorkBuddy / TraeWork 是**唯一**的样本来源 —— 它们没有原生钩子，
+	// 模型只能靠手工调 `mem search`。若只有 mem hook 写审计，那两个工具里用再久
+	// 也不会有可标注的样本。写失败静默：审计只是观测，不是功能。
+	if !*noAudit {
+		rec := audit.Record{
+			TS: started.Unix(), Event: "manual-search", Project: proj,
+			Query: q, Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
+		}
+		for _, h := range hits {
+			rec.Hashes = append(rec.Hashes, h.ID)
+			rec.Kinds = append(rec.Kinds, h.Kind)
+		}
+		_ = audit.Append(*auditFile, rec)
 	}
 
 	if c.json {
