@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,6 +29,8 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem touch  <id|前缀>             记录命中，刷新 last_seen_at 并累加 access_count
   mem forget <id|前缀>             删除一条记忆
   mem gc     [选项]                回收：TTL 到期 + 久未命中且低重要性
+  mem export [路径.jsonl]          导出为 JSONL（省略路径则写标准输出）
+  mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
   mem stats  [选项]                 库概览
   mem help
 
@@ -82,6 +85,10 @@ func main() {
 		err = cmdForget(os.Args[2:])
 	case "gc":
 		err = cmdGC(os.Args[2:])
+	case "export":
+		err = cmdExport(os.Args[2:])
+	case "import":
+		err = cmdImport(os.Args[2:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
 		return
@@ -387,6 +394,107 @@ func cmdGC(args []string) error {
 		return printJSON(res)
 	}
 	fmt.Printf("已回收 过期=%d 衰减=%d，保留 %d\n", res.Expired, res.Decayed, res.Kept)
+	return nil
+}
+
+// cmdExport 把全部记忆写成 JSONL：每行一条，供跨设备归集。
+// 给路径则写文件并把摘要打到标准输出；不给路径则整份 JSONL 走标准输出。
+//
+// 绝不导出活的 mem.db——写中途的同步会损坏 SQLite 库。
+func cmdExport(args []string) error {
+	var c common
+	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	c.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := strings.TrimSpace(strings.Join(fs.Args(), " "))
+
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	recs, err := st.Export()
+	if err != nil {
+		return err
+	}
+
+	var w io.Writer = os.Stdout
+	if path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		w = f
+	}
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	for _, r := range recs {
+		if err := enc.Encode(r); err != nil {
+			return err
+		}
+	}
+
+	if path == "" {
+		return nil
+	}
+	if c.json {
+		return printJSON(map[string]any{"exported": len(recs), "path": path})
+	}
+	fmt.Printf("已导出 %d 条 → %s\n", len(recs), path)
+	return nil
+}
+
+// cmdImport 读取 JSONL 并按 (content_hash, project) 归并进本地库。
+func cmdImport(args []string) error {
+	var c common
+	fs := flag.NewFlagSet("import", flag.ContinueOnError)
+	c.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	path := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if path == "" {
+		return errors.New("缺少文件路径，用法: mem import <in.jsonl>")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+	var recs []store.ExportRecord
+	for {
+		var r store.ExportRecord
+		if err := dec.Decode(&r); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fmt.Errorf("解析 JSONL 失败（第 %d 条起）: %w", len(recs)+1, err)
+		}
+		recs = append(recs, r)
+	}
+
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	res, err := st.Import(recs)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(res)
+	}
+	fmt.Printf("已归并 新增=%d 合并=%d 跳过=%d（读入 %d 行）\n",
+		res.Inserted, res.Merged, res.Skipped, len(recs))
 	return nil
 }
 
