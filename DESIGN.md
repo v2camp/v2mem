@@ -286,6 +286,8 @@ mem stats                          # 条数 / 分布 / 库大小
 - [ ] M5b-1 向量增强（暂缓）：sqlite-vec 的 Go 绑定当前不可用，见 §13.2
 - [x] **M6 Harness 集成**：`mem hook` 统一事件入口 + `mem init` 扫描选择与配置生成（11 个工具入口，见 §12）
 - [x] **M6.1 Level 1 运维**：`mem ingest` 机械化搬运 + `mem budget` 体量守卫；AGENTS.md 已接入（见 §14）
+- [x] **M7 度量与评测**：`mem audit` 埋点 + `mem eval recall|write`；口径红线与迁移判据见 §15
+- [x] **M7.1 召回退化修复**：长问句词组内 AND 导致 0 命中 → 精确优先、空手才放宽（§15.5）
 
 > M5 拆成两半是本次实现中的结论：相似归并属**近重复检测**（经典算法问题），
 > MinHash 几十行、微秒级、零依赖即可胜任，不必引入模型与 CGO。
@@ -666,9 +668,9 @@ TraeCode 与 dsh 一并受益。
 **延迟**（钩子在会话关键路径上，不能有可观开销，`/usr/bin/time -p` 实测）：
 `session-start` 0.01s、`prompt-submit` 0.01s、空事件 0.01s、库不存在 0.01s。
 
-### 12.7 测试（M6 新增 46 个用例，累计 119）
+### 12.7 测试
 
-`go test ./... -v` 实测：harness 11 + similarity 16 + store 49 + cmd 43 = **119**（M5a 时点为 73）。
+`go test ./... -v` 实测：harness 11 + similarity 16 + store 53 + eval 8 + audit 6 + cmd 65 = **159**（M6 完成时点为 119，M5a 时点为 73；口径与新增项见各自小节）。
 
 | 范围 | 用例 |
 |:---|:---|
