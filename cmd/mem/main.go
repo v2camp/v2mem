@@ -239,6 +239,8 @@ func cmdAdd(args []string) error {
 	device := fs.String("device", "", "来源设备")
 	salience := fs.Float64("salience", 0.5, "重要性 0..1")
 	ttl := fs.Duration("ttl", 0, "硬过期时长")
+	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
+	noAudit := fs.Bool("no-audit", false, "不写审计日志")
 	var tags stringSlice
 	fs.Var(&tags, "tag", "标记 k=v，可重复")
 	if err := fs.Parse(args); err != nil {
@@ -281,6 +283,22 @@ func cmdAdd(args []string) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// 审计：**写侧也留痕**。
+	//
+	// 此前只记读侧，导致「模型到底记了什么」完全不可观测 —— 而
+	// 「用户会话 → mem 记录 → 准确记录」这条评测方向正需要它。
+	// 写失败静默：审计只是观测，不是功能。
+	if !*noAudit {
+		mode := "create"
+		if !res.Created {
+			mode = "overwrite"
+		}
+		_ = audit.Append(*auditFile, audit.Record{
+			TS: time.Now().Unix(), Event: "manual-add", Project: *project,
+			Hashes: []string{res.Hash}, Kinds: []string{*kind}, Mode: mode,
+		})
 	}
 
 	if c.json {

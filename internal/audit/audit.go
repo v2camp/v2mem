@@ -16,14 +16,17 @@ import (
 // Record 是一次钩子激活的记录。
 type Record struct {
 	TS      int64    `json:"ts"`
-	Event   string   `json:"event"` // session-start | prompt-submit | manual
+	Event   string   `json:"event"` // session-start | prompt-submit | manual-search | manual-add
 	Harness string   `json:"harness,omitempty"`
 	Project string   `json:"project,omitempty"`
-	Query   string   `json:"query,omitempty"`  // prompt-submit 才有
-	Hashes  []string `json:"hashes,omitempty"` // 实际注入的记忆
+	Query   string   `json:"query,omitempty"`  // 读侧才有（prompt-submit 的用户提问）
+	Hashes  []string `json:"hashes,omitempty"` // 读侧＝实际注入的记忆 id；写侧＝写入的 content_hash
 	Kinds   []string `json:"kinds,omitempty"`
 	Empty   bool     `json:"empty"` // 注入内容为空
-	MS      int64    `json:"ms"`
+	// Mode 仅写侧使用：create=新增，overwrite=命中「相同知识覆盖」。
+	// 用它可算「模型重复记录率」——去重是否在起作用。
+	Mode string `json:"mode,omitempty"`
+	MS   int64  `json:"ms"`
 }
 
 // Path 返回默认审计日志路径（与库同目录，便于一起备份/清理）。
@@ -103,7 +106,19 @@ type Summary struct {
 	AvgMS     float64        `json:"avg_ms"`
 	ByEvent   map[string]int `json:"by_event"`
 	ByHarness map[string]int `json:"by_harness"`
-	WithQuery int            `json:"with_query"` // 可用于评测的样本数
+	WithQuery int            `json:"with_query"` // 可用于检索评测的样本数（读侧，带 query）
+
+	// 读/写两侧分别计数 —— 回答「这套东西到底用起来了没有」要看这两个数，
+	// 而不是看总次数：只有写侧增长说明只记不查，只有读侧增长说明只查不记。
+	Retrievals int `json:"retrievals"` // 读侧：session-start / prompt-submit / manual-search
+	Writes     int `json:"writes"`     // 写侧：manual-add / manual-forget
+	Creates    int `json:"creates"`    // 其中新增
+	Overwrites int `json:"overwrites"` // 其中命中「相同知识覆盖」→ 可算重复记录率
+}
+
+// isWriteEvent 判定事件属于写侧。写侧没有 query，「空注入率」不适用于它。
+func isWriteEvent(e string) bool {
+	return e == "manual-add" || e == "manual-forget"
 }
 
 // Summarize 汇总。WithQuery 是「能拿来评测的样本数」——
@@ -123,6 +138,17 @@ func Summarize(rs []Record) Summary {
 		}
 		if strings.TrimSpace(r.Query) != "" {
 			s.WithQuery++
+		}
+		if isWriteEvent(r.Event) {
+			s.Writes++
+			switch r.Mode {
+			case "create":
+				s.Creates++
+			case "overwrite":
+				s.Overwrites++
+			}
+		} else {
+			s.Retrievals++
 		}
 	}
 	if s.Total > 0 {
