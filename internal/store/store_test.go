@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -611,5 +612,134 @@ func TestSearchSingleRuneQueryStillWorks(t *testing.T) {
 	}
 	if len(hits) != 1 {
 		t.Errorf("单字应能命中 1 条，got %d", len(hits))
+	}
+}
+
+// ---------- 钩子事件的幂等去重 ----------
+
+func TestClaimHookEventGrantsOnceThenRefuses(t *testing.T) {
+	s := newTestStore(t)
+	const key = "evt-1"
+	now := int64(1000)
+	staleBefore := now - 10
+
+	got, err := s.ClaimHookEvent(key, now, staleBefore)
+	if err != nil || !got {
+		t.Fatalf("第一次声明应成功，got=%v err=%v", got, err)
+	}
+	got, err = s.ClaimHookEvent(key, now+1, staleBefore)
+	if err != nil {
+		t.Fatalf("ClaimHookEvent: %v", err)
+	}
+	if got {
+		t.Error("窗口内重复声明应被拒绝（这正是抑制重复注入的依据）")
+	}
+}
+
+// 过期后允许重新声明，否则同一会话里后续同问句会被永久抑制。
+func TestClaimHookEventAllowsAfterWindow(t *testing.T) {
+	s := newTestStore(t)
+	const key = "evt-2"
+	first := int64(1000)
+	if got, _ := s.ClaimHookEvent(key, first, first-10); !got {
+		t.Fatal("首次声明应成功")
+	}
+	// 第二次事件的 now 远晚于首次，staleBefore 也随之推进 ⇒ 旧记录已过期
+	second := first + 60
+	if got, err := s.ClaimHookEvent(key, second, second-10); err != nil || !got {
+		t.Errorf("超窗口后应可重新声明，got=%v err=%v", got, err)
+	}
+}
+
+// 不同键互不影响 —— 否则会把「不同问句」误判成重复。
+func TestClaimHookEventIsPerKey(t *testing.T) {
+	s := newTestStore(t)
+	now := int64(1000)
+	for _, k := range []string{"a", "b", "c"} {
+		if got, _ := s.ClaimHookEvent(k, now, now-10); !got {
+			t.Errorf("键 %s 首次声明应成功", k)
+		}
+	}
+}
+
+// 原子性：并发声明同一键，只能有一个赢家。
+//
+// 必须用**两个独立的 Store（各自连接池）指向同一文件**来模拟真实场景 ——
+// 宿主的合并语义是并行拉起两个进程，各自持有自己的连接。
+// 单个 Store 内并发不足以暴露「先查后插」的竞态：连接池会把语句串行化，
+// 非原子实现也会侥幸通过（实测）。
+func TestClaimHookEventIsAtomicUnderConcurrency(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "race.db")
+	// 每个 Store 允许多连接，否则池会把并发压成串行
+	open := func() *Store {
+		st, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		st.db.SetMaxOpenConns(4)
+		return st
+	}
+	stores := []*Store{open(), open()}
+	defer func() {
+		for _, st := range stores {
+			st.Close()
+		}
+	}()
+
+	const key = "race"
+	const perStore = 4
+	now := int64(1000)
+
+	start := make(chan struct{})
+	results := make(chan bool, perStore*len(stores))
+	var wg sync.WaitGroup
+	for _, st := range stores {
+		for i := 0; i < perStore; i++ {
+			wg.Add(1)
+			go func(st *Store) {
+				defer wg.Done()
+				<-start // 屏障：让所有 goroutine 同时冲线
+				got, err := st.ClaimHookEvent(key, now, now-10)
+				if err != nil {
+					results <- false
+					return
+				}
+				results <- got
+			}(st)
+		}
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	winners := 0
+	for got := range results {
+		if got {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Errorf("并发声明同一键应恰好 1 个赢家，got %d —— 去重不原子就会重复注入", winners)
+	}
+}
+
+func TestPruneHookDedupRemovesOnlyOldRows(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.ClaimHookEvent("old", 100, 0); err != nil {
+		t.Fatalf("ClaimHookEvent: %v", err)
+	}
+	if _, err := s.ClaimHookEvent("new", 1000, 0); err != nil {
+		t.Fatalf("ClaimHookEvent: %v", err)
+	}
+	if err := s.PruneHookDedup(500); err != nil {
+		t.Fatalf("PruneHookDedup: %v", err)
+	}
+	// 清理后 old 可被重新声明，new 仍被拒
+	if got, _ := s.ClaimHookEvent("old", 1001, 1001-10); !got {
+		t.Error("过期记录应已被清理，可重新声明")
+	}
+	// staleBefore=991 ⇒ ts=1000 仍是新鲜的，声明应被拒（证明该行未被清理）
+	if got, _ := s.ClaimHookEvent("new", 1001, 991); got {
+		t.Error("新鲜记录不应被清理")
 	}
 }

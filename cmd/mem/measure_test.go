@@ -742,3 +742,227 @@ func TestCmdReportRejectsBadSince(t *testing.T) {
 		t.Error("非法 --since 应报错")
 	}
 }
+
+// --file 的语义不能因 tier 变化而翻转：`.md` 一律按指令块处理。
+//
+// 起因：workbuddy 从指令级更正为 native 后，`mem init --harness workbuddy --file AGENTS.md`
+// 突然改去解析 JSON 并报错 —— 同一个参数因接入等级不同而含义不同，属哑陷阱。
+func TestInitFileFlagInfersInstructionTargetByExtension(t *testing.T) {
+	proj := t.TempDir()
+	md := filepath.Join(proj, "AGENTS.md")
+	if err := os.WriteFile(md, []byte("# 已有内容\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// 不带 --scope，且 harness 是 native —— 也必须按指令块写入
+	if _, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "workbuddy", "--file", md})
+	}); err != nil {
+		t.Fatalf("--file 指向 .md 时不应报错（应写指令块而非解析 JSON）: %v", err)
+	}
+	body, err := os.ReadFile(md)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(body), instrBegin) {
+		t.Errorf("应写入指令块，got:\n%s", body)
+	}
+	if !strings.Contains(string(body), "# 已有内容") {
+		t.Error("不得覆盖已有内容")
+	}
+	// 反向：--file 指向 .json 时仍按 hooks 配置处理
+	js := filepath.Join(proj, "settings.json")
+	if _, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "workbuddy", "--file", js})
+	}); err != nil {
+		t.Fatalf("--file 指向 .json 应按 hooks 配置写入: %v", err)
+	}
+	jb, _ := os.ReadFile(js)
+	if !strings.Contains(string(jb), hookMarker) {
+		t.Errorf(".json 落点应写 hooks 配置，got:\n%s", jb)
+	}
+}
+
+// ---------- 幂等去重：同一事件被多处配置重复触发只注入一次 ----------
+
+func TestCmdHookSuppressesDuplicateTriggerOfSameEvent(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进同步目录"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	stdin := hookStdin("UserPromptSubmit", proj, "同步目录能不能放")
+	hook := func() string {
+		out, err := withStdin(t, stdin, func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", ap})
+		})
+		if err != nil {
+			t.Fatalf("cmdHook: %v", err)
+		}
+		return out
+	}
+
+	first := hook()
+	if !strings.Contains(first, "记忆库不能放进同步目录") {
+		t.Fatalf("首次应正常注入，got:\n%s", first)
+	}
+	second := hook()
+	if strings.TrimSpace(second) != "" {
+		t.Errorf("同一事件的第二次触发应被抑制（不注入任何内容），got:\n%s", second)
+	}
+}
+
+// 🔴 这是最关键的一条：两处配置的 harness 名不同（traework / traecode），
+// 去重键若含 harness 就会永远失效。
+func TestCmdHookDedupIgnoresHarnessName(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "一条用于验证跨 harness 去重的记忆"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	stdin := hookStdin("UserPromptSubmit", proj, "验证跨 harness 去重")
+	out1, err := withStdin(t, stdin, func() error {
+		return cmdHook([]string{"--db", db, "--harness", "traework", "--audit", "-"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook #1: %v", err)
+	}
+	if strings.TrimSpace(out1) == "" {
+		t.Fatal("首次（traework）应注入")
+	}
+	out2, err := withStdin(t, stdin, func() error {
+		return cmdHook([]string{"--db", db, "--harness", "traecode", "--audit", "-"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook #2: %v", err)
+	}
+	if strings.TrimSpace(out2) != "" {
+		t.Errorf("换 harness 名的同一事件仍应被抑制 —— 键含 harness 会让去重失效，got:\n%s", out2)
+	}
+}
+
+// 不同提问是两个真实事件，必须各注入一次（否则会把正常使用误杀）。
+func TestCmdHookDoesNotSuppressDifferentPrompt(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进同步目录"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	for _, q := range []string{"同步目录能不能放", "同步目录能不能放数据库文件"} {
+		out, err := withStdin(t, hookStdin("UserPromptSubmit", proj, q), func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", "-"})
+		})
+		if err != nil {
+			t.Fatalf("cmdHook(%q): %v", q, err)
+		}
+		if strings.TrimSpace(out) == "" {
+			t.Errorf("不同提问 %q 不应被抑制", q)
+		}
+	}
+}
+
+func TestCmdHookDedupCanBeDisabled(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进同步目录"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	stdin := hookStdin("UserPromptSubmit", proj, "同步目录")
+	for i := 0; i < 2; i++ {
+		out, err := withStdin(t, stdin, func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", "-", "--dedup-window", "0"})
+		})
+		if err != nil {
+			t.Fatalf("cmdHook #%d: %v", i+1, err)
+		}
+		if strings.TrimSpace(out) == "" {
+			t.Errorf("--dedup-window 0 时第 %d 次也应注入", i+1)
+		}
+	}
+}
+
+// 被抑制的触发要留痕 —— 它本身是「重复触发是否真的发生」的度量。
+func TestCmdHookRecordsSuppressionInAudit(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进同步目录"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	stdin := hookStdin("UserPromptSubmit", proj, "同步目录")
+	for i := 0; i < 2; i++ {
+		if _, err := withStdin(t, stdin, func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", ap})
+		}); err != nil {
+			t.Fatalf("cmdHook #%d: %v", i+1, err)
+		}
+	}
+	rs, err := audit.Read(ap, 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(rs) != 2 {
+		t.Fatalf("两次触发都应留痕（一次正常、一次抑制），got %d", len(rs))
+	}
+	if rs[0].Suppressed {
+		t.Error("第一次不应标为抑制")
+	}
+	if !rs[1].Suppressed {
+		t.Error("第二次应标为抑制")
+	}
+	s := audit.Summarize(rs)
+	if s.Suppressed != 1 {
+		t.Errorf("汇总应统计抑制数=1，got %d", s.Suppressed)
+	}
+	if s.Retrievals != 1 {
+		t.Errorf("被抑制的触发不应计入读侧活动，got %d", s.Retrievals)
+	}
+}
+
+// 失败开放：判不出是否重复时照常注入 —— 漏注入是功能缺失，重复注入只是啰嗦。
+func TestCmdHookFailsOpenWhenDedupUnavailable(t *testing.T) {
+	afile := filepath.Join(t.TempDir(), "notadir")
+	if err := os.WriteFile(afile, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	badDB := filepath.Join(afile, "x.db") // 父路径是普通文件 ⇒ 打不开库
+	proj, name := hookProjectDir(t, "demo-repo")
+	goodDB := testDB(t)
+	if err := cmdAdd([]string{"--db", goodDB, "--project", name, "去重失败也要注入的记忆"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	// 用坏路径做去重（失败），但渲染仍用不存在的库 ⇒ 至少不能报错
+	_, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
+		return cmdHook([]string{"--db", badDB, "--harness", "claude", "--audit", "-"})
+	})
+	if err != nil {
+		t.Errorf("去重与渲染都失败时也必须静默放过，got: %v", err)
+	}
+}
+
+// SessionStart 没有 prompt，同样要能去重。
+func TestCmdHookSuppressesDuplicateSessionStart(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "本工程的一条记忆"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	stdin := hookStdin("SessionStart", proj, "")
+	first, err := withStdin(t, stdin, func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", "-"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook #1: %v", err)
+	}
+	second, err := withStdin(t, stdin, func() error {
+		return cmdHook([]string{"--db", db, "--harness", "codex", "--audit", "-"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook #2: %v", err)
+	}
+	if strings.TrimSpace(second) != "" {
+		t.Errorf("重复的 SessionStart 应被抑制，got:\n%s", second)
+	}
+	// 首次若为空（无硬规则时只注入提示）也应视为已处理，这里只断言第二次为空
+	_ = first
+}

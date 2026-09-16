@@ -566,6 +566,38 @@ type Stats struct {
 	ExpiredLive int            `json:"expired_pending_gc"`
 }
 
+// ClaimHookEvent 原子地声明「本次钩子事件归我处理」。
+//
+// 语义（单条 SQL 完成，无需显式事务）：
+//   - 键不存在          → 插入成功 → 返回 true（归我）
+//   - 键存在且 ts 已过期 → 更新成功 → 返回 true（归我）
+//   - 键存在且 ts 仍新鲜 → WHERE 不满足、更新 0 行 → 返回 false（别人刚处理过，应抑制）
+//
+// 为什么必须原子：宿主的合并语义是**并行执行**，两处配置可能同时拉起进程。
+// 若先 SELECT 再 INSERT，两个进程都会读到「不存在」而双双注入，去重形同虚设。
+//
+// staleBefore 由调用方按「窗口」算好：ts 早于它的记录视为过期，允许重新声明。
+func (s *Store) ClaimHookEvent(key string, now, staleBefore int64) (bool, error) {
+	const stmt = `INSERT INTO hook_dedup(key, ts) VALUES(?, ?)
+	              ON CONFLICT(key) DO UPDATE SET ts = excluded.ts
+	              WHERE hook_dedup.ts < ?`
+	res, err := s.db.Exec(stmt, key, now, staleBefore)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// PruneHookDedup 清掉过期的去重记录（避免表无限增长）。
+func (s *Store) PruneHookDedup(before int64) error {
+	_, err := s.db.Exec(`DELETE FROM hook_dedup WHERE ts < ?`, before)
+	return err
+}
+
 // HashByID 取一条记忆的 content_hash。
 // 评测的金标准用哈希表达目标，因此需要按 id 反查哈希。
 func (s *Store) HashByID(id string) (string, error) {
