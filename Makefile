@@ -19,9 +19,15 @@ build-linux:
 build-win:
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o bin/$(BIN)-win.exe $(PKG)
 
-# M5 可选增强分支：需要 CGO + libonnxruntime，会失去静态分发与便捷交叉编译
-build-onnx:
-	CGO_ENABLED=1 go build -tags local_onnx -o bin/$(BIN)-onnx $(PKG)
+# ⚠️ ONNX 本地嵌入（M5b）**未实现**，此处刻意不提供目标。
+#
+# 曾有一个 `build-onnx` 目标，但代码里没有任何文件使用 `local_onnx` 构建标签，
+# 于是它产出的二进制与默认构建**逐字节相同**（实测均 11383042 字节）——
+# 一个名字承诺了 ONNX、实际什么也没多出来的目标。按本仓库「预留须显式标注」的
+# 原则，宁可没有目标，也不留一个静默存在的假目标。
+#
+# 现状与决策依据见 DESIGN.md §13：纯 Go 的 sqlite-vec 绑定当前不可用，
+# 且向量还需要 embedding 来源；建议先做零包体成本的 M5b-0（复用已有 MinHash 签名）。
 
 smoke: build
 	@DB=/tmp/v2mem-smoke.db; rm -f "$$DB" "$$DB-wal" "$$DB-shm"; \
@@ -32,4 +38,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test build-linux build-win build-onnx smoke clean
+.PHONY: build install test build-linux build-win smoke clean

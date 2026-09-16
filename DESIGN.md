@@ -1107,6 +1107,35 @@ shell 钩子，指令级判断成立。
 且依赖模型是否遵守 AGENTS.md 的指令 —— 这本身也是可以观察的：`mem audit` 里
 `manual-search` 的占比就是「指令遵守率」的一个代理指标。
 
+### 15.12 指引本身是坏的：选项位置踩坑（含扩散修复）
+
+`mem search "<关键词>" --scope current --json` 与 `mem ingest <文件> --project <工程>`
+这两条命令都**执行失败**，而它们出现在**每次注入的用法提示**与**指令级接入块**里 ——
+等于把坏命令教给模型。Go 的 flag 在**首个位置参数处停止解析**，选项被当成位置参数：
+
+| 写法 | 结果 |
+|:---|:---|
+| `mem search "<关键词>" --scope current --json` | 被 §15.6 的守卫拦下并报错（提示选项要在前） |
+| `mem ingest <文件> --project <工程>` | `错误: open --project: no such file or directory` |
+
+**扩散范围（四处）**：`hook.go` 的 `hintBlock()`、`init.go` 的 `instructionBlock()`
+（search 与 ingest 各一处）、`level1.go` 的 `budget` 建议行。其中 `instructionBlock`
+那一处已被写进 `training-products/AGENTS.md` 并合入 main，需要重新生成。
+
+**修复**：全部改为选项在前；`AGENTS.md` 用 `mem init --file` 就地替换重新生成
+（差异仅那两行，门禁 PASS，tokens 4882 → 4962）。
+
+**护栏**：新增 `TestGuidanceCommandsAreExecutable` —— 抽取 `hintBlock()` 与
+`instructionBlock()` 里所有 `mem` 命令，断言**选项必须写在位置参数之前**；
+另有 `TestGuidanceNamesRealSubcommands` 断言引用的子命令真实存在。
+两个用例都做了变异验证（把写法改回错误形式即报警）。
+
+> 写这个护栏时自己也踩了两次：抽取器第一版只认反引号（`hintBlock` 用的是双引号），
+> 校验器第一版把**子命令名**与**选项的值**（如 `--scope current` 的 `current`）都当成了
+> 位置参数，导致所有命令被误判违规。这本身就是个提醒：**校验器的正确性也要被验证** ——
+> 所以用例里加了「至少校验 N 条命令，否则视为抽取器失效」的前置断言，
+> 防止它退化成空转。
+
 ### 15.11 隐私提示
 
 审计日志记录**真实用户提问原文**（`prompt-submit` 的 `query`）。它落在
