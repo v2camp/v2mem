@@ -455,3 +455,266 @@ func dumpSnap(m map[string]snap) string {
 	}
 	return sb.String()
 }
+
+// ---------- M4.1: 取代关系的跨设备重建 ----------
+//
+// `superseded_by` 存的是本地随机 id，跨设备直接搬会变成悬挂引用；
+// 而完全不搬，其他设备就不知道取代关系，会重新看到两条重复。
+// 解法：导出时把取代关系表达成「身份键」(content_hash, project)，导入时解析回本地 id。
+
+// supersessionView 把「谁的取代指针指向哪条知识」表达成与 id 无关的形式。
+// 这是跨设备比较取代关系唯一有意义的口径 —— 本地 id 天然不同。
+func supersessionView(t *testing.T, s *Store) map[string]string {
+	t.Helper()
+	rows, err := s.db.Query(
+		`SELECT m.content_hash, m.project,
+		        COALESCE(t.content_hash, ''), COALESCE(t.project, '')
+		   FROM memories m
+		   LEFT JOIN memories t ON t.id = m.superseded_by`)
+	if err != nil {
+		t.Fatalf("查询取代视图: %v", err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var selfHash, selfProj, tgtHash, tgtProj string
+		if err := rows.Scan(&selfHash, &selfProj, &tgtHash, &tgtProj); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		val := ""
+		if tgtHash != "" || tgtProj != "" {
+			val = tgtHash + "\x00" + tgtProj
+		}
+		out[selfHash+"\x00"+selfProj] = val
+	}
+	return out
+}
+
+func TestExportCarriesSupersessionAsIdentityKey(t *testing.T) {
+	s := newTestStore(t)
+	keep := addWith(t, s, AddInput{Content: simBase, Project: "p1", Salience: 0.9})
+	dup := addWith(t, s, AddInput{Content: simVariant, Project: "p1", Salience: 0.3})
+	if _, err := s.Consolidate(0.7); err != nil {
+		t.Fatalf("Consolidate: %v", err)
+	}
+	_ = keep
+
+	recs, err := s.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	var found bool
+	for _, r := range recs {
+		if r.ID != dup {
+			continue
+		}
+		found = true
+		if r.Superseded == nil {
+			t.Fatal("被取代的记录导出时必须带取代引用")
+		}
+		if r.Superseded.Project != "p1" {
+			t.Errorf("引用应带工程，got %q", r.Superseded.Project)
+		}
+		if r.Superseded.Hash != HashOf(simBase) {
+			t.Errorf("引用应指向存活者的 content_hash，got %q", r.Superseded.Hash)
+		}
+	}
+	if !found {
+		t.Fatal("未在导出结果中找到被取代的记录")
+	}
+}
+
+// 导入端必须把引用解析成「本地」id，而不是照搬远端 id（那会变成悬挂引用）。
+func TestImportRebuildsSupersessionWithLocalIDs(t *testing.T) {
+	remote := newTestStore(t)
+	addWith(t, remote, AddInput{Content: simBase, Project: "p1", Salience: 0.9})
+	dupRemote := addWith(t, remote, AddInput{Content: simVariant, Project: "p1", Salience: 0.3})
+	if _, err := remote.Consolidate(0.7); err != nil {
+		t.Fatalf("Consolidate: %v", err)
+	}
+	recs, err := remote.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	local := newTestStore(t)
+	res, err := local.Import(recs)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if res.Unresolved != 0 {
+		t.Errorf("两条都在文件里，不应有无法解析的引用，got %+v", res)
+	}
+
+	view := supersessionView(t, local)
+	key := HashOf(simVariant) + "\x00p1"
+	if got := view[key]; got != HashOf(simBase)+"\x00p1" {
+		t.Errorf("导入后取代指针应指向本地存活者的身份键，got %q", got)
+	}
+
+	// 且必须是真的本地 id，不是远端 id
+	var localSup *string
+	if err := local.db.QueryRow(`SELECT superseded_by FROM memories WHERE content_hash = ? AND project = ?`,
+		HashOf(simVariant), "p1").Scan(&localSup); err != nil {
+		t.Fatalf("查询: %v", err)
+	}
+	if localSup == nil {
+		t.Fatal("superseded_by 应已写入")
+	}
+	if *localSup == dupRemote {
+		t.Error("superseded_by 不应照搬远端的随机 id（会成为悬挂引用）")
+	}
+	var exists int
+	if err := local.db.QueryRow(`SELECT COUNT(*) FROM memories WHERE id = ?`, *localSup).Scan(&exists); err != nil {
+		t.Fatalf("查询存活者: %v", err)
+	}
+	if exists != 1 {
+		t.Error("superseded_by 必须指向本地确实存在的记录")
+	}
+}
+
+// 文件里被取代者出现在存活者之前时，两遍解析仍须成功。
+func TestImportResolvesSupersessionRegardlessOfFileOrder(t *testing.T) {
+	remote := newTestStore(t)
+	addWith(t, remote, AddInput{Content: simBase, Project: "p1", Salience: 0.9})
+	addWith(t, remote, AddInput{Content: simVariant, Project: "p1", Salience: 0.3})
+	if _, err := remote.Consolidate(0.7); err != nil {
+		t.Fatalf("Consolidate: %v", err)
+	}
+	recs, err := remote.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	// 导出按 (content_hash, project) 排序，被取代者可能排在存活者之前；
+	// 这里显式倒序，确保测的是「与顺序无关」而不是「恰好顺序合适」。
+	for i, j := 0, len(recs)-1; i < j; i, j = i+1, j-1 {
+		recs[i], recs[j] = recs[j], recs[i]
+	}
+
+	local := newTestStore(t)
+	res, err := local.Import(recs)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if res.Unresolved != 0 {
+		t.Errorf("两遍解析应不依赖文件顺序，got %+v", res)
+	}
+	view := supersessionView(t, local)
+	if got := view[HashOf(simVariant)+"\x00p1"]; got != HashOf(simBase)+"\x00p1" {
+		t.Errorf("倒序文件也应正确重建取代关系，got %q", got)
+	}
+}
+
+// 存活者不在文件里时，引用无法解析：必须计数上报，而不是静默留空或写悬挂 id。
+func TestImportReportsUnresolvedSupersession(t *testing.T) {
+	remote := newTestStore(t)
+	addWith(t, remote, AddInput{Content: simBase, Project: "p1", Salience: 0.9})
+	addWith(t, remote, AddInput{Content: simVariant, Project: "p1", Salience: 0.3})
+	if _, err := remote.Consolidate(0.7); err != nil {
+		t.Fatalf("Consolidate: %v", err)
+	}
+	recs, err := remote.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	// 只保留被取代者，丢掉存活者
+	var partial []ExportRecord
+	for _, r := range recs {
+		if r.Content == simVariant {
+			partial = append(partial, r)
+		}
+	}
+	if len(partial) != 1 {
+		t.Fatalf("应只剩 1 条，got %d", len(partial))
+	}
+
+	local := newTestStore(t)
+	res, err := local.Import(partial)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if res.Unresolved != 1 {
+		t.Errorf("存活着缺失时应报 1 条无法解析，got %+v", res)
+	}
+	var sup *string
+	if err := local.db.QueryRow(`SELECT superseded_by FROM memories`).Scan(&sup); err != nil {
+		t.Fatalf("查询: %v", err)
+	}
+	if sup != nil {
+		t.Errorf("无法解析的引用不得写入（会成悬挂），got %v", *sup)
+	}
+}
+
+// 一条记录已在本地被取代，随后导入同一份它仍然是被取代状态。
+func TestImportKeepsAlreadySupersededRecordSuperseded(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: simBase, Project: "p1", Salience: 0.9})
+	addWith(t, s, AddInput{Content: simVariant, Project: "p1", Salience: 0.3})
+	if _, err := s.Consolidate(0.7); err != nil {
+		t.Fatalf("Consolidate: %v", err)
+	}
+	recs, err := s.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	before := supersessionView(t, s)
+	if _, err := s.Import(recs); err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	after := supersessionView(t, s)
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("导入自身导出不应改变取代关系\n前: %v\n后: %v", before, after)
+	}
+
+	// 视图口径：search 应只看到 1 条
+	hits, err := s.Search(SearchQuery{Query: "隐藏目录", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Errorf("被取代者仍应被检索隐去，got %d 条", len(hits))
+	}
+}
+
+// 端到端最强判据：一端做过归并、另一端独立写过同一事实，
+// 交叉导入后两侧的「记忆集合 + 取代关系」必须完全一致。
+func TestCrossDeviceConvergenceWithSupersession(t *testing.T) {
+	a := newTestStore(t)
+	addWith(t, a, AddInput{Content: simBase, Project: "p1", Device: "A", Salience: 0.9})
+	addWith(t, a, AddInput{Content: simVariant, Project: "p1", Device: "A", Salience: 0.3})
+	a.Add(AddInput{Content: "仅A有的事实条目内容", Project: "p1", Device: "A"}) //nolint:errcheck
+	if _, err := a.Consolidate(0.7); err != nil {
+		t.Fatalf("Consolidate A: %v", err)
+	}
+
+	b := newTestStore(t)
+	addWith(t, b, AddInput{Content: simBase, Project: "p1", Device: "B", Salience: 0.5})
+	addWith(t, b, AddInput{Content: "仅B有的事实条目内容", Project: "p1", Device: "B"})
+
+	recsA, err := a.Export()
+	if err != nil {
+		t.Fatalf("Export A: %v", err)
+	}
+	recsB, err := b.Export()
+	if err != nil {
+		t.Fatalf("Export B: %v", err)
+	}
+	if _, err := b.Import(recsA); err != nil {
+		t.Fatalf("B.Import(A): %v", err)
+	}
+	if _, err := a.Import(recsB); err != nil {
+		t.Fatalf("A.Import(B): %v", err)
+	}
+
+	if !reflect.DeepEqual(snapshot(t, a), snapshot(t, b)) {
+		t.Errorf("内容投影未收敛\nA: %s\nB: %s", dumpSnap(snapshot(t, a)), dumpSnap(snapshot(t, b)))
+	}
+	va, vb := supersessionView(t, a), supersessionView(t, b)
+	// B 端从未跑过 consolidate，其本地副本此时未被标记；
+	// 但它收到了 A 的取代关系，故两侧的取代视图应一致。
+	if !reflect.DeepEqual(va, vb) {
+		t.Errorf("取代关系未收敛\nA: %v\nB: %v", va, vb)
+	}
+}

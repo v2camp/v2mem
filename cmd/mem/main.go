@@ -500,8 +500,12 @@ func cmdImport(args []string) error {
 	if c.json {
 		return printJSON(res)
 	}
-	fmt.Printf("已归并 新增=%d 合并=%d 跳过=%d（读入 %d 行）\n",
-		res.Inserted, res.Merged, res.Skipped, len(recs))
+	fmt.Printf("已归并 新增=%d 合并=%d 跳过=%d", res.Inserted, res.Merged, res.Skipped)
+	if res.Unresolved > 0 {
+		// 取代引用的目标既不在文件里也不在本地：留空而非写悬挂 id，必须让人看见
+		fmt.Printf(" 未解析=%d（取代引用的目标不在文件与本地库中）", res.Unresolved)
+	}
+	fmt.Printf("（读入 %d 行）\n", len(recs))
 	return nil
 }
 

@@ -13,6 +13,15 @@ import (
 	"strings"
 )
 
+// Ref 是跨设备可解析的身份引用。
+//
+// 取代关系不能直接用 id 表达：id 是本地随机值，照搬到另一端就是悬挂引用。
+// 用「身份键」(content_hash, project) 表达，导入端再解析回本地 id。
+type Ref struct {
+	Hash    string `json:"hash"`
+	Project string `json:"project"`
+}
+
 // ExportRecord 是归集的传输单元：JSONL 一行一条。
 // 不含 content_idx（派生列，导入端按自身规则重算）。
 type ExportRecord struct {
@@ -26,7 +35,8 @@ type ExportRecord struct {
 	UpdatedAt    int64               `json:"updated_at"`
 	LastSeenAt   int64               `json:"last_seen_at"`
 	ExpiresAt    *int64              `json:"expires_at"`
-	SupersededBy *string             `json:"superseded_by"`
+	SupersededBy string              `json:"superseded_by_id,omitempty"` // 本地 id，仅供排查
+	Superseded   *Ref                `json:"superseded,omitempty"`       // 可跨设备重建的取代引用
 	OriginDevice string              `json:"origin_device"`
 	OriginTool   string              `json:"origin_tool"`
 	AccessCount  int                 `json:"access_count"`
@@ -35,20 +45,25 @@ type ExportRecord struct {
 
 // ImportStats 汇总一次归并的结果。
 type ImportStats struct {
-	Inserted int `json:"inserted"` // 本地没有，新插入
-	Merged   int `json:"merged"`   // 本地已有，按字段规则归并
-	Skipped  int `json:"skipped"`  // 内容为空等无法归并
+	Inserted   int `json:"inserted"`   // 本地没有，新插入
+	Merged     int `json:"merged"`     // 本地已有，按字段规则归并
+	Skipped    int `json:"skipped"`    // 内容为空等无法归并
+	Unresolved int `json:"unresolved"` // 取代引用的目标不在本地也不在文件里
 }
 
 // Export 导出全部记忆，按 (content_hash, project) 排序以保证可复现——
 // 否则每次导出的 JSONL 都会无谓 diff，跨设备比对失去意义。
 func (s *Store) Export() ([]ExportRecord, error) {
+	// LEFT JOIN 自身：把取代指针的本地 id 翻译成「身份键」，
+	// 这样接收端才能把它接到自己那条同名记录上，而不是搬一个不存在的 id。
 	rows, err := s.db.Query(
-		`SELECT id, content, kind, content_hash, project, salience,
-		        created_at, updated_at, last_seen_at, expires_at,
-		        superseded_by, origin_device, origin_tool, access_count
-		   FROM memories
-		  ORDER BY content_hash, project`)
+		`SELECT m.id, m.content, m.kind, m.content_hash, m.project, m.salience,
+		        m.created_at, m.updated_at, m.last_seen_at, m.expires_at,
+		        m.origin_device, m.origin_tool, m.access_count,
+		        t.id, t.content_hash, t.project
+		   FROM memories m
+		   LEFT JOIN memories t ON t.id = m.superseded_by
+		  ORDER BY m.content_hash, m.project`)
 	if err != nil {
 		return nil, err
 	}
@@ -58,10 +73,16 @@ func (s *Store) Export() ([]ExportRecord, error) {
 	idx := map[string]int{} // memory id → 在 recs 中的下标
 	for rows.Next() {
 		var r ExportRecord
+		var tgtID, tgtHash, tgtProject *string
 		if err := rows.Scan(&r.ID, &r.Content, &r.Kind, &r.ContentHash, &r.Project, &r.Salience,
 			&r.CreatedAt, &r.UpdatedAt, &r.LastSeenAt, &r.ExpiresAt,
-			&r.SupersededBy, &r.OriginDevice, &r.OriginTool, &r.AccessCount); err != nil {
+			&r.OriginDevice, &r.OriginTool, &r.AccessCount,
+			&tgtID, &tgtHash, &tgtProject); err != nil {
 			return nil, err
+		}
+		if tgtID != nil {
+			r.SupersededBy = *tgtID
+			r.Superseded = &Ref{Hash: *tgtHash, Project: *tgtProject}
 		}
 		idx[r.ID] = len(recs)
 		recs = append(recs, r)
@@ -119,6 +140,9 @@ func (s *Store) Import(recs []ExportRecord) (*ImportStats, error) {
 	}
 	defer tx.Rollback()
 
+	// identity 记录「本批记录的身份键 → 本地 id」，供第二遍解析取代引用
+	identity := map[string]string{}
+
 	for _, r := range recs {
 		content := strings.TrimSpace(r.Content)
 		if content == "" {
@@ -151,12 +175,11 @@ func (s *Store) Import(recs []ExportRecord) (*ImportStats, error) {
 				   updated_at    = MAX(updated_at, ?),
 				   last_seen_at  = MAX(last_seen_at, ?),
 				   expires_at    = CASE WHEN expires_at IS NULL OR ? IS NULL
-				                        THEN NULL ELSE MAX(expires_at, ?) END,
-				   superseded_by = COALESCE(superseded_by, ?)
+				                        THEN NULL ELSE MAX(expires_at, ?) END
 				 WHERE id = ?`,
 				kind, r.Salience, r.AccessCount,
 				r.CreatedAt, r.UpdatedAt, r.LastSeenAt,
-				r.ExpiresAt, r.ExpiresAt, r.SupersededBy,
+				r.ExpiresAt, r.ExpiresAt,
 				localID,
 			); err != nil {
 				return nil, err
@@ -192,6 +215,54 @@ func (s *Store) Import(recs []ExportRecord) (*ImportStats, error) {
 					return nil, err
 				}
 			}
+		}
+
+		// 记下本批记录的身份键 → 本地 id，供第二遍解析取代引用。
+		// 键必须用归一化后的 h（文件缺 content_hash 时会由 HashOf 兜底），
+		// 用原始 r.ContentHash 会在那种情况下建出对不上的键。
+		identity[h+"\x00"+r.Project] = localID
+	}
+
+	// 第二遍：重建取代关系。
+	//
+	// 必须分两遍：被取代者可能排在存活者之前（导出按 content_hash 排序，
+	// 顺序与取代关系无关），一遍扫描会解析不到目标。
+	// 目标优先在本批记录里找，其次回落到库里已有的记录（存活者可能不在本文件内）。
+	for _, r := range recs {
+		if r.Superseded == nil || r.Superseded.Hash == "" {
+			continue
+		}
+		selfID, ok := identity[r.ContentHash+"\x00"+r.Project]
+		if !ok {
+			continue // 该记录本身被跳过（内容为空），无需处理
+		}
+		key := r.Superseded.Hash + "\x00" + r.Superseded.Project
+
+		target, ok := identity[key]
+		if !ok {
+			err := tx.QueryRow(
+				`SELECT id FROM memories WHERE content_hash = ? AND project = ?`,
+				r.Superseded.Hash, r.Superseded.Project,
+			).Scan(&target)
+			if errors.Is(err, sql.ErrNoRows) {
+				// 目标既不在文件里也不在本地：宁可留空并计数上报，
+				// 也不能写入一个不存在的 id（那就是悬挂引用）。
+				stats.Unresolved++
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		if target == selfID {
+			// 自引用是不可能的取代关系，跳过以免污染检索过滤
+			stats.Unresolved++
+			continue
+		}
+		if _, err := tx.Exec(
+			`UPDATE memories SET superseded_by = ? WHERE id = ?`, target, selfID,
+		); err != nil {
+			return nil, err
 		}
 	}
 
