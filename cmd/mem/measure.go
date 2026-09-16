@@ -39,6 +39,7 @@ func cmdAudit(args []string) error {
 	path := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
 	statsOnly := fs.Bool("stats", false, "只打印汇总")
 	tail := fs.Int("tail", 10, "列出最近多少条（0=不列）")
+	showHits := fs.Bool("hits", true, "列出每条记录实际涉及的记忆内容（可用 --hits=false 关闭）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -91,6 +92,25 @@ func cmdAudit(args []string) error {
 		return nil
 	}
 
+	// 需要还原内容时，把窗口内所有引用一次性批量取回（读侧存本地 id，写侧存 content_hash）
+	var contents map[string]string
+	if *showHits {
+		var refs []string
+		seen := map[string]bool{}
+		for i := len(rs) - 1; i >= 0 && i > len(rs)-1-*tail; i-- {
+			for _, h := range rs[i].Hashes {
+				if !seen[h] {
+					seen[h] = true
+					refs = append(refs, h)
+				}
+			}
+		}
+		if st, err := store.Open(c.db); err == nil {
+			contents, _ = st.ContentsByRefs(refs)
+			st.Close()
+		}
+	}
+
 	fmt.Println("\n最近记录（新→旧）：")
 	start := len(rs) - 1
 	for i := start; i >= 0 && i > start-*tail; i-- {
@@ -99,10 +119,37 @@ func cmdAudit(args []string) error {
 		if q == "" {
 			q = "（无 query）"
 		}
-		fmt.Printf("  %s  %-14s 命中%2d 空=%-5v %4dms  %s\n",
-			r.Event, r.Harness, len(r.Hashes), r.Empty, r.MS, truncateRunes(q, 40))
+		marks := ""
+		if r.Suppressed {
+			marks += "  [已抑制]"
+		}
+		if r.Mode != "" {
+			marks += "  [" + r.Mode + "]"
+		}
+		fmt.Printf("  %s  %-14s %-11s %s%s\n",
+			formatAuditTime(r.TS), r.Event, r.Harness, truncateRunes(oneLine(q), 42), marks)
+		if !*showHits {
+			continue
+		}
+		for _, ref := range r.Hashes {
+			if c, ok := contents[ref]; ok {
+				fmt.Printf("        ↳ %s\n", truncateRunes(oneLine(c), 72))
+			} else {
+				fmt.Printf("        ↳ %s（内容不可用：可能已被删除或取代）\n", shortID(ref))
+			}
+		}
 	}
 	return nil
+}
+
+// formatAuditTime 按「今天只显时刻、跨天带日期」渲染，兼顾可读与省位。
+func formatAuditTime(ts int64) string {
+	t := time.Unix(ts, 0)
+	now := time.Now()
+	if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
+		return t.Format("15:04:05")
+	}
+	return t.Format("01-02 15:04")
 }
 
 func joinCounts(m map[string]int) string {

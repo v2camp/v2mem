@@ -27,6 +27,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
 用法:
   mem add    [选项] "<原子事实>"    写入一条记忆（相同内容自动覆盖）
   mem search [选项] "<查询>"        全文检索（FTS5 / bm25）
+  mem ls     [选项]                列出库里的记忆（无需查询词；可按工程/类型/标记过滤）
   mem touch  <id|前缀>             记录命中，刷新 last_seen_at 并累加 access_count
   mem forget <id|前缀>             删除一条记忆
   mem gc     [选项]                回收：TTL 到期 + 久未命中且低重要性
@@ -91,7 +92,7 @@ hook 选项:
 // 起因：新增 `mem report` 时漏了同步测试里的清单，护栏立刻报警 ——
 // 清单有两个出处就一定会漂移，所以把它抽成一处。
 var knownSubcommands = []string{
-	"add", "search", "stats", "touch", "forget", "gc", "consolidate",
+	"add", "search", "ls", "stats", "touch", "forget", "gc", "consolidate",
 	"export", "import", "hook", "harness", "init", "ingest", "budget",
 	"audit", "eval", "report", "help",
 }
@@ -108,6 +109,8 @@ func main() {
 		err = cmdAdd(os.Args[2:])
 	case "search":
 		err = cmdSearch(os.Args[2:])
+	case "ls":
+		err = cmdLs(os.Args[2:])
 	case "stats":
 		err = cmdStats(os.Args[2:])
 	case "touch":
@@ -350,6 +353,12 @@ func cmdSearch(args []string) error {
 	// --json 当成查询的一部分 —— 既不报错也搜不到东西，是个静默陷阱（实测踩过）。
 	if bad := misplacedFlag(q); bad != "" {
 		return fmt.Errorf("查询里出现了选项 %q：选项必须写在查询之前（mem search --json \"<查询>\"）", bad)
+	}
+	// --scope all 与 --project 语义矛盾：all 就是「忽略工程」。
+	// 此前只在 store 的注释里声明要拦，实际没拦 —— 结果是静默忽略工程过滤，
+	// 用户以为过滤生效了。注释比代码超前，这里补上实现。
+	if *scope == "all" && strings.TrimSpace(*project) != "" {
+		return errors.New("--scope all 与 --project 矛盾：all 表示跨工程、忽略工程过滤；要按工程过滤请去掉 --scope all")
 	}
 	switch *scope {
 	case "", "all", "current", "global":

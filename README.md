@@ -69,6 +69,7 @@ mem init              # 扫描 → 选择要注入钩子的工具
 |:---|:---|
 | `mem add [--kind K] [--project P \| --global] [--tag k=v] [--salience F] [--ttl DUR] "<事实>"` | 写入一条记忆。**相同内容自动覆盖**（按归一化后的 hash），不会重复 |
 | `mem search [--limit N] [--scope S] [--project P] [--kind K] [--tag k=v] "<查询>"` | 全文检索（FTS5 + bm25）。`--scope`：`current`（本工程+全局，**按当前目录推断工程**）/ `global` / `all`（默认） |
+| `mem ls [--project P] [--kind K] [--tag k=v] [--scope S] [--limit N]` | **列出库里的记忆**（不需要查询词）。默认跨工程全部列出、按工程分组；给了 `--project` 则按其过滤 |
 | `mem touch <id\|前缀>` | 记录一次命中：刷新 `last_seen_at`、累加 `access_count`。这是衰减机制的输入 |
 
 ### 生命周期
@@ -107,7 +108,7 @@ mem init              # 扫描 → 选择要注入钩子的工具
 
 | 命令 | 说明 |
 |:---|:---|
-| `mem audit [--stats] [--tail N]` | 审计日志：钩子激活次数、空注入率、**可评测样本数**、**读侧/写侧计数**（判断"到底用起来没有"看这两个数，不看总次数） |
+| `mem audit [--stats] [--tail N] [--hits=false]` | 审计日志。汇总给钩子激活次数、空注入率、可评测样本数、**读侧/写侧计数**；`--tail` 逐条给**时间 + 事件 + 实际涉及的记忆内容**（`--hits=false` 只看摘要） |
 | `mem eval recall [--gold 文件] [--auto N] [--k N]` | 测「检索命中是否准」 |
 | `mem eval write --session <文件> [--gold 文件]` | 测「记录是否准」（漏记/多记/疑似碎片） |
 
