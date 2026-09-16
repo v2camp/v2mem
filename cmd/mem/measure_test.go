@@ -467,12 +467,11 @@ func TestGuidanceCommandsAreExecutable(t *testing.T) {
 
 // 指引里出现的每个子命令名都必须是真实的子命令。
 // 防的是「文档写了、命令不存在」这类漂移。
+// 清单取自 knownSubcommands（单一出处），不再自带一份。
 func TestGuidanceNamesRealSubcommands(t *testing.T) {
-	known := map[string]bool{
-		"add": true, "search": true, "touch": true, "forget": true, "gc": true,
-		"consolidate": true, "export": true, "import": true, "hook": true,
-		"harness": true, "init": true, "ingest": true, "budget": true,
-		"audit": true, "eval": true, "stats": true, "help": true,
+	known := map[string]bool{}
+	for _, s := range knownSubcommands {
+		known[s] = true
 	}
 	for name, block := range map[string]string{
 		"hook 用法提示": hintBlock(),
@@ -480,16 +479,43 @@ func TestGuidanceNamesRealSubcommands(t *testing.T) {
 	} {
 		for _, c := range extractMemCommands(block) {
 			fields := strings.Fields(c)
-			if len(fields) < 2 {
+			if len(fields) < 2 || strings.HasPrefix(fields[1], "-") {
 				continue
 			}
-			sub := fields[1]
-			if strings.HasPrefix(sub, "-") {
-				continue
+			if !known[fields[1]] {
+				t.Errorf("%s 引用了不存在的子命令 %q：%s", name, fields[1], c)
 			}
-			if !known[sub] {
-				t.Errorf("%s 引用了不存在的子命令 %q：%s", name, sub, c)
-			}
+		}
+	}
+}
+
+// 新增了子命令却忘了写进 usage 文本，是同一类漂移。用单一清单反向核对。
+func TestUsageTextCoversEveryKnownSubcommand(t *testing.T) {
+	for _, sub := range knownSubcommands {
+		if !strings.Contains(usageText, "mem "+sub) {
+			t.Errorf("usage 文本未登记子命令 %q —— 新增子命令必须同步 usage", sub)
+		}
+	}
+}
+
+// usage 里登记的每个 `mem <sub>` 都必须是已知子命令，反之亦然。
+// 这条把「清单」与「用户看到的帮助」钉在一起。
+func TestUsageTextHasNoUnknownSubcommand(t *testing.T) {
+	known := map[string]bool{}
+	for _, s := range knownSubcommands {
+		known[s] = true
+	}
+	for _, line := range strings.Split(usageText, "\n") {
+		l := strings.TrimSpace(line)
+		if !strings.HasPrefix(l, "mem ") {
+			continue
+		}
+		sub := strings.Fields(l)[1]
+		if strings.HasPrefix(sub, "-") {
+			continue
+		}
+		if !known[sub] {
+			t.Errorf("usage 登记了未在 knownSubcommands 中的子命令 %q", sub)
 		}
 	}
 }
