@@ -37,6 +37,8 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem init   --harness <名字>       把钩子写入该工具的配置（幂等、合并、带备份）
   mem ingest <文件.md>              把既有 md 文件里的条目机械化搬进记忆库
   mem budget --file <文件>          检查 Level 1 文件是否超出注入预算
+  mem audit  [--stats]             审计日志：钩子激活次数、空注入率、可评测样本数
+  mem eval   recall|write          评测：检索命中是否准（recall）／记录是否准（write）
   mem stats  [选项]                 库概览
   mem help
 
@@ -117,6 +119,10 @@ func main() {
 		err = cmdIngest(os.Args[2:])
 	case "budget":
 		err = cmdBudget(os.Args[2:])
+	case "audit":
+		err = cmdAudit(os.Args[2:])
+	case "eval":
+		err = cmdEval(os.Args[2:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
 		return
@@ -149,6 +155,21 @@ func (s *stringSlice) String() string { return strings.Join(*s, ",") }
 func (s *stringSlice) Set(v string) error {
 	*s = append(*s, v)
 	return nil
+}
+
+// misplacedFlag 检查查询文本里是否混入了本命令的选项。
+// 只认已知选项名，避免把正文里出现的 "--xxx"（如一条讲 CLI 用法的记忆）误判。
+func misplacedFlag(query string) string {
+	known := map[string]bool{
+		"--json": true, "--db": true, "--limit": true,
+		"--project": true, "--kind": true, "--tag": true, "--scope": true,
+	}
+	for _, tok := range strings.Fields(query) {
+		if known[tok] {
+			return tok
+		}
+	}
+	return ""
 }
 
 func printJSON(v any) error {
@@ -289,6 +310,11 @@ func cmdSearch(args []string) error {
 	q := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if q == "" {
 		return errors.New("缺少查询，用法: mem search \"<query>\"")
+	}
+	// Go 的 flag 解析在首个位置参数处停止，因此 `mem search "查询" --json` 会把
+	// --json 当成查询的一部分 —— 既不报错也搜不到东西，是个静默陷阱（实测踩过）。
+	if bad := misplacedFlag(q); bad != "" {
+		return fmt.Errorf("查询里出现了选项 %q：选项必须写在查询之前（mem search --json \"<查询>\"）", bad)
 	}
 	switch *scope {
 	case "", "all", "current", "global":

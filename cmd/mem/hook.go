@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/wanghui/v2mem/internal/audit"
 	"github.com/wanghui/v2mem/internal/harness"
 	"github.com/wanghui/v2mem/internal/store"
 )
@@ -51,6 +53,7 @@ func cmdHook(args []string) error {
 	harnessFlag := fs.String("harness", "", "harness 名；决定项目目录取自哪个环境变量")
 	limit := fs.Int("limit", defaultHookLimit, "注入的记忆条数上限")
 	maxChars := fs.Int("max-chars", defaultHookBudget, "注入内容的字符预算")
+	auditPath := fs.String("audit", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；\"-\" 表示关闭）")
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 参数解析失败，已静默放过:", err)
@@ -79,10 +82,43 @@ func cmdHook(args []string) error {
 		fmt.Fprintf(os.Stderr, "v2mem hook: event=%s project=%q dir=%s\n", event, project, dir)
 	}
 
-	if text := renderHookContext(c, event, project, in.Prompt, *limit, *maxChars); text != "" {
+	started := time.Now()
+	text, injected := renderHookContext(c, event, project, in.Prompt, *limit, *maxChars)
+	if text != "" {
 		fmt.Print(text)
 	}
+
+	// 审计：为「用户会话 → mem 查询」沉淀真实样本。写失败必须静默 ——
+	// 这条在宿主会话关键链上，审计问题绝不能让会话收到错误。
+	if *auditPath != "-" {
+		rec := audit.Record{
+			TS: started.Unix(), Event: string(event), Harness: harnessName(*harnessFlag, in),
+			Project: project, Query: strings.TrimSpace(in.Prompt),
+			Empty: strings.TrimSpace(text) == "", MS: time.Since(started).Milliseconds(),
+		}
+		for _, h := range injected {
+			rec.Hashes = append(rec.Hashes, h.ID)
+			rec.Kinds = append(rec.Kinds, h.Kind)
+		}
+		_ = audit.Append(*auditPath, rec)
+	}
 	return nil
+}
+
+// harnessName 推断本次调用来自哪个工具：显式参数优先，否则由项目目录环境变量反推。
+func harnessName(flagVal string, in hookInput) string {
+	if v := strings.TrimSpace(flagVal); v != "" {
+		if h, err := harness.Get(v); err == nil {
+			return h.Name
+		}
+		return v
+	}
+	for _, h := range harness.All() {
+		if h.ProjectDirFromEnv() != "" {
+			return h.Name
+		}
+	}
+	return ""
 }
 
 // resolveHookEvent 依次尝试显式参数与 stdin 字段，容忍写法差异。
@@ -134,17 +170,20 @@ func hookProject(harnessName string, in hookInput) (name, dir string) {
 	return detectProjectAt(wd), wd
 }
 
-// renderHookContext 构造要注入模型的文本。返回空串表示不注入。
-func renderHookContext(c common, event harness.Event, project, prompt string, limit, maxChars int) string {
+// renderHookContext 构造要注入模型的文本，并返回本次实际注入的记忆。
+//
+// 返回 hits 是为了审计：没有真实会话的「查询 → 命中」样本，
+// 检索质量就无法评测（见 internal/audit 与 DESIGN.md §15）。
+func renderHookContext(c common, event harness.Event, project, prompt string, limit, maxChars int) (string, []store.Hit) {
 	st, err := store.Open(c.db)
 	if err != nil {
 		// 库打不开时仍告诉模型「有这么个库」，否则用户会以为记忆系统不存在
 		fmt.Fprintln(os.Stderr, "v2mem hook: 打开记忆库失败:", err)
 		if event == harness.EventSessionStart {
 			return fmt.Sprintf("[v2mem] 本地分层记忆库（Level 2）。当前工程：%s\n%s",
-				orGlobal(project), hintBlock())
+				orGlobal(project), hintBlock()), nil
 		}
-		return ""
+		return "", nil
 	}
 	defer st.Close()
 
@@ -154,7 +193,7 @@ func renderHookContext(c common, event harness.Event, project, prompt string, li
 	case harness.EventPromptSubmit:
 		return promptSubmitContext(st, project, prompt, limit, maxChars)
 	}
-	return ""
+	return "", nil
 }
 
 // sessionStartContext 注入「硬规则 + 本工程记忆 + 用法」。
@@ -162,7 +201,7 @@ func renderHookContext(c common, event harness.Event, project, prompt string, li
 // 顺序有讲究：跨工程硬规则在前（通常是红线，且对所有工程生效），
 // 本工程记忆在后，用法提示压尾并**预留预算**，保证它一定不被截断 ——
 // 它的作用正是告诉模型「还有多级记忆可查」，被截断就失去了钩子的意义。
-func sessionStartContext(st *store.Store, project string, limit, maxChars int) string {
+func sessionStartContext(st *store.Store, project string, limit, maxChars int) (string, []store.Hit) {
 	hint := hintBlock()
 	head := fmt.Sprintf("[v2mem] 本机有跨会话的本地记忆库（Level 2，正文不进上下文）。当前工程：%s\n",
 		orGlobal(project))
@@ -174,32 +213,49 @@ func sessionStartContext(st *store.Store, project string, limit, maxChars int) s
 
 	var sb strings.Builder
 	sb.WriteString(head)
+	var injected []store.Hit
 
 	// 跨工程硬规则
 	if hits, err := st.List(store.ListQuery{Scope: "global", Limit: limit}); err == nil && len(hits) > 0 {
-		block, used := formatHits("硬规则（跨工程，务必遵守）", hits, budget)
-		sb.WriteString(block)
-		budget -= used
+		if block, used := formatHits("硬规则（跨工程，务必遵守）", hits, budget); block != "" {
+			sb.WriteString(block)
+			budget -= used
+			injected = append(injected, hits[:countLines(block)]...)
+		}
 	}
 	// 本工程的记忆（Scope=project 只取本工程，避免与上面的全局段重复）
 	if budget > 0 && project != "" {
 		if hits, err := st.List(store.ListQuery{Scope: "project", Project: project, Limit: limit}); err == nil && len(hits) > 0 {
-			block, used := formatHits("本工程记忆", hits, budget)
-			sb.WriteString(block)
-			budget -= used
+			if block, used := formatHits("本工程记忆", hits, budget); block != "" {
+				sb.WriteString(block)
+				budget -= used
+				injected = append(injected, hits[:countLines(block)]...)
+			}
 		}
 	}
 
 	sb.WriteString(hint)
-	return sb.String()
+	return sb.String(), injected
+}
+
+// countLines 数 formatHits 实际渲染了多少条 —— 预算截断时命中数少于候选数，
+// 审计必须记「真正注入的」而非「查到的」。
+func countLines(block string) int {
+	n := 0
+	for _, l := range strings.Split(block, "\n") {
+		if strings.HasPrefix(l, "- [") {
+			n++
+		}
+	}
+	return n
 }
 
 // promptSubmitContext 依据用户提问检索并注入相关记忆。
 // 无命中时返回空串：每轮注入无关内容纯属浪费 token。
-func promptSubmitContext(st *store.Store, project, prompt string, limit, maxChars int) string {
+func promptSubmitContext(st *store.Store, project, prompt string, limit, maxChars int) (string, []store.Hit) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
-		return ""
+		return "", nil
 	}
 	hits, err := st.Search(store.SearchQuery{
 		Query:   prompt,
@@ -208,14 +264,14 @@ func promptSubmitContext(st *store.Store, project, prompt string, limit, maxChar
 		Limit:   limit,
 	})
 	if err != nil || len(hits) == 0 {
-		return ""
+		return "", nil
 	}
 	head := "[v2mem] 相关历史记忆（若与当前代码冲突，以代码为准）：\n"
 	block, _ := formatHits("", hits, maxChars-runeLen(head))
 	if block == "" {
-		return ""
+		return "", nil
 	}
-	return head + block
+	return head + block, hits[:countLines(block)]
 }
 
 // formatHits 渲染命中列表，返回文本与消耗的字符数。
