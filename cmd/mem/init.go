@@ -443,15 +443,17 @@ func reportWriteResult(dryRun, changed bool) {
 	}
 }
 
-// initInstruction 为无原生钩子的工具写入指令级钩子块。
+// initInstruction 为「无原生钩子」或「原生钩子暂不可用」的工具写入指令级钩子块。
+//
+// 注意：更正注册表后，所有已知工具的默认接入都是 native/bridge，
+// 这条路径因此只在显式 `--scope instruction` 时走到 —— 它是有意保留的**兜底通道**：
+// 当原生钩子未生效（需 trust / 需重启 / 被企业策略禁用）时，仍能靠指令块工作。
+// 故落点缺省为 AGENTS.md，而不是让命令报错。
 func initInstruction(h *harness.Harness, project string, dryRun, skipNoPos bool) error {
-	if len(h.Instruction) == 0 {
-		if skipNoPos {
-			return errSkipUnsupported
-		}
-		return fmt.Errorf("%s 既无 shell hook 配置也无指令文件，无法接入；可用 --file 指定落点", h.Name)
+	rel := "AGENTS.md"
+	if len(h.Instruction) > 0 {
+		rel = h.Instruction[0]
 	}
-	rel := h.Instruction[0]
 	var target string
 	if strings.HasPrefix(rel, "~") {
 		target = harness.ExpandHome(rel)
