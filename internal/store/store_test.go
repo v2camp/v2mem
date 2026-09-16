@@ -415,3 +415,116 @@ func TestSearchScopeGlobalReturnsOnlyProjectlessMemories(t *testing.T) {
 		t.Errorf("scope=global 返回了非全局记忆: %+v", hits[0])
 	}
 }
+
+// ---------- M6: 无查询词的列举（会话起始摘要用） ----------
+
+// List 与 Search 的分工：Search 要匹配词，List 只要「最重要 / 最近的」。
+// 会话起始注入需要的是后者 —— 那时还没有用户提问，没有关键词可用。
+func TestListReturnsMostSalientFirst(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: "低重要性条目甲", Project: "p1", Salience: 0.2})
+	addWith(t, s, AddInput{Content: "高重要性条目乙", Project: "p1", Salience: 0.95})
+	addWith(t, s, AddInput{Content: "中重要性条目丙", Project: "p1", Salience: 0.5})
+
+	hits, err := s.List(ListQuery{Scope: "all", Limit: 10})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(hits) != 3 {
+		t.Fatalf("应返回 3 条，got %d", len(hits))
+	}
+	want := []string{"高重要性条目乙", "中重要性条目丙", "低重要性条目甲"}
+	for i, c := range want {
+		if hits[i].Content != c {
+			t.Errorf("第 %d 条应为 %q，got %q", i, c, hits[i].Content)
+		}
+	}
+}
+
+func TestListHonoursLimit(t *testing.T) {
+	s := newTestStore(t)
+	for _, c := range []string{"列举条目甲", "列举条目乙", "列举条目丙", "列举条目丁"} {
+		addWith(t, s, AddInput{Content: c, Project: "p1", Salience: 0.5})
+	}
+	hits, err := s.List(ListQuery{Scope: "all", Limit: 2})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Errorf("应受 Limit 限制，got %d", len(hits))
+	}
+}
+
+func TestListScopeCurrentAndGlobal(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: "甲工程条目内容", Project: "projA", Salience: 0.9})
+	addWith(t, s, AddInput{Content: "乙工程条目内容", Project: "projB", Salience: 0.9})
+	addWith(t, s, AddInput{Content: "全局条目内容", Project: "", Salience: 0.9})
+
+	cur, err := s.List(ListQuery{Scope: "current", Project: "projA", Limit: 10})
+	if err != nil {
+		t.Fatalf("List current: %v", err)
+	}
+	if len(cur) != 2 {
+		t.Fatalf("current 应含本工程与全局共 2 条，got %d", len(cur))
+	}
+	glb, err := s.List(ListQuery{Scope: "global", Limit: 10})
+	if err != nil {
+		t.Fatalf("List global: %v", err)
+	}
+	if len(glb) != 1 || glb[0].Content != "全局条目内容" {
+		t.Errorf("global 应只含全局 1 条，got %+v", glb)
+	}
+	all, err := s.List(ListQuery{Scope: "all", Limit: 10})
+	if err != nil {
+		t.Fatalf("List all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("all 应含 3 条，got %d", len(all))
+	}
+}
+
+// 与 Search 共用同一套可见性规则：被取代的、已过期的都不出现。
+func TestListSharesVisibilityRulesWithSearch(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: "可见条目内容甲", Project: "p1", Salience: 0.9})
+	sup := addWith(t, s, AddInput{Content: "已被取代的条目内容", Project: "p1", Salience: 0.9})
+	exp := addWith(t, s, AddInput{Content: "已过期的条目内容", Project: "p1", Salience: 0.9})
+	setColumn(t, s, sup, "superseded_by", "some-other-id")
+	setColumn(t, s, exp, "expires_at", 1)
+
+	hits, err := s.List(ListQuery{Scope: "all", Limit: 10})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Content != "可见条目内容甲" {
+		t.Errorf("应只返回 1 条可见条目，got %+v", hits)
+	}
+}
+
+func TestListOnEmptyStoreReturnsNothing(t *testing.T) {
+	s := newTestStore(t)
+	hits, err := s.List(ListQuery{Scope: "all", Limit: 5})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("空库应返回 0 条，got %d", len(hits))
+	}
+}
+
+// 显式 all 必须跨工程：若写成布尔串判断，「all + 非空 Project」会落进
+// Project 分支使 all 静默失效（实测被变异测试暴露过）。
+func TestSearchScopeAllIgnoresProjectArgument(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: "甲工程条目内容", Project: "projA"})
+	addWith(t, s, AddInput{Content: "乙工程条目内容", Project: "projB"})
+
+	hits, err := s.Search(SearchQuery{Query: "工程条目", Scope: "all", Project: "projA", Limit: 10})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Errorf("scope=all 应跨工程返回 2 条（忽略 Project），got %d", len(hits))
+	}
+}

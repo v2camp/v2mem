@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -101,6 +102,389 @@ func TestCmdSearchScopeCurrentNarrowsToCurrentProject(t *testing.T) {
 func testDB(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(t.TempDir(), "mem.db")
+}
+
+// ---------- M6: Harness 钩子 ----------
+//
+// 测试数据的两个前提必须同时满足，否则用例会以「被工程过滤掉」的方式假通过：
+//   ① 记忆的 project 与钩子推断出的工程名一致
+//   ② 工程目录带 .git，使 mem add 与钩子走同一套推断
+// 这组用例里每条断言都要求「有内容」，而不是「为空」，正是为了堵住这类假通过。
+
+// withStdin 替换 stdin/stdout 后运行 fn，返回被捕获的标准输出。
+func withStdin(t *testing.T, input string, fn func() error) (string, error) {
+	t.Helper()
+	oldIn, oldOut := os.Stdin, os.Stdout
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe(stdin): %v", err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe(stdout): %v", err)
+	}
+	os.Stdin, os.Stdout = inR, outW
+	go func() {
+		_, _ = inW.WriteString(input)
+		inW.Close()
+	}()
+	runErr := fn()
+	outW.Close()
+	os.Stdin, os.Stdout = oldIn, oldOut
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, outR); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	return buf.String(), runErr
+}
+
+// hookStdin 生成各 harness 通用的 stdin JSON。
+func hookStdin(event, cwd, prompt string) string {
+	m := map[string]string{"hook_event_name": event, "cwd": cwd}
+	if prompt != "" {
+		m["prompt"] = prompt
+	}
+	b, _ := json.Marshal(m)
+	return string(b)
+}
+
+// hookProjectDir 造一个「像真仓库」的临时工程目录，返回目录与其工程名。
+//
+// 同时清空各家注入项目目录的环境变量。**这一步不可省**：宿主（IDE / 编辑器）
+// 自身就可能设了 CLAUDE_PROJECT_DIR 之类的变量，钩子会优先采纳它，
+// 于是测试验证的变成「宿主的环境」而不是被测逻辑 —— 实测就是靠这一条
+// 才让一批 prompt-submit 用例从「静默空输出」恢复为真实验证。
+func hookProjectDir(t *testing.T, name string) (dir string, project string) {
+	t.Helper()
+	for _, k := range []string{
+		"TRAE_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CODEBUDDY_PROJECT_DIR",
+		"QODER_PROJECT_DIR", "QODERCN_PROJECT_DIR",
+	} {
+		t.Setenv(k, "")
+	}
+	dir = filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	return dir, name
+}
+
+func TestCmdHookSessionStartInjectsHardRulesAndProjectMemory(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--global", "--kind", "preference", "--salience", "0.95",
+		"所有自建工具默认 CGO_ENABLED=0 构建"}); err != nil {
+		t.Fatalf("cmdAdd global: %v", err)
+	}
+	if err := cmdAdd([]string{"--db", db, "--project", name, "--kind", "decision", "--salience", "0.8",
+		"本工程的部署脚本放在 scripts 目录"}); err != nil {
+		t.Fatalf("cmdAdd project: %v", err)
+	}
+
+	out, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	for _, want := range []string{"mem search", "v2mem", name, "CGO_ENABLED=0", "本工程的部署脚本"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("SessionStart 注入应包含 %q，got:\n%s", want, out)
+		}
+	}
+}
+
+// 钩子只是「告诉模型还有多级记忆可查」——必须给出可执行的检索指令，否则模型不会去查。
+func TestCmdHookSessionStartTeachesRetrievalCommands(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	out, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	for _, want := range []string{"mem search", "mem add", "mem touch"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("应教会模型使用 %q，got:\n%s", want, out)
+		}
+	}
+}
+
+func TestCmdHookPromptSubmitInjectsOnlyRelevantMemories(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "--kind", "pitfall",
+		"记忆库不能放进 iCloud 同步目录，会损坏 SQLite"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if err := cmdAdd([]string{"--db", db, "--project", name, "--kind", "fact",
+		"公司年会的抽奖规则是三局两胜"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+
+	out, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "iCloud 同步目录能不能放数据库"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if !strings.Contains(out, "iCloud") {
+		t.Fatalf("应注入与提问相关的记忆，got:\n%s", out)
+	}
+	if strings.Contains(out, "抽奖") {
+		t.Errorf("不应注入无关记忆，got:\n%s", out)
+	}
+}
+
+// 反向对照：别的工程的记忆不得注入 —— 证明 Scope=current 真的在过滤，
+// 而不只是「碰巧没命中」。
+func TestCmdHookPromptSubmitExcludesOtherProjects(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", "some-other-repo", "--kind", "pitfall",
+		"记忆库不能放进 iCloud 同步目录，会损坏 SQLite"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+
+	out, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "iCloud 同步目录能不能放数据库"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("他工程的记忆不应注入，got:\n%s", out)
+	}
+
+	// 同一份数据换成全局记忆后必须能注入，否则上一条断言可能只是「库是空的」造成的假通过
+	if err := cmdAdd([]string{"--db", db, "--global", "--kind", "pitfall",
+		"记忆库不能放进 iCloud 同步目录，会损坏 SQLite"}); err != nil {
+		t.Fatalf("cmdAdd global: %v", err)
+	}
+	out2, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "iCloud 同步目录能不能放数据库"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if !strings.Contains(out2, "iCloud") {
+		t.Errorf("全局记忆应能注入，got:\n%s", out2)
+	}
+}
+
+// 无命中时输出必须为空 —— 每轮都注入噪声是纯 token 浪费。
+func TestCmdHookPromptSubmitStaysSilentWhenNothingMatches(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进 iCloud 同步目录"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	// 先确认这条记忆在库里确实查得到，排除「空库导致空输出」的假通过
+	probe, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "iCloud 同步目录"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook probe: %v", err)
+	}
+	if !strings.Contains(probe, "iCloud") {
+		t.Fatalf("前置条件不成立：相关提问应能命中，got:\n%s", probe)
+	}
+
+	out, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "今天天气怎么样"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Errorf("无命中时应静默，got:\n%s", out)
+	}
+}
+
+// 🔴 硬约束：记忆系统绝不能阻断宿主会话。任何异常输入都要静默放过。
+func TestCmdHookNeverFailsOnBadInput(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	cases := map[string]string{
+		"空输入":         "",
+		"非 JSON":      "i am not json",
+		"截断的 JSON":    `{"hook_event_name":`,
+		"空 JSON 对象":   `{}`,
+		"未知事件":        hookStdin("PreToolUse", proj, ""),
+		"事件名下划线写法":    hookStdin("session_start", proj, ""),
+		"cwd 不存在":     hookStdin("SessionStart", "/no/such/dir", ""),
+		"prompt 非字符串": `{"hook_event_name":"UserPromptSubmit","prompt":{"nested":1}}`,
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, err := withStdin(t, input, func() error {
+				return cmdHook([]string{"--db", db, "--harness", "claude"})
+			})
+			if err != nil {
+				t.Errorf("异常输入必须静默放过（否则会打断宿主会话），got err=%v", err)
+			}
+			if name == "未知事件" && strings.TrimSpace(out) != "" {
+				t.Errorf("不处理的事件不应产生输出，got:\n%s", out)
+			}
+		})
+	}
+}
+
+// 库不存在不是错误：首次使用时要能正常注入「系统可用」的提示。
+func TestCmdHookWorksWhenLibraryDoesNotExistYet(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "nested", "never-created.db")
+	proj, _ := hookProjectDir(t, "demo-repo")
+	out, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("库不存在不应报错: %v", err)
+	}
+	if !strings.Contains(out, "mem search") {
+		t.Errorf("仍应注入可用提示，got:\n%s", out)
+	}
+}
+
+func TestCmdHookPromptSubmitHonoursLimit(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	for _, c := range []string{
+		"项目统一用 pnpm 管理依赖，不要用 npm",
+		"项目统一用 pnpm 的 workspace 协议引用内部包",
+		"项目统一用 pnpm 的 lockfile 才纳入版本控制",
+		"项目统一用 pnpm 时禁用 npm run",
+		"项目统一用 pnpm 的 catalogs 统一版本号",
+	} {
+		if err := cmdAdd([]string{"--db", db, "--project", name, c}); err != nil {
+			t.Fatalf("cmdAdd: %v", err)
+		}
+	}
+	out, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "pnpm 依赖怎么管"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--limit", "2"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if n := strings.Count(out, "pnpm"); n != 2 {
+		t.Errorf("应恰好注入 2 条（--limit 2），命中行数 got %d:\n%s", n, out)
+	}
+}
+
+// 🔴 每轮注入必须有字符预算，否则记忆一多就会吃掉上下文。
+//
+// 这里必须同时放开 --limit，否则条数上限会先把量兜住（实测：用默认 --limit 3 时
+// 输出天然低于预算，把预算逻辑整段删掉测试也不会失败 —— 断言根本没生效）。
+func TestCmdHookRespectsCharBudget(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	for i := 0; i < 40; i++ {
+		// 内容必须逐条互异：写同一个字符串会被「相同知识覆盖」收敛成一条，
+		// 那样预算根本不会成为约束（实测踩过）。
+		long := fmt.Sprintf("第%d条很长的记忆条目用于测试字符预算控制%s", i, strings.Repeat("填充内容", 12))
+		if err := cmdAdd([]string{"--db", db, "--project", name, "--salience", "0.9", long}); err != nil {
+			t.Fatalf("cmdAdd: %v", err)
+		}
+	}
+	out, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude",
+			"--limit", "40", "--max-chars", "600"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	// 先确认「放开 limit 后确实有远超预算的内容可注入」，否则下一条断言可能因数据不足而假通过
+	unbounded, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude",
+			"--limit", "40", "--max-chars", "100000"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook unbounded: %v", err)
+	}
+	if len([]rune(unbounded)) <= 600 {
+		t.Fatalf("前置条件不成立：放开采纳量后应远超 600 字符，got %d", len([]rune(unbounded)))
+	}
+
+	if n := len([]rune(out)); n > 600 {
+		t.Errorf("注入长度 %d 超出预算 600，got:\n%s", n, out)
+	}
+	// 同时确认记忆段真的被渲染过，排除「什么都没输出」造成的假通过
+	if !strings.Contains(out, "本工程记忆") {
+		t.Errorf("预算内应至少渲染出记忆段，got:\n%s", out)
+	}
+	if !strings.Contains(out, "mem search") {
+		t.Errorf("用法提示必须保留（它是钩子本体），got:\n%s", out)
+	}
+}
+
+// 不注入环境变量的工具（QoderWork / Codex）只能靠 stdin 的 cwd 定位工程。
+func TestCmdHookFallsBackToStdinCwd(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "该工程专属的记忆条目内容"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+
+	out, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "qoderwork"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if !strings.Contains(out, name) {
+		t.Errorf("应从 stdin 的 cwd 推断工程名 %q，got:\n%s", name, out)
+	}
+	if !strings.Contains(out, "该工程专属的记忆条目内容") {
+		t.Errorf("应注入该工程的记忆，got:\n%s", out)
+	}
+}
+
+// 环境变量优先于 stdin 的 cwd（部分 harness 会注入准确的项目目录）。
+func TestCmdHookPrefersProjectEnvOverStdinCwd(t *testing.T) {
+	db := testDB(t)
+	realProj, realName := hookProjectDir(t, "real-repo")
+	_, otherName := hookProjectDir(t, "other-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", realName, "真实工程的记忆条目"}); err != nil {
+		t.Fatalf("cmdAdd real: %v", err)
+	}
+	if err := cmdAdd([]string{"--db", db, "--project", otherName, "干扰工程的记忆条目"}); err != nil {
+		t.Fatalf("cmdAdd other: %v", err)
+	}
+	t.Setenv("CLAUDE_PROJECT_DIR", realProj)
+
+	out, err := withStdin(t, hookStdin("SessionStart", "/somewhere/else", ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if !strings.Contains(out, realName) {
+		t.Errorf("应优先用环境变量指向的工程 %q，got:\n%s", realName, out)
+	}
+	if !strings.Contains(out, "真实工程的记忆条目") {
+		t.Errorf("应注入真实工程的记忆，got:\n%s", out)
+	}
+	if strings.Contains(out, "干扰工程的记忆条目") {
+		t.Errorf("不应注入干扰工程的记忆，got:\n%s", out)
+	}
+}
+
+// 显式 --event 用于手工调试与不传 hook_event_name 的场景。
+func TestCmdHookAcceptsExplicitEventFlag(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--global", "全局硬规则样本内容"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	out, err := withStdin(t, hookStdin("", proj, ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--event", "session-start"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if !strings.Contains(out, "全局硬规则样本内容") {
+		t.Errorf("--event 应生效，got:\n%s", out)
+	}
 }
 
 // ---------- M5a: 相似知识归并 ----------
@@ -394,5 +778,378 @@ func TestCmdTouchRejectsUnknownID(t *testing.T) {
 	db := testDB(t)
 	if err := cmdTouch([]string{"--db", db, "ffffffff"}); err == nil {
 		t.Fatal("未知 ID 应返回错误")
+	}
+}
+
+// ---------- M6: 配置生成（mem init / mem harness） ----------
+
+func TestCmdHarnessListCoversUserToolsAndShowsTier(t *testing.T) {
+	out, err := captureStdout(t, func() error { return cmdHarness([]string{}) })
+	if err != nil {
+		t.Fatalf("cmdHarness: %v", err)
+	}
+	for _, want := range []string{
+		"claude", "traecode", "codebuddy", "qoder", "qoderwork", "codex", "dsh",
+		"workbuddy", "traework",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("列表应含 %q，got:\n%s", want, out)
+		}
+	}
+	// 确定性等级必须显式可见 —— 只有 native 才是代码强制
+	for _, want := range []string{"native", "instruction"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("应标注接入等级 %q，got:\n%s", want, out)
+		}
+	}
+}
+
+func TestCmdInitWritesHooksConfigWithBothEvents(t *testing.T) {
+	proj := t.TempDir()
+	out, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "codex", "--project", proj})
+	})
+	if err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	if !strings.Contains(out, "SessionStart") || !strings.Contains(out, "UserPromptSubmit") {
+		t.Errorf("摘要应报告写入的事件，got:\n%s", out)
+	}
+
+	path := filepath.Join(proj, ".codex", "hooks.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("应写出 %s: %v", path, err)
+	}
+	var cfg struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Type    string `json:"type"`
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("写出的应是合法 JSON: %v\n%s", err, data)
+	}
+	for _, ev := range []string{"SessionStart", "UserPromptSubmit"} {
+		groups, ok := cfg.Hooks[ev]
+		if !ok || len(groups) == 0 || len(groups[0].Hooks) == 0 {
+			t.Fatalf("事件 %s 应登记 hook，got %s", ev, data)
+		}
+		h := groups[0].Hooks[0]
+		if h.Type != "command" {
+			t.Errorf("%s 的 hook type 应为 command，got %q", ev, h.Type)
+		}
+		if !strings.Contains(h.Command, "hook") {
+			t.Errorf("%s 的 command 应调用 mem hook，got %q", ev, h.Command)
+		}
+		if !strings.Contains(h.Command, "--harness") {
+			t.Errorf("%s 的 command 应带 --harness 以便正确推断工程，got %q", ev, h.Command)
+		}
+	}
+}
+
+// 必须用绝对路径调用二进制：harness 拉起 hook 时环境往往很干净，
+// 依赖 PATH 里的 mem 会静默失效。
+func TestCmdInitUsesAbsoluteCommandPath(t *testing.T) {
+	proj := t.TempDir()
+	if _, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "claude", "--project", proj})
+	}); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(proj, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	cmd := extractFirstCommand(t, cfg, "SessionStart")
+	if !filepath.IsAbs(firstToken(cmd)) {
+		t.Errorf("命令应用绝对路径，got %q", cmd)
+	}
+}
+
+// 合并而非覆盖：用户自己的 hook 与其它配置键都必须保留。
+func TestCmdInitMergesWithoutClobberingExistingConfig(t *testing.T) {
+	proj := t.TempDir()
+	dir := filepath.Join(proj, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(dir, "settings.json")
+	existing := `{
+  "model": "my-model",
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "/usr/local/bin/my-own-hook.sh"}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/guard.sh"}]}
+    ]
+  }
+}`
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "claude", "--project", proj})
+	}); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if cfg["model"] != "my-model" {
+		t.Errorf("无关配置键应保留，got %+v", cfg["model"])
+	}
+	hooks := cfg["hooks"].(map[string]any)
+	if _, ok := hooks["PreToolUse"]; !ok {
+		t.Error("用户自己的 PreToolUse 配置应保留")
+	}
+	groups := hooks["SessionStart"].([]any)
+	var keptOwn, keptOurs bool
+	for _, g := range groups {
+		for _, h := range g.(map[string]any)["hooks"].([]any) {
+			c := h.(map[string]any)["command"].(string)
+			if strings.Contains(c, "my-own-hook.sh") {
+				keptOwn = true
+			}
+			if strings.Contains(c, "hook") && strings.Contains(c, "--harness") {
+				keptOurs = true
+			}
+		}
+	}
+	if !keptOwn {
+		t.Error("用户自己的 SessionStart hook 应保留（合并而非覆盖）")
+	}
+	if !keptOurs {
+		t.Error("应写入 v2mem 的 hook")
+	}
+}
+
+// 幂等：重复 init 不得累积重复条目（否则 hook 会被调用多次）。
+func TestCmdInitIsIdempotent(t *testing.T) {
+	proj := t.TempDir()
+	path := filepath.Join(proj, ".codex", "hooks.json")
+	for i := 0; i < 3; i++ {
+		if _, err := captureStdout(t, func() error {
+			return cmdInit([]string{"--harness", "codex", "--project", proj})
+		}); err != nil {
+			t.Fatalf("cmdInit #%d: %v", i+1, err)
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	hooks := cfg["hooks"].(map[string]any)
+	for _, ev := range []string{"SessionStart", "UserPromptSubmit"} {
+		groups := hooks[ev].([]any)
+		if len(groups) != 1 {
+			t.Errorf("%s 应只有 1 组（重复 init 不得累积），got %d", ev, len(groups))
+		}
+	}
+	// 再跑一次内容必须逐字节不变
+	before := string(data)
+	if _, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "codex", "--project", proj})
+	}); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != before {
+		t.Errorf("幂等：内容应逐字节不变\n前:\n%s\n后:\n%s", before, after)
+	}
+}
+
+func TestCmdInitDryRunWritesNothing(t *testing.T) {
+	proj := t.TempDir()
+	out, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "codex", "--project", proj, "--dry-run"})
+	})
+	if err != nil {
+		t.Fatalf("cmdInit --dry-run: %v", err)
+	}
+	if !strings.Contains(out, "SessionStart") {
+		t.Errorf("dry-run 应打印将要写入的内容，got:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(proj, ".codex", "hooks.json")); !os.IsNotExist(err) {
+		t.Error("dry-run 不得写文件")
+	}
+}
+
+func TestCmdInitBacksUpExistingFile(t *testing.T) {
+	proj := t.TempDir()
+	dir := filepath.Join(proj, ".codex")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	original := `{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"/bin/true"}]}]}}`
+	path := filepath.Join(dir, "hooks.json")
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "codex", "--project", proj})
+	}); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	backup, err := os.ReadFile(path + ".v2mem.bak")
+	if err != nil {
+		t.Fatalf("应生成备份: %v", err)
+	}
+	if string(backup) != original {
+		t.Errorf("备份应是原始内容\nwant: %s\ngot:  %s", original, backup)
+	}
+
+	// 再跑一次并中途改动文件：备份必须仍是「首次触碰前」的原始状态，
+	// 否则第二次的中间态会盖掉唯一一份干净备份。
+	if err := os.WriteFile(path, []byte(`{"hooks":{},"changed_by_user":true}`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "codex", "--project", proj})
+	}); err != nil {
+		t.Fatalf("cmdInit #2: %v", err)
+	}
+	backup2, err := os.ReadFile(path + ".v2mem.bak")
+	if err != nil {
+		t.Fatalf("备份应仍存在: %v", err)
+	}
+	if string(backup2) != original {
+		t.Errorf("备份不得被后续 init 覆盖\nwant: %s\ngot:  %s", original, backup2)
+	}
+}
+
+// 指令级接入（无原生 hook 的工具）：写带标记的指令块，且可重复更新。
+func TestCmdInitInstructionTierWritesMarkedBlock(t *testing.T) {
+	proj := t.TempDir()
+	path := filepath.Join(proj, ".workbuddy", "memory", "MEMORY.md")
+	// 预置用户已有内容
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("# 我的项目记忆\n\n已有内容要保留\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "workbuddy", "--project", proj})
+	})
+	if err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	if !strings.Contains(out, "指令级") {
+		t.Errorf("应告知用户这是指令级接入（可靠性低于原生钩子），got:\n%s", out)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	body := string(data)
+	if !strings.Contains(body, "已有内容要保留") {
+		t.Error("不得覆盖用户已有内容")
+	}
+	if !strings.Contains(body, "mem search") {
+		t.Errorf("指令块应教会模型检索，got:\n%s", body)
+	}
+	first := body
+
+	// 再跑一次：应就地替换标记块而不是追加
+	if _, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "workbuddy", "--project", proj})
+	}); err != nil {
+		t.Fatalf("cmdInit #2: %v", err)
+	}
+	again, _ := os.ReadFile(path)
+	if string(again) != first {
+		t.Errorf("重复 init 应就地替换而非追加\n前:\n%s\n后:\n%s", first, again)
+	}
+	if n := strings.Count(string(again), instrBegin); n != 1 {
+		// 数标记而不是数正文里的词：同一份指令块内 "mem search" 本身就会出现两次，
+		// 数内容会把「一份块」误判成「两份」（实测踩过）。
+		t.Errorf("指令块只应存在一份，got %d 份", n)
+	}
+}
+
+func TestCmdInitRejectsUnknownHarnessAndBadScope(t *testing.T) {
+	if err := cmdInit([]string{"--harness", "no-such-tool"}); err == nil {
+		t.Error("未知 harness 应报错")
+	}
+	if err := cmdInit([]string{"--harness", "codex", "--project", t.TempDir(), "--scope", "bogus"}); err == nil {
+		t.Error("非法 --scope 应报错")
+	}
+}
+
+// 辅助：从 config 里取指定事件的第一条 command
+func extractFirstCommand(t *testing.T, cfg map[string]any, event string) string {
+	t.Helper()
+	hooks, ok := cfg["hooks"].(map[string]any)
+	if !ok {
+		t.Fatalf("缺 hooks 段: %+v", cfg)
+	}
+	groups, ok := hooks[event].([]any)
+	if !ok || len(groups) == 0 {
+		t.Fatalf("缺事件 %s: %+v", event, hooks)
+	}
+	g := groups[0].(map[string]any)
+	hs := g["hooks"].([]any)
+	return hs[0].(map[string]any)["command"].(string)
+}
+
+func firstToken(cmd string) string {
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.Trim(fields[0], `"`)
+}
+
+// --file 覆盖：用于把指令块放到不挤占记忆预算的位置。
+func TestCmdInitFileOverrideWritesToGivenPath(t *testing.T) {
+	proj := t.TempDir()
+	target := filepath.Join(proj, "AGENTS.md")
+	if err := os.WriteFile(target, []byte("# 项目规则\n\n已有规则\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdInit([]string{"--harness", "workbuddy", "--project", proj, "--file", target})
+	})
+	if err != nil {
+		t.Fatalf("cmdInit --file: %v", err)
+	}
+	if !strings.Contains(out, target) {
+		t.Errorf("摘要应报告目标文件，got:\n%s", out)
+	}
+	body, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(body), "已有规则") {
+		t.Error("不得覆盖已有内容")
+	}
+	if !strings.Contains(string(body), instrBegin) {
+		t.Error("应写入指令块")
+	}
+	// 默认指令文件不应被创建
+	if _, err := os.Stat(filepath.Join(proj, ".workbuddy", "memory", "MEMORY.md")); !os.IsNotExist(err) {
+		t.Error("指定 --file 后不应再写默认位置")
 	}
 }
