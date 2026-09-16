@@ -47,13 +47,17 @@ mem stats             # 库概览
 mem add --kind decision "记忆库数据固定放 ~/.v2mem，代码与数据分离"
 mem add --global --kind preference "自建 Go 工具默认 CGO_ENABLED=0 构建"
 mem search "记忆库 数据"
-mem search --scope current --json "构建方式"
+mem search --json "构建方式" --limit 5
 
 mem harness           # 看本机装了哪些 AI 工具、各是什么接入方式
 mem init              # 扫描 → 选择要注入钩子的工具
 ```
 
 `--project` 默认取当前 git 仓库名；`--global` 写入"工程标记为空"的记忆，对所有工程生效。
+
+> ⚠️ **选项必须写在位置参数之前**：`mem search --json "查询"`，不是 `mem search "查询" --json`。
+> Go 的 flag 在首个非选项参数处停止解析，写反了会把选项当成查询内容（v2mem 会直接报错拦下）。
+> 同理 `mem ingest --project <工程> <文件>`。
 
 ---
 
@@ -64,7 +68,7 @@ mem init              # 扫描 → 选择要注入钩子的工具
 | 命令 | 说明 |
 |:---|:---|
 | `mem add [--kind K] [--project P \| --global] [--tag k=v] [--salience F] [--ttl DUR] "<事实>"` | 写入一条记忆。**相同内容自动覆盖**（按归一化后的 hash），不会重复 |
-| `mem search [--limit N] [--scope S] [--project P] [--kind K] [--tag k=v] "<查询>"` | 全文检索（FTS5 + bm25）。`--scope`：`current`（本工程+全局）/ `global` / `all`（默认） |
+| `mem search [--limit N] [--scope S] [--project P] [--kind K] [--tag k=v] "<查询>"` | 全文检索（FTS5 + bm25）。`--scope`：`current`（本工程+全局，**按当前目录推断工程**）/ `global` / `all`（默认） |
 | `mem touch <id\|前缀>` | 记录一次命中：刷新 `last_seen_at`、累加 `access_count`。这是衰减机制的输入 |
 
 ### 生命周期
