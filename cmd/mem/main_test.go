@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -100,6 +101,131 @@ func TestCmdSearchScopeCurrentNarrowsToCurrentProject(t *testing.T) {
 func testDB(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(t.TempDir(), "mem.db")
+}
+
+// ---------- M4: 跨设备归集 ----------
+
+func TestCmdExportWritesOneJSONLinePerMemory(t *testing.T) {
+	db := testDB(t)
+	for _, c := range []string{"导出端到端甲", "导出端到端乙"} {
+		if err := cmdAdd([]string{"--db", db, "--project", "p1", c}); err != nil {
+			t.Fatalf("cmdAdd: %v", err)
+		}
+	}
+	out := filepath.Join(t.TempDir(), "dump.jsonl")
+	if _, err := captureStdout(t, func() error { return cmdExport([]string{"--db", db, out}) }); err != nil {
+		t.Fatalf("cmdExport: %v", err)
+	}
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("每条记忆应占一行，期望 2 行，got %d: %q", len(lines), data)
+	}
+	for _, ln := range lines {
+		var r store.ExportRecord
+		if err := json.Unmarshal([]byte(ln), &r); err != nil {
+			t.Fatalf("每行应是合法 JSON: %v (%q)", err, ln)
+		}
+		if r.ContentHash == "" {
+			t.Error("导出记录缺 content_hash（归并身份键）")
+		}
+	}
+}
+
+func TestCmdExportToStdoutWhenNoPathGiven(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "--global", "仅用于导出到标准输出的样本"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	out, err := captureStdout(t, func() error { return cmdExport([]string{"--db", db}) })
+	if err != nil {
+		t.Fatalf("cmdExport: %v", err)
+	}
+	if !strings.Contains(out, "仅用于导出到标准输出的样本") {
+		t.Errorf("未给路径时应把 JSONL 写到标准输出，got: %q", out)
+	}
+	if !strings.Contains(out, `"content_hash"`) {
+		t.Errorf("标准输出应是 JSONL 而非摘要，got: %q", out)
+	}
+}
+
+func TestCmdImportRoundTripPreservesOriginDevice(t *testing.T) {
+	src, dst := testDB(t), testDB(t)
+	if err := cmdAdd([]string{"--db", src, "--project", "p1", "--device", "dev-far",
+		"跨设备往返验证事实"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	dump := filepath.Join(t.TempDir(), "dump.jsonl")
+	if _, err := captureStdout(t, func() error { return cmdExport([]string{"--db", src, dump}) }); err != nil {
+		t.Fatalf("cmdExport: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error { return cmdImport([]string{"--db", dst, dump}) })
+	if err != nil {
+		t.Fatalf("cmdImport: %v", err)
+	}
+	if !strings.Contains(out, "新增=1") {
+		t.Errorf("应报告新增 1 条，got: %q", out)
+	}
+
+	st, err := store.Open(dst)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	recs, err := st.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("目标库应有 1 条，got %d", len(recs))
+	}
+	if recs[0].OriginDevice != "dev-far" {
+		t.Errorf("溯源设备应随导入保留，got %q", recs[0].OriginDevice)
+	}
+}
+
+// 第二次导入必须走归并而不是新插 —— 若归并逻辑退化，这里会报「新增=1」。
+func TestCmdImportTwiceReportsMergeNotInsert(t *testing.T) {
+	src, dst := testDB(t), testDB(t)
+	if err := cmdAdd([]string{"--db", src, "--project", "p1", "CLI 重复导入验证事实"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	dump := filepath.Join(t.TempDir(), "dump.jsonl")
+	if _, err := captureStdout(t, func() error { return cmdExport([]string{"--db", src, dump}) }); err != nil {
+		t.Fatalf("cmdExport: %v", err)
+	}
+	if _, err := captureStdout(t, func() error { return cmdImport([]string{"--db", dst, dump}) }); err != nil {
+		t.Fatalf("cmdImport #1: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error { return cmdImport([]string{"--db", dst, dump}) })
+	if err != nil {
+		t.Fatalf("cmdImport #2: %v", err)
+	}
+	if !strings.Contains(out, "新增=0") || !strings.Contains(out, "合并=1") {
+		t.Errorf("重复导入应报告 新增=0 合并=1，got: %q", out)
+	}
+
+	hits := searchOnce(t, dst, store.SearchQuery{Query: "CLI 重复导入验证", Limit: 5})
+	if len(hits) != 1 {
+		t.Errorf("重复导入不应产生重复行，got %d", len(hits))
+	}
+}
+
+func TestCmdImportMissingFileErrors(t *testing.T) {
+	db := testDB(t)
+	missing := filepath.Join(t.TempDir(), "nope.jsonl")
+	if err := cmdImport([]string{"--db", db, missing}); err == nil {
+		t.Fatal("文件不存在时应报错")
+	}
+	if err := cmdImport([]string{"--db", db}); err == nil {
+		t.Fatal("缺少路径时应报错")
+	}
 }
 
 // searchOnce 直接开库检索，用于断言「库里到底存了什么」，绕开 CLI 的打印格式。
