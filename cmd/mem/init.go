@@ -655,23 +655,31 @@ func upsertMarkedBlock(path, block string, dryRun bool) (changed bool, err error
 	return true, os.WriteFile(path, []byte(next), 0o644)
 }
 
-// instructionBlock 是指令级钩子的正文：明确告诉模型「有这么一个库」以及怎么用。
-func instructionBlock(harnessName string) string {
+// instructionBlock 是指令级钩子的正文。
+//
+// 除了「告诉模型有这么一个库」，还必须给出**容量纪律**：
+// 会话级文件每轮注入且有上限，若允许把细节写进去，它必然再度膨胀、
+// 再度被截断、再度需要人工压缩 —— 这正是要解决的问题本身。
+func instructionBlock(_ string) string {
 	lines := []string{
 		instrBegin,
 		"## 分层记忆（v2mem · 由 `mem init` 生成）",
 		"",
-		"本机有一个跨会话的本地记忆库（Level 2，正文不进上下文，按需检索）。",
-		"接入工具：`" + harnessName + "`",
+		"本机有一个跨会话的本地记忆库（Level 2），正文不进上下文，按需检索。",
 		"",
-		"- 需要历史决策 / 踩坑 / 约定时：",
+		"### 容量纪律（防止本文件再度膨胀）",
+		"",
+		"本文件每轮注入且有容量上限，灌满即被截断。因此只留三样：跨工程硬规则、",
+		"当前任务态、本段钩子；细节 / 踩坑 / 数据 / 历史决策一律写进记忆库。",
+		"",
+		"- 查历史决策 / 踩坑 / 约定：",
 		"  `mem search \"<关键词>\" --scope current --json`",
-		"- 学到新的原子事实时（一条只写一个事实，不要写长段落）：",
+		"- 记下新的原子事实（一条只写一个事实，不写长段落）：",
 		"  `mem add --kind decision|pitfall|preference|fact \"<原子事实>\"`",
-		"- 用上了某条记忆后反馈一次：",
-		"  `mem touch <id前8位>`",
+		"- 把既有 md 文件的条目一次性搬进库：`mem ingest <文件> --project <工程>`",
+		"- 用上了某条记忆后反馈：`mem touch <id前8位>`",
 		"",
-		"规则：不要凭空断言历史决策，不确定就先 `mem search`；查不到再问用户。",
+		"不要凭空断言历史决策，不确定就先 `mem search`；查不到再问用户。",
 		instrEnd,
 	}
 	return strings.Join(lines, "\n")
