@@ -528,3 +528,88 @@ func TestSearchScopeAllIgnoresProjectArgument(t *testing.T) {
 		t.Errorf("scope=all 应跨工程返回 2 条（忽略 Project），got %d", len(hits))
 	}
 }
+
+// ---------- M7: 自然语言长问句的召回退化 ----------
+//
+// 实测缺陷（由 mem eval 的审计日志暴露）：用户用自然语言提问时命中 0 条，
+// 因为长问句没有空格 → 被当成一个词组 → 词组内 AND 要求全部 bigram 都出现。
+
+func TestSearchFindsLongNaturalLanguageQuestion(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: "日志不再人工蒸馏进 MEMORY.md：改用 mem ingest 搬进库", Project: "p1"})
+	addWith(t, s, AddInput{Content: "记忆库数据固定放 ~/.v2mem 目录，代码与数据分离", Project: "p1"})
+
+	const q = "日志怎么搬进记忆库"
+	// 先固化「精确表达式确实空手」这一前提，否则下面的断言可能因别的原因通过
+	exact, err := s.Search(SearchQuery{Query: q, Scope: "all", Limit: 5, NoBroadFallback: true})
+	if err != nil {
+		t.Fatalf("Search exact: %v", err)
+	}
+	if len(exact) != 0 {
+		t.Fatalf("前置条件不成立：精确表达式本应 0 命中（AND 过严），got %d 条", len(exact))
+	}
+
+	hits, err := s.Search(SearchQuery{Query: q, Scope: "all", Limit: 5})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("长问句应通过退化召回拿到结果，got 0（这正是修复前的问题）")
+	}
+	if !strings.Contains(hits[0].Content, "mem ingest") {
+		t.Errorf("最相关的那条应排在前，got %q", hits[0].Content)
+	}
+}
+
+// 退化只在空手时发生：精确有结果时不得放宽（否则精度会悄悄下降）。
+//
+// 构造要点：AND 只作用在**同一段连续汉字**内（词组内），词组之间是 OR。
+// 所以要让「精确能中、放宽会多中」，必须用**单段无空格的长查询**，
+// 让那些 bigram 的 AND 恰好只被一条记忆满足。
+func TestSearchDoesNotBroadenWhenExactMatches(t *testing.T) {
+	s := newTestStore(t)
+	// A 含完整 bigram 链（记忆/忆库/库不/不能/能放/放同/同步/步目/目录）
+	addWith(t, s, AddInput{Content: "记忆库不能放同步目录", Project: "p1"})
+	// B 是 A 的后缀，缺 记忆/忆库/库不 三个 bigram —— 放宽后会命中，精确不会
+	addWith(t, s, AddInput{Content: "不能放同步目录", Project: "p1"})
+
+	hits, err := s.Search(SearchQuery{Query: "记忆库不能放同步目录", Scope: "all", Limit: 5})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("精确表达式本应命中 A")
+	}
+	for _, h := range hits {
+		if h.Content == "不能放同步目录" {
+			t.Errorf("精确有命中时不得放宽，否则会带出只共享部分 bigram 的 B：%q", h.Content)
+		}
+	}
+}
+
+// 退化不得改变可见性规则：被取代/过期的记忆仍不得出现。
+func TestBroadFallbackKeepsVisibilityRules(t *testing.T) {
+	s := newTestStore(t)
+	id := addWith(t, s, AddInput{Content: "一条会被取代的长记忆内容用于测试", Project: "p1"})
+	setColumn(t, s, id, "superseded_by", "someone-else")
+	hits, err := s.Search(SearchQuery{Query: "这条长记忆怎么找", Scope: "all", Limit: 5})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("退化路径也必须遵守 superseded 过滤，got %d 条", len(hits))
+	}
+}
+
+// 单字查询走通（退化表达式的边界）。
+func TestSearchSingleRuneQueryStillWorks(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: "库不放同步目录", Project: "p1"})
+	hits, err := s.Search(SearchQuery{Query: "库", Scope: "all", Limit: 5})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Errorf("单字应能命中 1 条，got %d", len(hits))
+	}
+}

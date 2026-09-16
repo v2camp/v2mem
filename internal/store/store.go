@@ -159,6 +159,29 @@ func indexText(s string) string {
 // queryExpr 把用户输入编译成 FTS5 MATCH 表达式。
 // 语义：词组内部 AND（精确），词组之间 OR（记忆检索以召回优先，靠 bm25 排序）。
 // 所有词都用 strconv.Quote 包成字面量，避免特殊字符破坏 FTS5 语法。
+// queryExprBroad 把所有 term 用 OR 连接，交给 bm25 排序。
+//
+// 它是精确表达式空手时的退化形式。为什么不能默认用它：多词查询会失去
+// 「都要出现」的约束，精度下降。所以策略是「先精确、空手才放宽」。
+func queryExprBroad(q string) string {
+	var terms []string
+	scanTokens(q,
+		func(han []rune) {
+			if len(han) == 1 {
+				terms = append(terms, strconv.Quote(string(han)))
+				return
+			}
+			for i := 0; i+1 < len(han); i++ {
+				terms = append(terms, strconv.Quote(string(han[i:i+2])))
+			}
+		},
+		func(word []rune) {
+			terms = append(terms, strconv.Quote(string(word))+"*")
+		},
+	)
+	return strings.Join(terms, " OR ")
+}
+
 func queryExpr(q string) string {
 	var groups []string
 	scanTokens(q,
@@ -298,7 +321,9 @@ type SearchQuery struct {
 	Kind    string            // 空表示不限
 	Tags    map[string]string // 标记过滤：AND 语义，需全部满足
 	Scope   string            // ""|"all" 不限工程；"current" = 当前工程 + 全局（project 为空）；"global" = 只要全局
-	Limit   int
+	// NoBroadFallback 关闭「精确无命中时退化为全 OR」的行为（调试/对照用）
+	NoBroadFallback bool
+	Limit           int
 }
 
 // Hit 是一条检索结果。
@@ -326,8 +351,29 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 	if q.Limit <= 0 {
 		q.Limit = 10
 	}
-
 	now := time.Now().Unix()
+
+	hits, err := s.searchWith(expr, q, now)
+	if err != nil {
+		return nil, err
+	}
+	// 精确表达式无命中时退化为「全 OR + bm25 排序」。
+	//
+	// 为什么必须退化：自然语言长问句没有空格，会被当成**一个词组**，
+	// 而词组内是 AND —— 要求全部 bigram 都出现在同一条记忆里，对真实提问过严。
+	// 实测「日志怎么搬进记忆库」命中 0 条，而「日志 记忆库」命中 3 条。
+	// 退化保留精度优先（先试精确），只在完全空手时才放宽。
+	if len(hits) == 0 && !q.NoBroadFallback {
+		if broad := queryExprBroad(q.Query); broad != "" && broad != expr {
+			broad = "(" + broad + ")"
+			return s.searchWith(broad, q, now)
+		}
+	}
+	return hits, nil
+}
+
+// searchWith 用给定表达式执行一次检索。
+func (s *Store) searchWith(expr string, q SearchQuery, now int64) ([]Hit, error) {
 	// 可见性判据与 List 共用同一函数，避免两处各写一遍后漂移
 	where := append([]string{"fts_mem MATCH ?"}, visibilityWhere()...)
 	args := []any{expr, now}
@@ -518,6 +564,14 @@ type Stats struct {
 	ByKind      map[string]int `json:"by_kind"`
 	ByProject   map[string]int `json:"by_project"`
 	ExpiredLive int            `json:"expired_pending_gc"`
+}
+
+// HashByID 取一条记忆的 content_hash。
+// 评测的金标准用哈希表达目标，因此需要按 id 反查哈希。
+func (s *Store) HashByID(id string) (string, error) {
+	var h string
+	err := s.db.QueryRow(`SELECT content_hash FROM memories WHERE id = ?`, id).Scan(&h)
+	return h, err
 }
 
 // visibilityWhere 返回「一条记忆是否对检索可见」的条件。
