@@ -119,15 +119,17 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 
 ## 5. 四大机制
 
-| 机制 | 实现 |
-|:---|:---|
-| **相同知识覆盖** | `content_hash` 唯一索引 + `ON CONFLICT DO UPDATE`：刷新 `updated_at`、累加 `access_count`。零成本、写入期完成 |
-| **相似知识归并** | **异步** consolidation：余弦 > 0.92 的簇 → 保留最富一条为规范，其余置 `superseded_by` 并建 `merged_into` 边，tags 取并集 |
-| **过期机制** | 三种并存：① 硬 TTL（`expires_at`）② 久用衰减 `decay = exp(-ln2 · Δt / halflife)` ③ 被取代（`superseded_by` + `valid_to`，给出时序性而无需图库） |
-| **基于标记的归并** | `content_hash` 相同 → tags 取并集、`created_at` 取最早、`updated_at`/`salience` 取最大，`origin_device` 保留为溯源集合 |
+以下四条均已落地（M1–M5a）。标记 ✅ 为已实现，⏳ 为未实现。
 
-**排序**：`score = w1·bm25_rank + w2·(1−cosine) + w3·salience + w4·decay(last_seen_at)`；
-或更简单——RRF 融合两路排名后乘衰减因子。
+| 机制 | 实现 | 状态 |
+|:---|:---|:---|
+| **相同知识覆盖** | `content_hash` 唯一索引（`(content_hash, project)`）。同一条命中即刷新 `updated_at`/`last_seen_at`、`access_count + 1`、`salience` 取 max、tags 取并集。零额外成本，写入期完成 | ✅ |
+| **相似知识归并** | `mem consolidate`：字符 3-gram MinHash 估 Jaccard（**不是余弦，不用 embedding**），同 `project` 内聚簇，留 1 条、其余置 `superseded_by`，tags 转移给存活者 | ✅ |
+| **过期机制** | 三种并存：① 硬 TTL（`expires_at`）② 久用衰减（`gc --max-idle` + `--min-salience`）③ 被取代（`superseded_by`，从检索中隐去但保留可追溯） | ✅ |
+| **基于标记的归并** | 跨设备 JSONL 导入的字段级规则：tags 并集、`created_at` 取最早、`updated_at`/`last_seen_at` 取较晚、`access_count`/`salience` 取 max、`expires_at` NULL 优先。详见 §7.2 | ✅ |
+
+**相似归并的准确性来自护栏而非阈值**（实现细节见 §11.10）。检索排序当前为
+`bm25 ASC, salience DESC, last_seen_at DESC`；RRF 融合向量路排名留待 M5b ⏳。
 
 ## 6. 检索接口与 Level 1 钩子契约
 
@@ -211,7 +213,7 @@ mem search   "<query>" [--project P] [--scope current|global|all] [--tag k=v]...
 mem touch    <id>                  # 命中反馈，刷新 last_seen_at / access_count
 mem forget   <id>                  # 显式删除
 mem gc                             # 过期清理 + 衰减淘汰
-mem consolidate                    # 异步：相似归并（需 embedding 时才启用）
+mem consolidate [--threshold 0.7]  # 相似归并：近重复聚簇，留 1 条、其余置 superseded_by
 mem export   [out.jsonl]
 mem import   <in.jsonl>            # 跨设备归并
 mem stats                          # 条数 / 分布 / 库大小
@@ -237,8 +239,13 @@ mem stats                          # 条数 / 分布 / 库大小
 - [x] M2 生命周期：`touch` / `gc`（TTL + 衰减）+ `forget`
 - [x] M3 标记与工程维度：`--project` / `--global` / `--tag` / `--scope` 全链路
 - [x] M4 跨设备：`export` / `import` 归并 + 溯源
-- [ ] M5 增强（可选）：sqlite-vec 向量 + `consolidate` 相似归并 + RRF 融合
+- [x] **M5a 相似归并（纯 Go，无模型）**：字符 n-gram MinHash + 四条护栏 + `consolidate`
+- [ ] M5b 增强（可选）：sqlite-vec 向量 + RRF 融合（**不再是相似归并的前置**，只是检索召回的另一路）
 - [ ] M6 Harness 集成：Level 1 钩子模板 + 原生钩子（自动预检索 / 自动回写）
+
+> M5 拆成两半是本次实现中的结论：相似归并属**近重复检测**（经典算法问题），
+> MinHash 几十行、微秒级、零依赖即可胜任，不必引入模型与 CGO。
+> 于是 M5b 的向量化从「相似归并的前置」降级为「检索召回的另一路」。
 
 ### 11.9 M4 已完成能力（跨设备归集）
 
@@ -391,3 +398,85 @@ make build-onnx  # M5 可选分支：-tags local_onnx，需 CGO + libonnxruntime
 | 负对照：不存在的 tag / 存在+不存在 tag / 不存在的工程 | 0 / 0 / 0 | 0 / 0 / 0 ✅ |
 
 > 度量教训：首版 e2e 用 `wc -l` 计数，而空结果会打印一行 `（无结果）`，导致负对照恒为 1 —— **负对照抓出的是度量工具失准，不是代码缺陷**。最终改用 `--json` + 长度统计，并先自检仪器（`--limit 1` 应得 1）。
+
+### 11.10 M5a 相似归并：为什么单靠阈值不够
+
+用字符 3-gram + MinHash 估 Jaccard（`internal/similarity`）。选择这条路而非 embedding，是为守住
+「零 CGO / 零外部服务 / 单文件分发」：近重复检测是经典算法问题，不是语义理解问题。
+
+#### 实测校准矩阵（2026-09-17，阈值 0.7）
+
+| 样本 | 相似度 | 判定 |
+|:---|:---|:---|
+| 完全相同 | 1.000 | 归并 |
+| 仅差尾字（目录 / 目录下） | 0.984 | 归并 |
+| 同义改写（SQLite / sqlite 库） | 0.906 | 归并 |
+| 补一句（…目录 → …目录，方便统一回收） | 0.781 | 归并 |
+| 差两字（目录 / 路径） | 0.750 | 归并 |
+| **🔴 数字反转（`CGO_ENABLED=0` / `=1`）** | **0.906** | **拒绝**（护栏拦下） |
+| 同主题不同细节 | 0.406 | 不归并 |
+| 短句差一字（同步目录 / 共享目录） | 0.078 | 不归并 |
+| 负对照：主题无关 / 结构相近 / 完全无关 | 0.000 / 0.031 / 0.000 | 不归并 |
+
+两个致命问题，都不是靠调阈值能解决的：
+
+1. **`CGO_ENABLED=0` 与 `=1` 相似度高达 0.906。** 字符 n-gram 对「一个字符导致语义反转」完全无感。
+   若只卡阈值 0.8，两条**互斥的规则**会被合成一条——比漏归并危险得多。
+2. **短文本的估计方差不可接受。** 「库不放同步目录」vs「库不放共享目录」只差一字，相似度仅 0.078
+   （shingle 集太小）。短文本几乎永远够不到阈值；这既是保护也是缺陷。
+
+#### 归并裁定 = 阈值（提召回）+ 四条护栏（保精度）
+
+| 护栏 | 规则 | 理由 |
+|:---|:---|:---|
+| 短文本 | 两侧 shingle 数均 ≥ 8（约 10 字符） | 估计方差过大时不做统计推断；完全相同由 hash 覆盖机制负责 |
+| 长度比 | 长/短 ≤ 3 | 3-gram 覆盖率会让「一句话被长句包含」也拿到不低的分 |
+| 数字 | 抽出的数字串**同序同内容** | 端口 6379/6380、开关 0/1、版本 v2mem/v3mem 都属语义反转 |
+| 否定 | 否定词计数相同 | 「可以」与「不可以」必须区分 |
+
+数字与否定只做**计数/集合比较**，不做语义分析——刻意保守：漏归并只是少省一点空间，
+误归并会让两条互斥规则合并成错的。
+
+拒绝理由枚举（`similarity.Reason*`）：`too-short` / `length-ratio` / `digits-differ` /
+`negation-differs` / `below-threshold`。测试逐条断言理由，保证测到的确实是目标分支。
+
+#### 存活者与幂等
+
+存活者规则必须完全确定（两台设备独立运行也要得到同一结论）：
+`salience` 降序 → `access_count` 降序 → `created_at` 升序 → `id` 升序。
+
+幂等来源：被取代者不再进入下一轮的比较范围（查询条件含 `superseded_by IS NULL`），
+故重复运行 `取代=0`。归并**不删行**，被取代者保留可追溯，并由 `export` 带走以让其他设备知晓取代关系。
+
+#### 测试（M5a 新增 28 个用例）
+
+| 范围 | 用例 |
+|:---|:---|
+| similarity 基础 | 完全相同 = 1.0、近重复高分、无关低分、确定性、签名可复现、空串/单字边界、有界且对称 |
+| 校准矩阵 | 上表 11 个样本的相似度区间 + 归并裁定，任何调参漂移都会报警 |
+| 护栏 | 数字不同拒绝 / 数字一致允许 / 否定反转拒绝 / 长度悬殊拒绝 / 过短拒绝 / 阈值不足拒绝 / 标识符数字参与比较 |
+| store 归并 | 高 salience 存活并写 `superseded_by`、取代后从检索消失、幂等、跨工程不归并、**数字反转拒绝（护栏接线验证）**、阈值生效、平手确定性、标记转移、三簇成员、忽略已过期 |
+| CLI | 归并并入 + 检索隐藏、`--threshold` 生效 |
+
+**变异测试（验证接线，不只是包内自测）**：
+
+| 变异 | 捕获用例 |
+|:---|:---|
+| 去掉 `Search` 的 `m.superseded_by IS NULL` | `TestSupersededMemoriesAreExcludedFromSearch`（`got 2`）✅ |
+| 护栏跳过数字检查 | `TestConsolidateRefusesDigitReversal` + `TestCalibrationMatrix` + `TestJudgeRejectsWhenDigitsDiffer` ✅ |
+
+变异 B 的输出具体证实了风险：无护栏时 `CGO_ENABLED=0` 与 `=1` 以 **0.8125** 相似度被合并。
+
+**e2e**（7 条播种：3 条近重复 + 1 对危险对 + 1 条无关 + 1 条跨工程同句）：
+
+| 判据 | 结果 |
+|:---|:---|
+| 3 条近重复 → 1 簇取代 2 条，存活者为最高 salience | `簇=1 取代=2`，存活 0.9 那条 ✅ |
+| 危险对 0/1 双双保留 | 2 条均可见 ✅ |
+| 跨工程同句各自独立 | 2 条命中 ✅ |
+| 幂等 | 二次运行 `扫描=5 取代=0`（扫描数已排除被取代的 2 条）✅ |
+| `stats` 口径 | `总条数 7 / 检索可见 5 / 已归并 2` ✅ |
+
+**e2e 失败的一个案例值得记录**：`simBase`/`simVariant` 这组测试数据在构造时先后被数字护栏
+（`~/.v2mem` 里的 2）与短文本护栏（8 字 → 6 个 shingle）拦下，测到的是别的分支而非阈值分支。
+**多护栏判定链的测试必须逐条控制前面所有护栏的输入条件**，否则「测试通过」不代表目标逻辑被覆盖。

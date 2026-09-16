@@ -29,6 +29,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem touch  <id|前缀>             记录命中，刷新 last_seen_at 并累加 access_count
   mem forget <id|前缀>             删除一条记忆
   mem gc     [选项]                回收：TTL 到期 + 久未命中且低重要性
+  mem consolidate [选项]           相似知识归并（近重复聚簇，留 1 条）
   mem export [路径.jsonl]          导出为 JSONL（省略路径则写标准输出）
   mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
   mem stats  [选项]                 库概览
@@ -59,6 +60,10 @@ gc 选项:
   --max-idle <dur>      久未命中阈值（默认 720h，即 30 天）
   --min-salience <f>    低于此重要性才淘汰（默认 0.2）
 
+consolidate 选项:
+  --threshold <f>       相似度阈值 0..1（默认 0.7）
+                        准确性由护栏保证（数字/否定/长度/短文本），阈值只影响召回
+
 示例:
   mem add --kind decision "记忆库数据必须放在 ~/.v2mem，不放代码目录"
   mem search "记忆库 数据 路径"
@@ -85,6 +90,8 @@ func main() {
 		err = cmdForget(os.Args[2:])
 	case "gc":
 		err = cmdGC(os.Args[2:])
+	case "consolidate":
+		err = cmdConsolidate(os.Args[2:])
 	case "export":
 		err = cmdExport(os.Args[2:])
 	case "import":
@@ -498,6 +505,43 @@ func cmdImport(args []string) error {
 	return nil
 }
 
+// cmdConsolidate 做相似知识归并：把措辞略有差异的近重复聚成簇，
+// 留 1 条（salience / 命中次数 / 更早创建 依次优先），其余置 superseded_by。
+//
+// 准确性靠 similarity.Judge 的四条护栏（数字、否定、长度、短文本），不单靠阈值。
+func cmdConsolidate(args []string) error {
+	var c common
+	fs := flag.NewFlagSet("consolidate", flag.ContinueOnError)
+	c.register(fs)
+	threshold := fs.Float64("threshold", store.DefaultConsolidateThreshold, "相似度阈值 0..1")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *threshold < 0 || *threshold > 1 {
+		return fmt.Errorf("--threshold 应落在 [0,1]，got %v", *threshold)
+	}
+
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	res, err := st.Consolidate(*threshold)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(res)
+	}
+	fmt.Printf("已归并 扫描=%d 簇=%d 取代=%d\n", res.Scanned, res.Groups, res.Superseded)
+	for _, p := range res.Pairs {
+		fmt.Printf("  %s ← %s  (相似度 %.3f)\n",
+			shortID(p.Survivor), shortID(p.Superseded), p.Similarity)
+	}
+	return nil
+}
+
 func cmdStats(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
@@ -523,6 +567,10 @@ func cmdStats(args []string) error {
 	fmt.Printf("库路径   %s\n", s.Path)
 	fmt.Printf("大小     %.1f KB\n", float64(s.SizeBytes)/1024)
 	fmt.Printf("总条数   %d\n", s.Total)
+	fmt.Printf("检索可见 %d（未被取代；已过期的另计）\n", s.Live)
+	if s.Superseded > 0 {
+		fmt.Printf("已归并   %d（被相似归并取代，保留可追溯）\n", s.Superseded)
+	}
 	fmt.Printf("待回收   %d\n", s.ExpiredLive)
 	if len(s.ByKind) > 0 {
 		keys := make([]string, 0, len(s.ByKind))

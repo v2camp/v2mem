@@ -103,6 +103,59 @@ func testDB(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "mem.db")
 }
 
+// ---------- M5a: 相似知识归并 ----------
+
+const (
+	cliSimBase    = "记忆库数据文件必须放在用户主目录的隐藏目录里"
+	cliSimVariant = "记忆库数据文件必须放在用户主目录下的隐藏目录里"
+)
+
+func TestCmdConsolidateMergesNearDuplicateAndHidesItFromSearch(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "--salience", "0.9", cliSimBase}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "--salience", "0.3", cliSimVariant}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error { return cmdConsolidate([]string{"--db", db}) })
+	if err != nil {
+		t.Fatalf("cmdConsolidate: %v", err)
+	}
+	if !strings.Contains(out, "取代=1") {
+		t.Errorf("应报告取代 1 条，got: %q", out)
+	}
+
+	hits := searchOnce(t, db, store.SearchQuery{Query: "隐藏目录", Limit: 10})
+	if len(hits) != 1 {
+		t.Fatalf("归并后检索应只剩 1 条，got %d", len(hits))
+	}
+	if hits[0].Content != cliSimBase {
+		t.Errorf("留下的应是高 salience 的那条，got %q", hits[0].Content)
+	}
+}
+
+func TestCmdConsolidateHonoursThresholdFlag(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "--salience", "0.9", cliSimBase}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "--salience", "0.3", cliSimVariant}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdConsolidate([]string{"--db", db, "--threshold", "0.999"})
+	})
+	if err != nil {
+		t.Fatalf("cmdConsolidate: %v", err)
+	}
+	if !strings.Contains(out, "取代=0") {
+		t.Errorf("阈值 0.999 时不应取代，got: %q", out)
+	}
+}
+
 // ---------- M4: 跨设备归集 ----------
 
 func TestCmdExportWritesOneJSONLinePerMemory(t *testing.T) {

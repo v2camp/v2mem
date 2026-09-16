@@ -331,6 +331,9 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 	where := []string{
 		"fts_mem MATCH ?",
 		"(m.expires_at IS NULL OR m.expires_at > ?)",
+		// 已被相似归并取代的记忆不再出现：否则用户会同时看到两条互相矛盾的答案。
+		// 它们仍留在库里（可由 export 带走、可追溯），只是不参与检索。
+		"m.superseded_by IS NULL",
 	}
 	args := []any{expr, now}
 
@@ -508,6 +511,8 @@ type Stats struct {
 	Path        string         `json:"path"`
 	SizeBytes   int64          `json:"size_bytes"`
 	Total       int            `json:"total"`
+	Live        int            `json:"live"`
+	Superseded  int            `json:"superseded"`
 	ByKind      map[string]int `json:"by_kind"`
 	ByProject   map[string]int `json:"by_project"`
 	ExpiredLive int            `json:"expired_pending_gc"`
@@ -520,6 +525,18 @@ func (s *Store) Stats() (*Stats, error) {
 		st.SizeBytes = fi.Size()
 	}
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&st.Total); err != nil {
+		return nil, err
+	}
+	// Live 与 Superseded 是检索可见性的口径：只有 superseded_by IS NULL
+	// 且未过期的条目会出现在 search 结果里。
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL`,
+	).Scan(&st.Live); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM memories WHERE superseded_by IS NOT NULL`,
+	).Scan(&st.Superseded); err != nil {
 		return nil, err
 	}
 	if err := s.db.QueryRow(
