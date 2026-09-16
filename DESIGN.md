@@ -1051,3 +1051,64 @@ prompt-submit  claude  命中 0 空=true  v2mem 的钩子会不会阻断会话
 6. 三项都达标后再精简 MEMORY.md —— 那时替换是有证据的，不是凭感觉的。
 
 在此之前，`MEMORY.md` **保持现状不动**。
+
+### 15.8 衔接状态核实（2026-09-17 实测，纠正一处想当然）
+
+「装上了」不等于「会生效」。逐项核实结果：
+
+| 工具 | 接入方式 | 配置文件 | 是否会产生审计样本 |
+|:---|:---|:---|:---|
+| Claude Code | native | `~/.claude/settings.json` ✅ | ✅ 已装 |
+| TraeCode | native | `~/.trae-cn/hooks.json` ✅ | ✅ 已装 |
+| CodeBuddy Code | native | `~/.codebuddy/settings.json` ✅ | ✅ 已装 |
+| Codex CLI | native | `~/.codex/hooks.json` ✅ | ⚠️ 需用户先在 `/hooks` 里 **trust**，否则不执行 |
+| QoderWork CN | native | `~/.qoderworkcn/settings.json` ✅ | ⚠️ 需**重启**（不支持热加载） |
+| **WorkBuddy** | instruction | AGENTS.md 的指令块 ✅ | ❌ **无原生钩子**（见下） |
+| **TraeWork** | instruction | 同上（AGENTS.md 共享） | ❌ **无原生钩子** |
+| **DeepSeek Harness** | bridge | 需 `dsh plugin --profile add dsh-hooks-claude-code` | ❌ **dsh CLI 未安装**，桥接包未装 |
+
+**WorkBuddy 的核实结论**：`~/.workbuddy/settings.json` 存在，但内容是应用自身配置
+（IM 通道绑定、凭据、连接方式），**没有 `hooks` 段**。故 WorkBuddy 确实没有用户可配的
+shell 钩子，指令级判断成立。
+
+> 附带的两次教训：
+> 1. 首次核查用 `ls | head -6` 列目录，把 `settings.json` 截掉了，差点得出错误结论。
+>    **列目录不要截断**，否则「没看到」会被当成「不存在」。
+> 2. 该 settings.json 以**明文**保存了第三方 appSecret 与 botToken。这不在本任务范围内，
+>    但值得单独收紧（文件权限或凭据外置）。
+
+### 15.9 🔴 已修的关键缺口：`mem search` 原先不写审计
+
+**问题**：审计原先只在 `mem hook` 里写。而 WorkBuddy / TraeWork 是**指令级**接入 ——
+它们没有原生钩子，模型只能靠手工调 `mem search` 来用记忆库。于是：
+
+> 在 WorkBuddy 里用一个月，审计日志**一条都不会增加**，回来也标注不出任何东西。
+
+这使「先并行跑一段时间再评测」的计划对**最主要的两个工具失效**。
+
+**修复**：`mem search` 也写审计（`event=manual-search`，默认开启，`--no-audit` 关闭），
+记录真实 query、命中记忆、耗时。审计写失败静默 —— 它只是观测，不是功能。
+
+**实测**：模拟指令级路径检索 3 次后，审计 5 → 8 条，`按事件: manual-search=3 prompt-submit=4`。
+两类事件现在都能积累：`prompt-submit`（原生钩子工具）与 `manual-search`（指令级工具）。
+
+### 15.10 所以「随便用哪个都会生效」不成立，差异如下
+
+| 你用什么 | 钩子自动注入 | 审计积累 |
+|:---|:---|:---|
+| Claude Code / TraeCode / CodeBuddy | ✅ 自动 | ✅ |
+| Codex | ✅（先 trust 一次） | ✅ |
+| QoderWork CN | ✅（重启后） | ✅ |
+| **WorkBuddy / TraeWork** | ❌ 靠模型遵守指令 | ✅ 仅当模型主动 `mem search`（修复后） |
+| **dsh** | ❌ 未衔接（CLI 未装） | ❌ |
+
+结论：**「回来激活评测」这件事，前提是你主要在原生钩子已生效的工具里工作**。
+若主要在 WorkBuddy 里工作，样本只能来自「模型主动检索」，量会少得多，
+且依赖模型是否遵守 AGENTS.md 的指令 —— 这本身也是可以观察的：`mem audit` 里
+`manual-search` 的占比就是「指令遵守率」的一个代理指标。
+
+### 15.11 隐私提示
+
+审计日志记录**真实用户提问原文**（`prompt-submit` 的 `query`）。它落在
+`~/.v2mem/audit.jsonl`，仅本机。若某些提问不便留痕，用 `--audit -`（钩子）
+或 `--no-audit`（手工检索）关闭；也可定期清理该文件（它只是评测样本，不影响记忆库）。
