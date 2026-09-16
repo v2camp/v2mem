@@ -293,7 +293,7 @@ func cmdBudget(args []string) error {
 		fmt.Printf("库中记忆  : %d 条（[%s] 工程，代码强制 0 注入字符）\n", libCount, proj)
 	}
 	if over > 0 {
-		fmt.Println("建议      : 把细节移到记忆库：mem ingest <文件> --project " + proj)
+		fmt.Println("建议      : 把细节移到记忆库：mem ingest --project " + proj + " <文件>")
 		return fmt.Errorf("%s 超出预算 %d 字符", filepath.Base(*file), over)
 	}
 	return nil

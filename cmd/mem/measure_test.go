@@ -360,3 +360,135 @@ func TestCmdSearchStillReturnsHitsWhenAuditFails(t *testing.T) {
 		t.Errorf("审计失败时仍必须返回命中，got:\n%s", out)
 	}
 }
+
+// ---------- 护栏：生成给模型的指引里，命令必须可直接执行 ----------
+
+// 逐行抽取文本里的 mem 命令。同时容忍反引号包裹（指令块）与裸行（用法提示），
+// 并剥掉行尾的 `# 注释`。
+func extractMemCommands(text string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		l := strings.TrimSpace(line)
+		l = strings.TrimPrefix(l, "- ")
+		l = strings.TrimPrefix(l, "`")
+		l = strings.TrimSuffix(l, "`")
+		l = strings.TrimPrefix(l, "\"")
+		l = strings.TrimSuffix(l, "\"")
+		if !strings.HasPrefix(l, "mem ") {
+			continue
+		}
+		if i := strings.Index(l, "  #"); i > 0 {
+			l = l[:i]
+		}
+		out = append(out, strings.TrimSpace(l))
+	}
+	return out
+}
+
+// valueFlags 是「后面跟一个值」的选项。校验时必须跳过它们的值，
+// 否则会把 `--scope current` 里的 current 误当成位置参数（这是第一版的错）。
+var valueFlags = map[string]bool{
+	"--db": true, "--limit": true, "--project": true, "--kind": true, "--tag": true,
+	"--scope": true, "--salience": true, "--ttl": true, "--tool": true, "--device": true,
+	"--harness": true, "--event": true, "--max-chars": true, "--min-runes": true,
+	"--k": true, "--auto": true, "--gold": true, "--session": true, "--file": true,
+	"--threshold": true, "--max-idle": true, "--min-salience": true,
+	"--audit-file": true, "--audit": true, "--tail": true,
+}
+
+// flagsAfterPositional 返回第一个「写在位置参数之后」的选项（无则空串）。
+//
+// 注意要跳过 `mem <子命令>` 这两段 —— 子命令名本身不是位置参数（第一版就是
+// 把 `search` 当成了位置参数，于是所有命令都被误判为违规）。eval 还多一层子命令。
+func flagsAfterPositional(cmd string) string {
+	fields := strings.Fields(cmd)
+	skip := 2
+	if len(fields) > 1 && fields[1] == "eval" {
+		skip = 3
+	}
+	if len(fields) <= skip {
+		return ""
+	}
+	expectValue := false
+	seenPositional := false
+	for _, tok := range fields[skip:] {
+		if expectValue {
+			expectValue = false
+			continue
+		}
+		if strings.HasPrefix(tok, "-") {
+			if seenPositional {
+				return tok
+			}
+			if valueFlags[tok] {
+				expectValue = true
+			}
+			continue
+		}
+		seenPositional = true
+	}
+	return ""
+}
+
+// 🔴 本项目生成的所有「给模型看的命令」都必须真的能跑。
+//
+// 起因：hintBlock / instructionBlock 里曾写成 `mem search "<关键词>" --scope current --json`
+// 与 `mem ingest <文件> --project <工程>` —— Go 的 flag 在**首个位置参数处停止解析**，
+// 于是选项被当成位置参数：前者被守卫拦下报错，后者直接 `open --project: no such file`。
+// 这两段文本会被注入到每一次会话里，模型照着执行就会失败 —— 属于「指引本身是坏的」。
+//
+// 这个用例把「选项必须在位置参数之前」固化成不变量。
+func TestGuidanceCommandsAreExecutable(t *testing.T) {
+	blocks := map[string]string{
+		"hook 注入的用法提示":      hintBlock(),
+		"指令级接入块(workbuddy)": instructionBlock("workbuddy"),
+		"指令级接入块(traework)":  instructionBlock("traework"),
+	}
+	total := 0
+	for name, block := range blocks {
+		cmds := extractMemCommands(block)
+		if len(cmds) == 0 {
+			t.Errorf("%s 里没抽到任何 mem 命令 —— 抽取器失效，这个用例就成了空转", name)
+			continue
+		}
+		for _, c := range cmds {
+			total++
+			if bad := flagsAfterPositional(c); bad != "" {
+				t.Errorf("%s 的命令把选项写在了位置参数之后，实际执行会失败：\n  %s\n  违规选项: %s",
+					name, c, bad)
+			}
+		}
+	}
+	if total < 6 {
+		t.Errorf("至少应校验 6 条命令，实际 %d 条（抽取器可能漏了）", total)
+	}
+}
+
+// 指引里出现的每个子命令名都必须是真实的子命令。
+// 防的是「文档写了、命令不存在」这类漂移。
+func TestGuidanceNamesRealSubcommands(t *testing.T) {
+	known := map[string]bool{
+		"add": true, "search": true, "touch": true, "forget": true, "gc": true,
+		"consolidate": true, "export": true, "import": true, "hook": true,
+		"harness": true, "init": true, "ingest": true, "budget": true,
+		"audit": true, "eval": true, "stats": true, "help": true,
+	}
+	for name, block := range map[string]string{
+		"hook 用法提示": hintBlock(),
+		"指令块":       instructionBlock("x"),
+	} {
+		for _, c := range extractMemCommands(block) {
+			fields := strings.Fields(c)
+			if len(fields) < 2 {
+				continue
+			}
+			sub := fields[1]
+			if strings.HasPrefix(sub, "-") {
+				continue
+			}
+			if !known[sub] {
+				t.Errorf("%s 引用了不存在的子命令 %q：%s", name, sub, c)
+			}
+		}
+	}
+}
