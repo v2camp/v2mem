@@ -120,9 +120,14 @@ mem init              # 扫描 → 选择要注入钩子的工具
 
 | 等级 | 含义 | 覆盖的工具 |
 |:---|:---|:---|
-| `native` | 有原生 shell 钩子，事件触发即执行（**代码强制**） | Claude Code、TraeCode、CodeBuddy、Qoder / Qoder CN、QoderWork / QoderWork CN、Codex |
+| `native` | 有原生 shell 钩子，事件触发即执行（**代码强制**） | Claude Code、TraeCode、TraeWork、CodeBuddy、WorkBuddy、Qoder / Qoder CN、QoderWork / QoderWork CN、Codex |
 | `bridge` | 通过官方桥接包复用他家钩子协议 | DeepSeek Harness（`dsh-hooks-claude-code`） |
-| `instruction` | 无原生钩子，只能把指令写进会话级文件靠模型遵守（**概率性**） | WorkBuddy、TraeWork |
+| `instruction` | 无原生钩子，把指令写进会话级文件靠模型遵守（**概率性**）。当前**无工具默认走这条**，它作为兜底通道保留 | `mem init --scope instruction` 可强制 |
+
+> **WorkBuddy 与 TraeWork 原先被判为 instruction —— 那是错的。** 判断依据不该是「官方文档有没有写」，
+> 而要看他**内置的 Agent 运行时是谁的**：WorkBuddy 内置 CodeBuddy（用户级钩子就是
+> `~/.codebuddy/settings.json`，与 CodeBuddy Code 共用）；TraeWork(TRAE SOLO) 的项目级钩子是
+> `.trae/hooks.json`、全局是数据目录下的 `hooks.json`。两者均是代码强制执行。
 
 ```bash
 mem init                     # 扫描本机 → 显示 11 个入口（● = 已装）→ 让你选
@@ -140,7 +145,9 @@ mem harness                  # 不带参数只看清单
 - **QoderWork / QoderWork CN**：不支持热加载，**改完要重启**
 - **CodeBuddy**：面板外的手工改动可能需在 `/hooks` 面板内确认
 - **dsh**：需先装桥接包 `dsh plugin --profile add dsh-hooks-claude-code`
-- **WorkBuddy / TraeWork**：无原生钩子，走指令级（写进 `AGENTS.md`）
+- **WorkBuddy**：与 CodeBuddy Code 共用 `~/.codebuddy/settings.json`，无需单独安装
+- **TraeWork**：项目级写 `<项目>/.trae/hooks.json`（与 TraeCode 项目级同路径）；全局是数据目录下的 `hooks.json`
+- **兜底**（任何工具）：`mem init --harness <名字> --scope instruction [--file <路径>]` 把指令写进文件
 
 卸载：删掉配置文件里带 `# v2mem` 标记的 hook 条目即可。
 
@@ -220,8 +227,9 @@ internal/
    `sqlite-vec` 的 Go 绑定当前**不可用**：它锁在落后 18 个小版本的驱动上，唯一能编译的
    组合运行时报 wazero 特性错。且向量还需要 embedding 来源。建议先做零成本的替代项
    （复用已实现的 MinHash 签名 + RRF 融合）。见 §13
-2. **WorkBuddy / TraeWork 是指令级接入**：没有原生钩子，模型是否主动检索不可保证。
-   但由此产生的 `manual-search` 审计占比，正好可以作为"指令遵守率"的代理指标
+2. **WorkBuddy 与 TraeWork 的钩子路径来自应用包静态分析**（尚未观察到真实会话触发）。
+   验证方法：用一次之后看 `mem audit --tail 5` 是否出现 `prompt-submit` 记录 —— 有即生效。
+   未生效时的兜底：`mem init --scope instruction` 把指令写进 `AGENTS.md`（概率性，且占每轮 token）
 3. **检索退化是启发式**：只在精确表达式 0 命中时才放宽，不做更聪明的查询改写
 4. **指令级接入的默认落点需要你判断**：写进 `AGENTS.md` 会占每轮 token（实测 +344/轮）；
    若项目另有带预算的记忆文件，用 `--file` 指定落点

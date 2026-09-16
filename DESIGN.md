@@ -581,8 +581,8 @@ M4 时代没有 `superseded_by`，故限制无影响；M5a 一旦产生取代关
 | QoderWork CN | native | 同上 | **无** | `~/.qoderworkcn/settings.json` | alibabacloud.com/help/zh/lingma/hook |
 | Codex CLI | native | SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PermissionRequest / PreCompact / PostCompact / SubagentStart / SubagentStop / Stop | **无（只走 stdin `cwd`）** | `~/.codex/hooks.json`（或 config.toml 的 `[hooks]`） | developers.openai.com/codex/hooks |
 | DeepSeek Harness (dsh) | **bridge** | Cordis 扩展点：`agent/session-start`、`agent/pre-step`、`tools/pre-execute`、`tools/post-execute`、`session/event` | 插件内 `ctx` | 无 hooks.json；桥接包读 `~/.claude/settings.json` | dsh 官方文档 |
-| TraeWork | **instruction** | — | `TRAE_PROJECT_DIR` / `CLAUDE_PROJECT_DIR` | 无公开 hook 文档 | docs.trae.cn/traework/ |
-| WorkBuddy | **instruction** | — | — | 无公开 hook 文档 | workbuddy.cn/docs/workbuddy/Overview |
+| TraeWork（TRAE SOLO） | **native**（更正，原判 instruction） | 同名 6 事件 | `TRAE_PROJECT_DIR` / `CLAUDE_PROJECT_DIR` | `<项目>/.trae/hooks.json`；全局为数据目录下 `hooks.json` | 应用包内证据，见 §12.13 |
+| WorkBuddy | **native**（更正，原判 instruction） | 同 CodeBuddy | `CODEBUDDY_PROJECT_DIR` | `~/.codebuddy/settings.json`（与 CodeBuddy 共用） | 应用包内证据，见 §12.13 |
 
 用户点名的 8 个入口 → 注册表名的映射（有测试固化）：
 `trae work→traework`、`trae code→traecode`、`work buddy→workbuddy`、`code buddy→codebuddy`、
@@ -771,6 +771,58 @@ WorkBuddy 与 TraeWork 走指令级接入。落点有两个候选，结论是 **
 - `--harness a,b,c` 仍可一次装多个；`--harness` 与 `--all` 互斥。
 - 项目级写入（`--project`）不再提示「未检测到配置目录」——项目级本就该在项目里新建文件，
   那时提示纯属误导。
+
+### 12.13 🔴 重大更正：WorkBuddy 与 TraeWork 都是 native（原判 instruction 是错的）
+
+**错在哪**：最初的判断依据是「官方文档有没有发布钩子配置」——两者都没有，于是归入指令级。
+这个判据太浅：它只看了**应用自己的设置文件**，没看**它内置的 Agent 运行时是谁的**。
+
+**怎么查出来的**（方法可复用，不必依赖公开文档）：
+
+```bash
+# 1) 先列全应用（注意 glob 大小写：*[Tt]rae* 匹配不到全大写的 TRAE）
+ls /Applications | grep -i trae            # → TRAE SOLO CN.app（即 TraeWork）、Trae CN.app
+
+# 2) 在主程序里搜钩子关键词
+grep -a -c 'UserPromptSubmit' "/Applications/TRAE SOLO CN.app/Contents/Resources/app/modules/ai-agent/libharness.dylib"
+
+# 3) 在 JS 资源里找资产表/路径声明
+grep -o -E '.{80}hooks\.json.{80}' ".../workbench.desktop.main.solo-lite-slim.js"
+```
+
+**TraeWork（`TRAE SOLO CN.app`，bundle id `cn.trae.solo.app`）的证据**：
+
+| 证据 | 内容 |
+|:---|:---|
+| workbench JS 资产表 | `{assetType:"hook", scope:3, projectRelPath:".trae/hooks.json", globalRelPath:"hooks.json"}` |
+| `libharness.dylib` | 含 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` / `SessionEnd` / `Notification` |
+| 配置键 | `HooksConfiguration{ enabled_folders, run_mode, import_claude_folders, global_hooks_enabled, global_import_claude_enabled }` |
+| 执行上下文 | `HookExecContext{ event_name, additional_context, text_stdout, blocking_error, stop_reason }` —— 与 TraeCode 同一套协议 |
+| 附带发现 | 支持**直接导入 Claude Code 的钩子目录**（`import_claude_folders`） |
+
+**WorkBuddy 的证据**：
+
+| 证据 | 内容 |
+|:---|:---|
+| 应用包内含 CodeBuddy CLI 及中文文档 | `hooks.md` 明确列出用户级 `~/.codebuddy/settings.json`、项目级 `<项目根>/.codebuddy/settings.json`、项目本地 `.codebuddy/settings.local.json` |
+| 内置插件用的是 CodeBuddy 格式 | `builtin-plugins/sheetagent/hooks/hooks.json` → `type:"command"` + `${CODEBUDDY_PLUGIN_ROOT}` |
+| 环境变量 | `CODEBUDDY_PROJECT_DIR` / `CODEBUDDY_PLUGIN_ROOT` / `CODEBUDDY_SKILL_DIR` |
+| 结论 | WorkBuddy 的 Agent 运行时**就是 CodeBuddy**，故与 `codebuddy` 共用同一份用户级配置 |
+
+**两点必须讲清**：
+
+1. **两者共用同一运行时**，故钩子侧无法区分 WorkBuddy 与 CodeBuddy Code。配置里保留运行时本名
+   `codebuddy` 作为标签，审计中的 `harness` 字段也会是 `codebuddy`。这是事实而非缺陷。
+2. **路径与事件来自静态分析，尚未观察到真实会话触发。** 验证方法：
+   用一次之后 `mem audit --tail 5` 看是否出现 `prompt-submit` 记录；有即生效。
+   注册表的 `Notes` 里保留了「⚠️ 待实机验证」，并有测试断言这句话必须在。
+
+**已安装**：TraeWork 项目级 → `<repo>/.trae/hooks.json`（该目录已被本仓库 gitignore，属本地文件）；
+WorkBuddy → 复用 `~/.codebuddy/settings.json`（无需单独安装）。
+
+**副作用（留给用户判断）**：既然两者原生钩子已就位，写进 `AGENTS.md` 的指令块就是**冗余兜底**，
+代价 +344 tokens/轮。**待实机验证钩子确实触发后**，可考虑移除那一块省 token；
+在此之前保留 —— 原生钩子未验证时它是唯一靠得住的通道。
 
 ## 13. M5b（向量 + RRF）的 ROI 预算
 

@@ -244,41 +244,55 @@ var registry = []Harness{
 	},
 	{
 		Name:    "traework",
-		Aliases: []string{"trae-work", "tw"},
-		Label:   "TraeWork（AI 工作台）",
-		Tier:    TierInstruction,
-		// 官方文档未发布钩子配置；TraeWork 的 Code 模式构建于 TraeCode SOLO 之上。
-		ProjectEnv:  []string{"TRAE_PROJECT_DIR", "CLAUDE_PROJECT_DIR"},
-		Instruction: []string{"AGENTS.md"},
-		Verify:      "在 TraeWork 中发起新会话，问它「你有哪些记忆可用」",
-		Docs:        "https://docs.trae.cn/traework/",
+		Aliases: []string{"trae-work", "tw", "trae-solo"},
+		Label:   "TraeWork（原 TRAE SOLO）",
+		Tier:    TierNative,
+		// 证据取自应用包本身，不再靠「有没有公开文档」推断：
+		//   · workbench JS 的资产表：{assetType:"hook", projectRelPath:".trae/hooks.json", globalRelPath:"hooks.json"}
+		//   · libharness.dylib 含 SessionStart / UserPromptSubmit / PreToolUse / PostToolUse /
+		//     Stop / SessionEnd / Notification，以及 HooksConfiguration（global_hooks_enabled、
+		//     import_claude_folders、global_import_claude_enabled）
+		//   · HookExecContext 字段 additional_context / text_stdout / blocking_error / stop_reason
+		//     —— 与 TraeCode 是同一套「stdout 文本即注入上下文」协议
+		// 全局候选：dylib 记默认数据目录 ~/.trae-local（本机不存在），
+		// 而 ~/.trae-cn 与 ~/.trae 存在且与 TraeCode CN 同族，故三者都列。
+		GlobalConfig:  []string{"~/.trae-local/hooks.json", "~/.trae-cn/hooks.json", "~/.trae/hooks.json"},
+		ProjectConfig: []string{".trae/hooks.json"},
+		ProjectEnv:    []string{"TRAE_PROJECT_DIR", "CLAUDE_PROJECT_DIR"},
+		Verify:        "新开一个 TraeWork 会话，再 `mem audit --tail 5` 看是否出现 prompt-submit 记录",
+		Docs:          "https://docs.trae.cn/traework/",
 		Notes: []string{
-			"🔴 官方文档未发布 shell hook 配置，故按指令级钩子接入（可靠性低于原生钩子）",
-			"TraeWork 的 Code 模式构建于 TraeCode SOLO 之上；若与 TraeCode 共用运行时，TraeCode 的 hooks.json 可能同样生效 —— 未经验证，不据此写入",
+			"🔴 原判为指令级是错的：官方文档未发布，但应用包内自带完整钩子实现",
+			"项目级 `.trae/hooks.json` 与 TraeCode 项目级路径相同；全局是数据目录下的 hooks.json",
+			"支持 import_claude_folders / global_import_claude_enabled：可直接导入 Claude Code 的钩子",
+			"⚠️ 待实机验证：路径与事件来自应用包静态分析，尚未观察到真实会话触发（验证方法见 Verify）",
 		},
 	},
 	{
 		Name:    "workbuddy",
 		Aliases: []string{"work-buddy", "wb"},
 		Label:   "WorkBuddy",
-		Tier:    TierInstruction,
-		// WorkBuddy 的公开扩展机制是项目记忆文件 + 技能 + 自动化，未见 shell hook 配置文档。
-		//
-		// 默认落点选 AGENTS.md 而不是 .workbuddy/memory/MEMORY.md：
-		//   - 两者每轮都会注入，但 MEMORY.md 是「记忆」文件，自带严格注入预算
-		//     （本机实测约 7800 字符上限），再塞说明会挤占真正的记忆；
-		//   - AGENTS.md 语义上就是「在这个仓库怎么做事」，钩子说明天然属于它；
-		//   - 实测本机仓库根没有 CODEBUDDY.md，故 AGENTS.md 未被遮蔽
-		//     （同层存在 CODEBUDDY.md 时后者优先、AGENTS.md 会被忽略）。
-		ProjectEnv:  []string{},
-		Instruction: []string{"AGENTS.md"},
-		Verify:      "新会话中问它「个人记忆库里有什么关于 X 的记录」",
-		Docs:        "https://www.workbuddy.cn/docs/workbuddy/Overview",
+		Tier:    TierNative,
+		// 证据取自应用包本身。决定权**不在**应用自己的 ~/.workbuddy/settings.json
+		// （那份只有 IM 通道绑定与凭据、无 hooks 段），而在它内置的 CodeBuddy 运行时：
+		//   · WorkBuddy.app 内自带 CodeBuddy CLI 及中文文档，hooks.md 明确列出
+		//     用户级 ~/.codebuddy/settings.json、项目级 <项目根>/.codebuddy/settings.json、
+		//     项目本地 <项目根>/.codebuddy/settings.local.json
+		//   · 内置插件 sheetagent 的 hooks/hooks.json 就是 CodeBuddy 格式
+		//     （type:command + ${CODEBUDDY_PLUGIN_ROOT}）
+		//   · 环境变量 ${CODEBUDDY_PROJECT_DIR} / ${CODEBUDDY_PLUGIN_ROOT} / ${CODEBUDDY_SKILL_DIR}
+		// 故与 codebuddy 共用同一份用户级配置：写一处，两个工具都生效。
+		GlobalConfig:  []string{"~/.codebuddy/settings.json"},
+		ProjectConfig: []string{".codebuddy/settings.json", ".codebuddy/settings.local.json"},
+		ProjectEnv:    []string{"CODEBUDDY_PROJECT_DIR"},
+		Verify:        "新开一个 WorkBuddy 会话，再 `mem audit --tail 5` 看是否出现 prompt-submit 记录",
+		Docs:          "https://www.workbuddy.cn/docs/workbuddy/Overview",
 		Notes: []string{
-			"🔴 官方文档面向办公场景，未发布 shell hook 配置，故按指令级钩子接入",
-			"已发布的扩展机制：项目记忆文件（.workbuddy/memory/）、技能（skills/）、自动化任务",
-			"🔴 落点选 AGENTS.md：它每轮注入且语义上就是仓库工作规则；MEMORY.md 有严格注入预算，不宜占用",
-			"⚠️ 若项目根同时存在 CODEBUDDY.md，AGENTS.md 会被忽略 —— 此时用 --file 指向 CODEBUDDY.md",
+			"🔴 原判为指令级是错的：不该只看应用自己的 settings.json，要看他内置的 Agent 运行时",
+			"与 codebuddy 共用 ~/.codebuddy/settings.json —— 无需单独安装",
+			"⚠️ 两者共用同一运行时（WorkBuddy 内置 CodeBuddy），故钩子侧无法区分二者；配置里保留运行时本名 codebuddy 作为标签，审计中的 harness 字段也会是 codebuddy —— 这是事实而非缺陷，二者钩子行为完全一致",
+			"兜底通道仍在：`mem init --scope instruction` 把指令写进 AGENTS.md，但那是概率性的",
+			"⚠️ 待实机验证：路径取自应用包内文档，尚未观察到桌面端会话触发（验证方法见 Verify）",
 		},
 	},
 }

@@ -1051,7 +1051,7 @@ func TestCmdInitInstructionTierWritesMarkedBlock(t *testing.T) {
 	}
 
 	out, err := captureStdout(t, func() error {
-		return cmdInit([]string{"--harness", "workbuddy", "--project", proj})
+		return cmdInit([]string{"--harness", "workbuddy", "--project", proj, "--scope", "instruction"})
 	})
 	if err != nil {
 		t.Fatalf("cmdInit: %v", err)
@@ -1131,7 +1131,7 @@ func TestCmdInitFileOverrideWritesToGivenPath(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	out, err := captureStdout(t, func() error {
-		return cmdInit([]string{"--harness", "workbuddy", "--project", proj, "--file", target})
+		return cmdInit([]string{"--harness", "workbuddy", "--project", proj, "--scope", "instruction", "--file", target})
 	})
 	if err != nil {
 		t.Fatalf("cmdInit --file: %v", err)

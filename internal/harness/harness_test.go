@@ -229,3 +229,67 @@ func TestHarnessesWithoutEnvAreMarked(t *testing.T) {
 		}
 	}
 }
+
+// 固化这次更正：workbuddy 与 traework 都是 native。
+//
+// 起因：两者最初都按「官方文档未发布钩子配置」判为 instruction（靠模型遵守指令，概率性）。
+// 真相要从**应用包本身**看：
+//   - WorkBuddy 内置 CodeBuddy CLI 与文档，用户级钩子就是 ~/.codebuddy/settings.json；
+//     其内置插件 hooks.json 也是 CodeBuddy 格式。→ 与 codebuddy 共用配置。
+//   - TraeWork(TRAE SOLO) 的 workbench JS 资产表直接声明 .trae/hooks.json（项目级）
+//     与 hooks.json（全局），harness dylib 内含同一套事件与 HookExecContext 字段。
+//
+// 教训：判断某工具支不支持钩子，**不要只看它的官方文档或它自己的 settings.json**，
+// 要看他内置的 Agent 运行时是谁的。
+func TestDesktopAppsAreNativeNotInstruction(t *testing.T) {
+	cases := []struct {
+		name       string
+		projectCfg string
+		globalCfg  string
+		projectEnv string
+	}{
+		{"workbuddy", ".codebuddy/settings.json", "~/.codebuddy/settings.json", "CODEBUDDY_PROJECT_DIR"},
+		{"traework", ".trae/hooks.json", "~/.trae-cn/hooks.json", "TRAE_PROJECT_DIR"},
+	}
+	for _, c := range cases {
+		h, err := Get(c.name)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", c.name, err)
+		}
+		if h.Tier != TierNative {
+			t.Errorf("%s 应为 native（应用包内自带钩子实现），got %q", c.name, h.Tier)
+		}
+		if !hasPath(h.ProjectConfig, c.projectCfg) {
+			t.Errorf("%s 项目级路径应含 %q，got %v", c.name, c.projectCfg, h.ProjectConfig)
+		}
+		if !hasPath(h.GlobalConfig, c.globalCfg) {
+			t.Errorf("%s 用户级路径应含 %q，got %v", c.name, c.globalCfg, h.GlobalConfig)
+		}
+		if !hasPath(h.ProjectEnv, c.projectEnv) {
+			t.Errorf("%s 项目目录环境变量应含 %q（钩子靠它定位工程），got %v", c.name, c.projectEnv, h.ProjectEnv)
+		}
+		// 待实机验证的表述必须留着 —— 静态分析不等于观察到真实触发
+		joined := strings.Join(h.Notes, " ")
+		if !strings.Contains(joined, "待实机验证") {
+			t.Errorf("%s 的 Notes 应显式标注「待实机验证」（路径来自静态分析，未观测到真实触发）", c.name)
+		}
+	}
+}
+
+func hasPath(paths []string, want string) bool {
+	for _, p := range paths {
+		if p == want {
+			return true
+		}
+	}
+	return false
+}
+
+// 更正后没有任何工具默认走指令级，但兜底通道必须仍然可用（--scope instruction）。
+func TestInstructionScopeStillWorksAsFallback(t *testing.T) {
+	for _, h := range All() {
+		if h.Tier == TierInstruction {
+			t.Errorf("%s 仍是指令级？本次更正后所有已知工具都应有原生钩子", h.Name)
+		}
+	}
+}
