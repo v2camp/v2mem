@@ -249,7 +249,7 @@ func TestCmdHookPromptSubmitExcludesOtherProjects(t *testing.T) {
 	}
 
 	out, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "iCloud 同步目录能不能放数据库"), func() error {
-		return cmdHook([]string{"--db", db, "--harness", "claude"})
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0"})
 	})
 	if err != nil {
 		t.Fatalf("cmdHook: %v", err)
@@ -264,7 +264,7 @@ func TestCmdHookPromptSubmitExcludesOtherProjects(t *testing.T) {
 		t.Fatalf("cmdAdd global: %v", err)
 	}
 	out2, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "iCloud 同步目录能不能放数据库"), func() error {
-		return cmdHook([]string{"--db", db, "--harness", "claude"})
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0"})
 	})
 	if err != nil {
 		t.Fatalf("cmdHook: %v", err)
@@ -388,7 +388,7 @@ func TestCmdHookRespectsCharBudget(t *testing.T) {
 		}
 	}
 	out, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
-		return cmdHook([]string{"--db", db, "--harness", "claude",
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0",
 			"--limit", "40", "--max-chars", "600"})
 	})
 	if err != nil {
@@ -396,7 +396,7 @@ func TestCmdHookRespectsCharBudget(t *testing.T) {
 	}
 	// 先确认「放开 limit 后确实有远超预算的内容可注入」，否则下一条断言可能因数据不足而假通过
 	unbounded, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
-		return cmdHook([]string{"--db", db, "--harness", "claude",
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0",
 			"--limit", "40", "--max-chars", "100000"})
 	})
 	if err != nil {

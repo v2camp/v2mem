@@ -59,6 +59,9 @@ func cmdAudit(args []string) error {
 	fmt.Printf("总激活次数: %d\n", s.Total)
 	fmt.Printf("空注入    : %d（%.1f%%）\n", s.Empty, s.EmptyRate*100)
 	fmt.Printf("平均耗时  : %.1f ms\n", s.AvgMS)
+	if s.Suppressed > 0 {
+		fmt.Printf("重复触发  : 已抑制 %d 次\n", s.Suppressed)
+	}
 	fmt.Printf("可评测样本: %d（带 query 的读侧次数 —— 检索评测的分母来源）\n", s.WithQuery)
 	// 读/写分开报：只记不查或只查不记，都会在这两个数上立刻显形
 	ratio := "—"
@@ -70,6 +73,10 @@ func cmdAudit(args []string) error {
 		fmt.Printf("写侧构成  : 新增 %d，命中覆盖 %d（重复记录率 %.0f%%）\n",
 			s.Creates, s.Overwrites,
 			float64(s.Overwrites)/float64(s.Writes)*100)
+	}
+	if s.Suppressed > 0 {
+		// 抑制数 >0 是「同一事件被多处配置触发」的直接证据 —— 提示可清理冗余配置
+		fmt.Printf("重复触发  : 已抑制 %d 次（同一事件被多处配置并行触发；可清理冗余钩子配置）\n", s.Suppressed)
 	}
 	if len(s.ByEvent) > 0 {
 		fmt.Printf("按事件    : %s\n", joinCounts(s.ByEvent))

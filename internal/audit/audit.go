@@ -29,7 +29,10 @@ type Record struct {
 	// Mode 仅写侧使用：create=新增，overwrite=命中「相同知识覆盖」。
 	// 用它可算「模型重复记录率」——去重是否在起作用。
 	Mode string `json:"mode,omitempty"`
-	MS   int64  `json:"ms"`
+	// Suppressed=true 表示这次触发被幂等去重抑制了（同一事件被多处配置并行触发）。
+	// 它本身是度量：能看出「重复触发」在真实环境里是否真的发生。
+	Suppressed bool  `json:"suppressed,omitempty"`
+	MS         int64 `json:"ms"`
 }
 
 // Path 返回默认审计日志路径（与库同目录，便于一起备份/清理）。
@@ -114,6 +117,7 @@ type Summary struct {
 	// 读/写两侧分别计数 —— 回答「这套东西到底用起来了没有」要看这两个数，
 	// 而不是看总次数：只有写侧增长说明只记不查，只有读侧增长说明只查不记。
 	Retrievals int `json:"retrievals"` // 读侧：session-start / prompt-submit / manual-search
+	Suppressed int `json:"suppressed"` // 被幂等去重抑制的重复触发次数（>0 说明配置存在重复）
 	Writes     int `json:"writes"`     // 写侧：manual-add / manual-forget
 	Creates    int `json:"creates"`    // 其中新增
 	Overwrites int `json:"overwrites"` // 其中命中「相同知识覆盖」→ 可算重复记录率
@@ -141,6 +145,11 @@ func Summarize(rs []Record) Summary {
 		}
 		if strings.TrimSpace(r.Query) != "" {
 			s.WithQuery++
+		}
+		if r.Suppressed {
+			s.Suppressed++
+			// 被抑制的触发没有注入任何内容，不计入读侧活动
+			continue
 		}
 		if isWriteEvent(r.Event) {
 			s.Writes++

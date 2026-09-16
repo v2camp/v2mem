@@ -101,7 +101,7 @@ mem init              # 扫描 → 选择要注入钩子的工具
 |:---|:---|
 | `mem harness` | 列出支持的 11 个工具入口：接入方式、配置路径、本机是否已装 |
 | `mem init [--harness 名字] [--all] [--project 目录] [--file 路径] [--dry-run]` | 把钩子写进该工具配置。不带参数则进入扫描选择流程 |
-| `mem hook` | **钩子入口**：读 stdin JSON，把要注入的内容写 stdout。由 AI 工具调用，一般不手工执行 |
+| `mem hook` | **钩子入口**：读 stdin JSON，把要注入的内容写 stdout。由 AI 工具调用，一般不手工执行。同一事件被多处配置重复触发时**只注入一次**（`--dedup-window`，默认 10s，0 关闭） |
 
 ### 度量与评测
 

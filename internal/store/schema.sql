@@ -60,3 +60,19 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
   INSERT INTO fts_mem(fts_mem, rowid, content_idx) VALUES ('delete', old.rowid, old.content_idx);
   INSERT INTO fts_mem(rowid, content_idx) VALUES (new.rowid, new.content_idx);
 END;
+
+-- 钩子事件的幂等去重。
+--
+-- 要解决什么：同一个事件可能被**多处配置**触发（如 TraeWork 的项目级 .trae/hooks.json
+-- 与全局 ~/.trae-cn/hooks.json 都定义了 SessionStart / UserPromptSubmit），
+-- 按宿主文档的合并语义「同类事件所有匹配 hooks 并行执行」⇒ mem hook 会跑两次、
+-- 同样的内容注入两遍。
+--
+-- 做法：用一个原子声明把「同一事件只让一个调用者注入」变成数据库级保证。
+-- 并发下两个进程同时插入时，只有先到的那次能改变行数，另一次被 WHERE 挡掉。
+CREATE TABLE IF NOT EXISTS hook_dedup (
+  key TEXT PRIMARY KEY,
+  ts  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hook_dedup_ts ON hook_dedup(ts);

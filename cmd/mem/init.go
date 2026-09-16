@@ -175,7 +175,7 @@ func cmdInit(args []string) error {
 func initOne(h *harness.Harness, opts initOptions) error {
 	if strings.TrimSpace(opts.fileFlag) != "" {
 		return initAtExplicitFile(h, opts.fileFlag, opts.command, opts.dryRun,
-			opts.scope == "instruction" || h.Tier == harness.TierInstruction)
+			parseConfigTarget(opts.fileFlag, h, opts.scope))
 	}
 
 	switch opts.scope {
@@ -396,7 +396,30 @@ func splitList(s string) []string {
 
 // ---------- 写入 ----------
 
+// parseConfigTarget 决定 --file 的语义：写指令块还是写 hooks 配置。
+//
+// 起因：把 workbuddy / traework 从指令级更正为 native 之后，
+// `mem init --harness workbuddy --file AGENTS.md` 不再写指令块，而是把 .md 当 JSON 解析
+// 并报「不是合法 JSON」—— 同一个 --file 因 tier 变化而语义翻转，是个哑陷阱。
+//
+// 现在按扩展名推断：`.md` 视为指令级落点，其余视为 hooks 配置。
+// 显式 --scope 仍可覆盖推断。
 // initAtExplicitFile 把内容写到用户指定的文件（--file）。
+// 用途：指令级接入的默认落点常是「有注入预算的受限文件」，
+// 把 v2mem 的说明塞进去会挤占预算，因此需要能改指到别处（如 AGENTS.md）。
+func parseConfigTarget(fileFlag string, h *harness.Harness, scope string) bool {
+	if scope == "instruction" {
+		return true
+	}
+	if h.Tier == harness.TierInstruction {
+		return true
+	}
+	if scope == "auto" && strings.EqualFold(filepath.Ext(fileFlag), ".md") {
+		return true
+	}
+	return false
+}
+
 // 用途：指令级接入的默认落点常是「有注入预算的受限文件」，
 // 把 v2mem 的说明塞进去会挤占预算，因此需要能改指到别处（如 AGENTS.md）。
 func initAtExplicitFile(h *harness.Harness, path, command string, dryRun, instruction bool) error {

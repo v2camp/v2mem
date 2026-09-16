@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -54,6 +56,8 @@ func cmdHook(args []string) error {
 	limit := fs.Int("limit", defaultHookLimit, "注入的记忆条数上限")
 	maxChars := fs.Int("max-chars", defaultHookBudget, "注入内容的字符预算")
 	auditPath := fs.String("audit", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；\"-\" 表示关闭）")
+	dedupWindow := fs.Int("dedup-window", defaultDedupWindowSec,
+		"重复触发抑制窗口（秒）。同一事件被多处配置并行触发时只注入一次；0 关闭")
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 参数解析失败，已静默放过:", err)
@@ -83,6 +87,32 @@ func cmdHook(args []string) error {
 	}
 
 	started := time.Now()
+
+	// 幂等去重：同一事件若被**多处配置**并行触发（如 TraeWork 的项目级
+	// .trae/hooks.json 与全局 ~/.trae-cn/hooks.json 都定义了同一事件），
+	// 只让先到的那次注入。详情与设计约束见 hookDedupKey 的注释。
+	if *dedupWindow > 0 {
+		claimed, derr := claimHookEvent(c.db, in, event, *dedupWindow, started.Unix())
+		switch {
+		case derr != nil:
+			// 失败开放：判不出是否重复时照常注入。
+			// 注入两次只是啰嗦；**漏**注入是功能缺失 —— 两者代价不对等。
+			fmt.Fprintln(os.Stderr, "v2mem hook: 去重检查失败，按未重复处理:", derr)
+		case !claimed:
+			if *auditPath != "-" {
+				// 记下「被抑制」这件事：它本身是**并行会话是否真在重复触发**的度量。
+				_ = audit.Append(*auditPath, audit.Record{
+					TS: started.Unix(), Event: string(event),
+					Harness: harnessName(*harnessFlag, in), Project: project,
+					SessionID: in.SessionID, Query: strings.TrimSpace(in.Prompt),
+					Suppressed: true, MS: time.Since(started).Milliseconds(),
+				})
+			}
+			fmt.Fprintf(os.Stderr, "v2mem hook: event=%s 的重复触发已抑制（另一处配置已注入）\n", event)
+			return nil
+		}
+	}
+
 	text, injected := renderHookContext(c, event, project, in.Prompt, *limit, *maxChars)
 	if text != "" {
 		fmt.Print(text)
@@ -324,4 +354,45 @@ func truncateRunes(s string, n int) string {
 		return string(rs)
 	}
 	return string(rs[:n]) + "…"
+}
+
+// defaultDedupWindowSec 是重复触发抑制窗口。
+//
+// 为什么需要窗口而不是永久去重：同一会话里用户**可能合理地重复同一句话**
+// （如两次「继续」）。那是两个真实事件，应各注入一次。而重复触发发生在**毫秒级**，
+// 用秒级窗口即可区分二者；且窗口内被抑制的那次，其内容与刚注入的完全相同、
+// 仍在上下文里，抑制的损失可忽略。
+const defaultDedupWindowSec = 10
+
+// hookDedupKey 由「事件 + 会话 + 提问 + 目录」算出（sha256 前 32 位十六进制）。
+//
+// 🔴 刻意**不含 harness**：同一事件的重复触发恰恰来自两处配置用了**不同的 harness 名**
+// （TraeWork 项目级写 `--harness traework`、全局写 `--harness traecode`）。
+// 把 harness 纳入键，去重会永远失效 —— 那正是要防的场景。
+// 不含 `--limit/--max-chars` 等同理：它们是本工具的旋钮，不该影响「是否为同一事件」。
+func hookDedupKey(in hookInput, event harness.Event) string {
+	h := sha256.New()
+	for _, part := range []string{string(event), in.SessionID, strings.TrimSpace(in.Prompt), in.Cwd} {
+		_, _ = io.WriteString(h, part)
+		_, _ = h.Write([]byte{0}) // 分隔符，避免字段拼接歧义
+	}
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// claimHookEvent 判断本次事件是否归当前调用处理。
+// 任何错误都返回 err，由调用方决定「失败开放」。
+func claimHookEvent(db string, in hookInput, event harness.Event, windowSec int, now int64) (bool, error) {
+	st, err := store.Open(db)
+	if err != nil {
+		return false, err
+	}
+	defer st.Close()
+
+	claimed, err := st.ClaimHookEvent(hookDedupKey(in, event), now, now-int64(windowSec))
+	if err != nil {
+		return false, err
+	}
+	// 顺手清理过期记录（窗口的 100 倍），避免表无限增长。失败不影响主流程。
+	_ = st.PruneHookDedup(now - int64(windowSec)*100)
+	return claimed, nil
 }
