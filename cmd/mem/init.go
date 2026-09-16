@@ -1,23 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/wanghui/v2mem/internal/harness"
 )
 
-// 本文件负责「把钩子装进各工具」。两条纪律：
+// 本文件负责「把钩子装进各工具」。三条纪律：
 //
 //  1. **合并，不覆盖**。用户已有的 hook 与无关配置键必须原样保留；
 //     解析不了就报错退出，绝不拿默认值盖掉用户文件。
 //  2. **幂等**。重复执行不得累积重复条目（否则钩子会被调用多次、注入翻倍），
 //     因此写入前先摘掉自己上次写的条目。
+//  3. **选择权在用户**。不带 --harness 时进入「扫描 → 选择」流程，
+//     不无差别地往所有工具里写。
 const (
 	// instrBegin/instrEnd 是指令级接入的标记块边界，靠它们实现「就地替换」。
 	instrBegin = "<!-- >>> v2mem 自动生成，勿手改；重跑 `mem init` 覆盖本块 >>> -->"
@@ -25,7 +30,37 @@ const (
 	// hookTimeoutSec 是钩子超时。记忆查询是本地 SQLite 读，20 秒绰绰有余，
 	// 又不至于在库异常时把宿主拖住。
 	hookTimeoutSec = 20
+	// hookMarker 是写在 hook 命令末尾的标记，用于识别「这条是本工具生成的」。
+	//
+	// 为什么不用「可执行文件名 == mem」来识别：一旦二进制改名（mem-0.3、v2mem，
+	// 或 go test 生成的 mem.test），识别就失效，重复 init 会不断累积条目、
+	// 让钩子被调用多次。实测被幂等用例抓过。
+	//
+	// 写成 shell 注释是安全的：各家文档的 command 都经 shell 执行
+	// （bash / zsh / sh / powershell 皆以 # 为注释），且不污染实际参数。
+	hookMarker = "# v2mem"
 )
+
+// errSkipUnsupported 表示该工具在当前范围下没有可写位置（非错误，应报告跳过）。
+var errSkipUnsupported = errors.New("该工具在当前范围下无配置文件")
+
+type initOptions struct {
+	project   string
+	scope     string
+	fileFlag  string
+	command   string
+	dryRun    bool
+	skipNoPos bool // 无写入位置时返回 errSkipUnsupported 而不是报错
+}
+
+// scanEntry 是扫描结果的一行。
+type scanEntry struct {
+	Idx       int
+	H         harness.Harness
+	Detected  bool   // 用户级配置目录已存在，即本机很可能装了
+	Target    string // 当前 --project 下会写到哪
+	Skippable bool   // 当前范围下没有可写位置
+}
 
 func cmdHarness(args []string) error {
 	var c common
@@ -38,13 +73,13 @@ func cmdHarness(args []string) error {
 		return printJSON(harness.All())
 	}
 
-	fmt.Println("v2mem 支持的 harness 接入方式（* = 检测到本机已安装）")
+	fmt.Println("v2mem 支持的 harness 接入方式（● = 检测到本机已安装）")
 	fmt.Println()
 	for _, h := range harness.All() {
 		mark := " "
 		target := "（无配置文件，见说明）"
 		if existing := h.ExistingGlobalConfigs(); len(existing) > 0 {
-			mark = "*"
+			mark = "●"
 			target = existing[0]
 		} else if len(h.GlobalConfig) > 0 {
 			target = harness.ExpandHome(h.GlobalConfig[0])
@@ -58,8 +93,9 @@ func cmdHarness(args []string) error {
 	fmt.Println("bridge      = 通过官方桥接包复用他家的 hook 协议")
 	fmt.Println("instruction = 无原生钩子，只能把指令写进会话级文件靠模型遵守（可靠性低一档）")
 	fmt.Println()
-	fmt.Println("查看某家的详情：mem init --harness <name> --dry-run")
-	fmt.Println("写入配置：      mem init --harness <name> [--project <项目目录>]")
+	fmt.Println("装钩子：mem init              进入扫描选择流程")
+	fmt.Println("        mem init --harness <名字> [--project <项目目录>]")
+	fmt.Println("        mem init --all        不询问，处理全部已检测到的")
 	return nil
 }
 
@@ -67,18 +103,14 @@ func cmdInit(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	c.register(fs)
-	harnessName := fs.String("harness", "", "要接入的工具名（见 mem harness）")
+	harnessFlag := fs.String("harness", "", "要接入的工具，逗号分隔（留空则进入扫描选择）")
+	all := fs.Bool("all", false, "不询问，处理全部已检测到的工具")
 	project := fs.String("project", "", "写入该目录的项目级配置（默认写用户级）")
 	scope := fs.String("scope", "auto", "auto|global|project|instruction")
 	dryRun := fs.Bool("dry-run", false, "只显示将写入的内容，不落盘")
 	command := fs.String("command", "", "覆盖 hook 命令（默认用当前二进制的绝对路径）")
-	file := fs.String("file", "", "覆盖目标文件路径（用于把指令块放到不挤占记忆预算的位置）")
+	file := fs.String("file", "", "覆盖目标文件路径")
 	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	h, err := harness.Get(*harnessName)
-	if err != nil {
 		return err
 	}
 	switch *scope {
@@ -86,29 +118,87 @@ func cmdInit(args []string) error {
 	default:
 		return fmt.Errorf("未知 --scope: %q（可选 auto|global|project|instruction）", *scope)
 	}
-
-	if strings.TrimSpace(*file) != "" {
-		return initAtExplicitFile(h, *file, *command, *dryRun, *scope == "instruction" || h.Tier == harness.TierInstruction)
+	opts := initOptions{
+		project: *project, scope: *scope, fileFlag: *file,
+		command: *command, dryRun: *dryRun,
 	}
 
-	switch *scope {
+	names := splitList(*harnessFlag)
+	switch {
+	case len(names) > 0 && *all:
+		return errors.New("--harness 与 --all 不可同时使用")
+	case len(names) == 0 && *all:
+		selected, err := selectAll(*project)
+		if err != nil {
+			return err
+		}
+		names = selected
+	case len(names) == 0:
+		selected, err := promptSelection(*project)
+		if err != nil {
+			return err
+		}
+		if len(selected) == 0 {
+			fmt.Println("已取消，未做任何改动。")
+			return nil
+		}
+		names = selected
+	}
+
+	// 多选时容忍「某些工具在当前范围下没有落点」，报告跳过而不是整批失败
+	opts.skipNoPos = len(names) > 1
+	var skipped []string
+	for i, name := range names {
+		h, err := harness.Get(name)
+		if err != nil {
+			return err
+		}
+		if i > 0 {
+			fmt.Println()
+		}
+		if err := initOne(h, opts); err != nil {
+			if errors.Is(err, errSkipUnsupported) {
+				skipped = append(skipped, name)
+				continue
+			}
+			return err
+		}
+	}
+	if len(skipped) > 0 {
+		fmt.Printf("\n跳过 %d 个（当前范围下没有可写位置）：%s\n", len(skipped), strings.Join(skipped, "、"))
+		fmt.Println("如需接入：去掉 --project 写用户级配置，或用 --file 指定落点。")
+	}
+	return nil
+}
+
+// initOne 处理单个工具。
+func initOne(h *harness.Harness, opts initOptions) error {
+	if strings.TrimSpace(opts.fileFlag) != "" {
+		return initAtExplicitFile(h, opts.fileFlag, opts.command, opts.dryRun,
+			opts.scope == "instruction" || h.Tier == harness.TierInstruction)
+	}
+
+	switch opts.scope {
 	case "instruction":
-		return initInstruction(h, *project, *dryRun)
+		return initInstruction(h, opts.project, opts.dryRun, opts.skipNoPos)
 	case "project":
 		if len(h.ProjectConfig) == 0 {
 			return fmt.Errorf("%s 官方未提供项目级配置文件，只能写用户级（去掉 --scope project）", h.Name)
 		}
 	}
 
-	if h.Tier == harness.TierInstruction && *scope == "auto" {
-		return initInstruction(h, *project, *dryRun)
+	if h.Tier == harness.TierInstruction && opts.scope == "auto" {
+		return initInstruction(h, opts.project, opts.dryRun, opts.skipNoPos)
 	}
 
-	target, isNew, err := resolveConfigTarget(h, *project, *scope)
+	target, isNew, err := resolveConfigTarget(h, opts.project, opts.scope)
 	if err != nil {
+		if opts.skipNoPos {
+			return errSkipUnsupported
+		}
 		return err
 	}
-	cmd := *command
+	cmd := opts.command
 	if strings.TrimSpace(cmd) == "" {
 		cmd = defaultHookCommand(h.Name)
 	} else {
@@ -116,7 +206,7 @@ func cmdInit(args []string) error {
 		cmd = withMarker(cmd)
 	}
 
-	changed, err := upsertHooksConfig(target, cmd, *dryRun)
+	changed, err := upsertHooksConfig(target, cmd, opts.dryRun)
 	if err != nil {
 		return err
 	}
@@ -125,14 +215,10 @@ func cmdInit(args []string) error {
 	fmt.Printf("文件    : %s%s\n", target, map[bool]string{true: "（新建）", false: ""}[isNew])
 	fmt.Printf("命令    : %s\n", cmd)
 	fmt.Printf("事件    : %s、%s\n", harness.EventNames[harness.EventSessionStart], harness.EventNames[harness.EventPromptSubmit])
-	if *dryRun {
-		fmt.Println("模式    : --dry-run，未写盘")
-	} else if changed {
-		fmt.Println("结果    : 已写入（原文件已备份为 <文件>.v2mem.bak）")
-	} else {
-		fmt.Println("结果    : 内容已是最新，未改动")
-	}
-	printFollowUp(h, isNew)
+	reportWriteResult(opts.dryRun, changed)
+	// 只在写「用户级」配置时才提示未检测到 —— 项目级写入本就该在项目里新建文件，
+	// 那时报「未检测到配置目录」纯属误导。
+	printFollowUp(h, isNew && opts.project == "")
 	return nil
 }
 
@@ -147,10 +233,7 @@ func resolveConfigTarget(h *harness.Harness, project, scope string) (path string
 		return p, errors.Is(statErr, os.ErrNotExist), nil
 	}
 	if len(h.GlobalConfig) == 0 {
-		if len(h.Instruction) > 0 {
-			return "", false, fmt.Errorf("%s 没有 shell hook 配置，请用 --scope instruction（或直接 mem init --harness %s）", h.Name, h.Name)
-		}
-		return "", false, fmt.Errorf("%s 无可写入的配置路径", h.Name)
+		return "", false, fmt.Errorf("%s 没有 shell hook 配置，请用 --scope instruction 或 --file 指定落点", h.Name)
 	}
 	path, isNew = h.ResolveGlobalConfig()
 	if path == "" {
@@ -159,15 +242,240 @@ func resolveConfigTarget(h *harness.Harness, project, scope string) (path string
 	return path, isNew, nil
 }
 
-// hookMarker 是写在 hook 命令末尾的标记，用于识别「这条是本工具生成的」。
+// ---------- 扫描与选择 ----------
+
+// scanHarnesses 列出全部已知入口及其在当前范围下的落点。
 //
-// 为什么不用「可执行文件名 == mem」来识别：一旦二进制改名（mem-0.3、v2mem，
-// 或 go test 生成的 mem.test），识别就失效，重复 init 会不断累积条目、
-// 让钩子被调用多次。实测被幂等用例抓过。
+// 刻意列出**全部**而不是只列检测到的：索引因此稳定（不受本机环境影响），
+// 也允许用户选一个我们没探到路径的工具（它可能装在别处）。
+func scanHarnesses(project string) []scanEntry {
+	all := harness.All()
+	out := make([]scanEntry, 0, len(all))
+	for i, h := range all {
+		e := scanEntry{Idx: i + 1, H: h}
+		e.Detected = len(h.ExistingGlobalConfigs()) > 0
+		switch {
+		case project != "" && len(h.ProjectConfig) > 0:
+			e.Target = filepath.Join(project, h.ProjectConfig[0])
+		case project != "" && len(h.Instruction) > 0:
+			e.Target = filepath.Join(project, h.Instruction[0])
+		case len(h.GlobalConfig) > 0:
+			e.Target, _ = h.ResolveGlobalConfig()
+		case len(h.Instruction) > 0:
+			e.Target = harness.ExpandHome(h.Instruction[0])
+		default:
+			e.Target = "（无）"
+		}
+		e.Skippable = project != "" && len(h.ProjectConfig) == 0 && len(h.Instruction) == 0
+		out = append(out, e)
+	}
+	return out
+}
+
+func countDetected(entries []scanEntry) int {
+	n := 0
+	for _, e := range entries {
+		if e.Detected {
+			n++
+		}
+	}
+	return n
+}
+
+// selectAll 返回 --all 应处理的工具：默认只处理检测到已安装的。
 //
-// 写成 shell 注释是安全的：各家文档的 command 都经 shell 执行
-// （bash / zsh / sh / powershell 皆以 # 为注释），且不污染实际参数。
-const hookMarker = "# v2mem"
+// 被排除的必须**逐条报告**，否则用户以为「全都装了」，实际有工具被静默跳过。
+func selectAll(project string) ([]string, error) {
+	entries := scanHarnesses(project)
+	fmt.Printf("扫描本机：检测到 %d 个已安装的工具（共 %d 个已知入口）\n\n", countDetected(entries), len(entries))
+
+	var names, skipped []string
+	for _, e := range entries {
+		if e.Detected || (project != "" && !e.Skippable) {
+			names = append(names, e.H.Name)
+			continue
+		}
+		if e.Skippable {
+			skipped = append(skipped, e.H.Name+"（当前范围无落点）")
+		} else {
+			skipped = append(skipped, e.H.Name+"（未检测到）")
+		}
+	}
+	if len(names) == 0 {
+		return nil, errors.New("未检测到任何已安装的工具；可用 --harness 指定，或确认工具是否装在本机")
+	}
+	if len(skipped) > 0 {
+		fmt.Printf("跳过 %d 个：%s\n\n", len(skipped), strings.Join(skipped, "、"))
+	}
+	return names, nil
+}
+
+// promptSelection 打印扫描结果并读取用户选择。
+func promptSelection(project string) ([]string, error) {
+	entries := scanHarnesses(project)
+	fmt.Printf("扫描本机：检测到 %d 个已安装的工具（共 %d 个已知入口）\n\n", countDetected(entries), len(entries))
+	for _, e := range entries {
+		mark := " "
+		if e.Detected {
+			mark = "●"
+		}
+		note := ""
+		if e.Skippable {
+			note = "   ← 当前范围无落点"
+		}
+		fmt.Printf("  [%2d] %s %-16s %-11s %s%s\n", e.Idx, mark, e.H.Name, e.H.Tier, e.Target, note)
+	}
+	fmt.Println()
+	fmt.Print("选择要注入钩子的工具（编号或名字，逗号分隔；a=全部已检测到；q=取消）：")
+
+	line, _ := readLine()
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "", "q", "quit", "n", "no":
+		return nil, nil
+	case "a", "all", "*":
+		return selectAll(project)
+	}
+	return parseSelection(line, entries)
+}
+
+// readLine 读一行；EOF 时返回已读到的内容（管道输入不会有结尾换行）。
+func readLine() (string, error) {
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return line, err
+	}
+	return line, nil
+}
+
+// parseSelection 把「编号或名字」的列表解析成 harness 名，去重保序。
+func parseSelection(line string, entries []scanEntry) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	for _, tok := range splitList(line) {
+		if n, err := strconv.Atoi(tok); err == nil {
+			found := false
+			for _, e := range entries {
+				if e.Idx == n {
+					add(e.H.Name)
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("编号 %d 超出范围（可用 1-%d）", n, len(entries))
+			}
+			continue
+		}
+		h, err := harness.Get(tok)
+		if err != nil {
+			return nil, err
+		}
+		add(h.Name)
+	}
+	return out, nil
+}
+
+// splitList 拆分逗号/空格/顿号分隔的名字列表。
+func splitList(s string) []string {
+	var out []string
+	for _, tok := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '、'
+	}) {
+		if tok = strings.TrimSpace(tok); tok != "" {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// ---------- 写入 ----------
+
+// initAtExplicitFile 把内容写到用户指定的文件（--file）。
+// 用途：指令级接入的默认落点常是「有注入预算的受限文件」，
+// 把 v2mem 的说明塞进去会挤占预算，因此需要能改指到别处（如 AGENTS.md）。
+func initAtExplicitFile(h *harness.Harness, path, command string, dryRun, instruction bool) error {
+	if instruction || len(h.GlobalConfig) == 0 {
+		changed, err := upsertMarkedBlock(path, instructionBlock(h.Name), dryRun)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("harness : %s（%s，指令级 · 指定文件）\n", h.Name, h.LabelOrName())
+		fmt.Printf("文件    : %s\n", path)
+		reportWriteResult(dryRun, changed)
+		fmt.Println("说明    : ⚠️ 指令级接入 —— 靠模型遵守，没有代码强制")
+		printFollowUp(h, false)
+		return nil
+	}
+
+	cmd := command
+	if strings.TrimSpace(cmd) == "" {
+		cmd = defaultHookCommand(h.Name)
+	} else {
+		cmd = withMarker(cmd)
+	}
+	changed, err := upsertHooksConfig(path, cmd, dryRun)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("harness : %s（%s，%s · 指定文件）\n", h.Name, h.LabelOrName(), h.Tier)
+	fmt.Printf("文件    : %s\n", path)
+	fmt.Printf("命令    : %s\n", cmd)
+	fmt.Printf("事件    : %s、%s\n", harness.EventNames[harness.EventSessionStart], harness.EventNames[harness.EventPromptSubmit])
+	reportWriteResult(dryRun, changed)
+	printFollowUp(h, false)
+	return nil
+}
+
+func reportWriteResult(dryRun, changed bool) {
+	switch {
+	case dryRun:
+		fmt.Println("模式    : --dry-run，未写盘")
+	case changed:
+		fmt.Println("结果    : 已写入（原文件已备份为 <文件>.v2mem.bak）")
+	default:
+		fmt.Println("结果    : 内容已是最新，未改动")
+	}
+}
+
+// initInstruction 为无原生钩子的工具写入指令级钩子块。
+func initInstruction(h *harness.Harness, project string, dryRun, skipNoPos bool) error {
+	if len(h.Instruction) == 0 {
+		if skipNoPos {
+			return errSkipUnsupported
+		}
+		return fmt.Errorf("%s 既无 shell hook 配置也无指令文件，无法接入；可用 --file 指定落点", h.Name)
+	}
+	rel := h.Instruction[0]
+	var target string
+	if strings.HasPrefix(rel, "~") {
+		target = harness.ExpandHome(rel)
+	} else if project != "" {
+		target = filepath.Join(project, rel)
+	} else {
+		if skipNoPos {
+			return errSkipUnsupported
+		}
+		return fmt.Errorf("%s 的指令文件 %s 属项目级，请用 --project <项目目录> 指定位置", h.Name, rel)
+	}
+
+	changed, err := upsertMarkedBlock(target, instructionBlock(h.Name), dryRun)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("harness : %s（%s，%s）\n", h.Name, h.LabelOrName(), h.Tier)
+	fmt.Printf("文件    : %s\n", target)
+	reportWriteResult(dryRun, changed)
+	fmt.Println("说明    : ⚠️ 指令级接入 —— 本块靠模型遵守，没有代码强制，可靠性低于原生钩子")
+	printFollowUp(h, false)
+	return nil
+}
 
 // defaultHookCommand 用当前二进制的绝对路径，而不是裸 `mem`。
 //
@@ -306,81 +614,6 @@ func backupOnce(path string, raw []byte) error {
 		return nil
 	}
 	return os.WriteFile(bak, raw, 0o644)
-}
-
-// initAtExplicitFile 把内容写到用户指定的文件（--file）。
-// 用途：WorkBuddy / TraeWork 这类指令级接入，其默认指令文件常是「有注入预算的
-// 受限文件」，把 v2mem 的说明塞进去会挤占预算，因此需要能改指到别处（如 AGENTS.md）。
-func initAtExplicitFile(h *harness.Harness, path, command string, dryRun, instruction bool) error {
-	if instruction || len(h.GlobalConfig) == 0 {
-		changed, err := upsertMarkedBlock(path, instructionBlock(h.Name), dryRun)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("harness : %s（%s，指令级 · 指定文件）\n", h.Name, h.LabelOrName())
-		fmt.Printf("文件    : %s\n", path)
-		reportWriteResult(dryRun, changed)
-		fmt.Println("说明    : ⚠️ 指令级接入 —— 靠模型遵守，没有代码强制")
-		printFollowUp(h, false)
-		return nil
-	}
-
-	cmd := command
-	if strings.TrimSpace(cmd) == "" {
-		cmd = defaultHookCommand(h.Name)
-	} else {
-		cmd = withMarker(cmd)
-	}
-	changed, err := upsertHooksConfig(path, cmd, dryRun)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("harness : %s（%s，%s · 指定文件）\n", h.Name, h.LabelOrName(), h.Tier)
-	fmt.Printf("文件    : %s\n", path)
-	fmt.Printf("命令    : %s\n", cmd)
-	fmt.Printf("事件    : %s、%s\n", harness.EventNames[harness.EventSessionStart], harness.EventNames[harness.EventPromptSubmit])
-	reportWriteResult(dryRun, changed)
-	printFollowUp(h, false)
-	return nil
-}
-
-func reportWriteResult(dryRun, changed bool) {
-	switch {
-	case dryRun:
-		fmt.Println("模式    : --dry-run，未写盘")
-	case changed:
-		fmt.Println("结果    : 已写入（原文件已备份为 <文件>.v2mem.bak）")
-	default:
-		fmt.Println("结果    : 内容已是最新，未改动")
-	}
-}
-
-// initInstruction 为无原生钩子的工具写入指令级钩子块。
-func initInstruction(h *harness.Harness, project string, dryRun bool) error {
-	if len(h.Instruction) == 0 {
-		return fmt.Errorf("%s 既无 shell hook 配置也无指令文件，无法接入", h.Name)
-	}
-	rel := h.Instruction[0]
-	var target string
-	if strings.HasPrefix(rel, "~") {
-		target = harness.ExpandHome(rel)
-	} else if project != "" {
-		target = filepath.Join(project, rel)
-	} else {
-		return fmt.Errorf("%s 的指令文件 %s 属项目级，请用 --project <项目目录> 指定位置", h.Name, rel)
-	}
-
-	changed, err := upsertMarkedBlock(target, instructionBlock(h.Name), dryRun)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("harness : %s（%s，%s）\n", h.Name, h.LabelOrName(), h.Tier)
-	fmt.Printf("文件    : %s\n", target)
-	reportWriteResult(dryRun, changed)
-	fmt.Println("说明    : ⚠️ 指令级接入 —— 本块靠模型遵守，没有代码强制，可靠性低于原生钩子")
-	printFollowUp(h, false)
-	return nil
 }
 
 // upsertMarkedBlock 在标记块范围内就地替换；没有标记块则追加。

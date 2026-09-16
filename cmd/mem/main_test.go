@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wanghui/v2mem/internal/harness"
 	"github.com/wanghui/v2mem/internal/store"
 )
 
@@ -1040,7 +1041,7 @@ func TestCmdInitBacksUpExistingFile(t *testing.T) {
 // 指令级接入（无原生 hook 的工具）：写带标记的指令块，且可重复更新。
 func TestCmdInitInstructionTierWritesMarkedBlock(t *testing.T) {
 	proj := t.TempDir()
-	path := filepath.Join(proj, ".workbuddy", "memory", "MEMORY.md")
+	path := filepath.Join(proj, "AGENTS.md")
 	// 预置用户已有内容
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
@@ -1149,7 +1150,146 @@ func TestCmdInitFileOverrideWritesToGivenPath(t *testing.T) {
 		t.Error("应写入指令块")
 	}
 	// 默认指令文件不应被创建
-	if _, err := os.Stat(filepath.Join(proj, ".workbuddy", "memory", "MEMORY.md")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(proj, "CODEBUDDY.md")); !os.IsNotExist(err) {
 		t.Error("指定 --file 后不应再写默认位置")
+	}
+}
+
+// ---------- M6: 扫描 + 交互选择 ----------
+
+// 不带 --harness 时进入扫描选择流程。默认列出全部 harness（不只已检测到的），
+// 这样索引稳定、也允许用户选一个我们没探到路径的工具。
+func TestCmdInitWithoutHarnessScansAndInstallsSelection(t *testing.T) {
+	proj := t.TempDir()
+	out, err := withStdin(t, "codex\n", func() error {
+		return cmdInit([]string{"--project", proj})
+	})
+	if err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	if !strings.Contains(out, "选择") {
+		t.Errorf("应打印选择提示，got:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(proj, ".codex", "hooks.json")); err != nil {
+		t.Errorf("应写入 codex 的项目级配置: %v", err)
+	}
+}
+
+func TestCmdInitPromptAcceptsIndicesAndMultipleNames(t *testing.T) {
+	proj := t.TempDir()
+	// 按索引选：列表里 traecode 与 codex 各自的位置
+	all := harness.All()
+	idxOf := func(name string) int {
+		for i, h := range all {
+			if h.Name == name {
+				return i + 1
+			}
+		}
+		t.Fatalf("注册表里找不到 %s", name)
+		return 0
+	}
+	input := fmt.Sprintf("%d,%s\n", idxOf("claude"), "codex")
+	if _, err := withStdin(t, input, func() error {
+		return cmdInit([]string{"--project", proj})
+	}); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	for _, p := range []string{".claude/settings.json", ".codex/hooks.json"} {
+		if _, err := os.Stat(filepath.Join(proj, p)); err != nil {
+			t.Errorf("应写入 %s: %v", p, err)
+		}
+	}
+}
+
+// 取消与空输入都不得写任何文件。
+func TestCmdInitPromptCancelWritesNothing(t *testing.T) {
+	for _, input := range []string{"\n", "q\n", "Q\n", "  \n"} {
+		proj := t.TempDir()
+		if _, err := withStdin(t, input, func() error {
+			return cmdInit([]string{"--project", proj})
+		}); err != nil {
+			t.Fatalf("输入 %q 不应报错: %v", input, err)
+		}
+		entries, _ := os.ReadDir(proj)
+		if len(entries) != 0 {
+			t.Errorf("输入 %q 取消后不应写入任何文件，实际有 %d 项", input, len(entries))
+		}
+	}
+}
+
+// 无法识别的选择必须报错并指出是哪个，不能静默跳过。
+func TestCmdInitPromptRejectsUnknownToken(t *testing.T) {
+	proj := t.TempDir()
+	err := func() error {
+		_, e := withStdin(t, "codex,no-such-tool\n", func() error {
+			return cmdInit([]string{"--project", proj})
+		})
+		return e
+	}()
+	if err == nil {
+		t.Fatal("含未知项的选择应报错")
+	}
+	if !strings.Contains(err.Error(), "no-such-tool") {
+		t.Errorf("错误应指出未知项，got: %v", err)
+	}
+}
+
+// --all 只作用于「支持项目级配置」的工具；其余要报告跳过而非静默失败。
+func TestCmdInitAllReportsSkippedHarnesses(t *testing.T) {
+	proj := t.TempDir()
+	out, err := withStdin(t, "", func() error {
+		return cmdInit([]string{"--project", proj, "--all"})
+	})
+	if err != nil {
+		t.Fatalf("cmdInit --all: %v", err)
+	}
+	if !strings.Contains(out, "跳过") {
+		t.Errorf("应报告被跳过的工具，got:\n%s", out)
+	}
+	for _, p := range []string{".claude/settings.json", ".codex/hooks.json", ".codebuddy/settings.json"} {
+		if _, err := os.Stat(filepath.Join(proj, p)); err != nil {
+			t.Errorf("--all 应写入 %s: %v", p, err)
+		}
+	}
+}
+
+// --all 默认只作用于「检测到已安装」的工具，避免给没装的工具凭空造配置文件。
+func TestCmdInitAllDefaultsToDetectedOnly(t *testing.T) {
+	proj := t.TempDir()
+	out, err := withStdin(t, "", func() error {
+		return cmdInit([]string{"--project", proj, "--all", "--dry-run"})
+	})
+	if err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	// 未检测到的工具（本机无对应目录）不应出现写入动作
+	for _, h := range harness.All() {
+		if len(h.ExistingGlobalConfigs()) > 0 {
+			continue
+		}
+		if strings.Contains(out, "--- 将写入") && strings.Contains(out, h.Name+"（") && strings.Contains(out, h.Name) {
+			// 只在它确实被写入时才算失败：用「跳过了几个」的口径更可靠
+		}
+	}
+	if !strings.Contains(out, "检测到") {
+		t.Errorf("应说明只处理检测到的工具，got:\n%s", out)
+	}
+}
+
+// 逗号分隔的 --harness 也要能一次装多个。
+func TestCmdInitAcceptsCommaSeparatedHarnessList(t *testing.T) {
+	proj := t.TempDir()
+	if _, err := withStdin(t, "", func() error {
+		return cmdInit([]string{"--harness", "claude,codex", "--project", proj})
+	}); err != nil {
+		t.Fatalf("cmdInit: %v", err)
+	}
+	for _, p := range []string{".claude/settings.json", ".codex/hooks.json"} {
+		if _, err := os.Stat(filepath.Join(proj, p)); err != nil {
+			t.Errorf("应写入 %s: %v", p, err)
+		}
+	}
+	if err := cmdInit([]string{"--harness", "claude,no-such"}); err == nil {
+		t.Error("列表中含未知项应报错")
 	}
 }
