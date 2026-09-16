@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -965,4 +966,108 @@ func TestCmdHookSuppressesDuplicateSessionStart(t *testing.T) {
 	}
 	// 首次若为空（无硬规则时只注入提示）也应视为已处理，这里只断言第二次为空
 	_ = first
+}
+
+// 审计回溯要能看出「什么时候、注入了什么」—— 此前只有命中条数，无法自查。
+func TestCmdAuditTailShowsTimeAndResolvedContent(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "审计回溯要能还原出这条内容"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if _, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "要能还原"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", ap})
+	}); err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdAudit([]string{"--db", db, "--audit-file", ap, "--tail", "5"})
+	})
+	if err != nil {
+		t.Fatalf("cmdAudit: %v", err)
+	}
+	if !strings.Contains(out, "审计回溯要能还原出这条内容") {
+		t.Errorf("回溯应还原出实际注入的记忆内容，got:\n%s", out)
+	}
+	// 时刻应形如 HH:MM:SS（今天的记录）
+	if !regexp.MustCompile(`\d{2}:\d{2}:\d{2}`).MatchString(out) {
+		t.Errorf("回溯应显示时间，got:\n%s", out)
+	}
+}
+
+// 写侧记录存的是 content_hash（跨设备可连接），回溯也必须能还原。
+func TestCmdAuditTailResolvesWriteRecordsByHash(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := cmdAdd([]string{"--db", db, "--project", "demo", "--audit-file", ap,
+		"写侧记录也要能还原出内容"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdAudit([]string{"--db", db, "--audit-file", ap, "--tail", "5"})
+	})
+	if err != nil {
+		t.Fatalf("cmdAudit: %v", err)
+	}
+	if !strings.Contains(out, "写侧记录也要能还原出内容") {
+		t.Errorf("写侧记录应按 content_hash 还原内容，got:\n%s", out)
+	}
+	if !strings.Contains(out, "[create]") {
+		t.Errorf("应显示写入模式，got:\n%s", out)
+	}
+}
+
+func TestCmdAuditHitsCanBeDisabled(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "不该出现在回溯里的内容"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if _, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "问句"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", ap})
+	}); err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdAudit([]string{"--db", db, "--audit-file", ap, "--tail", "5", "--hits=false"})
+	})
+	if err != nil {
+		t.Fatalf("cmdAudit: %v", err)
+	}
+	if strings.Contains(out, "不该出现在回溯里的内容") {
+		t.Errorf("--hits=false 时不应还原内容，got:\n%s", out)
+	}
+}
+
+// 被抑制的触发在回溯里要显式标出 —— 这是「配置存在重复」的证据。
+func TestCmdAuditTailMarksSuppressed(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := audit.Append(p, audit.Record{TS: time.Now().Unix(), Event: "prompt-submit", Suppressed: true}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdAudit([]string{"--audit-file", p, "--tail", "3"})
+	})
+	if err != nil {
+		t.Fatalf("cmdAudit: %v", err)
+	}
+	if !strings.Contains(out, "[已抑制]") {
+		t.Errorf("回溯应标出被抑制的触发，got:\n%s", out)
+	}
+}
+
+// store 的注释此前声称「CLI 侧会把 --scope all + --project 判为矛盾用法」，
+// 但实现里没有 —— 结果是静默忽略工程过滤。这条断言把注释与实现对齐。
+func TestCmdSearchRejectsContradictoryScopeAndProject(t *testing.T) {
+	db := testDB(t)
+	if err := cmdSearch([]string{"--db", db, "--scope", "all", "--project", "p1", "查询"}); err == nil {
+		t.Error("--scope all 与 --project 同时给出应报错，而不是静默忽略工程过滤")
+	}
+	// 不指定 --scope 时 --project 应正常生效（这是默认分支的语义，要保持可用）
+	if err := cmdSearch([]string{"--db", db, "--project", "p1", "查询"}); err != nil {
+		t.Errorf("未指定 --scope 时 --project 应可用：%v", err)
+	}
 }

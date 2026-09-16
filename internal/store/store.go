@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -598,6 +599,68 @@ func (s *Store) PruneHookDedup(before int64) error {
 	return err
 }
 
+// sortedTagKeys 固定标记的遍历顺序，保证同一组标记生成同一条 SQL（可测、可复现）。
+func sortedTagKeys(tags map[string]string) []string {
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ContentsByRefs 批量取内容，供审计回溯把「这条记录涉及哪些记忆」还原成可读文本。
+//
+// 同时按 id 与 content_hash 匹配，返回的 map **两种键都填**：
+// 读侧记录存的是本地 id，写侧记录存的是 content_hash（跨设备可连接），
+// 调用方不必关心是哪种。
+// 找不到的引用不报错（记忆可能已被删除 / 被取代），调用方按缺省处理。
+func (s *Store) ContentsByRefs(refs []string) (map[string]string, error) {
+	out := make(map[string]string, len(refs))
+	if len(refs) == 0 {
+		return out, nil
+	}
+	const batch = 200
+	for i := 0; i < len(refs); i += batch {
+		end := i + batch
+		if end > len(refs) {
+			end = len(refs)
+		}
+		chunk := refs[i:end]
+		ph := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)*2)
+		for j, r := range chunk {
+			ph[j] = "?"
+			args = append(args, r)
+		}
+		for _, r := range chunk {
+			args = append(args, r)
+		}
+		rows, err := s.db.Query(
+			`SELECT id, content_hash, content FROM memories
+			  WHERE id IN (`+strings.Join(ph, ",")+`) OR content_hash IN (`+strings.Join(ph, ",")+`)`,
+			args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id, hash, content string
+			if err := rows.Scan(&id, &hash, &content); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[id] = content
+			out[hash] = content
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
 // HashByID 取一条记忆的 content_hash。
 // 评测的金标准用哈希表达目标，因此需要按 id 反查哈希。
 func (s *Store) HashByID(id string) (string, error) {
@@ -624,8 +687,11 @@ func visibilityWhere() []string {
 // 与 SearchQuery 的分工：Search 要匹配词，List 只要「最重要 / 最近的」。
 // 会话起始注入需要的是后者 —— 那时还没有用户提问，没有关键词可用。
 type ListQuery struct {
-	Scope   string // "current" = 本工程 + 全局；"project" = 只本工程；"global" = 只要全局；其他 → 不限
+	Scope string // "current" = 本工程 + 全局；"project" = 只本工程（供钩子分段注入去重）；
+	// "global" = 只要全局；"all" = 显式跨工程（忽略 Project）；"" = Project 非空则按其过滤
 	Project string
+	Kind    string            // 限定类型，"all"/空 表示不限
+	Tags    map[string]string // 限定标记，AND 语义
 	Limit   int
 }
 
@@ -647,6 +713,24 @@ func (s *Store) List(q ListQuery) ([]Hit, error) {
 		args = append(args, q.Project)
 	case "global":
 		where = append(where, "m.project = ''")
+	case "all":
+		// 显式跨工程：忽略 Project。
+		// CLI 侧把「--scope all + --project」判为矛盾用法，免得用户以为过滤生效了。
+	case "":
+		// 未指定作用域：Project 非空即按它过滤（与 Search 的 default 分支同义）
+		if q.Project != "" {
+			where = append(where, "m.project = ?")
+			args = append(args, q.Project)
+		}
+	}
+	if q.Kind != "" && q.Kind != "all" {
+		where = append(where, "m.kind = ?")
+		args = append(args, q.Kind)
+	}
+	// 标记按 AND 语义逐个加 EXISTS，与 Search 的写法保持一致
+	for _, k := range sortedTagKeys(q.Tags) {
+		where = append(where, "EXISTS (SELECT 1 FROM tags WHERE memory_id = m.id AND key = ? AND value = ?)")
+		args = append(args, k, q.Tags[k])
 	}
 	args = append(args, q.Limit)
 

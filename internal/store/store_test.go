@@ -743,3 +743,74 @@ func TestPruneHookDedupRemovesOnlyOldRows(t *testing.T) {
 		t.Error("新鲜记录不应被清理")
 	}
 }
+
+// ---------- 列全部记忆（供 mem ls 自查） ----------
+
+func TestListFiltersByKind(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: "一条决策类内容", Kind: "decision", Project: "p1"})
+	addWith(t, s, AddInput{Content: "一条踩坑类内容", Kind: "pitfall", Project: "p1"})
+
+	all, err := s.List(ListQuery{Scope: "all", Limit: 50})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("不限类型应返回 2 条，got %d", len(all))
+	}
+	pits, err := s.List(ListQuery{Scope: "all", Kind: "pitfall", Limit: 50})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(pits) != 1 || pits[0].Kind != "pitfall" {
+		t.Errorf("按类型过滤应只剩 1 条 pitfall，got %+v", pits)
+	}
+	// "all" 视同不限 —— 避免调用方传 'all' 时静默返回空
+	if got, _ := s.List(ListQuery{Scope: "all", Kind: "all", Limit: 50}); len(got) != 2 {
+		t.Errorf("Kind=all 应视同不限，got %d 条", len(got))
+	}
+}
+
+func TestListFiltersByTagsWithAndSemantics(t *testing.T) {
+	s := newTestStore(t)
+	addWith(t, s, AddInput{Content: "带两个标记的条目", Project: "p1",
+		Tags: map[string]string{"machine": "mini", "src": "log"}})
+	addWith(t, s, AddInput{Content: "只带一个标记的条目", Project: "p1",
+		Tags: map[string]string{"machine": "mini"}})
+
+	both, err := s.List(ListQuery{Scope: "all", Tags: map[string]string{"machine": "mini", "src": "log"}, Limit: 50})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(both) != 1 {
+		t.Errorf("两个标记应 AND（只剩 1 条），got %d", len(both))
+	}
+	one, err := s.List(ListQuery{Scope: "all", Tags: map[string]string{"machine": "mini"}, Limit: 50})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(one) != 2 {
+		t.Errorf("单个标记应匹配 2 条，got %d", len(one))
+	}
+}
+
+func TestContentsByRefsRestoresAuditTargets(t *testing.T) {
+	s := newTestStore(t)
+	id1 := addWith(t, s, AddInput{Content: "审计要还原的第一条内容", Project: "p1"})
+	id2 := addWith(t, s, AddInput{Content: "审计要还原的第二条内容", Project: "p1"})
+
+	got, err := s.ContentsByRefs([]string{id1, id2, "不存在的-id"})
+	if err != nil {
+		t.Fatalf("ContentsByIDs: %v", err)
+	}
+	if got[id1] != "审计要还原的第一条内容" || got[id2] != "审计要还原的第二条内容" {
+		t.Errorf("应还原出两条内容，got %+v", got)
+	}
+	if _, ok := got["不存在的-id"]; ok {
+		t.Error("不存在的 id 不应出现在结果里（记忆可能已删）")
+	}
+	// 空入参不报错
+	if m, err := s.ContentsByRefs(nil); err != nil || len(m) != 0 {
+		t.Errorf("空入参应返回空 map 且不报错，got %v %v", m, err)
+	}
+}
