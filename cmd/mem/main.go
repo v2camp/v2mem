@@ -40,6 +40,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem budget --file <文件>          检查 Level 1 文件是否超出注入预算
   mem audit  [--stats]             审计日志：钩子激活次数、空注入率、可评测样本数
   mem eval   recall|write          评测：检索命中是否准（recall）／记录是否准（write）
+  mem report [--since 8h]          任务收尾的 mem 评测结论（读/写活动 + 空命中 + 判定）
   mem stats  [选项]                 库概览
   mem help
 
@@ -124,6 +125,8 @@ func main() {
 		err = cmdAudit(os.Args[2:])
 	case "eval":
 		err = cmdEval(os.Args[2:])
+	case "report":
+		err = cmdReport(os.Args[2:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
 		return
