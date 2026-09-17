@@ -99,10 +99,24 @@ harness = 原生记忆, 工具记忆, 宿主, 钩子宿主
 
 实现时以 `internal/store` 的 `calibrate_test.go`（`//go:build calib`）为可复跑校准基线；参数改默认值前先重跑覆盖。
 
+### 5.5 命令参考（`mem lexicon init`）
+
+```text
+mem lexicon init --project <X> [--terms "词A,词B"]   # 主路径：真实查询词，精度高（校准即此路径）
+                 [--auto] [--min-freq N]            # 实验性：从记忆正文提 bigram 作候选，须跨 ≥2 条记忆
+                 [--threshold F] [--k N]            # 默认 θ=0.5、k=8（§5.4；阈值上限 0.5）
+                 [--out <path>]                     # 默认 <库目录>/synonyms.txt
+                 [--dry-run]                        # 只预览聚簇与复核清单，不写文件
+```
+
+- 候选词二选一：`--terms`（用户在 `gold/audit` 或手工给出的真实查询词）或 `--auto`（bigram 提取，跨 ≥2 条不同记忆才保留）。
+- 泛词护栏：库内记忆 ≥20 条时启用，命中记忆 > 库总量 30% 的候选不参与配对。
+- 输出：把聚簇里「已存在的别名」去重后追加到 `synonyms.txt` 的 `[<project>]` 段；`[0.40, θ)` 区间的词对列入复核清单而**不强采纳**。
+
 ## 6. 落地分期
 
 - **一期（已完成）**：`synonyms.txt` 解析 + 查询期展开 + `MEM_SYN_DICT` 开关 + `--explain` 诊断 + 检索集成 + 测试。
-- **二期（本设计，参数已校准）**：`mem lexicon init --scan` 提取管线（Step A-D，用 §5.4 默认值）+ agent 复核清单 + 僵尸清理。
+- **二期（本设计，参数已校准）**：`mem lexicon init --project <X>` 提取管线（Step A-D，用 §5.4 默认值）+ agent 复核清单 + 僵尸清理。
 
 ## 7. 测试与验收
 

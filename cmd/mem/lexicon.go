@@ -42,7 +42,7 @@ func cmdLexicon(args []string) error {
 	if len(args) >= 1 && args[0] == "init" {
 		return cmdLexiconInit(args[1:])
 	}
-	return errors.New("用法: mem lexicon init --scan --project <X>（从该工程记忆提取同义词写入 synonyms.txt）")
+	return errors.New("用法: mem lexicon init --project <X> [--terms \"词A,词B\"|--auto]（从该工程记忆提取同义词写入 synonyms.txt）")
 }
 
 func cmdLexiconInit(args []string) error {
