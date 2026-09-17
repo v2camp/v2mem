@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -257,6 +258,7 @@ func cmdEvalRecall(args []string) error {
 	fs := flag.NewFlagSet("eval recall", flag.ContinueOnError)
 	c.register(fs)
 	goldPath := fs.String("gold", "", "金标准 JSONL（每行 {\"query\":..,\"gold\":[\"<hash前缀>\"..]}）")
+	goldDir := fs.String("gold-dir", "", "金标准目录：合并同一目录下所有 *.gold.jsonl 为一份金标准（与 --gold 二选一）")
 	auto := &optionalInt{def: defaultAutoSample}
 	fs.Var(auto, "auto", fmt.Sprintf("免标注自召回下限测试：抽样 N 条记忆当金标准（裸用取默认 %d）", defaultAutoSample))
 	k := fs.Int("k", defaultEvalK, "top-k")
@@ -277,15 +279,19 @@ func cmdEvalRecall(args []string) error {
 	if *k <= 0 {
 		return fmt.Errorf("--k 应为正数，got %d", *k)
 	}
-	if *goldPath == "" && !auto.set {
-		return errors.New("需要 --gold <文件> 或 --auto [N]（真实评测请用 --gold）。\n" +
+	if *goldPath == "" && *goldDir == "" && !auto.set {
+		return errors.New("需要 --gold <文件>、--gold-dir <目录> 或 --auto [N]（真实评测请用 --gold/--gold-dir）。\n" +
 			"最短可用：\n" +
 			"  mem eval recall --auto           # 免标注下限自查（默认抽样 20 条）\n" +
 			"  mem eval recall --auto=50        # 指定抽样条数\n" +
-			"  mem eval recall --gold <文件>    # 真实金标准评测")
+			"  mem eval recall --gold <文件>    # 真实金标准评测（单文件）\n" +
+			"  mem eval recall --gold-dir <目录> # 真实金标准评测（合并目录下全部 *.gold.jsonl）")
 	}
-	if *goldPath != "" && auto.set {
-		return errors.New("--gold 与 --auto 不可同时使用")
+	if *goldPath != "" && *goldDir != "" {
+		return errors.New("--gold 与 --gold-dir 不可同时使用（--gold-dir 已合并目录下全部 *.gold.jsonl）")
+	}
+	if (*goldPath != "" || *goldDir != "") && auto.set {
+		return errors.New("--gold/--gold-dir 与 --auto 不可同时使用")
 	}
 
 	st, err := store.Open(c.db)
@@ -300,15 +306,44 @@ func cmdEvalRecall(args []string) error {
 		}
 		return runAutoRecall(st, c, auto.value, *k, *project)
 	}
-	return runGoldRecall(st, c, *goldPath, *k)
-}
-
-// runGoldRecall 跑真实金标准。这是**唯一能支撑「替换」决策**的指标来源。
-func runGoldRecall(st *store.Store, c common, goldPath string, k int) error {
-	cases, err := eval.LoadGold(goldPath)
+	if *goldDir != "" {
+		cases, err := loadGoldDir(*goldDir)
+		if err != nil {
+			return err
+		}
+		return runGoldRecall(st, c, cases, *goldDir, *k)
+	}
+	// 回退现有 --gold（单文件）。
+	cases, err := eval.LoadGold(*goldPath)
 	if err != nil {
 		return err
 	}
+	return runGoldRecall(st, c, cases, *goldPath, *k)
+}
+
+// loadGoldDir 读取同一目录下所有 *.gold.jsonl 并合并为一份金标准。
+// 目录下没有任何 *.gold.jsonl 时显式报错（空金标准不是合法输入）。
+func loadGoldDir(dir string) ([]eval.GoldCase, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.gold.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("%s 下没有 *.gold.jsonl（金标准目录为空）", dir)
+	}
+	var out []eval.GoldCase
+	for _, p := range matches {
+		cases, err := eval.LoadGold(p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cases...)
+	}
+	return out, nil
+}
+
+// runGoldRecall 跑真实金标准。这是**唯一能支撑「替换」决策**的指标来源。
+func runGoldRecall(st *store.Store, c common, cases []eval.GoldCase, label string, k int) error {
 	known, err := allHashes(st)
 	if err != nil {
 		return err
@@ -330,7 +365,7 @@ func runGoldRecall(st *store.Store, c common, goldPath string, k int) error {
 	rep := eval.Score(valid, retrieved, k)
 
 	if c.json {
-		return printJSON(map[string]any{"report": rep, "invalid": invalid, "gold_file": goldPath})
+		return printJSON(map[string]any{"report": rep, "invalid": invalid, "gold_file": label})
 	}
 	printRecallReport(rep)
 	if len(invalid) > 0 {
@@ -678,7 +713,7 @@ func cmdEvalActivity(args []string) error {
 			"audit_file": p, "exists": true,
 			"scope": *scope, "since": *since, "project": *project, "session": *session,
 			"include_bench": *includeBench,
-			"summary": s, "verdict": activityVerdict(s), "empty_queries": emptyQueries(rs, *topN),
+			"summary":       s, "verdict": activityVerdict(s), "empty_queries": emptyQueries(rs, *topN),
 		})
 	}
 
