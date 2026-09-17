@@ -42,6 +42,12 @@ func backupBeforeMutating(dbPath string, noBackup bool, backupDir string) (strin
 		dir = filepath.Join(filepath.Dir(path), "backup")
 	}
 	dest := filepath.Join(dir, fmt.Sprintf("mem-%s.db", time.Now().Format("20060102-150405")))
+	for i := 2; ; i++ { // 同秒内多次破坏性操作（gc→consolidate）会撞名；VACUUM INTO 拒绝覆盖
+		if _, err := os.Stat(dest); os.IsNotExist(err) {
+			break
+		}
+		dest = filepath.Join(dir, fmt.Sprintf("mem-%s-%d.db", time.Now().Format("20060102-150405"), i))
+	}
 	if err := st.Backup(dest); err != nil {
 		return "", err
 	}
