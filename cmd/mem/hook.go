@@ -226,6 +226,42 @@ func renderHookContext(c common, event harness.Event, project, prompt string, li
 	return "", nil
 }
 
+// notesEnabled 由 MEM_NO_NOTES 控制：置位时读侧回到「仅 v2mem 原始注入」，
+// 不做 notes 小字条去重。未置位（默认）则启用去重。
+func notesEnabled() bool {
+	return strings.TrimSpace(os.Getenv("MEM_NO_NOTES")) == ""
+}
+
+// filterRulesCoveredByNotes 去掉已被 notes 小字条覆盖的规则类细节条。
+//
+// 注入分工：硬规则的红线内容以小字条形式（mem notes）从库外单独提供给模型，
+// 若再把同一条规则塞进每轮的检索/硬规则注入里，同一知识会在上下文重复出现，
+// 白占预算。故对规则条的注入做一次过滤 —— 内容已在 notes 里的就不再重复注入。
+//
+// 失败开放：notes 读不出来时判不了「是否被覆盖」，宁可多注入也不漏 ——
+// 与钩子「绝不漏注入」的同一条原则。MEM_NO_NOTES 置位时这里原样返回。
+func filterRulesCoveredByNotes(st *store.Store, hits []store.Hit) []store.Hit {
+	if !notesEnabled() {
+		return hits
+	}
+	covered := map[string]bool{}
+	rules, err := collectRules(st)
+	if err != nil {
+		return hits
+	}
+	for _, r := range rules {
+		covered[oneLine(r.Content)] = true
+	}
+	out := hits[:0]
+	for _, h := range hits {
+		if h.Kind == "rule" && covered[oneLine(h.Content)] {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 // sessionStartContext 注入「硬规则 + 本工程记忆 + 用法」。
 //
 // 顺序有讲究：跨工程硬规则在前（通常是红线，且对所有工程生效），
@@ -246,7 +282,8 @@ func sessionStartContext(st *store.Store, project string, limit, maxChars int) (
 	var injected []store.Hit
 
 	// 跨工程硬规则
-	if hits, err := st.List(store.ListQuery{Scope: "global", Limit: limit}); err == nil && len(hits) > 0 {
+	if raw, err := st.List(store.ListQuery{Scope: "global", Limit: limit}); err == nil && len(raw) > 0 {
+		hits := filterRulesCoveredByNotes(st, raw)
 		if block, used := formatHits("硬规则（跨工程，务必遵守）", hits, budget); block != "" {
 			sb.WriteString(block)
 			budget -= used
@@ -294,6 +331,10 @@ func promptSubmitContext(st *store.Store, project, prompt string, limit, maxChar
 		Limit:   limit,
 	})
 	if err != nil || len(hits) == 0 {
+		return "", nil
+	}
+	hits = filterRulesCoveredByNotes(st, hits)
+	if len(hits) == 0 {
 		return "", nil
 	}
 	head := "[v2mem] 相关历史记忆（若与当前代码冲突，以代码为准）：\n"
