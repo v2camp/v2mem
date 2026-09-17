@@ -869,6 +869,91 @@ func TestSyncMergeSkipsEmptyContent(t *testing.T) {
 	}
 }
 
+// 远端导出里的取代关系经 SyncMerge 后应在本地重建为本地 id。
+func TestSyncMergeResolvesSupersession(t *testing.T) {
+	remote := newTestStore(t)
+	addWith(t, remote, AddInput{Content: simBase, Project: "p1", Salience: 0.9})
+	addWith(t, remote, AddInput{Content: simVariant, Project: "p1", Salience: 0.3})
+	if _, err := remote.Consolidate(0.7); err != nil {
+		t.Fatalf("Consolidate: %v", err)
+	}
+	recs := exportOf(t, remote)
+
+	local := newTestStore(t)
+	res, err := local.SyncMerge(recs)
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if res.Unresolved != 0 {
+		t.Errorf("存活者与被取代者都在文件里，不应有未解析引用，got %+v", res)
+	}
+	view := supersessionView(t, local)
+	if got := view[HashOf(simVariant)+"\x00p1"]; got != HashOf(simBase)+"\x00p1" {
+		t.Errorf("导入后取代指针应指向存活者身份键，got %q", got)
+	}
+}
+
+// 存活者缺失时引用无法解析：SyncMerge 必须计数上报，不写悬挂 id。
+func TestSyncMergeReportsUnresolvedSupersession(t *testing.T) {
+	remote := newTestStore(t)
+	addWith(t, remote, AddInput{Content: simBase, Project: "p1", Salience: 0.9})
+	dup := addWith(t, remote, AddInput{Content: simVariant, Project: "p1", Salience: 0.3})
+	if _, err := remote.Consolidate(0.7); err != nil {
+		t.Fatalf("Consolidate: %v", err)
+	}
+	recs := exportOf(t, remote)
+	var partial []ExportRecord
+	for _, r := range recs {
+		if r.ID == dup {
+			partial = append(partial, r)
+		}
+	}
+	if len(partial) != 1 {
+		t.Fatalf("应只剩被取代者 1 条，got %d", len(partial))
+	}
+
+	local := newTestStore(t)
+	res, err := local.SyncMerge(partial)
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if res.Unresolved != 1 {
+		t.Errorf("存活者缺失应报 1 条未解析，got %+v", res)
+	}
+	var sup *string
+	if err := local.db.QueryRow(`SELECT superseded_by FROM memories WHERE content_hash = ?`, HashOf(simVariant)).Scan(&sup); err != nil {
+		t.Fatalf("查询: %v", err)
+	}
+	if sup != nil {
+		t.Errorf("未解析引用不得写入，got %v", *sup)
+	}
+}
+
+// 远端导出缺 content_hash / kind 时，SyncMerge 应回退到本地归一化计算与默认 fact。
+func TestSyncMergeFallsBackMissingHashAndKind(t *testing.T) {
+	local := newTestStore(t)
+	rec := mkRec("缺hash与kind的事实", "", 900, "dev-far")
+	rec.ContentHash = "" // 手工编辑的导出可能漏了身份键
+	rec.Kind = ""
+
+	stats, err := local.SyncMerge([]ExportRecord{rec})
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if stats.Inserted != 1 {
+		t.Fatalf("应插入 1 条（用本地归一化回填 hash/kind），got %+v", stats)
+	}
+	var kind string
+	h := HashOf("缺hash与kind的事实")
+	if err := local.db.QueryRow(
+		`SELECT kind FROM memories WHERE content_hash = ?`, h).Scan(&kind); err != nil {
+		t.Fatalf("查询回填后的记录: %v", err)
+	}
+	if kind != "fact" {
+		t.Errorf("缺 kind 时应回填默认 fact，got %q", kind)
+	}
+}
+
 // 双向同步后两侧的事实投影应收敛（各自独有并入对方，共享事实一致）。
 //
 // 注意：只比「事实投影」，不比 tags——
