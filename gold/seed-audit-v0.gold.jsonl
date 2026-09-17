@@ -1,0 +1,6 @@
+{"query":"AGENTS.md 为什么每轮注入","gold":["92d57c40","c1f35338"]}
+{"query":"日志怎么搬进记忆库","gold":["ae31d2ae"]}
+{"query":"v2mem 的钩子会不会阻断会话","gold":["52f40c4c"]}
+{"query":"检索召回有问题吗","gold":["7ed77090","74b74870"]}
+{"query":"记忆库 数据","gold":["2ed087f6"]}
+{"query":"写侧审计","gold":["c67ba35d","48dc83dd","5fb235c5"]}
