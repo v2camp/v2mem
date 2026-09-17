@@ -1,0 +1,31 @@
+name: release
+on:
+  push:
+    branches: [ main ]
+permissions:
+  contents: write
+jobs:
+  gate-and-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要全部提交与 tag，供版本推导与 conventional commits 判断
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: cover gate
+        run: make cover-gate
+      - name: eval gate (recall5_min 不达标 → 本步失败 → 跳过打 tag)
+        run: |
+          make eval-gate || { echo "::error::recall5 未达 eval-policy.txt 门槛，拒绝发版"; exit 1; }
+      - name: derive next version
+        id: ver
+        run: echo "tag=$(bash scripts/derive-version.sh --repo . --last $(git describe --tags --abbrev=0 2>/dev/null || echo v0.1.0))" >> "$GITHUB_OUTPUT"
+      - name: tag & push
+        run: |
+          git config user.email "ci@v2mem"
+          git config user.name "v2mem-ci"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+          echo "打 tag ${{ steps.ver.outputs.tag }}"
