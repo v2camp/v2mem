@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/wanghui/v2mem/internal/similarity"
 	_ "modernc.org/sqlite"
 )
 
@@ -77,12 +79,51 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("建表失败: %w", err)
 	}
-	return &Store{db: db, path: path}, nil
+	// source 列是后加的：既有库没有该列，幂等补齐（ALTER 已存在列会报错，先探测）。
+	if err := ensureColumn(db, "memories", "source", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 source 列失败: %w", err)
+	}
+	st := &Store{db: db, path: path}
+	if err := st.backfillSigs(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("补齐 MinHash 签名失败: %w", err)
+	}
+	return st, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) Path() string { return s.path }
+
+// ensureColumn 幂等地给表补列：列已存在则不动，否则 ALTER 加上。
+// 用途：后加的列（如 source）不能影响既有库的打开。
+func ensureColumn(db *sql.DB, table, column, ddl string) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, ddl))
+	if err != nil {
+		return err
+	}
+	// 补列成功后补索引；列已存在时走索引创建也无妨（IF NOT EXISTS 幂等）。
+	_, err = db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS ix_mem_source ON memories(source)"))
+	return err
+}
 
 // ---------- 归一化与哈希 ----------
 
@@ -212,6 +253,60 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// ---------- M5b-0 模糊检索：MinHash 签名 ----------
+//
+// 检索侧用与 consolidate 同一套签名（字符 3-gram + MinHash）估计查询与记忆的
+// Jaccard，找回「措辞不同但说同一件事」的候选，再与 BM25 结果做 RRF 融合
+// （DESIGN.md §13.4）。签名必须跨进程可复现，故用定长小端编码存储。
+
+func encodeSig(sig similarity.Signature) []byte {
+	out := make([]byte, 8*len(sig))
+	for i, v := range sig {
+		binary.LittleEndian.PutUint64(out[i*8:], v)
+	}
+	return out
+}
+
+func decodeSig(b []byte) similarity.Signature {
+	sig := make(similarity.Signature, len(b)/8)
+	for i := range sig {
+		sig[i] = binary.LittleEndian.Uint64(b[i*8:])
+	}
+	return sig
+}
+
+// backfillSigs 给缺签名的记忆补齐签名。Add 已写签名，这里覆盖的是
+// import 直插等绕开 Add 的路径；首次 Open 后不再有缺失行，开销归零。
+func (s *Store) backfillSigs() error {
+	rows, err := s.db.Query(
+		`SELECT m.id, m.content FROM memories m
+		  WHERE NOT EXISTS (SELECT 1 FROM mem_sigs ms WHERE ms.memory_id = m.id)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type missing struct{ id, content string }
+	var list []missing
+	for rows.Next() {
+		var x missing
+		if err := rows.Scan(&x.id, &x.content); err != nil {
+			return err
+		}
+		list = append(list, x)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, x := range list {
+		if _, err := s.db.Exec(
+			`INSERT OR IGNORE INTO mem_sigs(memory_id, sig) VALUES (?, ?)`,
+			x.id, encodeSig(similarity.Sign(x.content))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ---------- 写入 ----------
 
 // AddInput 是写入一条记忆的参数。
@@ -221,6 +316,7 @@ type AddInput struct {
 	Project  string            // 工程标记
 	Tool     string            // claude-code|workbuddy|cursor|cli
 	Device   string            // 来源设备，默认取 hostname
+	Source   string            // human|llm|ingest|harness-summary|bench|test（写侧治理；空回填 human）
 	Tags     map[string]string // 多机/多工具/多工程标记
 	Salience float64           // 重要性 0..1
 	TTL      time.Duration     // 硬过期，0 表示不过期
@@ -247,6 +343,10 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	}
 	if in.Device == "" {
 		in.Device, _ = os.Hostname()
+	}
+	// 写侧治理：来源无标记时回填 human（兼容 CLI 直调），保证统计可归类。
+	if in.Source == "" {
+		in.Source = "human"
 	}
 
 	h := HashOf(in.Content)
@@ -275,9 +375,9 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 		if _, err = tx.Exec(
 			`UPDATE memories SET content = ?, content_idx = ?, updated_at = ?, last_seen_at = ?,
 			        access_count = access_count + 1, salience = MAX(salience, ?),
-			        expires_at = ?, origin_tool = ?
+			        expires_at = ?, origin_tool = ?, source = ?
 			 WHERE id = ?`,
-			in.Content, idx, now, now, in.Salience, expires, in.Tool, id,
+			in.Content, idx, now, now, in.Salience, expires, in.Tool, in.Source, id,
 		); err != nil {
 			return nil, err
 		}
@@ -288,10 +388,10 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 			`INSERT INTO memories
 			   (id, content, content_idx, kind, content_hash, project, salience,
 			    created_at, updated_at, last_seen_at, expires_at,
-			    origin_device, origin_tool, access_count)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
+			    origin_device, origin_tool, source, access_count)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
 			id, in.Content, idx, in.Kind, h, in.Project, in.Salience,
-			now, now, now, expires, in.Device, in.Tool,
+			now, now, now, expires, in.Device, in.Tool, in.Source,
 		); err != nil {
 			return nil, err
 		}
@@ -305,6 +405,14 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 		); err != nil {
 			return nil, err
 		}
+	}
+
+	// M5b-0：签名与内容同事务写入（覆盖分支也随新内容更新）。
+	if _, err = tx.Exec(
+		`INSERT OR REPLACE INTO mem_sigs(memory_id, sig) VALUES (?, ?)`,
+		id, encodeSig(similarity.Sign(in.Content)),
+	); err != nil {
+		return nil, err
 	}
 
 	if err = tx.Commit(); err != nil {
@@ -324,7 +432,9 @@ type SearchQuery struct {
 	Scope   string            // ""|"all" 不限工程；"current" = 当前工程 + 全局（project 为空）；"global" = 只要全局
 	// NoBroadFallback 关闭「精确无命中时退化为全 OR」的行为（调试/对照用）
 	NoBroadFallback bool
-	Limit           int
+	// NoFuzzy 关闭模糊检索（MinHash + RRF 融合，调试/对照用）。默认开启。
+	NoFuzzy bool
+	Limit   int
 }
 
 // Hit 是一条检索结果。
@@ -335,10 +445,15 @@ type Hit struct {
 	Project   string  `json:"project"`
 	Salience  float64 `json:"salience"`
 	UpdatedAt int64   `json:"updated_at"`
-	Rank      float64 `json:"rank"` // bm25，越小越相关
+	// Rank 是排序分：单路（无模糊检索）时为 bm25（越小越相关）；
+	// 融合后为 RRF 名次（1 起，越小越相关）。语义方向始终一致。
+	Rank float64 `json:"rank"`
 }
 
-// Search 走 FTS5 全文检索。已过期的记忆自动排除。
+// Search 走 FTS5 全文检索，并叠加模糊检索融合（M5b-0）。已过期的记忆自动排除。
+//
+// 管线：精确表达式（bm25）与模糊候选（MinHash 签名估计 Jaccard）做 RRF 融合，
+// 结果为空才退化为「全 OR + bm25」（精确优先、空手才放宽，§15.5）。
 // bm25 返回负值，ORDER BY rank ASC 即「最相关在前」。
 func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 	q.Query = strings.TrimSpace(q.Query)
@@ -354,30 +469,53 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 	}
 	now := time.Now().Unix()
 
-	hits, err := s.searchWith(expr, q, now)
+	precise, err := s.searchWith(expr, q, now)
 	if err != nil {
 		return nil, err
 	}
+	// M5b-0：查询足够长时才做模糊匹配——短查询的 Jaccard 估计方差不可接受。
+	// 模糊候选与精确结果融合：精确命中时也不放弃「措辞不同但相似」的召回。
+	var fuzzy []Hit
+	if !q.NoFuzzy && similarity.EnoughShingles(q.Query) {
+		if fuzzy, err = s.fuzzySearch(q, now); err != nil {
+			return nil, err
+		}
+	}
+	hits := capLimit(rrfFuse(precise, fuzzy), q.Limit)
+
 	// 精确表达式无命中时退化为「全 OR + bm25 排序」。
 	//
 	// 为什么必须退化：自然语言长问句没有空格，会被当成**一个词组**，
 	// 而词组内是 AND —— 要求全部 bigram 都出现在同一条记忆里，对真实提问过严。
 	// 实测「日志怎么搬进记忆库」命中 0 条，而「日志 记忆库」命中 3 条。
 	// 退化保留精度优先（先试精确），只在完全空手时才放宽。
+	// 退化结果同样与模糊候选融合（模糊候选总能被 broad 召回，融合负责排序）。
 	if len(hits) == 0 && !q.NoBroadFallback {
 		if broad := queryExprBroad(q.Query); broad != "" && broad != expr {
 			broad = "(" + broad + ")"
-			return s.searchWith(broad, q, now)
+			b, err := s.searchWith(broad, q, now)
+			if err != nil {
+				return nil, err
+			}
+			hits = capLimit(rrfFuse(b, fuzzy), q.Limit)
 		}
 	}
 	return hits, nil
 }
 
-// searchWith 用给定表达式执行一次检索。
-func (s *Store) searchWith(expr string, q SearchQuery, now int64) ([]Hit, error) {
-	// 可见性判据与 List 共用同一函数，避免两处各写一遍后漂移
-	where := append([]string{"fts_mem MATCH ?"}, visibilityWhere()...)
-	args := []any{expr, now}
+func capLimit(hits []Hit, n int) []Hit {
+	if len(hits) > n {
+		return hits[:n]
+	}
+	return hits
+}
+
+// searchWhereParts 构造 Search / fuzzySearch 共用的过滤片段与参数。
+// 注意：不含 MATCH 表达式与 LIMIT；两路检索共用同一套可见性/作用域判据，
+// 保证模糊候选不会泄漏过滤范围之外的记忆。
+func searchWhereParts(q SearchQuery, now int64) ([]string, []any) {
+	where := visibilityWhere()
+	args := []any{now}
 
 	// 作用域用显式 switch：写成一串布尔判断时「all + 非空 Project」
 	// 会落进 Project 分支，使 --scope all 静默失效。
@@ -406,6 +544,14 @@ func (s *Store) searchWith(expr string, q SearchQuery, now int64) ([]Hit, error)
 		where = append(where, "EXISTS (SELECT 1 FROM tags WHERE memory_id = m.id AND key = ? AND value = ?)")
 		args = append(args, k, v)
 	}
+	return where, args
+}
+
+// searchWith 用给定表达式执行一次检索。
+func (s *Store) searchWith(expr string, q SearchQuery, now int64) ([]Hit, error) {
+	parts, filterArgs := searchWhereParts(q, now)
+	where := append([]string{"fts_mem MATCH ?"}, parts...)
+	args := append([]any{expr}, filterArgs...)
 	args = append(args, q.Limit)
 
 	rows, err := s.db.Query(
@@ -430,6 +576,112 @@ func (s *Store) searchWith(expr string, q SearchQuery, now int64) ([]Hit, error)
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// fuzzyFloor 是模糊候选的 Jaccard 下限。
+// 归并（0.7）针对近重复；检索要的是「措辞不同但说同一件事」，放低到 0.4。
+// 阈值只影响召回宽度，精度由 RRF 融合与名次权重兜底（起点值，待实测校准）。
+const fuzzyFloor = 0.4
+
+// fuzzyCandidateCap 是送入 RRF 的模糊候选上限：候选过多会让低相关噪声淹没融合。
+const fuzzyCandidateCap = 40
+
+// fuzzySearch 用 MinHash 签名找回「措辞不同但相似」的记忆。
+//
+// 与 BM25 的差异：BM25 要求词项交集，签名估计字符 3-gram 的 Jaccard——
+// 插字、删字、改序仍保留相当比例的 3-gram，而 bigram 精确匹配会失败。
+// 候选按相似度降序返回（Rank 字段暂存相似度），供 rrfFuse 只按名次融合。
+func (s *Store) fuzzySearch(q SearchQuery, now int64) ([]Hit, error) {
+	parts, filterArgs := searchWhereParts(q, now)
+	rows, err := s.db.Query(
+		`SELECT m.id, m.content, m.kind, m.project, m.salience, m.updated_at, ms.sig
+		   FROM mem_sigs ms
+		   JOIN memories m ON m.id = ms.memory_id
+		  WHERE `+strings.Join(parts, " AND "), filterArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	qsig := similarity.Sign(q.Query)
+	var cands []Hit
+	for rows.Next() {
+		var h Hit
+		var sig []byte
+		if err := rows.Scan(&h.ID, &h.Content, &h.Kind, &h.Project, &h.Salience, &h.UpdatedAt, &sig); err != nil {
+			return nil, err
+		}
+		if len(sig) == 0 {
+			continue
+		}
+		sim := similarity.Estimate(qsig, decodeSig(sig))
+		if sim < fuzzyFloor {
+			continue
+		}
+		h.Rank = sim
+		cands = append(cands, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 相似度降序；同分按 id 升序，保证可复现
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].Rank != cands[j].Rank {
+			return cands[i].Rank > cands[j].Rank
+		}
+		return cands[i].ID < cands[j].ID
+	})
+	if len(cands) > fuzzyCandidateCap {
+		cands = cands[:fuzzyCandidateCap]
+	}
+	return cands, nil
+}
+
+// rrfK 是 RRF 的分母常数（k + rank）。取 60 是通行做法：对名次差异不敏感，
+// 两路都出现的文档显著领先只出现在单路的文档。
+const rrfK = 60
+
+// rrfFuse 用倒数排名融合多路检索结果（Reciprocal Rank Fusion）。
+// 只依赖名次不依赖分数，因此 bm25 与 Jaccard 可以同场排序。
+// 输出按融合分降序；同分按「出现的路数多者先、先见顺序先」破平，完全确定。
+// 融合后 Rank 字段改写为名次（1 起，越小越相关）。
+func rrfFuse(lists ...[]Hit) []Hit {
+	type entry struct {
+		hit   Hit
+		score float64
+		first int
+		seen  int
+	}
+	idx := map[string]*entry{}
+	var order []*entry
+	for _, list := range lists {
+		for i, h := range list {
+			e, ok := idx[h.ID]
+			if !ok {
+				e = &entry{hit: h, first: len(order)}
+				idx[h.ID] = e
+				order = append(order, e)
+			}
+			e.score += 1 / float64(rrfK+i+1)
+			e.seen++
+		}
+	}
+	sort.Slice(order, func(i, j int) bool {
+		a, b := order[i], order[j]
+		if a.score != b.score {
+			return a.score > b.score
+		}
+		if a.seen != b.seen {
+			return a.seen > b.seen
+		}
+		return a.first < b.first
+	})
+	out := make([]Hit, len(order))
+	for i, e := range order {
+		e.hit.Rank = float64(i + 1)
+		out[i] = e.hit
+	}
+	return out
 }
 
 // ---------- 生命周期：命中反馈 / 淘汰 / 删除 ----------

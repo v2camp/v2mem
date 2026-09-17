@@ -293,3 +293,68 @@ func TestInstructionScopeStillWorksAsFallback(t *testing.T) {
 		}
 	}
 }
+
+// ---------- 基础访问器（此前 0% 覆盖，随覆盖率基线补齐） ----------
+
+func TestLabelOrNamePrefersLabelAndFallsBackToName(t *testing.T) {
+	withLabel := &Harness{Name: "claude", Label: "Claude Code"}
+	if got := withLabel.LabelOrName(); got != "Claude Code" {
+		t.Errorf("LabelOrName() = %q，期望展示名 %q", got, "Claude Code")
+	}
+	// Label 缺失时必须回退到 Name —— 否则界面会打印出空白项，用户无从选择
+	bare := &Harness{Name: "claude"}
+	if got := bare.LabelOrName(); got != "claude" {
+		t.Errorf("无 Label 时 LabelOrName() = %q，期望回退到 Name", got)
+	}
+}
+
+// ExistingGlobalConfigs 决定「本机是否装了该工具」的判定，因此
+// 必须只保留父目录确实存在的候选；把不存在的路径算作已安装会误导用户。
+func TestExistingGlobalConfigsKeepsOnlyExistingParentDirs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".present"), 0o755); err != nil {
+		t.Fatalf("造目录: %v", err)
+	}
+
+	h := &Harness{
+		Name: "probe",
+		GlobalConfig: []string{
+			"~/.present/settings.json", // 父目录存在 → 保留
+			"~/.absent/hooks.json",     // 父目录不存在 → 丢弃
+			"/abs/absent/config.json",  // 绝对路径且父目录不存在 → 丢弃
+		},
+	}
+	got := h.ExistingGlobalConfigs()
+	if len(got) != 1 {
+		t.Fatalf("应只保留 1 个父目录已存在的候选，got %d: %v", len(got), got)
+	}
+	want := filepath.Join(home, ".present", "settings.json")
+	if got[0] != want {
+		t.Errorf("got %q，期望 %q", got[0], want)
+	}
+
+	// 无候选时返回空切片，不 panic
+	if empty := (&Harness{Name: "none"}).ExistingGlobalConfigs(); len(empty) != 0 {
+		t.Errorf("无候选应返回空，got %v", empty)
+	}
+}
+
+// 只展开裸 ~ 与 ~/ 前缀；其余形式（~user/x、相对路径、绝对路径）原样返回。
+func TestExpandHomeForms(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	cases := map[string]string{
+		"~":               home,
+		"~/a/b.json":      filepath.Join(home, "a", "b.json"),
+		"/etc/hosts":      "/etc/hosts",
+		"relative/x.json": "relative/x.json",
+		"~user/x":         "~user/x",
+	}
+	for in, want := range cases {
+		if got := ExpandHome(in); got != want {
+			t.Errorf("ExpandHome(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}

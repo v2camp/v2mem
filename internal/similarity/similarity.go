@@ -103,6 +103,13 @@ func Sign(text string) Signature {
 	return sig
 }
 
+// EnoughShingles 报告文本的 shingle 数是否达到统计推断的下限。
+// 检索侧用它决定是否值得做模糊匹配：shingle 太少时 Jaccard 估计方差不可接受
+// （与归并护栏 minShingles 同一判据，避免短查询被噪声淹没）。
+func EnoughShingles(text string) bool {
+	return len(Shingles(text)) >= minShingles
+}
+
 // Estimate 由两条签名估计 Jaccard 相似度，落在 [0,1]。
 func Estimate(a, b Signature) float64 {
 	if len(a) == 0 || len(b) == 0 {

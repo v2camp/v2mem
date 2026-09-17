@@ -562,12 +562,16 @@ func TestSearchFindsLongNaturalLanguageQuestion(t *testing.T) {
 	}
 }
 
-// 退化只在空手时发生：精确有结果时不得放宽（否则精度会悄悄下降）。
+// 退化只在空手时发生：精确有结果时不得放宽到 broad（否则精度会悄悄下降）。
 //
 // 构造要点：AND 只作用在**同一段连续汉字**内（词组内），词组之间是 OR。
 // 所以要让「精确能中、放宽会多中」，必须用**单段无空格的长查询**，
 // 让那些 bigram 的 AND 恰好只被一条记忆满足。
-func TestSearchDoesNotBroadenWhenExactMatches(t *testing.T) {
+//
+// M5b-0 之后契约更新：模糊融合（MinHash + RRF）可以把「措辞不同但相似」的
+// 候选作为**排在后位**的补充带进结果，但不得超越精确命中的条目——
+// 精度优先的判据从「禁止出现」变为「禁止越位」，由 RRF 的双路加权保证。
+func TestSearchFuzzyDoesNotOutrankExactMatches(t *testing.T) {
 	s := newTestStore(t)
 	// A 含完整 bigram 链（记忆/忆库/库不/不能/能放/放同/同步/步目/目录）
 	addWith(t, s, AddInput{Content: "记忆库不能放同步目录", Project: "p1"})
@@ -581,10 +585,8 @@ func TestSearchDoesNotBroadenWhenExactMatches(t *testing.T) {
 	if len(hits) == 0 {
 		t.Fatal("精确表达式本应命中 A")
 	}
-	for _, h := range hits {
-		if h.Content == "不能放同步目录" {
-			t.Errorf("精确有命中时不得放宽，否则会带出只共享部分 bigram 的 B：%q", h.Content)
-		}
+	if hits[0].Content != "记忆库不能放同步目录" {
+		t.Errorf("精确命中必须保持最前，got %q", hits[0].Content)
 	}
 }
 
@@ -812,5 +814,94 @@ func TestContentsByRefsRestoresAuditTargets(t *testing.T) {
 	// 空入参不报错
 	if m, err := s.ContentsByRefs(nil); err != nil || len(m) != 0 {
 		t.Errorf("空入参应返回空 map 且不报错，got %v %v", m, err)
+	}
+}
+
+// ---------- 基础访问器（此前 0% 覆盖，随覆盖率基线补齐） ----------
+
+// 数据与代码分离是本项目的硬规则：默认库必须落在 $HOME/.v2mem。
+// 若哪天有人把它改成「当前目录」，一次 git clean 就能把全部记忆带走。
+func TestDefaultPathLivesUnderHomeNotCodeDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	got := DefaultPath()
+	want := filepath.Join(home, ".v2mem", "mem.db")
+	if got != want {
+		t.Errorf("DefaultPath() = %q，期望 %q", got, want)
+	}
+	if !strings.HasPrefix(got, home) {
+		t.Errorf("默认库必须位于 $HOME 之下，got %q", got)
+	}
+	if filepath.Dir(got) == "." {
+		t.Errorf("默认库不得落在相对路径上，got %q", got)
+	}
+}
+
+func TestPathReportsOpenedPath(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "mem.db")
+	s, err := Open(p)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	if got := s.Path(); got != p {
+		t.Errorf("Path() = %q，期望 %q", got, p)
+	}
+}
+
+// 评测金标准用 content_hash 表达目标，故「按 id 反查哈希」必须与原哈希逐字一致；
+// 查不到时应报错，而不是静默返回空串（空串会被当成合法的金标准目标）。
+func TestHashByIDMatchesAddResult(t *testing.T) {
+	s := newTestStore(t)
+	res, err := s.Add(AddInput{Content: "活库 mem.db 绝不能放进 iCloud 同步目录", Device: "test"})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	got, err := s.HashByID(res.ID)
+	if err != nil {
+		t.Fatalf("HashByID: %v", err)
+	}
+	if got != res.Hash {
+		t.Errorf("HashByID(%s) = %q，期望与 Add 返回的 %q 一致", res.ID, got, res.Hash)
+	}
+	if _, err := s.HashByID("no-such-id"); err == nil {
+		t.Error("不存在的 id 应报错")
+	}
+}
+
+func TestStatsCountsKindsProjectsAndLive(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.Add(AddInput{Content: "构建默认 CGO_ENABLED=0", Kind: "decision", Device: "test"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if _, err := s.Add(AddInput{Content: "同步目录会损坏 SQLite", Kind: "pitfall", Project: "p1", Device: "test"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Path != s.Path() {
+		t.Errorf("Stats.Path = %q，期望 %q", st.Path, s.Path())
+	}
+	if st.Total != 2 {
+		t.Errorf("Total = %d，期望 2", st.Total)
+	}
+	if st.Live != 2 || st.Superseded != 0 {
+		t.Errorf("Live/Superseded = %d/%d，期望 2/0", st.Live, st.Superseded)
+	}
+	if st.ExpiredLive != 0 {
+		t.Errorf("ExpiredLive = %d，期望 0（无 TTL 条目）", st.ExpiredLive)
+	}
+	if st.ByKind["decision"] != 1 || st.ByKind["pitfall"] != 1 {
+		t.Errorf("ByKind = %+v，期望 decision/pitfall 各 1", st.ByKind)
+	}
+	// 工程为空的记忆在展示上归入 (global)，而不是留空串
+	if st.ByProject["(global)"] != 1 || st.ByProject["p1"] != 1 {
+		t.Errorf("ByProject = %+v，期望 (global)/p1 各 1", st.ByProject)
 	}
 }

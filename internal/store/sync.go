@@ -39,6 +39,7 @@ type ExportRecord struct {
 	Superseded   *Ref                `json:"superseded,omitempty"`       // 可跨设备重建的取代引用
 	OriginDevice string              `json:"origin_device"`
 	OriginTool   string              `json:"origin_tool"`
+	Source       string              `json:"source,omitempty"`
 	AccessCount  int                 `json:"access_count"`
 	Tags         map[string][]string `json:"tags"`
 }
@@ -59,7 +60,7 @@ func (s *Store) Export() ([]ExportRecord, error) {
 	rows, err := s.db.Query(
 		`SELECT m.id, m.content, m.kind, m.content_hash, m.project, m.salience,
 		        m.created_at, m.updated_at, m.last_seen_at, m.expires_at,
-		        m.origin_device, m.origin_tool, m.access_count,
+		        m.origin_device, m.origin_tool, m.source, m.access_count,
 		        t.id, t.content_hash, t.project
 		   FROM memories m
 		   LEFT JOIN memories t ON t.id = m.superseded_by
@@ -76,7 +77,7 @@ func (s *Store) Export() ([]ExportRecord, error) {
 		var tgtID, tgtHash, tgtProject *string
 		if err := rows.Scan(&r.ID, &r.Content, &r.Kind, &r.ContentHash, &r.Project, &r.Salience,
 			&r.CreatedAt, &r.UpdatedAt, &r.LastSeenAt, &r.ExpiresAt,
-			&r.OriginDevice, &r.OriginTool, &r.AccessCount,
+			&r.OriginDevice, &r.OriginTool, &r.Source, &r.AccessCount,
 			&tgtID, &tgtHash, &tgtProject); err != nil {
 			return nil, err
 		}
@@ -127,7 +128,7 @@ func (s *Store) Export() ([]ExportRecord, error) {
 //	last_seen_at 取较晚者
 //	expires_at   任一边为 NULL（永不过期）则结果为 NULL，否则取较晚者
 //	tags         并集（一键多值全部保留）
-//	origin_device / origin_tool  仅新插入时写入；已有记录保留本地值
+//	origin_device / origin_tool / source  仅新插入时写入；已有记录保留本地值
 //
 // 两条刻意的例外（本地书写形式优先，非可交换）：
 //   - content：hash 相同即视为同一事实（归一化已折叠大小写与空白），保留本地写法
@@ -192,11 +193,11 @@ func (s *Store) Import(recs []ExportRecord) (*ImportStats, error) {
 				`INSERT INTO memories
 				   (id, content, content_idx, kind, content_hash, project, salience,
 				    created_at, updated_at, last_seen_at, expires_at,
-				    origin_device, origin_tool, access_count)
-				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				    origin_device, origin_tool, source, access_count)
+				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				localID, content, indexText(content), kind, h, r.Project, r.Salience,
 				r.CreatedAt, r.UpdatedAt, r.LastSeenAt, r.ExpiresAt,
-				r.OriginDevice, r.OriginTool, r.AccessCount,
+				r.OriginDevice, r.OriginTool, r.Source, r.AccessCount,
 			); err != nil {
 				return nil, err
 			}

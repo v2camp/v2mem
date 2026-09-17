@@ -18,8 +18,12 @@ CREATE TABLE IF NOT EXISTS memories (
   superseded_by TEXT,
   origin_device TEXT NOT NULL,
   origin_tool   TEXT NOT NULL DEFAULT '',
+  source        TEXT NOT NULL DEFAULT '',
   access_count  INTEGER NOT NULL DEFAULT 0
 );
+
+-- 既有库（在此列加入前创建）没有 source 列：Open 时用 ensureColumn 幂等补上；
+-- 对应索引 ix_mem_source 在 ensureColumn 里补列成功后一并创建。
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_hash ON memories(content_hash, project);
 CREATE INDEX IF NOT EXISTS ix_mem_project ON memories(project);
@@ -76,3 +80,11 @@ CREATE TABLE IF NOT EXISTS hook_dedup (
 );
 
 CREATE INDEX IF NOT EXISTS idx_hook_dedup_ts ON hook_dedup(ts);
+
+-- M5b-0 模糊检索：每条记忆的 MinHash 签名（512B 小端 uint64 序列）。
+-- 与记忆同写同删（外键级联）；旧库缺签名的行由 Open 时一次性补齐（backfillSigs），
+-- 覆盖 import 直插等绕开 Add 的写入路径。
+CREATE TABLE IF NOT EXISTS mem_sigs (
+  memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+  sig       BLOB NOT NULL
+);

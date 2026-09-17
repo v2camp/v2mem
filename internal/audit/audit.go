@@ -8,10 +8,18 @@ package audit
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// MaxArchiveBytes 是触发自动轮转的日志体量上限。审计日志会随使用无限增长，
+// 若不设防最终会把 ~/.v2mem 撑爆；达到上限后，下一次追加前把当前日志归档。
+var MaxArchiveBytes int64 = 5 << 20 // 5MB
+
+// MaxArchives 是保留的归档份数（audit.jsonl.1 .. .N），更早的自动删除。
+const MaxArchives = 3
 
 // Record 是一次钩子激活的记录。
 type Record struct {
@@ -33,6 +41,9 @@ type Record struct {
 	// 它本身是度量：能看出「重复触发」在真实环境里是否真的发生。
 	Suppressed bool  `json:"suppressed,omitempty"`
 	MS         int64 `json:"ms"`
+	// Source 仅写侧使用：标记写入来源（human|llm|ingest|harness-summary|bench|test）。
+	// 用量视图默认排除 bench/test，避免程序化灌库污染统计。
+	Source string `json:"source,omitempty"`
 }
 
 // Path 返回默认审计日志路径（与库同目录，便于一起备份/清理）。
@@ -46,6 +57,9 @@ func Path() string {
 
 // Append 追加一条记录。
 //
+// 在写之前做体量轮转（超过 MaxArchiveBytes 即归档当前日志），避免文件无限膨胀。
+// 轮转失败会被吞掉：审计写失败绝不能影响记忆注入或宿主会话。
+//
 // 返回错误是为了可测；**调用方必须忽略它** —— 这条路径在宿主会话的关键链上，
 // 审计写失败绝不能影响记忆注入，更不能让会话收到错误。
 func Append(path string, r Record) error {
@@ -55,6 +69,7 @@ func Append(path string, r Record) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	_ = MaybeRotate(path, MaxArchiveBytes)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -67,6 +82,50 @@ func Append(path string, r Record) error {
 	}
 	_, err = f.Write(append(line, '\n'))
 	return err
+}
+
+// MaybeRotate 若日志超过 maxBytes 则归档为 .1，并把既有归档依次后移、
+// 删除超过 MaxArchives 份的旧档。未超限则不做任何事。文件不存在返回 nil。
+func MaybeRotate(path string, maxBytes int64) error {
+	if path == "" {
+		path = Path()
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if fi.Size() <= maxBytes {
+		return nil
+	}
+	return rotate(path)
+}
+
+// rotate 把当前日志归档为 .1，其余归档依次后移，删除超出保留数的旧档。
+func rotate(path string) error {
+	// 先删最旧，腾出 .N 位置，避免覆盖
+	oldest := fmt.Sprintf("%s.%d", path, MaxArchives)
+	_ = os.Remove(oldest)
+	// 从旧往新移位（先 .2→.3，再 .1→.2，最后 .0→.1）
+	for i := MaxArchives - 1; i >= 1; i-- {
+		src := fmt.Sprintf("%s.%d", path, i)
+		if _, err := os.Stat(src); err == nil {
+			if err := os.Rename(src, fmt.Sprintf("%s.%d", path, i+1)); err != nil {
+				return err
+			}
+		}
+	}
+	if err := os.Rename(path, path+".1"); err != nil {
+		return err
+	}
+	// 重建空当前日志，维持「当前日志恒存在」的不变量
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // Read 读最近 limit 条（limit<=0 表示全部）。坏行跳过而不是整体失败 ——
@@ -187,4 +246,55 @@ func Summarize(rs []Record) Summary {
 		s.AvgMS = float64(msTotal) / float64(s.Total)
 	}
 	return s
+}
+
+// AsyncAppender 是异步写的审计通道。
+//
+// 为什么存在：同步 Append 在每次调用时打开文件 + 轮转检查 + 写盘，虽然便宜，
+// 但在批量灌库 / 高频钩子场景仍会把磁盘 IO 摊到调用链上。异步化把写入交给
+// 后台 goroutine，调用方只投递记录就返回 —— 审计只是观测，不该拖慢宿主。
+//
+// 通道有界：生产端写满即drop（宁可丢审计也不阻塞调用方），与「审计失败静默」
+// 的总原则一致。Close 会排空队列再退出，保证进程退出前不留脏数据。
+type AsyncAppender struct {
+	path string
+	ch   chan Record
+	done chan struct{}
+}
+
+// NewAsyncAppender 启动一条后台写协程，pending 是通道容量。
+func NewAsyncAppender(path string, pending int) *AsyncAppender {
+	if pending < 1 {
+		pending = 64
+	}
+	a := &AsyncAppender{
+		path: path,
+		ch:   make(chan Record, pending),
+		done: make(chan struct{}),
+	}
+	go a.run()
+	return a
+}
+
+func (a *AsyncAppender) run() {
+	defer close(a.done)
+	for r := range a.ch {
+		_ = Append(a.path, r) // 写失败静默：观测从不超过功能
+	}
+}
+
+// Append 投递一条记录，非阻塞。队列满时丢弃并返回 false。
+func (a *AsyncAppender) Append(r Record) bool {
+	select {
+	case a.ch <- r:
+		return true
+	default:
+		return false
+	}
+}
+
+// Close 停发并等待后台写协程排空队列后退出。
+func (a *AsyncAppender) Close() {
+	close(a.ch)
+	<-a.done
 }
