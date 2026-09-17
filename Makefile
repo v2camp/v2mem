@@ -28,6 +28,27 @@ cover-gate:
 cover-update:
 	@./scripts/cover-gate.sh --update $(if $(FORCE),--force,)
 
+# ---------- 发布 / 评测门禁 ----------
+
+# 发布门禁：跑正式版 eval（gold 金标准集）并与 eval-policy.txt 的 recall5_min 比。
+# 不达标 → 脚本打印 RED 并返回非零（CI 借此阻止发版）。只判据，不推导版本。
+eval-gate:
+	@./scripts/release-eval.sh --gate-only
+
+# 预演：只打印下一个将推导出的版本号（不打 tag、不跑 eval）。
+release-dry:
+	@./scripts/derive-version.sh --repo . --last $$(git describe --tags --abbrev=0 2>/dev/null || echo v0.1.0)
+
+# 发版（本地可预演全流程）：先过覆盖率门禁 → 正式版 eval 门禁（含 recall5）→
+# 推导版本 → 写 .mem/reports/v<tag>.md → 本地打 tag。
+# 强制升档可传 OVERRIDE=major|minor|patch。
+release:
+	@make cover-gate
+	@TAG=$$(./scripts/release-eval.sh $(if $(OVERRIDE),--override $(OVERRIDE),)); \
+	echo "→ 发布版本: $$TAG"; \
+	git tag "$$TAG"; \
+	echo "已打 tag $$TAG（推送远端：git push origin $$TAG）"
+
 # 交叉编译示例：Go 内建支持，无需交叉工具链
 build-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/$(BIN)-linux-amd64 $(PKG)
@@ -54,4 +75,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test cover cover-gate cover-update build-linux build-win smoke clean
+.PHONY: build install test cover cover-gate cover-update build-linux build-win smoke clean eval-gate release-dry release
