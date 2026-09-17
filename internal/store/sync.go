@@ -11,6 +11,8 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+
+	"github.com/wanghui/v2mem/internal/similarity"
 )
 
 // Ref 是跨设备可解析的身份引用。
@@ -271,4 +273,244 @@ func (s *Store) Import(recs []ExportRecord) (*ImportStats, error) {
 		return nil, err
 	}
 	return stats, nil
+}
+
+// ---------- WS3: 三方合并 ----------
+//
+// Import 是无脑字段归并（updated_at 一律取 MAX），无法表达「最近者胜 /
+// 冲突并存」的决策：两台设备分别写下同一条记忆时，谁新谁说了算；时间戳
+// 撞车时则不能静默吞掉某一端的写入。
+//
+// SyncMerge 就是 `mem sync` 的合并判定：以 (content_hash, project) 为键，
+// 把远端一批记录并进本地库，规则如下：
+//
+//	本地没有此键         → 新插入
+//	远端 updated_at 明显更新 → 最近者胜：远端内容写法为准，时间戳推进到远端
+//	本地 updated_at 明显更新 → 本地已更新，远端较老，保持不动
+//	两端 updated_at 撞车   → 冲突并存：内容归一化后本就相同，故保留本地写法，
+//	                        但给该条打 sync 标记（不静默丢失任一端的来源信息），
+//	                        交由 mem merge 人工收敛
+//
+// 「并入本地库的方向」固定是远端 → 本地，不做双向（每端都跑一次 sync 即收敛）。
+// 唯一索引 ux_mem_hash 不允许 (content_hash, project) 出现两行，故冲突时以
+// 「同一条上打来源标记」表达并存，而不是复制成两行。
+//
+// 内容归一化相等 → content_hash 相同，因此「换写法」只动 content 原串与索引，
+// 身份键不变。凡是改 content 的分支都会同步 mem_sigs 签名与 content_idx，
+// 保证模糊检索与 FTS 与正文一致。
+
+// SyncTolerance 是时间戳冲突判定阈值（秒）。
+// 两端 updated_at 之差不超过该值的记录视为「无法自动决断」，走冲突并存。
+const SyncTolerance = 2
+
+// SyncConflict 描述一次无法自动决断的归并冲突。
+type SyncConflict struct {
+	Hash         string `json:"hash"`
+	Project      string `json:"project"`
+	LocalAt      int64  `json:"local_updated_at"`
+	RemoteAt     int64  `json:"remote_updated_at"`
+	RemoteDevice string `json:"remote_device,omitempty"`
+}
+
+// SyncStats 汇总一次三方合并。
+type SyncStats struct {
+	Inserted   int            `json:"inserted"`
+	Merged     int            `json:"merged"`      // 远端更新（最近者胜）已并入
+	NewerLocal int            `json:"newer_local"` // 本地已更新，远端较老，未改动
+	Conflicts  []SyncConflict `json:"conflicts,omitempty"`
+	Skipped    int            `json:"skipped"`
+	Unresolved int            `json:"unresolved"` // 取代引用目标既不在文件也不在本地
+}
+
+// SyncMerge 把远端导出的记录按三路规则并进本地库。见上方文档注释。
+func (s *Store) SyncMerge(remote []ExportRecord) (*SyncStats, error) {
+	stats := &SyncStats{}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// 本地 (hash, project) → (id, updated_at)，供判决使用。
+	type localMeta struct {
+		id   string
+		at   int64
+		proj string
+	}
+	localIdx := map[string]localMeta{}
+	rows, err := tx.Query(`SELECT content_hash, project, updated_at, id FROM memories`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var h, proj, id string
+		var at int64
+		if err := rows.Scan(&h, &proj, &at, &id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		localIdx[h+"\x00"+proj] = localMeta{id: id, at: at, proj: proj}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// identity 记录「本批记录的身份键 → 本地 id」，供第二遍解析取代引用。
+	identity := map[string]string{}
+
+	for _, r := range remote {
+		content := strings.TrimSpace(r.Content)
+		if content == "" {
+			stats.Skipped++
+			continue
+		}
+		h := r.ContentHash
+		if h == "" {
+			h = HashOf(content)
+		}
+		kind := r.Kind
+		if kind == "" {
+			kind = "fact"
+		}
+		idx := indexText(content)
+		key := h + "\x00" + r.Project
+
+		local, present := localIdx[key]
+		if !present {
+			// 新记录：直插（与 Import 相同，含签名、tags）。
+			id := newID()
+			if _, err := tx.Exec(
+				`INSERT INTO memories
+				   (id, content, content_idx, kind, content_hash, project, salience,
+				    created_at, updated_at, last_seen_at, expires_at,
+				    origin_device, origin_tool, source, access_count)
+				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				id, content, idx, kind, h, r.Project, r.Salience,
+				r.CreatedAt, r.UpdatedAt, r.LastSeenAt, r.ExpiresAt,
+				r.OriginDevice, r.OriginTool, r.Source, r.AccessCount,
+			); err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(
+				`INSERT OR REPLACE INTO mem_sigs(memory_id, sig) VALUES (?, ?)`,
+				id, encodeSig(similarity.Sign(content)),
+			); err != nil {
+				return nil, err
+			}
+			identity[key] = id
+			stats.Inserted++
+			syncMergeTags(tx, id, r.Tags)
+			continue
+		}
+
+		switch {
+		case r.UpdatedAt > local.at+SyncTolerance:
+			// 最近者胜：以远端写法为准，时间戳推进到远端，元数据取「更值得」项。
+			if _, err := tx.Exec(
+				`UPDATE memories SET
+				   content = ?, content_idx = ?,
+				   kind = MIN(kind, ?),
+				   salience = MAX(salience, ?),
+				   access_count = MAX(access_count, ?),
+				   created_at = MIN(created_at, ?),
+				   updated_at = ?,
+				   last_seen_at = MAX(last_seen_at, ?),
+				   expires_at = CASE WHEN expires_at IS NULL OR ? IS NULL
+				                    THEN NULL ELSE MAX(expires_at, ?) END
+				 WHERE id = ?`,
+				content, idx, kind, r.Salience, r.AccessCount,
+				r.CreatedAt, r.UpdatedAt, r.LastSeenAt,
+				r.ExpiresAt, r.ExpiresAt, local.id,
+			); err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(
+				`INSERT OR REPLACE INTO mem_sigs(memory_id, sig) VALUES (?, ?)`,
+				local.id, encodeSig(similarity.Sign(content)),
+			); err != nil {
+				return nil, err
+			}
+			stats.Merged++
+
+		case local.at > r.UpdatedAt+SyncTolerance:
+			// 本地已更新，远端较老：保持本地不动。
+			stats.NewerLocal++
+
+		default:
+			// 时间戳撞车：冲突并存。内容归一化后本就相同，保留本地写法，
+			// 但打上 sync 冲突标记，把远端设备的来源噪音显式留下，不静默吞掉。
+			if _, err := tx.Exec(
+				`INSERT OR IGNORE INTO tags(memory_id, key, value) VALUES (?, ?, ?)`,
+				local.id, "sync", "conflict:"+r.OriginDevice,
+			); err != nil {
+				return nil, err
+			}
+			stats.Conflicts = append(stats.Conflicts, SyncConflict{
+				Hash: h, Project: r.Project,
+				LocalAt: local.at, RemoteAt: r.UpdatedAt,
+				RemoteDevice: r.OriginDevice,
+			})
+		}
+
+		// 无论是并入还是保持，都取远端 tags 并集（幂等 INSERT OR IGNORE，
+		// 不引入重复），保证远端追加的机器/工具标记不因归并丢失。
+		syncMergeTags(tx, local.id, r.Tags)
+		identity[key] = local.id
+	}
+
+	// 第二遍：重建取代引用（与 Import 相同的两遍逻辑，见 Import 中注释）。
+	for _, r := range remote {
+		if r.Superseded == nil || r.Superseded.Hash == "" {
+			continue
+		}
+		selfID, ok := identity[r.ContentHash+"\x00"+r.Project]
+		if !ok {
+			continue // 该记录本身被跳过（内容为空），无需处理
+		}
+		key := r.Superseded.Hash + "\x00" + r.Superseded.Project
+		target, ok := identity[key]
+		if !ok {
+			err := tx.QueryRow(
+				`SELECT id FROM memories WHERE content_hash = ? AND project = ?`,
+				r.Superseded.Hash, r.Superseded.Project,
+			).Scan(&target)
+			if errors.Is(err, sql.ErrNoRows) {
+				stats.Unresolved++
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		if target == selfID {
+			stats.Unresolved++
+			continue
+		}
+		if _, err := tx.Exec(
+			`UPDATE memories SET superseded_by = ? WHERE id = ?`, target, selfID,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+// syncMergeTags 把一键多值的标记表并进目标记忆（幂等并集）。
+func syncMergeTags(tx *sql.Tx, memoryID string, tags map[string][]string) {
+	if len(tags) == 0 {
+		return
+	}
+	for k, vals := range tags {
+		for _, v := range vals {
+			_, _ = tx.Exec(
+				`INSERT OR IGNORE INTO tags(memory_id, key, value) VALUES (?,?,?)`,
+				memoryID, k, v,
+			)
+		}
+	}
 }

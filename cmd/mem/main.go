@@ -35,6 +35,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem consolidate [选项]           相似知识归并（近重复聚簇，留 1 条）
   mem export [路径.jsonl]          导出为 JSONL（省略路径则写标准输出）
   mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
+  mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
   mem harness [--json]              列出各工具的接入方式与检测结果
   mem init   --harness <名字>       把钩子写入该工具的配置（幂等、合并、带备份）
@@ -101,7 +102,7 @@ hook 选项:
 // 清单有两个出处就一定会漂移，所以把它抽成一处。
 var knownSubcommands = []string{
 	"add", "search", "ls", "stats", "touch", "forget", "notes", "gc", "consolidate",
-	"export", "import", "hook", "harness", "init", "uninstall", "ingest",
+	"export", "import", "sync", "hook", "harness", "init", "uninstall", "ingest",
 	"budget", "audit", "eval", "mcp", "help",
 }
 
@@ -135,6 +136,8 @@ func main() {
 		err = cmdExport(os.Args[2:])
 	case "import":
 		err = cmdImport(os.Args[2:])
+	case "sync":
+		err = cmdSync(os.Args[2:])
 	case "hook":
 		err = cmdHook(os.Args[2:])
 	case "harness":
