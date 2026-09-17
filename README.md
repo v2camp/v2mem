@@ -151,17 +151,18 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 · `mem forget <id\|前缀>`（删除一条）
 `gc` / `consolidate` 是破坏性操作，执行前**自动备份库快照**到 `<库目录>/backup/`；空库或加 `--no-backup` 则跳过。
 
-**跨设备**：`mem export [文件.jsonl]` / `mem import <文件.jsonl>`（按 `(content_hash, project)` 归并，**幂等**）。
-⚠️ **绝不要同步 `mem.db` 本体** —— 写入中途的同步会损坏 SQLite；只同步导出的 JSONL。
+**跨设备**：`mem export [文件.jsonl]` / `mem import <文件.jsonl>`（按 `(content_hash, project)` 归并，**幂等**）· `mem sync <remote>`（git 拉→三方合并→推，`content_hash+updated_at` 最近者胜、冲突并存打标记，`--abort` 复原；写前自动备份）。
+⚠️ **绝不要同步 `mem.db` 本体** —— 写入中途的同步会损坏 SQLite；`export/import` 与 `sync` 都只走导出的 JSONL。
 
-**Level 1 文件运维**：`mem ingest <文件.md...>`（把既有 md 机械化搬进库，幂等）
+**Level 1 文件运维**：`mem ingest <文件.md...>`（把既有 md 机械化搬进库，幂等；写侧治理含 `--source harness-summary` 锚定"任务收尾汇总"双路径写）
 · `mem budget --file <文件> [--max-chars N]`（检查注入文件是否超预算，超限非零退出）
+· `mem notes`（读侧硬规则小字条：抽 `kind=rule`/全局高优先记忆，一行一条、幂等；hook 注入去重，`MEM_NO_NOTES=1` 回退到仅原始注入）
 
 **接入与钩子**：`mem harness`（列出 11 个工具入口）· `mem init`（写入钩子配置）· `mem uninstall`（反向移除，`--all` 一键）
 · `mem hook`（钩子入口：读 stdin JSON、写 stdout；同一事件重复触发只注入一次，`--dedup-window` 默认 10s）
 
 **度量与评测**：`mem audit [--stats] [--tail N] [--hits=false]`（审计日志与读/写侧计数）· `mem eval`（**无参一键跑 `activity`，24h 窗口**）
-· `mem eval recall [--gold 文件] [--auto [N]] [--k N]`（检索命中是否准；`--auto` 裸用默认抽样 20）
+· `mem eval recall [--gold 文件 | --gold-dir 目录] [--auto [N]] [--k N]`（检索命中是否准；`--gold-dir` 合并目录下全部金标准，`--auto` 裸用默认抽样 20）
 · `mem eval write --session <文件> [--gold 文件]`（记录是否准：漏记/多记/疑似碎片）
 · `mem eval activity [--scope period\|task\|session] [--since D] [--session S] [--project P] [--top N]`
 （**用量视图**：一段时间/会话/任务内的读/写活动 + 空命中查询 + 四态结论。任务收尾由此产出，写进 `.mem/report.md`）
