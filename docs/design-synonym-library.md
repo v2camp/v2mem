@@ -117,6 +117,7 @@ mem lexicon init --project <X> [--terms "词A,词B"]   # 主路径：真实查�
 
 - **一期（已完成）**：`synonyms.txt` 解析 + 查询期展开 + `MEM_SYN_DICT` 开关 + `--explain` 诊断 + 检索集成 + 测试。
 - **二期（本设计，参数已校准）**：`mem lexicon init --project <X>` 提取管线（Step A-D，用 §5.4 默认值）+ agent 复核清单 + 僵尸清理。
+- **三期（§8）**：自动维护闭环 —— LLM 提取（agent 扫增量资产）+ 试用期回测 + 反馈沉淀 + 衰减清理，惰性触发。
 
 ## 7. 测试与验收
 
@@ -124,3 +125,88 @@ mem lexicon init --project <X> [--terms "词A,词B"]   # 主路径：真实查�
 - 作用域：`[project]` 词仅该工程命中。
 - 判据：构造 gold，断言"Recall↑ 且 MRR 不↓"通过/不通过行为。
 - 回归：跑既有 `mem eval recall` 确认引入词库不破坏现有基准。
+
+## 8. 自动维护闭环（LLM 提取 × 试用期回测 合并路线）
+
+§4 的闭环靠用户手动跑 `--explain`/`mem eval` 驱动；本节的路线把它自动化：
+**LLM 提取闭环**负责发现（召回侧），**试用期回测**负责决策（精度侧），两者合并为一个
+**词条生命周期状态机**，由统一的惰性触发机制驱动，全程反馈沉淀回写、驱动下轮提取。
+
+### 8.1 分工：谁管召回、谁管精度
+
+| 侧 | 承担者 | 依据 |
+|:---|:---|:---|
+| 发现（召回） | LLM 扫描增量资产 | 静态 bigram 不知"哪两个词同概念"（§5.1）；LLM 零样本阅读，不需要训练样本 |
+| 预检（候选过滤） | 行为 oracle | 复用 §5.2 Step B + §5.4 默认参数（Jaccard θ=0.5、泛词护栏） |
+| 决策（净收益） | 试用期回测 | §4 判据"Recall↑ 且 MRR 不↓"的自动化版本 |
+| 退出（生命周期） | 衰减打分 | §4.4 僵尸清理的自动化版本（ACT-R 式：命中次数 + 最近命中） |
+| 记忆（经验回写） | 反馈沉淀 | 确认/撤回/清理回写状态表 → 下轮提取的 few-shot + 黑名单 |
+
+### 8.2 词条生命周期状态机
+
+```
+candidate ──预检通过──▶ trial ──回测达标──▶ stable（查询期自动展开）
+              │                │
+              └─复核不通过──▶ reverted ────────┐
+                             stable ──久未命中──▶ zombie ──确认──▶ removed
+                                        （30 天待复查 / 90 天可删）
+   所有决策落定 ────────────▶ 反馈沉淀 ──▶ 下轮 candidate（few-shot + 黑名单）
+```
+
+- `trial → stable`：N 次真实查询后 ΔMRR 不↓。
+- `trial → reverted`：ΔMRR 明显回退即撤回（绝不自动保留不确定项，§5.3）。
+- `reverted` 后进入黑名单冷却期，避免反复横跳。
+
+### 8.3 词条状态字段
+
+```text
+word | standard | status(candidate/trial/stable/reverted/zombie/removed)
+source(llm|auto|terms) | confidence | reason          # LLM 提取的来源与置信理由
+trials | hit_count | mrr_delta | last_hit_at | updated_at  # 回测与衰减输入
+```
+
+### 8.4 触发机制：惰性 + 借道（无守护进程）
+
+v2mem 零常驻进程，mem 不会自己醒来。触发原则：
+**一切维护借道已有事件，只做轻量动作；重动作（LLM 提取、深度回测）排队给 agent/维护命令执行。**
+
+| 阶段 | 触发事件 | 借道点 | 动作（必须轻量） |
+|:---|:---|:---|:---|
+| 候选标记 | hook session-start / prompt-submit | 读路径 | 算资产指纹（AGENTS/README/docs/** 的 mtime+size 摘要），与上次比对，变了→写 pending 标记 |
+| LLM 提取 | agent 看到注入提示后主动执行 | `mem lexicon init --terms` | 扫资产产候选（不自动执行，只提示） |
+| 行为预检 | `mem lexicon init` | 同上 | Jaccard ≥0.5 + 泛词护栏 → 候选进 trial |
+| 试用累积 | 每次查询命中 trial 词 | search + hook prompt-submit | 累加 trials/hit_count（UPDATE，微秒级） |
+| 试用结算 | 维护命令或 session-end | `mem gc` / `mem audit` / hook session-end | 批量 settle：ΔMRR 不↓→stable，↓→reverted |
+| 僵尸衰减 | 维护命令 | `mem gc`（已有 TTL 锚点） | 衰减打分 → 待清理清单 |
+| 反馈沉淀 | 每层决策落定 | 各层收尾 | 回写状态表 |
+
+**统一锚点 = hook 生命周期**：session-start（指纹检测 + 首次判断 + 注入提示）、
+prompt-submit（试用累积）、session-end（结算 + 衰减刷新）。
+hook 是唯一"每次会话必发生"的确定性事件，"用户启动会话"即维护时机；
+主动维护命令（gc / lexicon init / audit）做深维护。
+
+### 8.5 首次使用冷启动
+
+- 状态文件 `.mem/lexicon_state.json` 不存在 → 判定首次使用 → 全量资产视为待提取。
+- 首次 hook 激活时注入提示 agent："检测到 N 份资产（AGENTS.md、docs/…），建议运行
+  `mem lexicon init --project <X>` 提取项目域同义词。"
+- 此后每次 hook 只比对增量差异，不再全量提示。
+
+### 8.6 防打扰设计
+
+- **按批次去重**：pending 标记带资产指纹，指纹没变不重复提示（注入给 `lexicon_pending: false`）。
+- **注入预算**：提示只占注入一行，不挤占记忆注入额度。
+- **结算收敛**：trial 词每 N 次查询只结算一次；reverted 进黑名单冷却期。
+
+### 8.7 落地分期
+
+- **阶段 1 自动候选**：agent 扫资产 → `mem lexicon init --terms` 消费 + 引入词条状态表（先接上"LLM 提取 + 沉淀"半环，不动检索内核）。
+- **阶段 2 试用回测**：trial 词在 audit 真实查询里累计 ΔMRR，N 次后自动 settle；这是唯一"自动写库"点。
+- **阶段 3 僵尸清理**：衰减打分 → 复核确认 → 移除回写，复用 `mem gc` 的备份纪律。
+
+### 8.8 验收标准
+
+- 状态机：给定状态序列，断言 candidate→trial→stable / reverted、stable→zombie→removed 转换正确。
+- 触发：hook 事件驱动下，指纹变更产生一次 pending 标记，且幂等（重复触发不重复提示）。
+- 回测：构造 gold，断言"试用后 ΔMRR 不↓ 才转 stable；↓ 则撤回"。
+- 回归：确认自动维护不破坏 §7 既有一期/二期行为（`mem eval recall` 基准不降）。
