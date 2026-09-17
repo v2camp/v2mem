@@ -4,8 +4,18 @@
 *.db-wal
 *.db-shm
 
+# 覆盖率产物（报告是本地视图，不入库；门槛以 coverage-policy.txt 为准）
+/coverage.out
+/coverage.html
+
 # 本地同步导出（跨设备归集用，不入库）
 /sync/
+
+# worktree 工作区（一任务一分支一 worktree，见 AGENTS.md「任务流程」）
+/.worktree/
+
+# 本地记忆/工具产物（不入库）
+/.workbuddy/
 
 # 编辑器 / 系统
 .DS_Store
