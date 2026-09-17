@@ -37,11 +37,12 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
   mem harness [--json]              列出各工具的接入方式与检测结果
   mem init   --harness <名字>       把钩子写入该工具的配置（幂等、合并、带备份）
+  mem uninstall --harness <名字>    反向操作：移除该工具里的 v2mem 钩子（--all 全部）
   mem ingest <文件.md>              把既有 md 文件里的条目机械化搬进记忆库
   mem budget --file <文件>          检查 Level 1 文件是否超出注入预算
   mem audit  [--stats]             审计日志：钩子激活次数、空注入率、可评测样本数
-  mem eval   recall|write          评测：检索命中是否准（recall）／记录是否准（write）
-  mem report [--since 8h]          任务收尾的 mem 评测结论（读/写活动 + 空命中 + 判定）
+  mem eval   recall|write|activity      评测：检索准不准（recall）／记录准不准（write）／用量视图（activity）
+  mem mcp                           MCP server（stdio）：把 search/add/ls/touch 暴露给支持 MCP 的工具
   mem stats  [选项]                 库概览
   mem help
 
@@ -56,6 +57,7 @@ add 选项:
   --tag <k=v>      标记，可重复，如 --tag machine=mini
   --tool <t>       来源工具（默认 cli）
   --device <d>     来源设备（默认 hostname）
+  --source <s>     来源标记: human|llm|ingest|harness-summary|bench|test（默认 human；bench/test 默认不计入用量视图）
   --salience <f>   重要性 0..1（默认 0.5）
   --ttl <dur>      硬过期，如 720h（默认不过期）
 
@@ -65,14 +67,19 @@ search 选项:
   --kind <k>       限定类型（默认不限）
   --tag <k=v>      限定标记，可重复，AND 语义（默认不限）
   --scope <s>      current=当前工程+全局；global=只要全局；all=跨工程（默认）
+  --no-fuzzy       关闭模糊检索（MinHash 签名 + RRF 融合，默认开启）
 
 gc 选项:
   --max-idle <dur>      久未命中阈值（默认 720h，即 30 天）
   --min-salience <f>    低于此重要性才淘汰（默认 0.2）
+  --no-backup           跳过 gc 前的库备份
+  --backup-dir <dir>    备份目录（默认 <库目录>/backup）
 
 consolidate 选项:
   --threshold <f>       相似度阈值 0..1（默认 0.7）
                         准确性由护栏保证（数字/否定/长度/短文本），阈值只影响召回
+  --no-backup           跳过归并前的库备份
+  --backup-dir <dir>    备份目录（默认 <库目录>/backup）
 
 hook 选项:
   --event <e>           session-start|prompt-submit|stop|session-end（默认从 stdin 推断）
@@ -93,8 +100,8 @@ hook 选项:
 // 清单有两个出处就一定会漂移，所以把它抽成一处。
 var knownSubcommands = []string{
 	"add", "search", "ls", "stats", "touch", "forget", "gc", "consolidate",
-	"export", "import", "hook", "harness", "init", "ingest", "budget",
-	"audit", "eval", "report", "help",
+	"export", "import", "hook", "harness", "init", "uninstall", "ingest",
+	"budget", "audit", "eval", "mcp", "help",
 }
 
 func main() {
@@ -131,6 +138,8 @@ func main() {
 		err = cmdHarness(os.Args[2:])
 	case "init":
 		err = cmdInit(os.Args[2:])
+	case "uninstall":
+		err = cmdUninstall(os.Args[2:])
 	case "ingest":
 		err = cmdIngest(os.Args[2:])
 	case "budget":
@@ -139,8 +148,8 @@ func main() {
 		err = cmdAudit(os.Args[2:])
 	case "eval":
 		err = cmdEval(os.Args[2:])
-	case "report":
-		err = cmdReport(os.Args[2:])
+	case "mcp":
+		err = cmdMCP(os.Args[2:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
 		return
@@ -181,6 +190,7 @@ func misplacedFlag(query string) string {
 	known := map[string]bool{
 		"--json": true, "--db": true, "--limit": true,
 		"--project": true, "--kind": true, "--tag": true, "--scope": true,
+		"--no-fuzzy": true, "--no-audit": true, "--audit-file": true,
 	}
 	for _, tok := range strings.Fields(query) {
 		if known[tok] {
@@ -254,6 +264,7 @@ func cmdAdd(args []string) error {
 	global := fs.Bool("global", false, "全局记忆：project 留空，对所有工程生效")
 	tool := fs.String("tool", "cli", "来源工具")
 	device := fs.String("device", "", "来源设备")
+	source := fs.String("source", "human", "来源标记: human|llm|ingest|harness-summary|bench|test")
 	salience := fs.Float64("salience", 0.5, "重要性 0..1")
 	ttl := fs.Duration("ttl", 0, "硬过期时长")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
@@ -294,6 +305,7 @@ func cmdAdd(args []string) error {
 		Project:  *project,
 		Tool:     *tool,
 		Device:   *device,
+		Source:   *source,
 		Tags:     tagMap,
 		Salience: *salience,
 		TTL:      *ttl,
@@ -315,6 +327,7 @@ func cmdAdd(args []string) error {
 		_ = audit.Append(*auditFile, audit.Record{
 			TS: time.Now().Unix(), Event: "manual-add", Project: *project,
 			Hashes: []string{res.Hash}, Kinds: []string{*kind}, Mode: mode,
+			Source: *source,
 		})
 	}
 
@@ -337,6 +350,7 @@ func cmdSearch(args []string) error {
 	project := fs.String("project", "", "限定工程")
 	kind := fs.String("kind", "", "限定类型")
 	scope := fs.String("scope", "", "作用域: current=当前工程+全局，global=只要全局，all=跨工程（默认）")
+	noFuzzy := fs.Bool("no-fuzzy", false, "关闭模糊检索（MinHash + RRF 融合）")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
 	noAudit := fs.Bool("no-audit", false, "不写审计日志")
 	var tags stringSlice
@@ -387,6 +401,7 @@ func cmdSearch(args []string) error {
 		Kind:    *kind,
 		Tags:    tagMap,
 		Scope:   *scope,
+		NoFuzzy: *noFuzzy,
 		Limit:   *limit,
 	})
 	if err != nil {
@@ -492,15 +507,25 @@ func cmdForget(args []string) error {
 	return nil
 }
 
-// cmdGC 回收过期与衰减的记忆。
+// cmdGC 回收过期与衰减的记忆。破坏性操作：先备份库快照。
 func cmdGC(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
 	c.register(fs)
 	maxIdle := fs.Duration("max-idle", 720*time.Hour, "久未命中阈值")
 	minSalience := fs.Float64("min-salience", 0.2, "低于此重要性才淘汰")
+	noBackup := fs.Bool("no-backup", false, "跳过 gc 前的库备份")
+	backupDir := fs.String("backup-dir", "", "备份目录（默认 <库目录>/backup）")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
+	if err != nil {
+		return err
+	}
+	if bak != "" && !c.json {
+		fmt.Printf("已备份 → %s\n", bak)
 	}
 
 	st, err := store.Open(c.db)
@@ -634,11 +659,21 @@ func cmdConsolidate(args []string) error {
 	fs := flag.NewFlagSet("consolidate", flag.ContinueOnError)
 	c.register(fs)
 	threshold := fs.Float64("threshold", store.DefaultConsolidateThreshold, "相似度阈值 0..1")
+	noBackup := fs.Bool("no-backup", false, "跳过归并前的库备份")
+	backupDir := fs.String("backup-dir", "", "备份目录（默认 <库目录>/backup）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *threshold < 0 || *threshold > 1 {
 		return fmt.Errorf("--threshold 应落在 [0,1]，got %v", *threshold)
+	}
+
+	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
+	if err != nil {
+		return err
+	}
+	if bak != "" && !c.json {
+		fmt.Printf("已备份 → %s\n", bak)
 	}
 
 	st, err := store.Open(c.db)

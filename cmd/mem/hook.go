@@ -334,8 +334,8 @@ func formatHits(title string, hits []store.Hit, budget int) (string, int) {
 // 命令必须写全，模型不会去猜参数。
 func hintBlock() string {
 	return "需要时可检索本库（按需查询，不要凭空断言历史决策）：\n" +
-		"  mem search --scope current --json \"<关键词>\"   # 查历史决策 / 踩坑 / 约定\n" +
-		"  mem add --kind decision|pitfall|preference|fact \"<原子事实>\"   # 记下新学到的事实\n" +
+		"  mem search --scope current --json \"<关键词>\"   # 查历史决策 / 踩坑 / 约定（关键词必填）\n" +
+		"  mem add --kind decision|pitfall|preference|fact \"<原子事实>\"   # 记下新学到的事实（正文必填，一条一个事实）\n" +
 		"  mem touch <id前8位>   # 命中后反馈，供过期机制参考\n"
 }
 

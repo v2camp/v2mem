@@ -1,8 +1,9 @@
 // 评测：回答「这套记忆系统到底准不准」，而不是靠印象。
 //
-// 两个方向都要测（用户提出）：
+// 三个族（用户提出）：
 //   - 用户会话 → mem 查询 → 命中是否准确   : mem eval recall（金标准）／audit（真实样本）
 //   - 用户会话 → mem 记录 → 记录是否准确   : mem eval write
+//   - 一段时间内的读/写活动与空命中        : mem eval activity（用量视图，兼任务收尾结论）
 //
 // 口径先定死再跑数，且**自动模式必须标注为下限测试** —— 不能让「自召回接近 100%」
 // 被当成「真实检索质量好」。这是本仓库评测纪律的老坑。
@@ -13,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -183,16 +185,71 @@ func sortStrings(xs []string) {
 
 func cmdEval(args []string) error {
 	if len(args) == 0 {
-		return errors.New("用法: mem eval recall|write（见 mem help）")
+		// 一键默认：最常用、且无需任何输入的是活动视图（读/写/空命中）。
+		// 给 24h 窗口，比 8h 更贴「最近一天有没有用起来」的直觉。
+		// 打印一行引导，告诉用户完整的等价指令（裸用一定是非 JSON 的人读模式）。
+		fmt.Println("→ 简化调用已自动补默认参数。完整指令：mem eval activity --since 24h")
+		fmt.Println()
+		return cmdEvalActivity([]string{"--since", "24h"})
 	}
 	switch args[0] {
 	case "recall":
 		return cmdEvalRecall(args[1:])
 	case "write":
 		return cmdEvalWrite(args[1:])
-	default:
-		return fmt.Errorf("未知子命令 %q；可选 recall | write", args[0])
+	case "activity":
+		return cmdEvalActivity(args[1:])
 	}
+	// 第一个 token 是 flag（以 - 开头）而非子命令 → 把它当成在默认 activity 上加参数，
+	// 例如 `mem eval --db X` / `mem eval --since 2h`。
+	if strings.HasPrefix(args[0], "-") {
+		return cmdEvalActivity(args)
+	}
+	return fmt.Errorf("未知子命令 %q；可选 recall | write | activity（不带子命令时默认跑 activity 24h）", args[0])
+}
+
+// defaultAutoSample 是 `--auto` 裸用时的默认抽样条数。
+const defaultAutoSample = 20
+
+// optionalInt 让 `--auto` 可裸用（取 default），也接受 `--auto=N` 与 `--auto N`。
+//
+// Go 标准 flag 的 int 必须给值，`--auto` 直接报"flag needs an argument"。
+// 这里用自定义 Value 并声明 IsBoolFlag：让 `--auto`（裸用）吃到 "true" 并取默认，
+// `--auto=50` / `--auto 50` 正常取数值；三种写法一致可用。
+type optionalInt struct {
+	set   bool // 用户在命令行写过 --auto
+	bare  bool // 裸用（未给数值，吃默认）
+	value int
+	def   int
+}
+
+// IsBoolFlag 允许 bare 形式：裸 `--auto` 时 Go flag 调 Set("true")。
+func (o *optionalInt) IsBoolFlag() bool { return true }
+
+func (o *optionalInt) String() string { return strconv.Itoa(o.value) }
+
+func (o *optionalInt) Set(s string) error {
+	o.set = true
+	if s == "" || s == "true" { // 裸 `--auto`：Go flag 传 "true"
+		o.bare = true
+		o.value = o.def
+		return nil
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return err
+	}
+	o.value = v
+	return nil
+}
+
+// evalHint 打印一行「简化调用已自动补默认参数、完整指令是什么」的引导。
+// 只在非 JSON 模式输出 —— JSON 不允许被任何非结构文本污染（LLM 解析会崩）。
+func evalHint(c common, full string) {
+	if c.json {
+		return
+	}
+	fmt.Printf("→ 简化调用已自动补默认参数。完整指令：%s\n\n", full)
 }
 
 func cmdEvalRecall(args []string) error {
@@ -200,19 +257,34 @@ func cmdEvalRecall(args []string) error {
 	fs := flag.NewFlagSet("eval recall", flag.ContinueOnError)
 	c.register(fs)
 	goldPath := fs.String("gold", "", "金标准 JSONL（每行 {\"query\":..,\"gold\":[\"<hash前缀>\"..]}）")
-	auto := fs.Int("auto", 0, "免标注自召回下限测试：抽样 N 条记忆当金标准")
+	auto := &optionalInt{def: defaultAutoSample}
+	fs.Var(auto, "auto", fmt.Sprintf("免标注自召回下限测试：抽样 N 条记忆当金标准（裸用取默认 %d）", defaultAutoSample))
 	k := fs.Int("k", defaultEvalK, "top-k")
 	project := fs.String("project", "", "限定工程（--auto 时按该工程抽样）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// 裸 `--auto` 时，紧跟的空格数值会被 Go flag 当成位置参数（bool flag 不消费下一 token）。
+	// 这里拾回：`--auto 1` 应等价 `--auto=1`，且显式给数后不再算「简化调用」。
+	if auto.set && auto.bare {
+		if rest := fs.Args(); len(rest) > 0 {
+			if v, err := strconv.Atoi(rest[0]); err == nil && v > 0 {
+				auto.value = v
+				auto.bare = false
+			}
+		}
+	}
 	if *k <= 0 {
 		return fmt.Errorf("--k 应为正数，got %d", *k)
 	}
-	if *goldPath == "" && *auto <= 0 {
-		return errors.New("需要 --gold <文件> 或 --auto <N>；真实评测请用 --gold")
+	if *goldPath == "" && !auto.set {
+		return errors.New("需要 --gold <文件> 或 --auto [N]（真实评测请用 --gold）。\n" +
+			"最短可用：\n" +
+			"  mem eval recall --auto           # 免标注下限自查（默认抽样 20 条）\n" +
+			"  mem eval recall --auto=50        # 指定抽样条数\n" +
+			"  mem eval recall --gold <文件>    # 真实金标准评测")
 	}
-	if *goldPath != "" && *auto > 0 {
+	if *goldPath != "" && auto.set {
 		return errors.New("--gold 与 --auto 不可同时使用")
 	}
 
@@ -222,8 +294,11 @@ func cmdEvalRecall(args []string) error {
 	}
 	defer st.Close()
 
-	if *auto > 0 {
-		return runAutoRecall(st, c, *auto, *k, *project)
+	if auto.set {
+		if auto.bare {
+			evalHint(c, fmt.Sprintf("mem eval recall --auto=%d", auto.value))
+		}
+		return runAutoRecall(st, c, auto.value, *k, *project)
 	}
 	return runGoldRecall(st, c, *goldPath, *k)
 }
@@ -373,7 +448,10 @@ func cmdEvalWrite(args []string) error {
 		return err
 	}
 	if *session == "" {
-		return errors.New("需要 --session <文件>")
+		return errors.New("需要 --session <文件>（抽哪个会话/日志）。\n" +
+			"最短可用：\n" +
+			"  mem eval write --session <会话/日志文件>          # 只给可自动算的质量指标\n" +
+			"  mem eval write --session <文件> --gold <清单>    # 附金标准，给漏记/多记")
 	}
 	cands, lines, err := extractCandidates(*session, *minRunes)
 	if err != nil {
@@ -513,28 +591,42 @@ func hashOrEmpty(st *store.Store, id string) string {
 	return h
 }
 
-// ---------- mem report：任务收尾的 mem 评测结论 ----------
+// ---------- mem eval activity：用量视图（任务收尾的 mem 评测结论） ----------
 
-// cmdReport 给「每次任务结束输出 mem 评测结论」提供参数支持。
+// cmdEvalActivity 给「每次任务结束输出 mem 评测结论」提供参数支持。
 //
-// 按时间窗（或会话）切出本次任务期间的读、写两侧活动，并直接给出结论 ——
-// 目的是让「mem 到底起没起作用」在任务收尾时就有一个可写进交付物的判据，
+// 按时间窗（period / task）或会话（session）切出期间的读、写两侧活动，并直接给出
+// 四态结论 —— 让「mem 到底起没起作用」在任务收尾时就有一个可写进交付物的判据，
 // 而不是等攒够样本再回头分析。
-func cmdReport(args []string) error {
+//
+// 它取代了被删除的 `mem report`：报与 eval 同级，不该有独立 CLI 入口（见
+// DESIGN.md §16）。task 粒度没有 harness 事件可依赖，由调用方显式给出窗口
+// （training-products 的 task-finish.sh 用分支首提交时间当起点）。
+func cmdEvalActivity(args []string) error {
 	var c common
-	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs := flag.NewFlagSet("eval activity", flag.ContinueOnError)
 	c.register(fs)
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
 	project := fs.String("project", "", "限定工程（默认不限）")
-	since := fs.String("since", "8h", "时间窗，如 30m / 2h / 24h")
-	session := fs.String("session", "", "限定会话 id（取钩子 stdin 的 session_id）")
+	scope := fs.String("scope", "period", "粒度: period|task|session")
+	since := fs.String("since", "8h", "时间窗，如 30m / 2h / 24h（period/task 粒度）")
+	session := fs.String("session", "", "限定会话 id（session 粒度）")
 	topN := fs.Int("top", 5, "空命中查询最多列几条")
+	includeBench := fs.Bool("include-bench", false, "计入 bench/test 来源的写侧（默认排除，避免程序化灌库污染统计）")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	switch *scope {
+	case "period", "task", "session":
+	default:
+		return fmt.Errorf("未知 --scope: %q（可选 period|task|session）", *scope)
 	}
 	d, err := time.ParseDuration(*since)
 	if err != nil || d <= 0 {
 		return fmt.Errorf("非法 --since: %q（需为 30m / 2h / 24h 这类正时长）", *since)
+	}
+	if *scope == "session" && *session == "" {
+		return errors.New("--scope session 需要 --session <会话 id>")
 	}
 	cutoff := time.Now().Add(-d).Unix()
 
@@ -560,13 +652,19 @@ func cmdReport(args []string) error {
 	}
 	var rs []audit.Record
 	for _, r := range all {
-		if r.TS < cutoff {
-			continue
-		}
 		if *project != "" && r.Project != *project {
 			continue
 		}
-		if *session != "" && r.SessionID != *session {
+		// 写侧治理：bench/test 属程序化灌库（基准/测试），默认不计入用量视图。
+		// --include-bench 放开。读侧（batch/read 事件）无 source，不受影响。
+		if !*includeBench && (r.Source == "bench" || r.Source == "test") {
+			continue
+		}
+		if *scope == "session" {
+			if r.SessionID != *session {
+				continue
+			}
+		} else if r.TS < cutoff {
 			continue
 		}
 		rs = append(rs, r)
@@ -578,18 +676,27 @@ func cmdReport(args []string) error {
 			// 带上读的是哪个日志：本次 bug 难发现的根因之一就是「报告没说它读了哪」，
 			// 空路径被静默当成空日志，从输出上看不出任何异常。
 			"audit_file": p, "exists": true,
-			"since": *since, "project": *project, "session": *session,
-			"summary": s, "verdict": reportVerdict(s), "empty_queries": emptyQueries(rs, *topN),
+			"scope": *scope, "since": *since, "project": *project, "session": *session,
+			"include_bench": *includeBench,
+			"summary": s, "verdict": activityVerdict(s), "empty_queries": emptyQueries(rs, *topN),
 		})
 	}
 
-	fmt.Printf("mem 评测结论（窗口 %s", *since)
+	fmt.Printf("mem 评测结论（%s级", *scope)
+	if *scope == "session" {
+		fmt.Printf("，会话 %s", *session)
+	} else {
+		fmt.Printf("，窗口 %s", *since)
+	}
 	if *project != "" {
 		fmt.Printf("，工程 %s", *project)
 	}
 	fmt.Printf("）\n")
 	fmt.Printf("日志      : %s\n\n", p)
 	fmt.Printf("活动      : 读侧 %d 次 / 写侧 %d 次\n", s.Retrievals, s.Writes)
+	if *includeBench {
+		fmt.Printf("（已含 bench/test 来源的写侧 —— 默认排除）\n")
+	}
 	fmt.Printf("空命中    : %d 次（%.1f%%）\n", s.Empty, s.EmptyRate*100)
 	fmt.Printf("平均耗时  : %.1f ms\n", s.AvgMS)
 	if s.Writes > 0 {
@@ -602,13 +709,13 @@ func cmdReport(args []string) error {
 			fmt.Printf("  - %s\n", truncateRunes(q, 60))
 		}
 	}
-	fmt.Printf("结论      : %s\n", reportVerdict(s))
+	fmt.Printf("结论      : %s\n", activityVerdict(s))
 	return nil
 }
 
-// reportVerdict 给出可直接写进交付物的一句话结论。
+// activityVerdict 给出可直接写进交付物的一句话结论。
 // 「只查未记」与「只记未查」是两种不同的故障，必须分开说。
-func reportVerdict(s audit.Summary) string {
+func activityVerdict(s audit.Summary) string {
 	switch {
 	case s.Total == 0:
 		return "本次任务未使用记忆库（窗口内既无检索也无记录活动）"
