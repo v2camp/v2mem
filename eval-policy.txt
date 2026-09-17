@@ -1,0 +1,3 @@
+# 发布门禁的召回阈值（单一真理源）。CI（make eval-gate）与 make release 同读。
+# 口径：Recall@5（宏平均，见 internal/eval 的评分定义）。0.60 即 60%。
+recall5_min=0.60

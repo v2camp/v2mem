@@ -20,6 +20,9 @@
 # 脑暴可视化草稿（不入库）
 /.superpowers/
 
+# 发布评测报告（make release 生成，属本地工件，不入库）
+/.mem/
+
 # 编辑器 / 系统
 .DS_Store
 *.swp
