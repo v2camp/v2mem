@@ -43,6 +43,7 @@ func cmdIngest(args []string) error {
 	project := fs.String("project", "", "工程标记（默认取当前 git 仓库名）")
 	kind := fs.String("kind", "fact", "记忆类型")
 	device := fs.String("device", "", "来源设备")
+	source := fs.String("source", "ingest", "来源标记（默认 ingest，机械化搬运）")
 	salience := fs.Float64("salience", 0.5, "重要性 0..1")
 	dryRun := fs.Bool("dry-run", false, "只列出候选项，不写库")
 	minRunes := fs.Int("min-runes", ingestMinRunes, "候选事实的最小字符数")
@@ -93,7 +94,8 @@ func cmdIngest(args []string) error {
 			}
 			r, err := st.Add(store.AddInput{
 				Content: cand, Kind: *kind, Project: proj,
-				Device: *device, Tags: tagMap, Salience: *salience,
+				Device: *device, Source: *source, Tool: "ingest",
+				Tags: tagMap, Salience: *salience,
 			})
 			if err != nil {
 				return err

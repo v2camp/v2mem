@@ -49,6 +49,54 @@ func TestCmdHookWritesAuditRecord(t *testing.T) {
 	}
 }
 
+// 钩子只读护栏：SessionStart / UserPromptSubmit 这类读事件只能查库，
+// 绝不能因为钩子被触发就往 memories 灌内容 —— 这是「注入内容冒充真实记忆」的守门。
+// 钩子允许触碰的只有内部去重表（hook_dedup），memories 必须一条都不多。
+func TestCmdHookReadOnly(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "--kind", "pitfall",
+		"唯一存在的记忆条"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	countMemories := func() int {
+		st, err := store.Open(db)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer st.Close()
+		rows, err := st.List(store.ListQuery{Scope: "all"})
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		return len(rows)
+	}
+	before := countMemories()
+
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	for _, ev := range []string{"SessionStart", "UserPromptSubmit"} {
+		if _, err := withStdin(t, hookStdin(ev, proj, "这条记忆和 iCloud 有关吗"), func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", ap})
+		}); err != nil {
+			t.Fatalf("hook %s: %v", ev, err)
+		}
+	}
+
+	if after := countMemories(); after != before {
+		t.Errorf("钩子读事件不应写入 memories: before=%d after=%d", before, after)
+	}
+
+	rs, err := audit.Read(ap, 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	for _, r := range rs {
+		if r.Event == "manual-add" || r.Event == "manual-forget" {
+			t.Errorf("钩子读事件不应产生写侧审计 %q: %+v", r.Event, r)
+		}
+	}
+}
+
 func TestCmdHookAuditCanBeDisabled(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
@@ -217,6 +265,98 @@ func TestCmdEvalRecallRejectsBothModesAndNeither(t *testing.T) {
 	gold := writeGold(t, t.TempDir(), []map[string]any{{"query": "q", "gold": []string{"x"}}})
 	if err := cmdEvalRecall([]string{"--db", db, "--gold", gold, "--auto", "3"}); err == nil {
 		t.Error("--gold 与 --auto 同时给出应报错")
+	}
+}
+
+// 缺参报错必须附「最短可抄命令」，否则用户不知道下一步该跑什么。
+func TestCmdEvalRecallErrorCarriesCopyableExample(t *testing.T) {
+	err := cmdEvalRecall([]string{"--db", testDB(t)})
+	if err == nil {
+		t.Fatal("既无 --gold 也无 --auto 应报错")
+	}
+	for _, want := range []string{"最短可用", "mem eval recall --auto", "--auto=50", "mem eval recall --gold"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("报错应含可抄示例 %q，got:\n%s", want, err)
+		}
+	}
+}
+
+// `--auto`（裸用，不带数值）必须直接跑，默认抽样 defaultAutoSample 条 ——
+// 这是用户最常踩的坑：Go 原生 int flag 会报 "flag needs an argument"。
+func TestCmdEvalRecallAutoBareRunsWithDefault(t *testing.T) {
+	db := testDB(t)
+	for _, c := range []string{"记忆库数据固定放 ~/.v2mem 目录", "活库不能放进 iCloud 同步目录"} {
+		if err := cmdAdd([]string{"--db", db, c}); err != nil {
+			t.Fatalf("cmdAdd: %v", err)
+		}
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdEvalRecall([]string{"--db", db, "--auto"})
+	})
+	if err != nil {
+		t.Fatalf("cmdEvalRecall --auto 裸用不应报错: %v", err)
+	}
+	for _, want := range []string{"下限", "不代表真实检索质量"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("输出应含 %q，got:\n%s", want, out)
+		}
+	}
+	// 裸用命中默认，首行要给出完整指令作引导
+	if !strings.Contains(out, "简化调用已自动补默认参数") ||
+		!strings.Contains(out, "mem eval recall --auto=20") {
+		t.Errorf("裸用应提示默认与完整指令（--auto=20），got:\n%s", out)
+	}
+}
+
+// `--auto N`（空格形式）也要等于 `--auto=N`，不能只认等号写法。
+func TestCmdEvalRecallAutoSpaceFormEqualsEqualsForm(t *testing.T) {
+	mk := func(arg ...string) string {
+		db := testDB(t)
+		for _, c := range []string{"记忆库数据固定放 ~/.v2mem 目录", "活库不能放进 iCloud 同步目录"} {
+			if err := cmdAdd([]string{"--db", db, c}); err != nil {
+				t.Fatalf("cmdAdd: %v", err)
+			}
+		}
+		argv := append([]string{"--db", db}, arg...)
+		out, err := captureStdout(t, func() error {
+			return cmdEvalRecall(argv)
+		})
+		if err != nil {
+			t.Fatalf("cmdEvalRecall %v: %v", arg, err)
+		}
+		return out
+	}
+	// 显式给数值（=N 或空格 N）不属「简化调用」，不应出现默认引导行
+	for _, explicit := range [][]string{{"--auto=1"}, {"--auto", "1"}} {
+		if strings.Contains(mk(explicit...), "简化调用已自动补默认参数") {
+			t.Errorf("显式 %v 不应出现默认引导行", explicit)
+		}
+	}
+	// 裸用才该有引导
+	if !strings.Contains(mk("--auto"), "简化调用已自动补默认参数") {
+		t.Error("裸用 --auto 应出现默认引导行")
+	}
+}
+
+// 一键默认：`mem eval`（不带子命令）应直接跑 activity，而不是报用法错。
+func TestCmdEvalWithNoSubcommandRunsActivity(t *testing.T) {
+	// 用空的 HOME 隔离默认审计路径，避免读到本机真实 ~/.v2mem/audit.jsonl
+	t.Setenv("HOME", t.TempDir())
+	out, err := captureStdout(t, func() error { return cmdEval(nil) })
+	if err != nil {
+		t.Fatalf("cmdEval(nil): %v", err)
+	}
+	if strings.Contains(out, "用法: mem eval recall|write|activity") {
+		t.Errorf("`mem eval` 无参不应再报旧用法错，got:\n%s", out)
+	}
+	// 空 HOME 下默认审计路径不存在，应走到 activity 的「日志不存在」分支，
+	// 证明确实进入了 activity（而不是报用法错）
+	if !strings.Contains(out, "审计日志不存在") {
+		t.Errorf("输出应含「审计日志不存在」（证明进了 activity），got:\n%s", out)
+	}
+	// 无参是一键默认，首行应提示完整等价指令
+	if !strings.Contains(out, "mem eval activity --since 24h") {
+		t.Errorf("无参应提示完整指令 mem eval activity --since 24h，got:\n%s", out)
 	}
 }
 
@@ -615,11 +755,11 @@ func TestAuditSummarySeparatesReadAndWrite(t *testing.T) {
 	}
 }
 
-// ---------- mem report：任务收尾的 mem 评测结论 ----------
+// ---------- mem eval activity：用量视图（任务收尾的 mem 评测结论） ----------
 
-// 给「每次任务结束输出 mem 评测结论」这条临时约定提供参数支持：
+// 给「每次任务结束输出 mem 评测结论」提供参数支持：
 // 按时间窗/会话切出本次任务的读、写两侧活动，直接给出结论与建议。
-func TestCmdReportProducesVerdict(t *testing.T) {
+func TestCmdEvalActivityProducesVerdict(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "audit.jsonl")
 	now := time.Now().Unix()
 	rs := []audit.Record{
@@ -634,10 +774,10 @@ func TestCmdReportProducesVerdict(t *testing.T) {
 		}
 	}
 	out, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+		return cmdEvalActivity([]string{"--audit-file", p, "--since", "1h"})
 	})
 	if err != nil {
-		t.Fatalf("cmdReport: %v", err)
+		t.Fatalf("cmdEvalActivity: %v", err)
 	}
 	for _, want := range []string{"读侧", "写侧", "结论"} {
 		if !strings.Contains(out, want) {
@@ -650,17 +790,17 @@ func TestCmdReportProducesVerdict(t *testing.T) {
 }
 
 // 「只查不记」与「只记不查」必须给出不同结论 —— 这是判断 mem 是否起作用的落点。
-func TestCmdReportDistinguishesReadOnlyAndWriteOnly(t *testing.T) {
+func TestCmdEvalActivityDistinguishesReadOnlyAndWriteOnly(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().Unix()
 
 	readOnly := filepath.Join(dir, "r.jsonl")
 	_ = audit.Append(readOnly, audit.Record{TS: now, Event: "manual-search", Query: "q", Hashes: []string{"a"}})
 	out1, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--audit-file", readOnly, "--since", "1h"})
+		return cmdEvalActivity([]string{"--audit-file", readOnly, "--since", "1h"})
 	})
 	if err != nil {
-		t.Fatalf("cmdReport: %v", err)
+		t.Fatalf("cmdEvalActivity: %v", err)
 	}
 	if !strings.Contains(out1, "只查未记") {
 		t.Errorf("只读侧活动应判为「只查未记」，got:\n%s", out1)
@@ -669,10 +809,10 @@ func TestCmdReportDistinguishesReadOnlyAndWriteOnly(t *testing.T) {
 	writeOnly := filepath.Join(dir, "w.jsonl")
 	_ = audit.Append(writeOnly, audit.Record{TS: now, Event: "manual-add", Mode: "create", Hashes: []string{"h"}})
 	out2, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--audit-file", writeOnly, "--since", "1h"})
+		return cmdEvalActivity([]string{"--audit-file", writeOnly, "--since", "1h"})
 	})
 	if err != nil {
-		t.Fatalf("cmdReport: %v", err)
+		t.Fatalf("cmdEvalActivity: %v", err)
 	}
 	if !strings.Contains(out2, "只记未查") {
 		t.Errorf("只写侧活动应判为「只记未查」，got:\n%s", out2)
@@ -680,7 +820,7 @@ func TestCmdReportDistinguishesReadOnlyAndWriteOnly(t *testing.T) {
 }
 
 // 空命中的查询原文必须列出来 —— 它们正是标注金标准的候选样本。
-func TestCmdReportListsEmptyHitQueries(t *testing.T) {
+func TestCmdEvalActivityListsEmptyHitQueries(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "audit.jsonl")
 	now := time.Now().Unix()
 	for _, q := range []string{"查得到的问题", "查不到的问题甲", "查不到的问题乙"} {
@@ -688,10 +828,10 @@ func TestCmdReportListsEmptyHitQueries(t *testing.T) {
 		_ = audit.Append(p, audit.Record{TS: now, Event: "manual-search", Query: q, Empty: empty})
 	}
 	out, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+		return cmdEvalActivity([]string{"--audit-file", p, "--since", "1h"})
 	})
 	if err != nil {
-		t.Fatalf("cmdReport: %v", err)
+		t.Fatalf("cmdEvalActivity: %v", err)
 	}
 	for _, want := range []string{"查不到的问题甲", "查不到的问题乙"} {
 		if !strings.Contains(out, want) {
@@ -704,7 +844,7 @@ func TestCmdReportListsEmptyHitQueries(t *testing.T) {
 }
 
 // 时间窗必须真的生效：窗外的事件不能计入。
-func TestCmdReportHonoursSinceWindow(t *testing.T) {
+func TestCmdEvalActivityHonoursSinceWindow(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "audit.jsonl")
 	now := time.Now().Unix()
 	// 两条都标 Empty：报告只列「空命中查询」，用它们做时间窗的判据才成立
@@ -712,10 +852,10 @@ func TestCmdReportHonoursSinceWindow(t *testing.T) {
 	_ = audit.Append(p, audit.Record{TS: now, Event: "manual-search", Query: "刚刚", Empty: true})
 
 	out, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+		return cmdEvalActivity([]string{"--audit-file", p, "--since", "1h"})
 	})
 	if err != nil {
-		t.Fatalf("cmdReport: %v", err)
+		t.Fatalf("cmdEvalActivity: %v", err)
 	}
 	if strings.Contains(out, "两小时前") {
 		t.Errorf("--since 1h 不应计入 2 小时前的事件，got:\n%s", out)
@@ -725,10 +865,30 @@ func TestCmdReportHonoursSinceWindow(t *testing.T) {
 	}
 }
 
-func TestCmdReportOnEmptyLogSaysSo(t *testing.T) {
+// session 粒度按会话 id 过滤，不按时间窗。
+func TestCmdEvalActivityScopeSession(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	now := time.Now().Unix()
+	_ = audit.Append(p, audit.Record{TS: now, Event: "manual-search", Query: "会话甲", SessionID: "sess-a", Empty: true})
+	_ = audit.Append(p, audit.Record{TS: now, Event: "manual-search", Query: "会话乙", SessionID: "sess-b", Empty: true})
+	out, err := captureStdout(t, func() error {
+		return cmdEvalActivity([]string{"--audit-file", p, "--scope", "session", "--session", "sess-a"})
+	})
+	if err != nil {
+		t.Fatalf("cmdEvalActivity: %v", err)
+	}
+	if !strings.Contains(out, "会话甲") {
+		t.Errorf("session 粒度应只统计该会话，got:\n%s", out)
+	}
+	if strings.Contains(out, "会话乙") {
+		t.Errorf("session 粒度不应计入其它会话，got:\n%s", out)
+	}
+}
+
+func TestCmdEvalActivityOnEmptyLogSaysSo(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "audit.jsonl")
 	out, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+		return cmdEvalActivity([]string{"--audit-file", p, "--since", "1h"})
 	})
 	if err != nil {
 		t.Fatalf("空审计不应报错: %v", err)
@@ -738,9 +898,15 @@ func TestCmdReportOnEmptyLogSaysSo(t *testing.T) {
 	}
 }
 
-func TestCmdReportRejectsBadSince(t *testing.T) {
-	if err := cmdReport([]string{"--since", "not-a-duration"}); err == nil {
+func TestCmdEvalActivityRejectsBadArgs(t *testing.T) {
+	if err := cmdEvalActivity([]string{"--since", "not-a-duration"}); err == nil {
 		t.Error("非法 --since 应报错")
+	}
+	if err := cmdEvalActivity([]string{"--scope", "bogus"}); err == nil {
+		t.Error("未知 --scope 应报错")
+	}
+	if err := cmdEvalActivity([]string{"--scope", "session"}); err == nil {
+		t.Error("--scope session 缺 --session 应报错")
 	}
 }
 
@@ -1077,13 +1243,14 @@ func TestCmdSearchRejectsContradictoryScopeAndProject(t *testing.T) {
 // 起因：`mem report` 未兜底 --audit-file，把空路径传给 audit.Read，
 // 而 os.Open("") 的 ENOENT 被 isNotExist 分支吞成「空日志」⇒
 // 明明有 27 条记录，却报出「本次任务未使用记忆库」这个**错误结论**。
-func TestCmdReportSaysLogMissingInsteadOfNoActivity(t *testing.T) {
+// activity 视图继承了这个兜底，这条断言继续守住它。
+func TestCmdEvalActivitySaysLogMissingInsteadOfNoActivity(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope.jsonl")
 	out, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--audit-file", missing, "--since", "8h"})
+		return cmdEvalActivity([]string{"--audit-file", missing, "--since", "8h"})
 	})
 	if err != nil {
-		t.Fatalf("cmdReport: %v", err)
+		t.Fatalf("cmdEvalActivity: %v", err)
 	}
 	if !strings.Contains(out, "审计日志不存在") {
 		t.Errorf("日志不存在时应明确说读不到，got:\n%s", out)
@@ -1101,10 +1268,10 @@ func TestCmdReportSaysLogMissingInsteadOfNoActivity(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 	out2, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--audit-file", p, "--since", "1h"})
+		return cmdEvalActivity([]string{"--audit-file", p, "--since", "1h"})
 	})
 	if err != nil {
-		t.Fatalf("cmdReport: %v", err)
+		t.Fatalf("cmdEvalActivity: %v", err)
 	}
 	if !strings.Contains(out2, "未使用记忆库") {
 		t.Errorf("日志存在但窗口内无活动时，才应给「未使用记忆库」，got:\n%s", out2)
@@ -1112,7 +1279,7 @@ func TestCmdReportSaysLogMissingInsteadOfNoActivity(t *testing.T) {
 }
 
 // 不指定 --audit-file 时必须读默认位置（与 cmdAudit 一致）。
-func TestCmdReportUsesDefaultAuditPath(t *testing.T) {
+func TestCmdEvalActivityUsesDefaultAuditPath(t *testing.T) {
 	def := audit.Path()
 	if err := audit.Append(def, audit.Record{
 		TS: time.Now().Unix(), Event: "manual-search", Query: "默认路径里的查询", Hashes: []string{"x"},
@@ -1122,10 +1289,10 @@ func TestCmdReportUsesDefaultAuditPath(t *testing.T) {
 	// 用 --json 精确断言：默认审计路径在整个测试二进制里是**共享**的，
 	// 其它用例也会往里写，所以不能卡「恰好 1 次」（实测因此抖动过）。
 	out, err := captureStdout(t, func() error {
-		return cmdReport([]string{"--since", "1h", "--json"})
+		return cmdEvalActivity([]string{"--since", "1h", "--json"})
 	})
 	if err != nil {
-		t.Fatalf("cmdReport: %v", err)
+		t.Fatalf("cmdEvalActivity: %v", err)
 	}
 	var got struct {
 		AuditFile string `json:"audit_file"`

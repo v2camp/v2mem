@@ -714,6 +714,37 @@ func TestCmdAddRejectsGlobalCombinedWithProject(t *testing.T) {
 	}
 }
 
+// M5b-0：--no-fuzzy 关闭模糊检索，措辞不同的近亲不再进入结果。
+func TestCmdSearchNoFuzzyFlagDisablesFuzzy(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "日志怎么放进记忆库里"}); err != nil {
+		t.Fatalf("cmdAdd paraphrase: %v", err)
+	}
+	if err := cmdAdd([]string{"--db", db, "日志怎么搬进记忆库里"}); err != nil {
+		t.Fatalf("cmdAdd target: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdSearch([]string{"--db", db, "--limit", "10", "日志怎么搬进记忆库里"})
+	})
+	if err != nil {
+		t.Fatalf("cmdSearch: %v", err)
+	}
+	if !strings.Contains(out, "日志怎么放进记忆库里") {
+		t.Errorf("默认应开启模糊检索、带回措辞不同的近亲，got: %q", out)
+	}
+
+	noFuzzyOut, err := captureStdout(t, func() error {
+		return cmdSearch([]string{"--db", db, "--no-fuzzy", "--limit", "10", "日志怎么搬进记忆库里"})
+	})
+	if err != nil {
+		t.Fatalf("cmdSearch --no-fuzzy: %v", err)
+	}
+	if strings.Contains(noFuzzyOut, "日志怎么放进记忆库里") {
+		t.Errorf("--no-fuzzy 应关闭模糊检索，got: %q", noFuzzyOut)
+	}
+}
+
 func TestCmdSearchScopeGlobalExcludesProjectMemories(t *testing.T) {
 	db := testDB(t)
 	if err := cmdAdd([]string{"--db", db, "--project", "alpha", "全局作用域验证的工程内条目"}); err != nil {
