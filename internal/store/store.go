@@ -34,6 +34,7 @@ var schemaSQL string
 type Store struct {
 	db   *sql.DB
 	path string
+	syn  *SynonymDict // 同义词展开词典；nil = 未启用（文件缺失或 MEM_SYN_DICT=0）
 }
 
 // DefaultPath 返回默认库路径：~/.v2mem/mem.db。
@@ -85,6 +86,8 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("迁移 source 列失败: %w", err)
 	}
 	st := &Store{db: db, path: path}
+	// 词库加载失败不致命：检索不该因辅助配置坏了而崩。
+	_ = st.reloadSynonyms()
 	if err := st.backfillSigs(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("补齐 MinHash 签名失败: %w", err)
@@ -460,6 +463,7 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 	if q.Query == "" {
 		return nil, errors.New("查询为空")
 	}
+	q.Query = s.ExpandQuery(q.Query, q.Project)
 	expr := queryExpr(q.Query)
 	if expr == "" {
 		return nil, errors.New("查询不含可检索内容（需至少含一个汉字或字母数字）")
