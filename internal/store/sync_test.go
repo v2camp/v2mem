@@ -646,6 +646,278 @@ func TestImportReportsUnresolvedSupersession(t *testing.T) {
 	}
 }
 
+// ---------- WS3: 三方合并 ----------
+
+// mkRec 构造一条远端导出的记录（身份键由内容哈希计算）。
+func mkRec(content, proj string, updatedAt int64, device string) ExportRecord {
+	return ExportRecord{
+		Content:      content,
+		ContentHash:  HashOf(content),
+		Kind:         "fact",
+		Project:      proj,
+		Salience:     0.5,
+		CreatedAt:    updatedAt,
+		UpdatedAt:    updatedAt,
+		LastSeenAt:   updatedAt,
+		OriginDevice: device,
+		OriginTool:   "cli",
+		Source:       "human",
+		AccessCount:  1,
+	}
+}
+
+// syncContent 返回本地库中该 (hash, project) 的原文内容。
+func syncContent(t *testing.T, s *Store, h, proj string) string {
+	t.Helper()
+	var c string
+	if err := s.db.QueryRow(
+		`SELECT content FROM memories WHERE content_hash = ? AND project = ?`, h, proj,
+	).Scan(&c); err != nil {
+		t.Fatalf("查询 content: %v", err)
+	}
+	return c
+}
+
+func hasTag(t *testing.T, s *Store, id, k, v string) bool {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM tags WHERE memory_id = ? AND key = ? AND value = ?`, id, k, v,
+	).Scan(&n); err != nil {
+		t.Fatalf("查询 tag: %v", err)
+	}
+	return n > 0
+}
+
+// 本地没有的键 → 新插入，且不因同步覆盖本地源信息以外的语义。
+func TestSyncMergeInsertsNewRecords(t *testing.T) {
+	local := newTestStore(t)
+	rec := mkRec("远端独有事实", "p1", 900, "dev-far")
+
+	stats, err := local.SyncMerge([]ExportRecord{rec})
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if stats.Inserted != 1 || stats.Merged != 0 || stats.NewerLocal != 0 {
+		t.Errorf("应插入 1 条，got %+v", stats)
+	}
+	if countAll(t, local) != 1 {
+		t.Errorf("应只有 1 条，got %d", countAll(t, local))
+	}
+	exp, err := local.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if len(exp) != 1 || exp[0].OriginDevice != "dev-far" {
+		t.Errorf("插入记录应保留远端溯源设备，got %+v", exp)
+	}
+}
+
+// 同 hash、远端更新（> 本地 + 阈值）→ 最近者胜：远端内容写法胜出、时间戳推进。
+func TestSyncMergeRemoteNewerWins(t *testing.T) {
+	const proj = "p1"
+	// 不同间距的同义写法 → 归一化后 hash 相同，但原文串可区分「谁新」。
+	oldSpell := "远程同步  事实"
+	newSpell := "远程同步 事实"
+	if HashOf(oldSpell) != HashOf(newSpell) {
+		t.Fatal("前置：两种写法应归一化为同一 content_hash")
+	}
+	s := newTestStore(t)
+	lid := addWith(t, s, AddInput{Content: oldSpell, Project: proj})
+	// 本地 updated_at 置旧
+	if _, err := s.db.Exec(`UPDATE memories SET updated_at = ? WHERE id = ?`, 1000, lid); err != nil {
+		t.Fatalf("set updated_at: %v", err)
+	}
+
+	remote := mkRec(newSpell, proj, 5000, "dev-far")
+	stats, err := s.SyncMerge([]ExportRecord{remote})
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if stats.Merged != 1 {
+		t.Errorf("远端更新应归并（最近者胜），got %+v", stats)
+	}
+
+	if got := syncContent(t, s, HashOf(newSpell), proj); got != newSpell {
+		t.Errorf("最近者胜应采纳远端新写法 %q，got %q", newSpell, got)
+	}
+	var at int64
+	if err := s.db.QueryRow(`SELECT updated_at FROM memories WHERE id = ?`, lid).Scan(&at); err != nil {
+		t.Fatalf("查询 updated_at: %v", err)
+	}
+	if at != 5000 {
+		t.Errorf("updated_at 应推进到远端 5000，got %d", at)
+	}
+	// 冲突标记不应当出现在「明确最近者胜」分支
+	if hasTag(t, s, lid, "sync", "conflict:dev-far") {
+		t.Error("最近者胜分支不应留下冲突标记")
+	}
+}
+
+// 同 hash、本地更新：保持本地，远端不做任何覆盖，也不打冲突标记。
+func TestSyncMergeLocalNewerKeepsLocal(t *testing.T) {
+	s := newTestStore(t)
+	lid := addWith(t, s, AddInput{Content: "本地更新事实", Project: "p1"})
+	if _, err := s.db.Exec(`UPDATE memories SET updated_at = ? WHERE id = ?`, 8000, lid); err != nil {
+		t.Fatalf("set updated_at: %v", err)
+	}
+
+	remote := mkRec("本地更新事实", "p1", 100, "dev-far")
+	stats, err := s.SyncMerge([]ExportRecord{remote})
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if stats.NewerLocal != 1 || stats.Merged != 0 {
+		t.Errorf("本地更新应保持，got %+v", stats)
+	}
+	if got := syncContent(t, s, HashOf("本地更新事实"), "p1"); got != "本地更新事实" {
+		t.Errorf("本地内容应保持不变，got %q", got)
+	}
+	if hasTag(t, s, lid, "sync", "conflict:dev-far") {
+		t.Error("本地更新分支不应留下冲突标记")
+	}
+}
+
+// 同 hash、时间戳撞车（≤ 阈值）→ 冲突并存：保留本地写法并打 sync 冲突标记，
+// 不静默吞掉任一设备；两端都记录在案供 mem merge 人工收敛。
+func TestSyncMergeConflictMarksAndKeeps(t *testing.T) {
+	// 两端 updated_at 取同一值，精确命中冲突分支。
+	at := int64(3000)
+	local := newTestStore(t)
+	lid := addWith(t, local, AddInput{Content: "并行编辑事实", Project: "p1"})
+	if _, err := local.db.Exec(`UPDATE memories SET updated_at = ? WHERE id = ?`, at, lid); err != nil {
+		t.Fatalf("set updated_at: %v", err)
+	}
+
+	remote := mkRec("并行编辑事实", "p1", at, "dev-far")
+	stats, err := local.SyncMerge([]ExportRecord{remote})
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if len(stats.Conflicts) != 1 {
+		t.Fatalf("应记录 1 条冲突，got %+v", stats)
+	}
+	if stats.Conflicts[0].LocalAt != at || stats.Conflicts[0].RemoteAt != at {
+		t.Errorf("冲突应如实记录两侧时间戳，got %+v", stats.Conflicts[0])
+	}
+	if stats.Conflicts[0].RemoteDevice != "dev-far" {
+		t.Errorf("冲突应记录远端设备，got %+v", stats.Conflicts[0])
+	}
+	if !hasTag(t, local, lid, "sync", "conflict:dev-far") {
+		t.Error("冲突时应打 sync 冲突标记（不静默吞远端来源）")
+	}
+	if got := syncContent(t, local, HashOf("并行编辑事实"), "p1"); got != "并行编辑事实" {
+		t.Errorf("冲突时保留本地写法，got %q", got)
+	}
+	if countAll(t, local) != 1 {
+		t.Errorf("冲突不应新增行（唯一索引），got %d", countAll(t, local))
+	}
+}
+
+// 阈值内（差 1 秒）也被视为撞车冲突，而不是「远端更」。
+func TestSyncMergeWithinToleranceIsConflict(t *testing.T) {
+	local := newTestStore(t)
+	lid := addWith(t, local, AddInput{Content: "阈值边界事实", Project: "p1"})
+	if _, err := local.db.Exec(`UPDATE memories SET updated_at = ? WHERE id = ?`, 1000, lid); err != nil {
+		t.Fatalf("set updated_at: %v", err)
+	}
+	remote := mkRec("阈值边界事实", "p1", 1001, "dev-far")
+	stats, err := local.SyncMerge([]ExportRecord{remote})
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if len(stats.Conflicts) != 1 {
+		t.Errorf("差 1 秒（≤2）应判撞车冲突，got %+v", stats)
+	}
+	if !hasTag(t, local, lid, "sync", "conflict:dev-far") {
+		t.Error("应打冲突标记")
+	}
+}
+
+// 远程 tags 在归并（并入/保持/冲突）后都应并集保留。
+func TestSyncMergeUnionsTags(t *testing.T) {
+	local := newTestStore(t)
+	lid := addWith(t, local, AddInput{Content: "标记并合事实", Project: "p1"})
+	if _, err := local.db.Exec(`UPDATE memories SET updated_at = ? WHERE id = ?`, 1000, lid); err != nil {
+		t.Fatalf("set updated_at: %v", err)
+	}
+	rec := mkRec("标记并合事实", "p1", 5000, "dev-far")
+	rec.Tags = map[string][]string{"machine": {"mini"}, "owner": {"wanghui"}}
+	if _, err := local.SyncMerge([]ExportRecord{rec}); err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	for k, v := range map[string]string{"machine": "mini", "owner": "wanghui"} {
+		if !hasTag(t, local, lid, k, v) {
+			t.Errorf("远端标记 %s=%s 应并集保留", k, v)
+		}
+	}
+}
+
+// 空内容记录应计入 skipped，不落库。
+func TestSyncMergeSkipsEmptyContent(t *testing.T) {
+	local := newTestStore(t)
+	rec := mkRec("   ", "p1", 100, "dev-far")
+	stats, err := local.SyncMerge([]ExportRecord{rec})
+	if err != nil {
+		t.Fatalf("SyncMerge: %v", err)
+	}
+	if stats.Skipped != 1 {
+		t.Errorf("空内容应跳过，got %+v", stats)
+	}
+	if countAll(t, local) != 0 {
+		t.Errorf("不应落库，got %d", countAll(t, local))
+	}
+}
+
+// 双向同步后两侧的事实投影应收敛（各自独有并入对方，共享事实一致）。
+//
+// 注意：只比「事实投影」，不比 tags——
+// 冲突并存时会在同一条上打 sync 标记，整库回灌到它的来源端时该标记可能落在
+// A 侧或 B 侧（取决于谁先合并），这是「来源可见性」的辅助噪音，不是数据分歧；
+// 内容与元数据的收敛才是本测试守的口径。
+func TestSyncMergeConvergesBothDirections(t *testing.T) {
+	a := newTestStore(t)
+	mustAdd(t, a, "仅A有的事实")
+	mustAdd(t, a, "共享事实")
+	b := newTestStore(t)
+	mustAdd(t, b, "仅B有的事实")
+	mustAdd(t, b, "共享事实")
+
+	if _, err := b.SyncMerge(exportOf(t, a)); err != nil {
+		t.Fatalf("b.SyncMerge(a): %v", err)
+	}
+	if _, err := a.SyncMerge(exportOf(t, b)); err != nil {
+		t.Fatalf("a.SyncMerge(b): %v", err)
+	}
+	sa, sb := stripTags(snapshot(t, a)), stripTags(snapshot(t, b))
+	if !reflect.DeepEqual(sa, sb) {
+		t.Errorf("双向同步后两侧应收敛\nA: %s\nB: %s", dumpSnap(sa), dumpSnap(sb))
+	}
+	if len(sa) != 3 {
+		t.Errorf("收敛后应有 3 条，got %d", len(sa))
+	}
+}
+
+// stripTags 抛出 tags 投影，仅保留「事实 + 位置元数据」用于收敛比较。
+func stripTags(m map[string]snap) map[string]snap {
+	out := make(map[string]snap, len(m))
+	for k, v := range m {
+		v.Tags = ""
+		out[k] = v
+	}
+	return out
+}
+
+// exportOf 导出某库的全部记录作为「远端输入」。
+func exportOf(t *testing.T, s *Store) []ExportRecord {
+	t.Helper()
+	recs, err := s.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	return recs
+}
+
 // 一条记录已在本地被取代，随后导入同一份它仍然是被取代状态。
 func TestImportKeepsAlreadySupersededRecordSuperseded(t *testing.T) {
 	s := newTestStore(t)
