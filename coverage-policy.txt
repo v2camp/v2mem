@@ -1,0 +1,23 @@
+# v2mem 单元测试覆盖率策略 —— 单一真理源
+#
+# 口径：`go test ./... -coverprofile=...`（包内视角）。
+#   每个包由自己的测试负责；跨包调用产生的覆盖不计入被调方 —— 这是 Go 的标准语义。
+#   例：harness.ExistingGlobalConfigs 由 cmd/mem 的测试执行到，但不算 harness 的覆盖率；
+#   故 harness 需要自己的单元测试，而不是依赖集成测试替它刷分。
+#
+# 下限（棘轮 / ratchet）：硬门禁。取自实测值向下取整，语义是「不得低于历史最好」。
+#   覆盖率因重构合法下降时，用 `make cover-update` 显式刷新下限，并在提交信息里写明原因。
+#   棘轮只允许上调：降标必须人工确认（`make cover-update FORCE=1`），不允许静默放宽。
+#
+# 目标：软提示，下一阶段努力方向，不阻断提交。
+#
+# 字段：包路径 <TAB> 下限 <TAB> 目标
+# 新增包必须在此登记 —— 门禁会拒绝任何未登记（即无门槛）的包。
+
+github.com/wanghui/v2mem/internal/eval	97	98
+github.com/wanghui/v2mem/internal/similarity	96	97
+github.com/wanghui/v2mem/internal/harness	93	96
+github.com/wanghui/v2mem/internal/audit	86	90
+github.com/wanghui/v2mem/internal/store	82	88
+github.com/wanghui/v2mem/cmd/mem	81	85
+TOTAL	83	88

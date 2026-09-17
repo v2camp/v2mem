@@ -1,19 +1,21 @@
 # v2mem
 
-个人 Agent 记忆系统。一个本地 CLI（命令名 `mem`），存"跨会话该记住的东西"，
+**个人 Agent 记忆系统** —— 一个本地 CLI（命令名 `mem`），存"跨会话该记住的东西"，
 让 AI 工具在**需要时**查得到，而不是把它们塞进每轮注入的上下文里。
 
-```
+**轻量** —— 单文件二进制约 **11 MB**：零 CGO、零外部服务、零常驻进程，直接依赖只有 1 个
+（`modernc.org/sqlite`，纯 Go 转译）
+**快** —— 200 条记忆库检索平均 **~9 ms/次**（FTS5 + bm25：精确优先、空手才放宽）
+**多工具** —— 原生接入 **11 个 AI 工具**（Claude Code / Codex / TraeCode / WorkBuddy / CodeBuddy / Qoder …），
+另提供 **MCP server**，任何支持 MCP 的工具一行配置即接入
+**跨会话** —— 记忆持久在本地 SQLite，会话之间、工程之间共享，不依赖任何云服务
+**跨平台** —— mac / linux / windows 预编译单文件，同一套记忆三端通用
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/wanghui/v2mem/main/scripts/install.sh | bash
 mem add --kind pitfall "活库 mem.db 绝不能放进 iCloud 同步目录，会损坏 SQLite"
 mem search "同步目录"
-
-# 装进你在用的 AI 工具（扫描本机 → 让你选）
-mem init
 ```
-
-- **零 CGO、零外部服务、零常驻进程**：单文件二进制约 11 MB，可交叉编译，数据是自己的一个 SQLite 文件
-- **直接依赖只有 1 个**（`modernc.org/sqlite`，纯 Go 转译）
-- 代码 4633 行 / 测试 4330 行，**164 个用例**（`make test` 可复现），全部 TDD 编写
 
 ---
 
@@ -38,83 +40,64 @@ AI 工具的"长期记忆"通常是一个每轮都注入的 Markdown 文件（`A
 
 ---
 
+## 安装
+
+```
+v2mem 有两条安装路径，二选一即可：
+```
+
+| 路径 | 适用 | 安装 | 更新 |
+|:---|:---|:---|:---|
+| **远程发布版**（推荐给使用者） | 稳定、随版本走 | `curl -fsSL …/install.sh \| bash` → `~/.local/bin/mem` | 重跑同一行脚本 |
+| **本地开发软链**（推荐给开发者） | 跟着代码走，改完即生效 | `make build` → `bin/mem`，软链到 PATH | 重新 `make build`，软链自动跟随 |
+
+```bash
+# 远程发布版（推荐）—— 从 GitHub Releases 下载预编译二进制，失败自动回退源码构建
+curl -fsSL https://raw.githubusercontent.com/wanghui/v2mem/main/scripts/install.sh | bash
+#   --dir ~/bin     指定安装目录（默认 ~/.local/bin）
+#   --version v0.1.0 指定版本 tag（默认 latest；未传入时拉最新发布）
+#   --from-source   跳过下载，强制源码构建
+
+# 本地开发软链 —— 让 $GOBIN 里的 mem 指向仓库构建产物，值随代码变
+make build                                                   # → bin/mem
+ln -sf "$PWD/bin/mem" "$(go env GOPATH)/bin/mem"             # 覆盖式软链
+```
+
+预编译产物：`mem-darwin-amd64|arm64`、`mem-linux-amd64|arm64`、`mem-windows-amd64.exe`。
+
+> ⚠️ **两条路径会互相覆盖**：`make install`（`go install`）会在 `$GOPATH/bin` 写入**真实文件**，覆盖已存在的软链。
+> 想回发布版就重跑 curl 安装；想回开发软链就重跑上面的 `ln -sf`。发布版与软链处于不同安装目录，互不冲突。
+> **发布版依赖已打 tag 并上传产物**（当前仓库尚未执行）；打 tag / 传产物见 `docs/DEVELOPER.md`。
+
+---
+
 ## 快速开始
 
 ```bash
-make install          # → ~/go/bin/mem（需 PATH 含 $GOPATH/bin）
 mem stats             # 库概览
-
 mem add --kind decision "记忆库数据固定放 ~/.v2mem，代码与数据分离"
 mem add --global --kind preference "自建 Go 工具默认 CGO_ENABLED=0 构建"
 mem search "记忆库 数据"
 mem search --json "构建方式" --limit 5
-
-mem harness           # 看本机装了哪些 AI 工具、各是什么接入方式
-mem init              # 扫描 → 选择要注入钩子的工具
+mem init              # 扫描本机 AI 工具 → 选择要注入钩子的工具（见下）
 ```
 
 `--project` 默认取当前 git 仓库名；`--global` 写入"工程标记为空"的记忆，对所有工程生效。
 
 > ⚠️ **选项必须写在位置参数之前**：`mem search --json "查询"`，不是 `mem search "查询" --json`。
 > Go 的 flag 在首个非选项参数处停止解析，写反了会把选项当成查询内容（v2mem 会直接报错拦下）。
-> 同理 `mem ingest --project <工程> <文件>`。
 
 ---
 
-## 命令一览
+## 三种接入方式
 
-### 写入与检索
+| 方式 | 适合 | 入口 |
+|:---|:---|:---|
+| **CLI** | 手工记/查，脚本与定时任务 | `mem add` / `mem search` / `mem ls` … |
+| **AI 工具钩子** | 你在用的 Agent 自动注入/记录 | `mem init`（下面「接入 AI 工具」） |
+| **MCP server** | 任何支持 MCP 的工具按需调用 | `mem mcp`（下面「MCP server」） |
 
-| 命令 | 说明 |
-|:---|:---|
-| `mem add [--kind K] [--project P \| --global] [--tag k=v] [--salience F] [--ttl DUR] "<事实>"` | 写入一条记忆。**相同内容自动覆盖**（按归一化后的 hash），不会重复 |
-| `mem search [--limit N] [--scope S] [--project P] [--kind K] [--tag k=v] "<查询>"` | 全文检索（FTS5 + bm25）。`--scope`：`current`（本工程+全局，**按当前目录推断工程**）/ `global` / `all`（默认） |
-| `mem ls [--project P] [--kind K] [--tag k=v] [--scope S] [--limit N]` | **列出库里的记忆**（不需要查询词）。默认跨工程全部列出、按工程分组；给了 `--project` 则按其过滤 |
-| `mem touch <id\|前缀>` | 记录一次命中：刷新 `last_seen_at`、累加 `access_count`。这是衰减机制的输入 |
-
-### 生命周期
-
-| 命令 | 说明 |
-|:---|:---|
-| `mem gc [--max-idle DUR] [--min-salience F]` | 回收：TTL 到期 + 久未命中**且**低重要性。高 salience 的记忆能抵御遗忘 |
-| `mem consolidate [--threshold F]` | 相似知识归并：把措辞不同的近重复聚簇，留 1 条、其余置 `superseded_by` |
-| `mem forget <id\|前缀>` | 删除一条记忆 |
-
-### 跨设备
-
-| 命令 | 说明 |
-|:---|:---|
-| `mem export [文件.jsonl]` | 导出全部记忆（省略路径写标准输出）。按 `(content_hash, project)` 排序，可复现 |
-| `mem import <文件.jsonl>` | 按 `(content_hash, project)` 归并。**幂等**：重复导入不改变状态 |
-
-**绝不要同步 `mem.db` 本体** —— 写入中途的同步会损坏 SQLite 库。跨设备只同步导出的 JSONL。
-
-### Level 1 文件运维
-
-| 命令 | 说明 |
-|:---|:---|
-| `mem ingest <文件.md...>` | 把既有 md 的条目机械化搬进库。跳过标题/代码围栏/纯指引行，**合并缩进续行**；幂等，可重复跑全量 |
-| `mem budget --file <文件> [--max-chars N]` | 检查注入文件是否超出预算。**超预算返回非零退出码**，供定时任务告警 |
-
-### 接入 AI 工具
-
-| 命令 | 说明 |
-|:---|:---|
-| `mem harness` | 列出支持的 11 个工具入口：接入方式、配置路径、本机是否已装 |
-| `mem init [--harness 名字] [--all] [--project 目录] [--file 路径] [--dry-run]` | 把钩子写进该工具配置。不带参数则进入扫描选择流程 |
-| `mem hook` | **钩子入口**：读 stdin JSON，把要注入的内容写 stdout。由 AI 工具调用，一般不手工执行。同一事件被多处配置重复触发时**只注入一次**（`--dedup-window`，默认 10s，0 关闭） |
-
-### 度量与评测
-
-| 命令 | 说明 |
-|:---|:---|
-| `mem audit [--stats] [--tail N] [--hits=false]` | 审计日志。汇总给钩子激活次数、空注入率、可评测样本数、**读侧/写侧计数**；`--tail` 逐条给**时间 + 事件 + 实际涉及的记忆内容**（`--hits=false` 只看摘要） |
-| `mem eval recall [--gold 文件] [--auto N] [--k N]` | 测「检索命中是否准」 |
-| `mem eval write --session <文件> [--gold 文件]` | 测「记录是否准」（漏记/多记/疑似碎片） |
-
----
-
-## 接入 AI 工具
+### 接入 AI 工具（钩子）
 
 协议高度同构：stdin 收 JSON、stdout 出内容、退出码定阻断。接入方式分三级，
 **可靠性差一个量级，`mem harness` 会明确标注**：
@@ -123,34 +106,65 @@ mem init              # 扫描 → 选择要注入钩子的工具
 |:---|:---|:---|
 | `native` | 有原生 shell 钩子，事件触发即执行（**代码强制**） | Claude Code、TraeCode、TraeWork、CodeBuddy、WorkBuddy、Qoder / Qoder CN、QoderWork / QoderWork CN、Codex |
 | `bridge` | 通过官方桥接包复用他家钩子协议 | DeepSeek Harness（`dsh-hooks-claude-code`） |
-| `instruction` | 无原生钩子，把指令写进会话级文件靠模型遵守（**概率性**）。当前**无工具默认走这条**，它作为兜底通道保留 | `mem init --scope instruction` 可强制 |
-
-> **WorkBuddy 与 TraeWork 原先被判为 instruction —— 那是错的。** 判断依据不该是「官方文档有没有写」，
-> 而要看他**内置的 Agent 运行时是谁的**：WorkBuddy 内置 CodeBuddy（用户级钩子就是
-> `~/.codebuddy/settings.json`，与 CodeBuddy Code 共用）；TraeWork(TRAE SOLO) 的项目级钩子是
-> `.trae/hooks.json`、全局是数据目录下的 `hooks.json`。两者均是代码强制执行。
+| `instruction` | 无原生钩子，把指令写进会话级文件靠模型遵守（**概率性**） | 兜底通道，`mem init --scope instruction` 可强制 |
 
 ```bash
 mem init                     # 扫描本机 → 显示 11 个入口（● = 已装）→ 让你选
 mem init --harness claude    # 直接指定
 mem init --dry-run           # 只看会写什么
-mem harness                  # 不带参数只看清单
 ```
 
-配置写入遵守四条纪律：**合并不覆盖**（解析不了就报错退出）、**幂等**（重复执行不累积）、
-**只备份一次**（`.v2mem.bak` 保存首次触碰前的状态）、**绝对路径**（钩子环境往往没有你的 PATH）。
+配置写入遵守四条纪律：**合并不覆盖**、**幂等**、**只备份一次**（`.v2mem.bak`）、**绝对路径**。
+个别工具需额外动作（Codex 首次要 trust 钩子、QoderWork 改完要重启等），`mem init` 会逐一打印。
+全部卸载：`mem uninstall --all`（或 `--harness <名字>` 单个），只摘掉带 `# v2mem` 标记的条目，不动你自己的配置。
 
-写入后 `mem init` 会打印**该工具怎么验证生效**。几个需要额外动作的：
+### MCP server
 
-- **Codex**：首次要在 `/hooks` 里 trust，否则钩子不执行；需 `[features] hooks = true`
-- **QoderWork / QoderWork CN**：不支持热加载，**改完要重启**
-- **CodeBuddy**：面板外的手工改动可能需在 `/hooks` 面板内确认
-- **dsh**：需先装桥接包 `dsh plugin --profile add dsh-hooks-claude-code`
-- **WorkBuddy**：与 CodeBuddy Code 共用 `~/.codebuddy/settings.json`，无需单独安装
-- **TraeWork**：项目级写 `<项目>/.trae/hooks.json`（与 TraeCode 项目级同路径）；全局是数据目录下的 `hooks.json`
-- **兜底**（任何工具）：`mem init --harness <名字> --scope instruction [--file <路径>]` 把指令写进文件
+`mem mcp` 暴露 4 个工具：`search`（检索）、`add`（写入，相同内容自动覆盖）、
+`ls`（列出）、`touch`（记录命中）。在支持 MCP 的工具里加一行进程配置即可：
 
-卸载：删掉配置文件里带 `# v2mem` 标记的 hook 条目即可。
+```json
+{ "mcpServers": { "v2mem": { "command": "mem", "args": ["mcp"] } } }
+```
+
+- **Claude Code**：`claude mcp add v2mem -- mem mcp`（或写入项目 `.mcp.json` 的 `mcpServers`）
+- **Codex**：`~/.codex/config.toml` 的 `[mcp_servers.v2mem] command = "mem" args = ["mcp"]`
+- 其余工具看各自的 MCP 配置格式，指向同一个 `mem mcp` 即可
+
+MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval activity` 的评测样本。
+
+---
+
+## 命令一览
+
+**写入与检索**
+
+| 命令 | 说明 |
+|:---|:---|
+| `mem add [--kind K] [--project P \| --global] [--tag k=v] [--salience F] [--ttl DUR] "<事实>"` | 写入一条记忆。**相同内容自动覆盖**（按归一化后的 hash），不会重复 |
+| `mem search [--limit N] [--scope S] [--project P] [--kind K] [--tag k=v] "<查询>"` | 全文检索（FTS5 + bm25）。`--scope`：`current`（本工程+全局，按当前目录推断工程）/ `global` / `all`（默认） |
+| `mem ls [--project P] [--kind K] [--tag k=v] [--scope S] [--limit N]` | **列出库里的记忆**（不需要查询词）。默认跨工程、按工程分组 |
+| `mem touch <id\|前缀>` | 记录一次命中：刷新 `last_seen_at`、累加 `access_count`。衰减机制的输入 |
+
+**生命周期**：`mem gc [--max-idle DUR] [--min-salience F] [--no-backup]`（回收：TTL 到期 + 久未命中**且**低重要性）
+· `mem consolidate [--threshold F] [--no-backup]`（相似知识归并，留 1 条、其余置 `superseded_by`）
+· `mem forget <id\|前缀>`（删除一条）
+`gc` / `consolidate` 是破坏性操作，执行前**自动备份库快照**到 `<库目录>/backup/`；空库或加 `--no-backup` 则跳过。
+
+**跨设备**：`mem export [文件.jsonl]` / `mem import <文件.jsonl>`（按 `(content_hash, project)` 归并，**幂等**）。
+⚠️ **绝不要同步 `mem.db` 本体** —— 写入中途的同步会损坏 SQLite；只同步导出的 JSONL。
+
+**Level 1 文件运维**：`mem ingest <文件.md...>`（把既有 md 机械化搬进库，幂等）
+· `mem budget --file <文件> [--max-chars N]`（检查注入文件是否超预算，超限非零退出）
+
+**接入与钩子**：`mem harness`（列出 11 个工具入口）· `mem init`（写入钩子配置）· `mem uninstall`（反向移除，`--all` 一键）
+· `mem hook`（钩子入口：读 stdin JSON、写 stdout；同一事件重复触发只注入一次，`--dedup-window` 默认 10s）
+
+**度量与评测**：`mem audit [--stats] [--tail N] [--hits=false]`（审计日志与读/写侧计数）· `mem eval`（**无参一键跑 `activity`，24h 窗口**）
+· `mem eval recall [--gold 文件] [--auto [N]] [--k N]`（检索命中是否准；`--auto` 裸用默认抽样 20）
+· `mem eval write --session <文件> [--gold 文件]`（记录是否准：漏记/多记/疑似碎片）
+· `mem eval activity [--scope period\|task\|session] [--since D] [--session S] [--project P] [--top N]`
+（**用量视图**：一段时间/会话/任务内的读/写活动 + 空命中查询 + 四态结论。任务收尾由此产出，写进 `.mem/report.md`）
 
 ---
 
@@ -159,88 +173,55 @@ mem harness                  # 不带参数只看清单
 | 路径 | 内容 |
 |:---|:---|
 | `~/.v2mem/mem.db` | 记忆库本体（SQLite，WAL） |
-| `~/.v2mem/audit.jsonl` | 审计日志：每次检索的真实 query、命中的记忆、耗时 |
+| `~/.v2mem/audit.jsonl` | 审计日志：每次检索的真实 query、命中的记忆、耗时。超过 5MB 自动轮转并保留 3 份归档（`audit.jsonl.1`…`.3`） |
 
 **审计日志会记录真实提问原文**。它只用于评测，删掉它不影响记忆库。
 不便留痕时用 `--no-audit`（`mem search`）或 `--audit -`（`mem hook`）关闭。
-
 `mem.db` **不要放在 iCloud / Dropbox / Syncthing 等同步目录里**。
 
 ---
 
 ## 设计要点
 
-每条都有实测依据，完整推理见 [`DESIGN.md`](./DESIGN.md)。
+每条都有实测依据，完整推理见 [`docs/DESIGN.md`](./docs/DESIGN.md)。
 
 | 要点 | 一句话理由 |
 |:---|:---|
 | 中文检索自建 `content_idx` | FTS5 内置分词器都不适用中文：`unicode61` 把整串汉字当一个词，`trigram` 有 3 字符下限（"目录"这种二字词查不到）。故汉字展开为一元组+二元组（§11.3） |
-| 检索"精确优先、空手才放宽" | 自然语言长问句没有空格 → 整句被当成一个词组做 AND → **必然 0 命中**（实测）。无命中时退化为全 term OR + bm25，精确有结果时不放宽（§15.5） |
+| 检索"精确优先、空手才放宽" | 自然语言长问句没有空格 → 整句被当成一个词组做 AND → **必然 0 命中**（实测）。无命中时退化为全 term OR + bm25（§15.5） |
 | 跨设备身份键是 `(content_hash, project)`，不是 id | id 是随机值，两台设备独立写同一事实必得不同 id；按 id 归并必然漏合（§7.1） |
-| 取代关系用身份键表达、导入端两遍解析 | 直接搬本地 id 会产生悬挂引用；完全不搬则其他设备不知道取代关系（§7.5） |
-| 相似归并的准确性靠**四条护栏**而非阈值 | 实测 `CGO_ENABLED=0` 与 `=1` 相似度高达 0.906 —— 只卡阈值会把两条**互斥规则**合成一条。护栏：短文本/长度比/数字/否定（§11.10） |
+| 相似归并的准确性靠**四条护栏**而非阈值 | 实测 `CGO_ENABLED=0` 与 `=1` 相似度高达 0.906 —— 只卡阈值会把两条**互斥规则**合成一条（§11.10） |
 | 钩子**绝不阻断宿主** | 记忆系统出问题不该让用户会话中断。所有异常静默放过，有 8 种异常输入的用例矩阵（§12.4） |
-| 每轮注入有字符预算，且提示预留预算 | 用法提示的作用正是告诉模型"还有多级记忆可查"，被截断就失去意义（§12.4） |
-| 先建度量，再谈替换 | 没有评测就换掉既有机制是凭感觉。口径红线见 §15.4；`--auto` 是**下限测试**，数字不得单独引用（§15） |
-
----
-
-## 开发
-
-```bash
-make test        # go test ./...（CGO_ENABLED=0）
-make build       # → bin/mem
-make smoke       # 造一个临时库跑 add/search/stats
-make build-linux # 交叉编译（Go 内建，无需交叉工具链）
-make build-win
-```
-
-```
-cmd/mem/            CLI 入口
-  main.go           add/search/touch/forget/gc/export/import/stats + help
-  hook.go           钩子入口（读 stdin、注入、审计埋点）
-  init.go           配置生成：扫描选择、合并写入、指令块
-  level1.go         ingest（机械化搬运）与 budget（体量守卫）
-  measure.go        audit / eval recall / eval write
-internal/
-  store/            SQLite + FTS5、schema、生命周期、跨设备归并、相似归并
-  similarity/       字符 n-gram + MinHash + 四条护栏（纯算法，无 IO）
-  harness/          11 个工具入口的接入注册表（纯数据）
-  audit/            审计日志读写与汇总
-  eval/             评测指标（纯函数，口径可独立测试）
-```
-
-**测试纪律**（不是建议，是踩过坑后固化的）：
-
-- **测试必须隔离 `HOME`**：`mem init` 在未给 `--project` 时写"用户级配置"路径。
-  曾因未隔离，测试二进制路径被写进了真实的 `~/.claude/settings.json`。
-  现在 `TestMain` 把 `HOME` 指向临时目录，并有护栏用例固化这一点
-- **变异测试要能编译**：用 `if false` 屏蔽分支会让变量变成未使用 → 编译失败 →
-  测试根本没跑（失败行还会被 `grep` 过滤掉），得到的是假结论。变异要保留变量使用
-- **负向断言要枚举全库**，不能只看检索返回的条目 —— 标题行本就不会被任何查询命中，
-  用它做负向断言等于没检查
+| 先建度量，再谈替换 | 没有评测就换掉既有机制是凭感觉。`--auto` 是**下限测试**，数字不得单独引用（§15） |
 
 ---
 
 ## 已知边界
 
-1. **向量检索（M5b）暂缓。** 包体不是障碍（换 wazero 驱动实测 +3.76 MB），但
-   `sqlite-vec` 的 Go 绑定当前**不可用**：它锁在落后 18 个小版本的驱动上，唯一能编译的
-   组合运行时报 wazero 特性错。且向量还需要 embedding 来源。建议先做零成本的替代项
-   （复用已实现的 MinHash 签名 + RRF 融合）。见 §13
-2. **WorkBuddy 与 TraeWork 的钩子路径来自应用包静态分析**（尚未观察到真实会话触发）。
-   验证方法：用一次之后看 `mem audit --tail 5` 是否出现 `prompt-submit` 记录 —— 有即生效。
-   未生效时的兜底：`mem init --scope instruction` 把指令写进 `AGENTS.md`（概率性，且占每轮 token）
+1. **向量检索（M5b）暂缓**：`sqlite-vec` 的 Go 绑定当前不可用（锁在落后 18 个小版本的驱动上，
+   唯一能编译的组合运行时报 wazero 特性错）。建议先做零成本替代项：复用已实现的 MinHash 签名 + RRF 融合（§13）
+2. **WorkBuddy / TraeWork 钩子路径来自应用包静态分析**（尚未观察到真实会话触发）。
+   验证：用一次后看 `mem audit --tail 5` 是否出现 `prompt-submit` 记录
 3. **检索退化是启发式**：只在精确表达式 0 命中时才放宽，不做更聪明的查询改写
-4. **指令级接入的默认落点需要你判断**：写进 `AGENTS.md` 会占每轮 token（实测 +344/轮）；
-   若项目另有带预算的记忆文件，用 `--file` 指定落点
-5. **审计日志记录提问原文**，见上文「数据与隐私」
+4. **审计日志记录提问原文**，见上文「数据与隐私」
 
 ---
 
 ## 文档分工
 
-| 文件 | 内容 |
-|:---|:---|
-| 本文件 | 是什么、怎么用、边界在哪 |
-| [`DESIGN.md`](./DESIGN.md) | 设计推理、实测数据、被否决的方案、踩过的坑。§12 各工具钩子事实、§13 M5b 预算、§14 与 WorkBuddy 结合、§15 度量与评测 |
+| 文件 | 读者 | 内容 |
+|:---|:---|:---|
+| 本文件 | 使用者 | 是什么、卖点、怎么装、怎么用、边界在哪 |
+| [`docs/DESIGN.md`](./docs/DESIGN.md) | 深度使用者 | 设计索引页：基础决策 + 各设计专题的「专题地图」 |
+| [`docs/design-*.md`](./docs/DESIGN.md) | 深度使用者 | 8 份设计专题（索引与地图见 DESIGN.md） |
+| [`docs/DEVELOPER.md`](./docs/DEVELOPER.md) | 开发者 | 构建命令、目录结构、覆盖率纪律、测试纪律、MCP 实现说明 |
+
+设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
+`design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 ·
+`design-workbuddy` WorkBuddy 结合 · `design-eval` 激活与评测 · `design-maintenance` 收尾运维 ·
+`design-write-governance` 写侧治理与短/跨会话记忆分配。
+「见 §N」这类跨章节引用按 DESIGN 索引页的专题地图定位文件。
+
+---
+
+面向使用者看本文件即可；要改代码、补测试、跑门禁，见 [`docs/DEVELOPER.md`](./docs/DEVELOPER.md)。

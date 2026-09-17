@@ -12,6 +12,22 @@ install:
 test:
 	CGO_ENABLED=0 go test ./...
 
+# 覆盖率报告：终端给函数级明细 + 汇总，HTML 给逐行可视化
+cover:
+	CGO_ENABLED=0 go test ./... -coverprofile=coverage.out
+	@go tool cover -func=coverage.out | tail -1
+	@go tool cover -html=coverage.out -o coverage.html
+	@echo "逐函数明细：go tool cover -func=coverage.out"
+	@echo "逐行可视化：coverage.html"
+
+# 覆盖率门禁：任一包低于下限即非零退出。阈值见 coverage-policy.txt（单一真理源）。
+cover-gate:
+	@./scripts/cover-gate.sh
+
+# 刷新下限（棘轮：只允许上调）。确需降标时显式写：make cover-update FORCE=1
+cover-update:
+	@./scripts/cover-gate.sh --update $(if $(FORCE),--force,)
+
 # 交叉编译示例：Go 内建支持，无需交叉工具链
 build-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/$(BIN)-linux-amd64 $(PKG)
@@ -38,4 +54,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test build-linux build-win smoke clean
+.PHONY: build install test cover cover-gate cover-update build-linux build-win smoke clean
