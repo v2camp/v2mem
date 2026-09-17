@@ -357,6 +357,7 @@ func cmdSearch(args []string) error {
 	kind := fs.String("kind", "", "限定类型")
 	scope := fs.String("scope", "", "作用域: current=当前工程+全局，global=只要全局，all=跨工程（默认）")
 	noFuzzy := fs.Bool("no-fuzzy", false, "关闭模糊检索（MinHash + RRF 融合）")
+	explain := fs.Bool("explain", false, "打印同义词展开诊断后退出")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
 	noAudit := fs.Bool("no-audit", false, "不写审计日志")
 	var tags stringSlice
@@ -399,6 +400,16 @@ func cmdSearch(args []string) error {
 		return err
 	}
 	defer st.Close()
+
+	if *explain {
+		expanded := st.ExpandQuery(q, proj)
+		if expanded == q {
+			fmt.Println("同义词展开: （无命中词库，原样检索）")
+		} else {
+			fmt.Printf("同义词展开: %q  →  %q\n", q, expanded)
+		}
+		return nil
+	}
 
 	started := time.Now()
 	hits, err := st.Search(store.SearchQuery{
