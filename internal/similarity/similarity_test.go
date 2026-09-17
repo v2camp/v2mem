@@ -2,6 +2,27 @@ package similarity
 
 import "testing"
 
+// ---------- 模糊检索护栏 ----------
+
+// EnoughShingles 是「是否值得做模糊估计」的判据（检索侧复用归并护栏 minShingles）。
+func TestEnoughShingles(t *testing.T) {
+	cases := []struct {
+		text string
+		want bool
+	}{
+		{"", false},
+		{"日志", false},
+		{"搬进记忆库", false},          // 5 字 → 3 个 trigram
+		{"日志怎么放进记忆库里", true}, // 10 字 → 8 个 trigram
+		{"日志怎么搬进记忆库里", true}, // 10 字 → 8 个 trigram
+	}
+	for _, c := range cases {
+		if got := EnoughShingles(c.text); got != c.want {
+			t.Errorf("EnoughShingles(%q) = %v, want %v", c.text, got, c.want)
+		}
+	}
+}
+
 // ---------- 相似度估计 ----------
 //
 // 用字符级 3-gram + MinHash 估 Jaccard，不依赖分词器与任何模型。

@@ -22,6 +22,43 @@ func TestAppendReadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAsyncAppenderDrainsOnClose(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	a := NewAsyncAppender(p, 8)
+	for i := 0; i < 5; i++ {
+		if !a.Append(Record{TS: int64(i), Event: "manual-add", Source: "llm"}) {
+			t.Fatalf("投递第 %d 条不应被拒", i)
+		}
+	}
+	a.Close() // 必须排空队列，读出来全部 5 条
+
+	rs, err := Read(p, 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(rs) != 5 {
+		t.Fatalf("Close 后应落盘全部 5 条，got %d", len(rs))
+	}
+	for i, r := range rs {
+		if r.Source != "llm" || r.Event != "manual-add" {
+			t.Errorf("第 %d 条字段有失: %+v", i, r)
+		}
+	}
+}
+
+// 队列满时 Drop 而不阻塞：审计只是观测，绝不能让投递方卡死。
+func TestAsyncAppenderDropsWhenFull(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	a := NewAsyncAppender(p, 2)
+	for i := 0; i < 2000; i++ {
+		a.Append(Record{TS: int64(i), Event: "manual-add"}) // 忽略返回，验证不阻塞
+	}
+	a.Close()
+	if _, err := Read(p, 0); err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+}
+
 func TestReadTakesLastN(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "audit.jsonl")
 	for _, q := range []string{"a1", "a2", "a3"} {
