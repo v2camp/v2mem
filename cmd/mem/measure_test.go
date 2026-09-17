@@ -169,6 +169,23 @@ func writeGold(t *testing.T, dir string, cases []map[string]any) string {
 	return p
 }
 
+// writeJSONL 把单个对象写成一行 JSON，追加到指定文件（用于把一个目录拆成多个 gold 文件）。
+func writeJSONL(t *testing.T, path string, c map[string]any) {
+	t.Helper()
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+}
+
 // 取库内某条记忆的 hash 前缀 —— 金标准用哈希而不是文本匹配。
 func hashPrefixOf(t *testing.T, db, contentSub string) string {
 	t.Helper()
@@ -210,6 +227,62 @@ func TestCmdEvalRecallWithGoldScoresPerfectMatch(t *testing.T) {
 	}
 	if !strings.Contains(out, "Recall@5: 100.0%") {
 		t.Errorf("应命中并报 100%%，got:\n%s", out)
+	}
+}
+
+// --gold-dir 读取同一目录下全部 *.gold.jsonl 并合并为一份金标准。
+// 起步集按 `v<N>-seed.gold.jsonl` 命名散落在 gold/ 下，发布评测用目录聚合它们。
+func TestCmdEvalRecallGoldDirMergesAllGoldFiles(t *testing.T) {
+	db := testDB(t)
+	mems := []string{"记忆库数据固定放 ~/.v2mem 目录", "活库不能放进 iCloud 同步目录"}
+	for _, c := range mems {
+		if err := cmdAdd([]string{"--db", db, c}); err != nil {
+			t.Fatalf("cmdAdd: %v", err)
+		}
+	}
+	dir := t.TempDir()
+	// 两个文件各带一条，合并后应构成两样本（跨文件聚合）
+	writeJSONL(t, filepath.Join(dir, "a.gold.jsonl"),
+		map[string]any{"query": "记忆库数据放哪", "gold": []string{hashPrefixOf(t, db, "~/.v2mem")}})
+	writeJSONL(t, filepath.Join(dir, "b.gold.jsonl"),
+		map[string]any{"query": "数据库能不能放同步目录", "gold": []string{hashPrefixOf(t, db, "iCloud")}})
+
+	out, err := captureStdout(t, func() error {
+		return cmdEvalRecall([]string{"--db", db, "--gold-dir", dir, "--k", "5"})
+	})
+	if err != nil {
+		t.Fatalf("cmdEvalRecall --gold-dir: %v", err)
+	}
+	if !strings.Contains(out, "有效样本: 2") {
+		t.Errorf("目录下两个 gold 文件应合并成 2 个样本，got:\n%s", out)
+	}
+	if !strings.Contains(out, "Recall@5: 100.0%") {
+		t.Errorf("两样本都应命中，got:\n%s", out)
+	}
+}
+
+// --gold-dir 是 --gold 的扩展：目录里若混着非 .gold.jsonl 文件要忽略，
+// 且空的/无匹配的目录要显式报错，不能静默当一个空金标准。
+func TestCmdEvalRecallGoldDirEmptyDirErrors(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "一条记忆"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	empty := t.TempDir()
+	if err := cmdEvalRecall([]string{"--db", db, "--gold-dir", empty}); err == nil {
+		t.Error("无 *.gold.jsonl 的目录应报错，而不是静默当作空金标准")
+	}
+}
+
+// --gold-dir 与 --gold 是互斥的，同时给出要报错（语义重叠）。
+func TestCmdEvalRecallGoldDirConflictsWithGold(t *testing.T) {
+	db := testDB(t)
+	gold := writeGold(t, t.TempDir(), []map[string]any{
+		{"query": "q", "gold": []string{"x"}},
+	})
+	dir := filepath.Dir(gold)
+	if err := cmdEvalRecall([]string{"--db", db, "--gold-dir", dir, "--gold", gold}); err == nil {
+		t.Error("--gold-dir 与 --gold 同时给出应报错")
 	}
 }
 
@@ -533,7 +606,7 @@ var valueFlags = map[string]bool{
 	"--db": true, "--limit": true, "--project": true, "--kind": true, "--tag": true,
 	"--scope": true, "--salience": true, "--ttl": true, "--tool": true, "--device": true,
 	"--harness": true, "--event": true, "--max-chars": true, "--min-runes": true,
-	"--k": true, "--auto": true, "--gold": true, "--session": true, "--file": true,
+	"--k": true, "--auto": true, "--gold": true, "--gold-dir": true, "--session": true, "--file": true,
 	"--threshold": true, "--max-idle": true, "--min-salience": true,
 	"--audit-file": true, "--audit": true, "--tail": true,
 }
