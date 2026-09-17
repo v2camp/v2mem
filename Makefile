@@ -12,6 +12,11 @@ install:
 test:
 	CGO_ENABLED=0 go test ./...
 
+# 端到端测试（黑盒）：跑真实二进制，覆盖 安装→初始化→使用→维护→优化→评测→卸载 全生命周期动线。
+# 独立于 go test ./...（e2e 目录带 build tag，默认构建不参与覆盖统计）。
+test-e2e:
+	go test -tags e2e -count=1 -v ./test/e2e
+
 # 覆盖率报告：终端给函数级明细 + 汇总，HTML 给逐行可视化
 cover:
 	CGO_ENABLED=0 go test ./... -coverprofile=coverage.out
