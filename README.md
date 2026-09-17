@@ -167,6 +167,11 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 · `mem eval activity [--scope period\|task\|session] [--since D] [--session S] [--project P] [--top N]`
 （**用量视图**：一段时间/会话/任务内的读/写活动 + 空命中查询 + 四态结论。任务收尾由此产出，写进 `.mem/report.md`）
 
+**同义词词库**：`mem lexicon init --project <X> [--terms "词A,词B"]`（从该工程记忆提取同义词写入 `synonyms.txt`：以既有检索为
+"行为 oracle"算命中集、按 Jaccard 相似度聚簇，泛词护栏 + `[0.40,0.5)` 复核区间防止跨概念误合；`--dry-run` 只预览不写）
+· `--auto`（实验性：从记忆正文自动提取 bigram 作候选，须跨 ≥2 条记忆，精度低于 `--terms`，输出走复核）
+同义词的作用域与迭代闭环见 [`docs/design-synonym-library.md`](./docs/design-synonym-library.md)。
+
 ---
 
 ## 数据与隐私
