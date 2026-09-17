@@ -31,6 +31,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem touch  <id|前缀>             记录命中，刷新 last_seen_at 并累加 access_count
   mem forget <id|前缀>             删除一条记忆
   mem notes  [选项]                输出硬规则小字条（一行一条，幂等）
+  mem lexicon init --scan --project <X>   从该工程记忆提取同义词并写入 synonyms.txt（--dry-run 预览）
   mem gc     [选项]                回收：TTL 到期 + 久未命中且低重要性
   mem consolidate [选项]           相似知识归并（近重复聚簇，留 1 条）
   mem export [路径.jsonl]          导出为 JSONL（省略路径则写标准输出）
@@ -101,7 +102,7 @@ hook 选项:
 // 起因：新增 `mem report` 时漏了同步测试里的清单，护栏立刻报警 ——
 // 清单有两个出处就一定会漂移，所以把它抽成一处。
 var knownSubcommands = []string{
-	"add", "search", "ls", "stats", "touch", "forget", "notes", "gc", "consolidate",
+	"add", "search", "ls", "stats", "touch", "forget", "notes", "lexicon", "gc", "consolidate",
 	"export", "import", "sync", "hook", "harness", "init", "uninstall", "ingest",
 	"budget", "audit", "eval", "mcp", "help",
 }
@@ -128,6 +129,8 @@ func main() {
 		err = cmdForget(os.Args[2:])
 	case "notes":
 		err = cmdNotes(os.Args[2:])
+	case "lexicon":
+		err = cmdLexicon(os.Args[2:])
 	case "gc":
 		err = cmdGC(os.Args[2:])
 	case "consolidate":
