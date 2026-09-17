@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/wanghui/v2mem/internal/audit"
 	"github.com/wanghui/v2mem/internal/store"
 )
 
@@ -43,10 +45,12 @@ func cmdIngest(args []string) error {
 	project := fs.String("project", "", "工程标记（默认取当前 git 仓库名）")
 	kind := fs.String("kind", "fact", "记忆类型")
 	device := fs.String("device", "", "来源设备")
-	source := fs.String("source", "ingest", "来源标记（默认 ingest，机械化搬运）")
+	source := fs.String("source", "", "来源标记（白名单允许 harness-summary，其余回落默认 ingest）")
 	salience := fs.Float64("salience", 0.5, "重要性 0..1")
 	dryRun := fs.Bool("dry-run", false, "只列出候选项，不写库")
 	minRunes := fs.Int("min-runes", ingestMinRunes, "候选事实的最小字符数")
+	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
+	noAudit := fs.Bool("no-audit", false, "不写审计日志")
 	var tags stringSlice
 	fs.Var(&tags, "tag", "标记 k=v，可重复")
 	if err := fs.Parse(args); err != nil {
@@ -63,6 +67,17 @@ func cmdIngest(args []string) error {
 	tagMap, err := parseTags(tags)
 	if err != nil {
 		return err
+	}
+
+	// 写侧锚定：ingest 是「harness 任务收尾收录」的确定入口。
+	// source 只允许显式锚定白名单内的 harness-summary，用于区分双路径里
+	// machine 收尾总结写出的记忆（source='harness-summary'，tool='ingest'）；
+	// 未显式给 source、或传了白名单外的值，一律回落默认 ingest ——
+	// 既有 add/ingest/mcp 各自锚定 human/ingest/llm，这里不允许借助
+	// --source 冒充别的来源，写侧治理不能让 --source 变成自由文本。
+	src := "ingest"
+	if *source == "harness-summary" {
+		src = *source
 	}
 
 	var st *store.Store
@@ -94,7 +109,7 @@ func cmdIngest(args []string) error {
 			}
 			r, err := st.Add(store.AddInput{
 				Content: cand, Kind: *kind, Project: proj,
-				Device: *device, Source: *source, Tool: "ingest",
+				Device: *device, Source: src, Tool: "ingest",
 				Tags: tagMap, Salience: *salience,
 			})
 			if err != nil {
@@ -105,6 +120,24 @@ func cmdIngest(args []string) error {
 			} else {
 				// 已存在 —— 这正是「同一份文件重复 ingest 幂等」的来源
 				res.Merged++
+			}
+
+			// 审计：ingest 是写侧收录入口，每条入库都留痕并携带 source。
+			// 写失败静默：审计只是观测，不是功能。
+			if !*noAudit {
+				mode := "create"
+				if !r.Created {
+					mode = "overwrite"
+				}
+				_ = audit.Append(*auditFile, audit.Record{
+					TS:      time.Now().Unix(),
+					Event:   "manual-add",
+					Project: proj,
+					Hashes:  []string{r.Hash},
+					Kinds:   []string{*kind},
+					Mode:    mode,
+					Source:  src,
+				})
 			}
 		}
 	}

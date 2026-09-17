@@ -52,7 +52,7 @@ func TestCmdIngestExtractsListItemsAndParagraphs(t *testing.T) {
 	src := writeFile(t, t.TempDir(), "log.md", ingestSample)
 
 	out, err := captureStdout(t, func() error {
-		return cmdIngest([]string{"--db", db, "--project", "demo", "--json", src})
+		return cmdIngest([]string{"--db", db, "--project", "demo", "--json", "--no-audit", src})
 	})
 	if err != nil {
 		t.Fatalf("cmdIngest: %v", err)
@@ -131,7 +131,7 @@ func TestCmdIngestIsIdempotent(t *testing.T) {
 	src := writeFile(t, t.TempDir(), "log.md", ingestSample)
 
 	first, err := captureStdout(t, func() error {
-		return cmdIngest([]string{"--db", db, "--project", "demo", "--json", src})
+		return cmdIngest([]string{"--db", db, "--project", "demo", "--json", "--no-audit", src})
 	})
 	if err != nil {
 		t.Fatalf("cmdIngest #1: %v", err)
@@ -139,7 +139,7 @@ func TestCmdIngestIsIdempotent(t *testing.T) {
 	before := countMemories(t, db)
 
 	second, err := captureStdout(t, func() error {
-		return cmdIngest([]string{"--db", db, "--project", "demo", "--json", src})
+		return cmdIngest([]string{"--db", db, "--project", "demo", "--json", "--no-audit", src})
 	})
 	if err != nil {
 		t.Fatalf("cmdIngest #2: %v", err)
@@ -177,7 +177,7 @@ func TestCmdIngestHonoursProjectKindAndTags(t *testing.T) {
 
 	if _, err := captureStdout(t, func() error {
 		return cmdIngest([]string{"--db", db, "--project", "proj-x",
-			"--kind", "pitfall", "--tag", "src=log", src})
+			"--kind", "pitfall", "--tag", "src=log", "--no-audit", src})
 	}); err != nil {
 		t.Fatalf("cmdIngest: %v", err)
 	}
