@@ -76,7 +76,7 @@ PRAGMA busy_timeout = 5000;
 CREATE TABLE memories (
   id             TEXT PRIMARY KEY,
   content        TEXT NOT NULL,          -- 原子事实，不是文档
-  kind           TEXT NOT NULL,          -- preference|decision|pitfall|task|reference
+  kind           TEXT NOT NULL,          -- preference|decision|pitfall|task|fact
   content_hash   TEXT NOT NULL,          -- 归一化哈希 → 相同知识覆盖
   project        TEXT,                   -- 工程标记（路径哈希）
   salience       REAL NOT NULL DEFAULT 0.5,
