@@ -42,6 +42,7 @@ type ExportRecord struct {
 	OriginDevice string              `json:"origin_device"`
 	OriginTool   string              `json:"origin_tool"`
 	Source       string              `json:"source,omitempty"`
+	Provenance   *string             `json:"provenance,omitempty"` // 原始 JSON；NULL 序列化为缺省（无溯源）
 	AccessCount  int                 `json:"access_count"`
 	Tags         map[string][]string `json:"tags"`
 }
@@ -62,7 +63,7 @@ func (s *Store) Export() ([]ExportRecord, error) {
 	rows, err := s.db.Query(
 		`SELECT m.id, m.content, m.kind, m.content_hash, m.project, m.salience,
 		        m.created_at, m.updated_at, m.last_seen_at, m.expires_at,
-		        m.origin_device, m.origin_tool, m.source, m.access_count,
+		        m.origin_device, m.origin_tool, m.source, m.provenance, m.access_count,
 		        t.id, t.content_hash, t.project
 		   FROM memories m
 		   LEFT JOIN memories t ON t.id = m.superseded_by
@@ -79,7 +80,7 @@ func (s *Store) Export() ([]ExportRecord, error) {
 		var tgtID, tgtHash, tgtProject *string
 		if err := rows.Scan(&r.ID, &r.Content, &r.Kind, &r.ContentHash, &r.Project, &r.Salience,
 			&r.CreatedAt, &r.UpdatedAt, &r.LastSeenAt, &r.ExpiresAt,
-			&r.OriginDevice, &r.OriginTool, &r.Source, &r.AccessCount,
+			&r.OriginDevice, &r.OriginTool, &r.Source, &r.Provenance, &r.AccessCount,
 			&tgtID, &tgtHash, &tgtProject); err != nil {
 			return nil, err
 		}
@@ -178,11 +179,13 @@ func (s *Store) Import(recs []ExportRecord) (*ImportStats, error) {
 				   updated_at    = MAX(updated_at, ?),
 				   last_seen_at  = MAX(last_seen_at, ?),
 				   expires_at    = CASE WHEN expires_at IS NULL OR ? IS NULL
-				                        THEN NULL ELSE MAX(expires_at, ?) END
+				                        THEN NULL ELSE MAX(expires_at, ?) END,
+				   provenance    = COALESCE(provenance, ?)
 				 WHERE id = ?`,
 				kind, r.Salience, r.AccessCount,
 				r.CreatedAt, r.UpdatedAt, r.LastSeenAt,
 				r.ExpiresAt, r.ExpiresAt,
+				r.Provenance,
 				localID,
 			); err != nil {
 				return nil, err
@@ -195,11 +198,11 @@ func (s *Store) Import(recs []ExportRecord) (*ImportStats, error) {
 				`INSERT INTO memories
 				   (id, content, content_idx, kind, content_hash, project, salience,
 				    created_at, updated_at, last_seen_at, expires_at,
-				    origin_device, origin_tool, source, access_count)
-				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				    origin_device, origin_tool, source, provenance, access_count)
+				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				localID, content, indexText(content), kind, h, r.Project, r.Salience,
 				r.CreatedAt, r.UpdatedAt, r.LastSeenAt, r.ExpiresAt,
-				r.OriginDevice, r.OriginTool, r.Source, r.AccessCount,
+				r.OriginDevice, r.OriginTool, r.Source, r.Provenance, r.AccessCount,
 			); err != nil {
 				return nil, err
 			}
