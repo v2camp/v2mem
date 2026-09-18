@@ -218,6 +218,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | 文件 | 读者 | 内容 |
 |:---|:---|:---|
 | 本文件 | 使用者 | 是什么、卖点、怎么装、怎么用、边界在哪 |
+| [`docs/VALUE.md`](./docs/VALUE.md) | 所有者 / 未来的 agent | **价值主张**：为什么这么做、红线在哪、下一步与判据（改设计前先读） |
 | [`docs/DESIGN.md`](./docs/DESIGN.md) | 深度使用者 | 设计索引页：基础决策 + 各设计专题的「专题地图」 |
 | [`docs/design-*.md`](./docs/DESIGN.md) | 深度使用者 | 8 份设计专题（索引与地图见 DESIGN.md） |
 | [`docs/DEVELOPER.md`](./docs/DEVELOPER.md) | 开发者 | 构建命令、目录结构、覆盖率纪律、测试纪律、MCP 实现说明 |
