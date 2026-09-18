@@ -223,11 +223,12 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/DEVELOPER.md`](./docs/DEVELOPER.md) | 开发者 | 构建命令、目录结构、覆盖率纪律、测试纪律、MCP 实现说明 |
 | [`docs/design-harness-memory-replace.md`](./docs/design-harness-memory-replace.md) | 使用者/开发者 | 用 v2mem 接替 harness 记忆(workbuddy/traeWork/原生)：读瘦身/写收录/git同步/版本CI门禁 |
 | [`docs/design-synonym-library.md`](./docs/design-synonym-library.md) | 使用者/开发者 | 同义词词库：起步配置/查询期展开/有效迭代闭环/初始化 agent 提取管线/自动维护闭环（§8：LLM 提取 × 试用回测） |
+| [`docs/design-provenance.md`](./docs/design-provenance.md) | 使用者/开发者 | 记忆溯源：`provenance` 字段走向、ALTER 迁移、ingest 写入、sync 传播与后续资产/词库联动设想 |
 
 设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
 `design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 ·
 `design-workbuddy` WorkBuddy 结合 · `design-eval` 激活与评测 · `design-maintenance` 收尾运维 ·
-`design-write-governance` 写侧治理与短/跨会话记忆分配。
+`design-write-governance` 写侧治理与短/跨会话记忆分配 · `design-provenance` 记忆溯源。
 「见 §N」这类跨章节引用按 DESIGN 索引页的专题地图定位文件。
 
 ---

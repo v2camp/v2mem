@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -903,5 +905,149 @@ func TestStatsCountsKindsProjectsAndLive(t *testing.T) {
 	// 工程为空的记忆在展示上归入 (global)，而不是留空串
 	if st.ByProject["(global)"] != 1 || st.ByProject["p1"] != 1 {
 		t.Errorf("ByProject = %+v，期望 (global)/p1 各 1", st.ByProject)
+	}
+}
+
+// ---------- 溯源（provenance） ----------
+
+func TestAddWritesProvenanceJSON(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.Add(AddInput{
+		Content: "钩子护栏只读不写", Project: "demo",
+		Provenance: &Provenance{File: "AGENTS.md", Line: 12, Source: "asset", Preview: "只读"},
+	})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	var raw string
+	if err := s.db.QueryRow(`SELECT provenance FROM memories WHERE project = 'demo'`).Scan(&raw); err != nil {
+		t.Fatalf("读取 provenance: %v", err)
+	}
+	if raw == "" {
+		t.Fatal("写入溯源后 provenance 不应为空")
+	}
+	var p Provenance
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("provenance 应为合法 JSON: %v", err)
+	}
+	if p.File != "AGENTS.md" || p.Line != 12 || p.Source != "asset" {
+		t.Errorf("provenance 字段解析不符: %+v", p)
+	}
+}
+
+func TestAddNilProvenanceStaysNull(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.Add(AddInput{Content: "无溯源记忆", Project: "demo"}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	var raw *string
+	if err := s.db.QueryRow(`SELECT provenance FROM memories WHERE project = 'demo'`).Scan(&raw); err != nil {
+		t.Fatalf("读取 provenance: %v", err)
+	}
+	if raw != nil {
+		t.Errorf("未传溯源应存 NULL，got %q", *raw)
+	}
+}
+
+// 相同知识覆盖时，只在新溯源非空时覆盖；保持原有（COALESCE 语义，不把已有溯源清空）。
+func TestAddOverrideKeepsExistingProvenance(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.Add(AddInput{
+		Content: "记忆库不放 iCloud", Project: "demo",
+		Provenance: &Provenance{File: "README.md", Line: 5, Source: "asset"},
+	})
+	if err != nil {
+		t.Fatalf("Add 首次: %v", err)
+	}
+	// 再次写入相同内容但未带溯源：应保留已有溯源而非清空
+	if _, err := s.Add(AddInput{Content: "记忆库不放 iCloud。", Project: "demo"}); err != nil {
+		t.Fatalf("Add 覆盖: %v", err)
+	}
+	var raw string
+	if err := s.db.QueryRow(`SELECT provenance FROM memories WHERE project = 'demo'`).Scan(&raw); err != nil {
+		t.Fatalf("读取 provenance: %v", err)
+	}
+	if !strings.Contains(raw, "README.md") {
+		t.Errorf("覆盖时未带溯源应保留原值，got %q", raw)
+	}
+}
+
+// 老库迁移：只有没有 provenance 列的 schema 打开后应自动补列（存量行 NULL，不报错）。
+func TestOpenAddsProvenanceColumnOnLegacyDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+	// 构造一个不带 provenance 列的老库：先建表再手动删列不可行（SQLite 限制），
+	// 改用「先写旧 schema 的最小 versions」——用不含 provenance 的 CREATE 表。
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE memories (
+		id TEXT PRIMARY KEY, content TEXT NOT NULL,
+		content_idx TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'fact',
+		content_hash TEXT NOT NULL, project TEXT NOT NULL DEFAULT '',
+		salience REAL NOT NULL DEFAULT 0.5, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+		last_seen_at INTEGER NOT NULL, expires_at INTEGER, superseded_by TEXT,
+		origin_device TEXT NOT NULL, origin_tool TEXT NOT NULL DEFAULT '',
+		source TEXT NOT NULL DEFAULT '', access_count INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		t.Fatalf("建老表: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO memories (id, content, content_idx, content_hash, project,
+		salience, created_at, updated_at, last_seen_at, origin_device, access_count)
+		VALUES ('old', '存量记忆', '', 'x', 'demo', 0.5, 1, 1, 1, 'd', 0)`); err != nil {
+		t.Fatalf("插存量: %v", err)
+	}
+	raw.Close()
+
+	// 用正常 Open 打开老库：应自动补 provenance 列且不破坏存量
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open 老库应成功（自动迁移 provenance 列），got %v", err)
+	}
+	defer s.Close()
+	var rawP *string
+	if err := s.db.QueryRow(`SELECT provenance FROM memories WHERE id = 'old'`).Scan(&rawP); err != nil {
+		t.Fatalf("老库迁移后应能读 provenance 列: %v", err)
+	}
+	if rawP != nil {
+		t.Errorf("存量行 provenance 应为 NULL，got %q", *rawP)
+	}
+}
+
+// sync 传播：Export 带 provenance，Import 到新库保留；本地已有且缺失时由远端补齐。
+func TestExportImportPropagatesProvenance(t *testing.T) {
+	src := newTestStore(t)
+	if _, err := src.Add(AddInput{
+		Content: "带溯源的知识", Project: "demo",
+		Provenance: &Provenance{File: "AGENTS.md", Line: 3, Source: "asset"},
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	recs, err := src.Export()
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Provenance == nil {
+		t.Fatalf("导出应携带单条 provenance 记录，got %d 条 provenance=%v", len(recs), recs[0].Provenance)
+	}
+
+	dst, err := Open(filepath.Join(t.TempDir(), "dst.db"))
+	if err != nil {
+		t.Fatalf("Open dst: %v", err)
+	}
+	defer dst.Close()
+	st, err := dst.Import(recs)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if st.Inserted != 1 {
+		t.Fatalf("应新插 1 条，got %+v", st)
+	}
+	var raw string
+	if err := dst.db.QueryRow(`SELECT provenance FROM memories WHERE project = 'demo'`).Scan(&raw); err != nil {
+		t.Fatalf("读取 provenance: %v", err)
+	}
+	if !strings.Contains(raw, "AGENTS.md") {
+		t.Errorf("Import 后 provenance 应保留，got %q", raw)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -84,6 +85,11 @@ func Open(path string) (*Store, error) {
 	if err := ensureColumn(db, "memories", "source", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("迁移 source 列失败: %w", err)
+	}
+	// provenance 列是后加的：存量行保持 NULL（无溯源），幂等 ALTER。
+	if err := ensureColumn(db, "memories", "provenance", "TEXT"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 provenance 列失败: %w", err)
 	}
 	st := &Store{db: db, path: path}
 	// 词库加载失败不致命：检索不该因辅助配置坏了而崩。
@@ -314,15 +320,57 @@ func (s *Store) backfillSigs() error {
 
 // AddInput 是写入一条记忆的参数。
 type AddInput struct {
-	Content  string            // 原子事实，不是文档
-	Kind     string            // preference|decision|pitfall|task|fact
-	Project  string            // 工程标记
-	Tool     string            // claude-code|workbuddy|cursor|cli
-	Device   string            // 来源设备，默认取 hostname
-	Source   string            // human|llm|ingest|harness-summary|bench|test（写侧治理；空回填 human）
-	Tags     map[string]string // 多机/多工具/多工程标记
-	Salience float64           // 重要性 0..1
-	TTL      time.Duration     // 硬过期，0 表示不过期
+	Content    string            // 原子事实，不是文档
+	Kind       string            // preference|decision|pitfall|task|fact
+	Project    string            // 工程标记
+	Tool       string            // claude-code|workbuddy|cursor|cli
+	Device     string            // 来源设备，默认取 hostname
+	Source     string            // human|llm|ingest|harness-summary|bench|test（写侧治理；空回填 human）
+	Tags       map[string]string // 多机/多工具/多工程标记
+	Salience   float64           // 重要性 0..1
+	TTL        time.Duration     // 硬过期，0 表示不过期
+	Provenance *Provenance       // 内容级溯源（源文件/行/预览）；nil = 无溯源
+}
+
+// Provenance 描述一条记忆的内容级来源（来源文件+锚点），用于资产联动与词库反查。
+// 以紧凑 JSON 存入 memories.provenance。设计见 docs/design-provenance.md。
+type Provenance struct {
+	File    string `json:"file"`              // 源文件相对路径（相对工程根）
+	Line    int    `json:"line,omitempty"`    // 锚点行号，无则省略
+	Source  string `json:"source,omitempty"`  // 溯源类型：asset/session/query…
+	Preview string `json:"preview,omitempty"` // 源片段预览，一眼可读
+}
+
+// provenanceJSON 序列化 Provenance 为紧凑 JSON；nil 返回 ""（存 NULL，即无溯源）。
+func provenanceJSON(p *Provenance) string {
+	if p == nil {
+		return ""
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// parseProvenance 把 memories.provenance 列的 JSON 反序列化为结构体；空串返回 nil。
+func parseProvenance(s string) *Provenance {
+	if s == "" {
+		return nil
+	}
+	var p Provenance
+	if err := json.Unmarshal([]byte(s), &p); err != nil {
+		return nil
+	}
+	return &p
+}
+
+// nullable 把空字符串转为 NULL（用于可空列；空溯源存 NULL 而非空串，语义清晰）。
+func nullable(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // AddResult 描述写入结果。Created=false 表示命中了「相同知识覆盖」。
@@ -372,15 +420,19 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	).Scan(&id)
 
 	created := false
+	provJSON := provenanceJSON(in.Provenance)
 	switch {
 	case err == nil:
-		// 相同知识覆盖：刷新时间戳、累加命中、salience 取较大值
+		// 相同知识覆盖：刷新时间戳、累加命中、salience 取较大值。
+		// provenance 仅当本次提供了新溯源时才覆盖，否则保留原有（COALESCE NULL）。
 		if _, err = tx.Exec(
 			`UPDATE memories SET content = ?, content_idx = ?, updated_at = ?, last_seen_at = ?,
 			        access_count = access_count + 1, salience = MAX(salience, ?),
 			        expires_at = ?, origin_tool = ?, source = ?
+			        , provenance = COALESCE(?, provenance)
 			 WHERE id = ?`,
-			in.Content, idx, now, now, in.Salience, expires, in.Tool, in.Source, id,
+			in.Content, idx, now, now, in.Salience, expires, in.Tool, in.Source,
+			nullable(provJSON), id,
 		); err != nil {
 			return nil, err
 		}
@@ -391,10 +443,10 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 			`INSERT INTO memories
 			   (id, content, content_idx, kind, content_hash, project, salience,
 			    created_at, updated_at, last_seen_at, expires_at,
-			    origin_device, origin_tool, source, access_count)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
+			    origin_device, origin_tool, source, provenance, access_count)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
 			id, in.Content, idx, in.Kind, h, in.Project, in.Salience,
-			now, now, now, expires, in.Device, in.Tool, in.Source,
+			now, now, now, expires, in.Device, in.Tool, in.Source, nullable(provJSON),
 		); err != nil {
 			return nil, err
 		}
