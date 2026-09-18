@@ -4,9 +4,8 @@
 *.db-wal
 *.db-shm
 
-# 覆盖率产物（报告是本地视图，不入库；门槛以 coverage-policy.txt 为准）
-/coverage.out
-/coverage.html
+# 临时产物（覆盖率报告等本地可再生视图，统一进 temp/，不入库）
+/temp/
 
 # 本地同步导出（跨设备归集用，不入库）
 /sync/

@@ -17,13 +17,15 @@ test:
 test-e2e:
 	go test -tags e2e -count=1 -v ./test/e2e
 
-# 覆盖率报告：终端给函数级明细 + 汇总，HTML 给逐行可视化
+# 覆盖率报告：终端给函数级明细 + 汇总，HTML 给逐行可视化。
+# 产物是本地可再生视图，统一进 temp/（见 .gitignore 的 /temp/ 忽略）。
 cover:
-	CGO_ENABLED=0 go test ./... -coverprofile=coverage.out
-	@go tool cover -func=coverage.out | tail -1
-	@go tool cover -html=coverage.out -o coverage.html
-	@echo "逐函数明细：go tool cover -func=coverage.out"
-	@echo "逐行可视化：coverage.html"
+	mkdir -p temp
+	CGO_ENABLED=0 go test ./... -coverprofile=temp/coverage.out
+	@go tool cover -func=temp/coverage.out | tail -1
+	@go tool cover -html=temp/coverage.out -o temp/coverage.html
+	@echo "逐函数明细：go tool cover -func=temp/coverage.out"
+	@echo "逐行可视化：temp/coverage.html"
 
 # 覆盖率门禁：任一包低于下限即非零退出。阈值见 coverage-policy.txt（单一真理源）。
 cover-gate:
