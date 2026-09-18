@@ -5,6 +5,10 @@
 本仓库的任务在独立 git worktree 中开发（一任务一分支一 worktree，全部建于 `.worktree/` 下），收尾时合入 main 并清理 worktree 与分支。
 版本管理规则：发版在 main 打语义化 tag（vX.Y.Z），只打在通过 `make cover-gate` 的提交上。
 
+## 设计权威
+
+判断「该不该做某项改动」时先读 `docs/VALUE.md`（价值主张 + 红线 + 判据）；它与 `README.md` / `docs/design-*.md` 的表述冲突时，以 `docs/VALUE.md` 为准。
+
 ## 测试覆盖率（硬约束，细节见 README「覆盖率要求」）
 
 1. 口径是**包内视角**：每个包由自己的测试负责，跨包调用不算被调方的覆盖率。
