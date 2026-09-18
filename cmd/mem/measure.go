@@ -493,16 +493,21 @@ func cmdEvalWrite(args []string) error {
 		return err
 	}
 
+	texts := make([]string, len(cands))
+	for i, c := range cands {
+		texts[i] = c.Text
+	}
+
 	res := map[string]any{
 		"session": *session, "lines": lines, "candidates": len(cands),
-		"fragments": countFragments(cands), "avg_runes": avgRunes(cands),
+		"fragments": countFragments(texts), "avg_runes": avgRunes(texts),
 	}
 	if *goldPath != "" {
 		gold, err := readGoldPhrases(*goldPath)
 		if err != nil {
 			return err
 		}
-		missed, extra := diffAgainstGold(cands, gold)
+		missed, extra := diffAgainstGold(texts, gold)
 		res["gold_total"] = len(gold)
 		res["missed"] = missed
 		res["extra_estimate"] = extra

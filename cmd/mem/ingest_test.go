@@ -6,6 +6,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -52,6 +53,51 @@ func TestCmdIngestSourceHarnessSummaryAnchorsStoreAndTool(t *testing.T) {
 	}
 	if tool != "ingest" {
 		t.Errorf("收尾收录应标记 tool='ingest'，got %q", tool)
+	}
+}
+
+// ingest 提取记忆时应带内容级溯源（源文件相对路径 + 起始行），供资产联动/词库反查。
+func TestCmdIngestWritesProvenanceFileAndLine(t *testing.T) {
+	db := testDB(t)
+	src := writeFile(t, t.TempDir(), "AGENTS.md", "- 钩子护栏只读不写记忆库\n- 记忆与数据分离\n")
+
+	if _, err := captureStdout(t, func() error {
+		return cmdIngest([]string{"--db", db, "--project", "demo", "--no-audit", src})
+	}); err != nil {
+		t.Fatalf("cmdIngest: %v", err)
+	}
+
+	dbh, err := sql.Open("sqlite", db)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer dbh.Close()
+
+	var prov string
+	if err := dbh.QueryRow(
+		`SELECT provenance FROM memories WHERE content = '钩子护栏只读不写记忆库' AND project = 'demo'`,
+	).Scan(&prov); err != nil {
+		t.Fatalf("读取 provenance: %v", err)
+	}
+	if prov == "" {
+		t.Fatal("ingest 应写入 provenance")
+	}
+	var p struct {
+		File   string `json:"file"`
+		Line   int    `json:"line"`
+		Source string `json:"source"`
+	}
+	if err := json.Unmarshal([]byte(prov), &p); err != nil {
+		t.Fatalf("provenance 应为 JSON: %v", err)
+	}
+	if p.File == "" {
+		t.Errorf("provenance.file 应为源文件名，got %q", p.File)
+	}
+	if p.Line <= 0 {
+		t.Errorf("provenance.line 应为正行号，got %d", p.Line)
+	}
+	if p.Source != "asset" {
+		t.Errorf("ingest 溯源类型应为 asset，got %q", p.Source)
 	}
 }
 

@@ -104,13 +104,20 @@ func cmdIngest(args []string) error {
 				if c.json {
 					continue
 				}
-				fmt.Printf("  + %s\n", cand)
+				fmt.Printf("  + %s\n", cand.Text)
 				continue
 			}
+			// 溯源：记录源文件相对路径 + 起始行，供资产联动与词库反查。
+			// 文件相对工程根；ingest 在工程目录内运行，直接可用相对路径。
+			prov := &store.Provenance{
+				File:   p,
+				Line:   cand.Line,
+				Source: "asset",
+			}
 			r, err := st.Add(store.AddInput{
-				Content: cand, Kind: *kind, Project: proj,
+				Content: cand.Text, Kind: *kind, Project: proj,
 				Device: *device, Source: src, Tool: "ingest",
-				Tags: tagMap, Salience: *salience,
+				Tags: tagMap, Salience: *salience, Provenance: prov,
 			})
 			if err != nil {
 				return err
@@ -169,29 +176,37 @@ func cmdIngest(args []string) error {
 //   - 过短/过长丢弃
 //
 // 去重交给 store 的「相同知识覆盖」，不在这里做 —— 归一化规则只有一处。
-func extractCandidates(path string, minRunes int) ([]string, int, error) {
+// Candidate 是从源文件抽出的一个候选事实及其锚点行号。
+type Candidate struct {
+	Text string // 原子事实
+	Line int    // 源文件行号（约等于事实起始行），用于溯源
+}
+
+// extractCandidates 从一个 markdown 文件里抽出候选原子事实。
+func extractCandidates(path string, minRunes int) ([]Candidate, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer f.Close()
 
-	var out []string
+	var out []Candidate
 	seen := map[string]bool{}
 	var cur []string
 	lines := 0
 	inFence := false
+	startLine := 0
 
 	flush := func() {
 		if len(cur) == 0 {
 			return
 		}
 		text := strings.Join(cur, " ")
-		cur = nil
 		if cand, ok := acceptable(text, minRunes); ok && !seen[cand] {
 			seen[cand] = true
-			out = append(out, cand)
+			out = append(out, Candidate{Text: cand, Line: startLine})
 		}
+		cur = nil
 	}
 
 	sc := bufio.NewScanner(f)
@@ -226,6 +241,7 @@ func extractCandidates(path string, minRunes int) ([]string, int, error) {
 		}
 		flush()
 		cur = []string{stripListMarker(trimmed)}
+		startLine = lines
 	}
 	flush()
 
