@@ -19,11 +19,13 @@ CREATE TABLE IF NOT EXISTS memories (
   origin_device TEXT NOT NULL,
   origin_tool   TEXT NOT NULL DEFAULT '',
   source        TEXT NOT NULL DEFAULT '',
+  provenance    TEXT,
   access_count  INTEGER NOT NULL DEFAULT 0
 );
 
 -- 既有库（在此列加入前创建）没有 source 列：Open 时用 ensureColumn 幂等补上；
 -- 对应索引 ix_mem_source 在 ensureColumn 里补列成功后一并创建。
+-- provenance 为后加列：ensureColumn 幂等 ALTER，存量行保持 NULL（无溯源）。
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_hash ON memories(content_hash, project);
 CREATE INDEX IF NOT EXISTS ix_mem_project ON memories(project);
