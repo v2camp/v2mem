@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // notesSalienceThreshold 是「高重要性」下限，用于把全局 (project 空)

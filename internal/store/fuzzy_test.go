@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wanghui/v2mem/internal/similarity"
+	"github.com/v2camp/v2mem/internal/similarity"
 )
 
 // ---------- M5b-0 签名存储 ----------

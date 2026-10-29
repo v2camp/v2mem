@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wanghui/v2mem/internal/audit"
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 const (

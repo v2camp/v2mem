@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 func cmdLs(args []string) error {

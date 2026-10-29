@@ -11,7 +11,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/wanghui/v2mem/internal/similarity"
+	"github.com/v2camp/v2mem/internal/similarity"
 )
 
 // DefaultConsolidateThreshold 是相似度阈值默认值。

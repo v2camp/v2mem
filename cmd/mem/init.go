@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/wanghui/v2mem/internal/harness"
+	"github.com/v2camp/v2mem/internal/harness"
 )
 
 // 本文件负责「把钩子装进各工具」。三条纪律：

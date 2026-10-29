@@ -10,7 +10,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // 二期同义词提取管线。设计见 docs/design-synonym-library.md §5。

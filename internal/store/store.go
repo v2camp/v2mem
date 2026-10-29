@@ -24,7 +24,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/wanghui/v2mem/internal/similarity"
+	"github.com/v2camp/v2mem/internal/similarity"
 	_ "modernc.org/sqlite"
 )
 

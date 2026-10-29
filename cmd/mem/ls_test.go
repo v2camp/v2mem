@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // 「我到底记了些什么」此前没有对应命令：search 要求先有查询词，export 是给机器读的。

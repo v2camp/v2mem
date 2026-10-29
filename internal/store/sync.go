@@ -12,7 +12,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/wanghui/v2mem/internal/similarity"
+	"github.com/v2camp/v2mem/internal/similarity"
 )
 
 // Ref 是跨设备可解析的身份引用。
