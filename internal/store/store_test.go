@@ -293,7 +293,7 @@ func TestSearchFiltersBySingleTag(t *testing.T) {
 func TestSearchFiltersByMultipleTagsWithANDSemantics(t *testing.T) {
 	s := newTestStore(t)
 	if _, err := s.Add(AddInput{
-		Content: "王辉的偏好设置", Device: "test", Project: "p",
+		Content: "本机的偏好设置", Device: "test", Project: "p",
 		Tags: map[string]string{"machine": "mini", "tool": "workbuddy"},
 	}); err != nil {
 		t.Fatalf("Add: %v", err)

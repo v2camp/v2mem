@@ -237,7 +237,7 @@ func TestImportMergesTagsAsUnion(t *testing.T) {
 
 	local := newTestStore(t)
 	addWith(t, local, AddInput{Content: fact, Project: "p1",
-		Tags: map[string]string{"machine": "laptop", "owner": "wanghui"}})
+		Tags: map[string]string{"machine": "laptop", "owner": "local"}})
 
 	res, err := local.Import(recs)
 	if err != nil {
@@ -252,7 +252,7 @@ func TestImportMergesTagsAsUnion(t *testing.T) {
 	for _, v := range got {
 		tags = v.Tags
 	}
-	for _, want := range []string{"machine=mini", "machine=laptop", "topic=sqlite", "owner=wanghui"} {
+	for _, want := range []string{"machine=mini", "machine=laptop", "topic=sqlite", "owner=local"} {
 		if !strings.Contains(tags, want) {
 			t.Errorf("标记应取并集，缺 %q，got %q", want, tags)
 		}
@@ -842,11 +842,11 @@ func TestSyncMergeUnionsTags(t *testing.T) {
 		t.Fatalf("set updated_at: %v", err)
 	}
 	rec := mkRec("标记并合事实", "p1", 5000, "dev-far")
-	rec.Tags = map[string][]string{"machine": {"mini"}, "owner": {"wanghui"}}
+	rec.Tags = map[string][]string{"machine": {"mini"}, "owner": {"local"}}
 	if _, err := local.SyncMerge([]ExportRecord{rec}); err != nil {
 		t.Fatalf("SyncMerge: %v", err)
 	}
-	for k, v := range map[string]string{"machine": "mini", "owner": "wanghui"} {
+	for k, v := range map[string]string{"machine": "mini", "owner": "local"} {
 		if !hasTag(t, local, lid, k, v) {
 			t.Errorf("远端标记 %s=%s 应并集保留", k, v)
 		}
