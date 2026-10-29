@@ -1,4 +1,4 @@
-module github.com/wanghui/v2mem
+module github.com/v2camp/v2mem
 
 go 1.27.1
 

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wanghui/v2mem/internal/harness"
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/harness"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // captureStdout 捕获命令输出，用于断言 CLI 的真实打印结果。

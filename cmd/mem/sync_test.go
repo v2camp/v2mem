@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // ---------- WS3: mem sync 跨设备 git 同步 ----------

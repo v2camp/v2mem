@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // seedy 工程记忆：两条「术语清单式」标准记忆，各含一组同义词（同一簇里词面互换）。

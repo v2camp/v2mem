@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/wanghui/v2mem/internal/audit"
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // 跨设备同步：`mem sync <remote>`。

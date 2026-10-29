@@ -2,7 +2,7 @@
 # v2mem 一键安装：优先下载预编译二进制（mac/linux/windows），失败回退源码构建。
 #
 # 用法：
-#   curl -fsSL https://raw.githubusercontent.com/wanghui/v2mem/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh | bash
 #   bash scripts/install.sh --dir ~/bin --version v0.1.0
 #
 # 选项：
@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-REPO="wanghui/v2mem"
+REPO="v2camp/v2mem"
 BASE="https://github.com/$REPO/releases/download"
 
 # ---------- 探测平台 ----------

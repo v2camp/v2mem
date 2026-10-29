@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // ---------- M6: Level 1 文件运维（ingest / budget） ----------

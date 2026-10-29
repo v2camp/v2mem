@@ -115,7 +115,7 @@ awk -v update="$UPDATE" -v force="$FORCE" -v outfile="$NEWPOLICY" '
 
     for (i = 1; i <= n; i++) {
       p = order[i]
-      short = p; sub(/^github\.com\/wanghui\/v2mem\//, "", short)
+      short = p; sub(/^github\.com\/v2camp\/v2mem\//, "", short)
 
       if (!(p in actual)) {
         if (!update) printf "%-20s %8s %7s %8s %9s  未采集到\n", short, "-", lower[p] "%", target[p] "%", "-"

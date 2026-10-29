@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // backupBeforeMutating 在破坏性操作（gc / consolidate）前生成库快照。

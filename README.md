@@ -12,7 +12,7 @@
 **跨平台** —— mac / linux / windows 预编译单文件，同一套记忆三端通用
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wanghui/v2mem/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh | bash
 mem add --kind pitfall "活库 mem.db 绝不能放进 iCloud 同步目录，会损坏 SQLite"
 mem search "同步目录"
 ```
@@ -53,7 +53,7 @@ v2mem 有两条安装路径，二选一即可：
 
 ```bash
 # 远程发布版（推荐）—— 从 GitHub Releases 下载预编译二进制，失败自动回退源码构建
-curl -fsSL https://raw.githubusercontent.com/wanghui/v2mem/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh | bash
 #   --dir ~/bin     指定安装目录（默认 ~/.local/bin）
 #   --version v0.1.0 指定版本 tag（默认 latest；未传入时拉最新发布）
 #   --from-source   跳过下载，强制源码构建

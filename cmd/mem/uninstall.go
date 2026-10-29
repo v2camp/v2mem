@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/wanghui/v2mem/internal/harness"
+	"github.com/v2camp/v2mem/internal/harness"
 )
 
 // 本文件实现 `mem uninstall`——init 的逆操作：

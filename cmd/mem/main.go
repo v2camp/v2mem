@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wanghui/v2mem/internal/audit"
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 const usageText = `v2mem (mem) — 个人 Agent 记忆系统

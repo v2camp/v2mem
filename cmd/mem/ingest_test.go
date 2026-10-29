@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/wanghui/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/audit"
 )
 
 // memSourceAndTool 直接从库文件读出某条正文对应的 (source, origin_tool)。

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wanghui/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // ---------- WS1.1: mem notes 硬规则小字条 ----------
