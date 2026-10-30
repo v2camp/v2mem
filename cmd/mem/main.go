@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -66,6 +67,8 @@ add 选项:
   --tool <t>       来源工具（默认 cli）
   --device <d>     来源设备（默认 hostname）
   --source <s>     来源标记: human|llm|ingest|harness-summary|bench|test（默认 human；bench/test 默认不计入用量视图）
+  --channel <c>    写时通道: user|agent|tool|import（默认按 source：human→user，llm→agent，ingest→import）
+  --no-scrub       关闭密钥打码（仅本地调试）
   --salience <f>   重要性 0..1（默认 0.5）
   --ttl <dur>      硬过期，如 720h（默认不过期）
 
@@ -77,6 +80,7 @@ search 选项:
   --scope <s>      current=当前工程+全局；global=只要全局；all=跨工程（默认）
   --layer <l>      memory=已定记忆（默认）；observation=近期痕迹；both=两层交错。别名 recent、all
   --no-fuzzy       关闭模糊检索（MinHash 签名 + RRF 融合，默认开启；只作用于已定记忆）
+  --no-scrub       审计 query 不打码（检索仍用原文；仅本地调试）
 
 gc 选项:
   --max-idle <dur>      久未命中阈值（默认 720h，即 30 天）
@@ -294,6 +298,8 @@ func cmdAdd(args []string) error {
 	tool := fs.String("tool", "cli", "来源工具")
 	device := fs.String("device", "", "来源设备")
 	source := fs.String("source", "human", "来源标记: human|llm|ingest|harness-summary|bench|test")
+	channel := fs.String("channel", "", "写时通道: user|agent|tool|import（空则按 source 取默认）")
+	noScrub := fs.Bool("no-scrub", false, "关闭密钥打码（仅本地调试）")
 	salience := fs.Float64("salience", 0.5, "重要性 0..1")
 	ttl := fs.Duration("ttl", 0, "硬过期时长")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
@@ -304,7 +310,7 @@ func cmdAdd(args []string) error {
 		return err
 	}
 
-	content := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	content := scrub.Apply(strings.TrimSpace(strings.Join(fs.Args(), " ")), *noScrub)
 	if content == "" {
 		return errors.New("缺少内容，用法: mem add \"<原子事实>\"")
 	}
@@ -335,6 +341,7 @@ func cmdAdd(args []string) error {
 		Tool:     *tool,
 		Device:   *device,
 		Source:   *source,
+		Channel:  *channel,
 		Tags:     tagMap,
 		Salience: *salience,
 		TTL:      *ttl,
@@ -384,6 +391,7 @@ func cmdSearch(args []string) error {
 	explain := fs.Bool("explain", false, "打印同义词展开诊断后退出")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
 	noAudit := fs.Bool("no-audit", false, "不写审计日志")
+	noScrub := fs.Bool("no-scrub", false, "审计 query 不打码（检索仍用原文；仅本地调试）")
 	var tags stringSlice
 	fs.Var(&tags, "tag", "标记 k=v，可重复")
 	if err := fs.Parse(args); err != nil {
@@ -461,7 +469,7 @@ func cmdSearch(args []string) error {
 	if !*noAudit {
 		rec := audit.Record{
 			TS: started.Unix(), Event: "manual-search", Project: proj,
-			Query: q, Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
+			Query: scrub.Apply(q, *noScrub), Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
 		}
 		for _, h := range hits {
 			rec.Hashes = append(rec.Hashes, h.ID)

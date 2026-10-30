@@ -1,3 +1,5 @@
 # 发布门禁的召回阈值（单一真理源）。CI（make eval-gate）与 make release 同读。
-# 口径：Recall@5（宏平均，见 internal/eval 的评分定义）。0.60 即 60%。
+# 口径：Recall@5（宏平均，见 internal/eval）。数据是 eval/sandbox 合成夹具，
+# 临时库灌入，不读 ~/.v2mem/mem.db。gold/ 的个人标注不参与本门禁。
+# strict-all@5 写入收据，不单独当门槛。0.60 即 60%。
 recall5_min=0.60

@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS memories (
   origin_device TEXT NOT NULL,
   origin_tool   TEXT NOT NULL DEFAULT '',
   source        TEXT NOT NULL DEFAULT '',
+  channel       TEXT NOT NULL DEFAULT '', -- user|agent|tool|import；与 source 并存。空=迁移前旧行
   provenance    TEXT,
   access_count  INTEGER NOT NULL DEFAULT 0
 );
@@ -103,7 +104,9 @@ CREATE TABLE IF NOT EXISTS observations (
   raw_ref       TEXT NOT NULL DEFAULT '', -- 可选外部路径，勿存密钥
   content_hash  TEXT NOT NULL,
   created_at    INTEGER NOT NULL,
-  meta_json     TEXT NOT NULL DEFAULT '{}'
+  meta_json     TEXT NOT NULL DEFAULT '{}',
+  channel       TEXT NOT NULL DEFAULT '', -- user|agent|tool|import
+  event_id      TEXT NOT NULL DEFAULT ''  -- 宿主事件号；空不参与幂等。唯一索引在 Open 里建
 );
 CREATE INDEX IF NOT EXISTS ix_obs_session ON observations(session_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_obs_project ON observations(project, created_at);
@@ -118,6 +121,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   content_hash  TEXT NOT NULL,
   status        TEXT NOT NULL,            -- pending|accepted|rejected|expired
   source        TEXT NOT NULL,            -- distill|dream|import-proposal
+  channel       TEXT NOT NULL DEFAULT '', -- user|agent|tool|import；与 source 并存
   salience      REAL NOT NULL DEFAULT 0.5,
   obs_ids_json  TEXT NOT NULL DEFAULT '[]',
   created_at    INTEGER NOT NULL,

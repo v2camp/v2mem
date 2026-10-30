@@ -10,6 +10,7 @@ import (
 
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/distill"
+	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -27,6 +28,7 @@ func cmdDistill(args []string) error {
 	strict := fs.Bool("strict", false, "失败时非零退出（默认 fail-open，退出码 0）")
 	pending := fs.Bool("pending", false, "蒸馏所有尚未处理的会话")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
+	noScrub := fs.Bool("no-scrub", false, "关闭密钥打码（仅本地调试）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -60,7 +62,7 @@ func cmdDistill(args []string) error {
 	for _, sid := range sessions {
 		out, n, err := distillOne(st, distillJob{
 			Session: sid, Provider: *provider, Model: model, Timeout: timeout,
-			Since: *since, Dry: *dry, Audit: *auditFile, DB: c.db,
+			Since: *since, Dry: *dry, Audit: *auditFile, DB: c.db, NoScrub: *noScrub,
 		})
 		total += n
 		if err != nil && failed == nil {
@@ -97,6 +99,7 @@ type distillJob struct {
 	Dry      bool
 	Audit    string
 	DB       string
+	NoScrub  bool
 }
 
 func distillOne(st *store.Store, job distillJob) (distill.Outcome, int, error) {
@@ -128,7 +131,7 @@ func distillOne(st *store.Store, job distillJob) (distill.Outcome, int, error) {
 		}
 		in[i] = distill.Observation{
 			ID: o.ID, SessionID: o.SessionID, Project: o.Project,
-			Summary: scrubSecrets(o.Summary),
+			Summary: scrub.Apply(o.Summary, job.NoScrub),
 		}
 	}
 	window := distill.WindowKey(ids)
@@ -163,7 +166,7 @@ func distillOne(st *store.Store, job distillJob) (distill.Outcome, int, error) {
 	for _, f := range out.Facts {
 		res, err := st.InsertCandidate(store.CandidateInput{
 			SessionID: job.Session, Project: project, Kind: f.Kind,
-			Content: scrubSecrets(f.Content), Source: "distill",
+			Content: scrub.Apply(f.Content, job.NoScrub), Source: "distill", Channel: store.ChannelAgent,
 			Salience: f.Salience, ObsIDs: f.ObsIDs,
 		})
 		if err != nil {

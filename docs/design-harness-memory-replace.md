@@ -50,9 +50,9 @@
 
 ### WS4 版本自动迭代 + eval 报告同步 + 发布门禁
 - 迭代推导：自上次 tag 之后合入 main 的 commits，按 conventional 取最高档：`!`/`BREAKING`→major；`feat:`→minor；其余→patch。
-- CI：main 合入触发 → `make cover-gate` 通过 → 跑正式版 eval（真实 gold 集，`eval-policy.txt` 记 `recall5_min`，默认 0.60）→ 达标才 `git tag` + push + 生成 `.mem/reports/v<tag>.md`；不达标 CI 红，不发版。
-- 报告头部：`tag`、`commit sha`、`coverage%`、`Recall@5`、**gold 集 hash**、日期、gold 行数；同 tag 可复现。
-- gold 集入仓 `gold/`，版本化。
+- CI：main 合入触发 → `make cover-gate` 通过 → 跑沙箱 eval（`eval/sandbox` 临时库，`eval-policy.txt` 的 `recall5_min`，默认 0.60）→ 达标才 `git tag` + push + 生成 `.mem/reports/v<tag>.md`；不达标 CI 红，不发版。个人 `gold/` 不参与这道门禁。
+- 报告头部：`tag`、`commit sha`、`coverage%`、`Recall@5`、**夹具 hash**、日期；同 tag 可复现。收据在 `eval/receipts/`，不入库。
+- 个人标注仍可放 `gold/`。发布用的合成夹具在 `eval/sandbox/`。
 - 阈值单一真理源：新增 `eval-policy.txt` 与 `coverage-policy.txt` 并列；CI 与本地 `make release` 读同一份。
 - override：仅本地 `make release OVERRIDE=major|minor|patch`；CI 无旁路放行。
 

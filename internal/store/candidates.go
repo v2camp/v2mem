@@ -25,6 +25,7 @@ type Candidate struct {
 	Hash      string   `json:"hash"`
 	Status    string   `json:"status"`
 	Source    string   `json:"source"`
+	Channel   string   `json:"channel,omitempty"`
 	Salience  float64  `json:"salience"`
 	ObsIDs    []string `json:"obs_ids"`
 	CreatedAt int64    `json:"created_at"`
@@ -39,6 +40,7 @@ type CandidateInput struct {
 	Kind      string
 	Content   string
 	Source    string
+	Channel   string
 	Salience  float64
 	ObsIDs    []string
 }
@@ -109,12 +111,17 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 	if in.Source == "" {
 		in.Source = "distill"
 	}
+	ch, err := DefaultChannel(in.Channel, in.Source)
+	if err != nil {
+		return nil, err
+	}
+	in.Channel = ch
 	if in.Salience <= 0 || in.Salience > 1 {
 		in.Salience = 0.5
 	}
 	hash := HashOf(in.Content)
 	var existing string
-	err := s.db.QueryRow(
+	err = s.db.QueryRow(
 		`SELECT id FROM candidates
 		  WHERE session_id = ? AND content_hash = ? AND status IN ('pending','accepted')`,
 		in.SessionID, hash).Scan(&existing)
@@ -133,10 +140,10 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 	id := newID()
 	now := time.Now().Unix()
 	_, err = s.db.Exec(`INSERT INTO candidates(
-		id, session_id, project, kind, content, content_hash, status, source,
+		id, session_id, project, kind, content, content_hash, status, source, channel,
 		salience, obs_ids_json, created_at
-	) VALUES (?,?,?,?,?,?, 'pending', ?,?,?,?)`,
-		id, in.SessionID, in.Project, in.Kind, in.Content, hash, in.Source,
+	) VALUES (?,?,?,?,?,?, 'pending', ?,?,?,?,?)`,
+		id, in.SessionID, in.Project, in.Kind, in.Content, hash, in.Source, in.Channel,
 		in.Salience, marshalObsIDs(in.ObsIDs), now)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -163,7 +170,7 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 
 func (s *Store) candidateByID(id string) (*Candidate, error) {
 	row := s.db.QueryRow(`SELECT id, session_id, project, kind, content, content_hash,
-		status, source, salience, obs_ids_json, created_at, decided_at, memory_id
+		status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id
 		FROM candidates WHERE id = ?`, id)
 	return scanCandidate(row)
 }
@@ -178,7 +185,7 @@ func scanCandidate(row rowScanner) (*Candidate, error) {
 	var decided sql.NullInt64
 	var memory sql.NullString
 	if err := row.Scan(&c.ID, &c.SessionID, &c.Project, &c.Kind, &c.Content, &c.Hash,
-		&c.Status, &c.Source, &c.Salience, &obsJSON, &c.CreatedAt, &decided, &memory); err != nil {
+		&c.Status, &c.Source, &c.Channel, &c.Salience, &obsJSON, &c.CreatedAt, &decided, &memory); err != nil {
 		return nil, err
 	}
 	c.ObsIDs = unmarshalObsIDs(obsJSON)
@@ -197,7 +204,7 @@ func (s *Store) ListCandidates(status, session string, limit int) ([]Candidate, 
 		limit = 50
 	}
 	q := `SELECT id, session_id, project, kind, content, content_hash,
-		status, source, salience, obs_ids_json, created_at, decided_at, memory_id
+		status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id
 		FROM candidates WHERE 1=1`
 	var args []any
 	if status != "" {
@@ -273,7 +280,7 @@ func (s *Store) AcceptCandidate(idOrPrefix string) (*AcceptResult, error) {
 	}
 	added, err := s.Add(AddInput{
 		Content: c.Content, Kind: c.Kind, Project: c.Project,
-		Source: "distill-accept", Salience: c.Salience, Tool: "distill",
+		Source: "distill-accept", Channel: c.Channel, Salience: c.Salience, Tool: "distill",
 	})
 	if err != nil {
 		return nil, err
@@ -445,7 +452,7 @@ func (s *Store) ObservationsForDistill(sessionID string, sinceUnix int64, limit 
 		limit = 200
 	}
 	q := `SELECT id, session_id, project, harness, event, tool_name, summary, raw_ref,
-	             content_hash, created_at, meta_json
+	             content_hash, created_at, meta_json, channel, event_id
 	        FROM observations WHERE 1=1`
 	var args []any
 	if sessionID != "" {
@@ -465,9 +472,8 @@ func (s *Store) ObservationsForDistill(sessionID string, sinceUnix int64, limit 
 	defer rows.Close()
 	var out []Observation
 	for rows.Next() {
-		var o Observation
-		if err := rows.Scan(&o.ID, &o.SessionID, &o.Project, &o.Harness, &o.Event,
-			&o.ToolName, &o.Summary, &o.RawRef, &o.Hash, &o.CreatedAt, &o.MetaJSON); err != nil {
+		o, err := scanObservation(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, o)

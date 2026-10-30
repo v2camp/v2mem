@@ -4,17 +4,20 @@ set -euo pipefail
 #
 # 职责（对应 make eval-gate / make release）：
 #   1. 读门槛单一真理源 eval-policy.txt 的 recall5_min
-#   2. 跑正式版 eval recall（gold 起点集，--gold-dir）取 Recall@5
+#   2. 跑沙箱 eval recall（eval/sandbox，临时库，不读 ~/.v2mem/mem.db）取 Recall@5
 #   3. 判据：recall < recall5_min → 打印 RED 并非零退出（CI 借此跳过打 tag）
 #   4. 非 --gate-only 时推导版本 → 写 .mem/reports/v<tag>.md → 把 tag 打到 stdout
+#
+# gold/ 里的个人标注不参与本门禁。
 #
 # 用法:
 #   release-eval.sh [--override major|minor|patch] [--gate-only]
 #
 # 环境变量:
-#   MEM_BIN   跑 eval 的二进制（默认 <仓库>/bin/mem；不存在则现场 go build）
-#   GOLD_DIR  金标准目录（默认 <仓库>/gold）
-#   REPO_DIR  git 仓库目录（默认 .）
+#   MEM_BIN       跑 eval 的二进制（默认 <仓库>/bin/mem；不存在则现场 go build）
+#   SANDBOX_DIR   合成夹具目录（默认 <仓库>/eval/sandbox）
+#   RECEIPTS_DIR  收据目录（默认 <仓库>/eval/receipts，已 gitignore）
+#   REPO_DIR      git 仓库目录（默认 .）
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GATE_ONLY=0
@@ -28,7 +31,8 @@ while [ $# -gt 0 ]; do
 done
 
 REPO_DIR="${REPO_DIR:-.}"
-GOLD_DIR="${GOLD_DIR:-$ROOT/gold}"
+SANDBOX_DIR="${SANDBOX_DIR:-$ROOT/eval/sandbox}"
+RECEIPTS_DIR="${RECEIPTS_DIR:-$ROOT/eval/receipts}"
 MEM_BIN="${MEM_BIN:-$ROOT/bin/mem}"
 
 # ---------- 1) 门槛（单一真理源） ----------
@@ -42,20 +46,35 @@ if [ ! -x "$MEM_BIN" ]; then
   (cd "$ROOT" && CGO_ENABLED=0 go build -o "$MEM_BIN" ./cmd/mem)
 fi
 
-# ---------- 3) 跑正式版 eval recall（JSON） ----------
+# ---------- 3) 跑沙箱 eval recall（JSON + 收据） ----------
 TMPJSON="$(mktemp)"
-trap 'rm -f "$TMPJSON"' EXIT
-if ! "$MEM_BIN" eval recall --gold-dir "$GOLD_DIR" --k 5 --json >"$TMPJSON" 2>/dev/null; then
-  echo "RED: eval 失败（--gold-dir $GOLD_DIR）" >&2
+TMPERR="$(mktemp)"
+trap 'rm -f "$TMPJSON" "$TMPERR"' EXIT
+rm -rf "$RECEIPTS_DIR"
+mkdir -p "$RECEIPTS_DIR"
+if ! "$MEM_BIN" eval recall --sandbox "$SANDBOX_DIR" --k 5 --json --receipts "$RECEIPTS_DIR" >"$TMPJSON" 2>"$TMPERR"; then
+  echo "RED: 沙箱 eval 失败（--sandbox $SANDBOX_DIR）" >&2
+  cat "$TMPERR" >&2 || true
   cat "$TMPJSON" >&2 || true
+  exit 1
+fi
+for f in manifest.json scores.ndjson evidence.ndjson; do
+  if [ ! -s "$RECEIPTS_DIR/$f" ]; then
+    echo "RED: 收据缺少 $RECEIPTS_DIR/$f" >&2
+    exit 1
+  fi
+done
+if grep -q '"content"' "$RECEIPTS_DIR/evidence.ndjson"; then
+  echo "RED: evidence.ndjson 含 content 字段" >&2
   exit 1
 fi
 RECALL="$(grep -o '"recall_at_k":[0-9.]*' "$TMPJSON" | head -1 | cut -d: -f2)"
 [ -n "$RECALL" ] || { echo "RED: 从 eval 输出解析不到 recall_at_k" >&2; cat "$TMPJSON" >&2; exit 1; }
+STRICT="$(grep -o '"strict_all_at_k":[0-9.]*' "$TMPJSON" | head -1 | cut -d: -f2)"
 
 # ---------- 4) 门禁判据 ----------
 if awk -v r="$RECALL" -v m="$MIN" 'BEGIN{ exit !(r >= m) }'; then
-  echo "GREEN: Recall@5=$RECALL  ≥  ${MIN}（门槛）"
+  echo "GREEN: Recall@5=$RECALL  ≥  ${MIN}（门槛）  strict-all@5=${STRICT:-n/a}  沙箱=$SANDBOX_DIR"
 else
   echo "RED: Recall@5=$RECALL  <  ${MIN}（eval-policy.txt 门槛）—— 不达标不发版" >&2
   exit 1
@@ -70,11 +89,12 @@ LAST="$(cd "$REPO_DIR" && git describe --tags --abbrev=0 2>/dev/null || echo v0.
 TAG="$(bash "$ROOT/scripts/derive-version.sh" --repo "$REPO_DIR" --last "$LAST" ${OVERRIDE:+--override "$OVERRIDE"})"
 SHA="$(cd "$REPO_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 GOLDHASH="$(
-  python3 - "$GOLD_DIR" <<'PY' 2>/dev/null || echo "n/a"
+  python3 - "$SANDBOX_DIR" <<'PY' 2>/dev/null || echo "n/a"
 import glob, hashlib, sys
 h = hashlib.sha256()
-for f in sorted(glob.glob(sys.argv[1] + "/*.gold.jsonl")):
-    h.update(open(f, "rb").read())
+for pat in ("/*.gold.jsonl", "/seed.jsonl"):
+    for f in sorted(glob.glob(sys.argv[1] + pat)):
+        h.update(open(f, "rb").read())
 print(h.hexdigest())
 PY
 )"

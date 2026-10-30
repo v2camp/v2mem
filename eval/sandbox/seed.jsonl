@@ -1,0 +1,9 @@
+{"layer":"memory","content":"沙箱评测必须使用临时记忆库，禁止读取用户主目录中的个人记忆","kind":"decision","project":"sandbox","source":"bench","channel":"import"}
+{"layer":"memory","content":"发布门禁只认仓库内的合成金标准，个人标注不参与发版","kind":"decision","project":"sandbox","source":"bench","channel":"import"}
+{"layer":"memory","content":"观测摘要默认不进入记忆检索，只有显式采纳才进入主库","kind":"fact","project":"sandbox","source":"bench","channel":"import"}
+{"layer":"memory","content":"写入前要擦除密钥令牌与私钥块，审计查询使用同一套规则","kind":"rule","project":"sandbox","source":"bench","channel":"import"}
+{"layer":"memory","content":"同一宿主事件号重复捕获时只保留第一条观测","kind":"fact","project":"sandbox","source":"bench","channel":"import"}
+{"layer":"memory","content":"沙箱工程甲的构建缓存放在仓库外的临时目录","kind":"fact","project":"sandbox","source":"bench","channel":"import"}
+{"layer":"memory","content":"沙箱工程甲的测试夹具使用合成会话而不含个人信息","kind":"fact","project":"sandbox","source":"bench","channel":"import"}
+{"layer":"memory","content":"中文长问句检索先走精确匹配，没有命中再放宽为词间或","kind":"pitfall","project":"sandbox","source":"bench","channel":"import"}
+{"layer":"observation","session_id":"sandbox-sess-1","project":"sandbox","harness":"sandbox","event":"post-tool-use","tool_name":"Shell","summary":"合成会话只留下青柠标记，不进入默认检索","channel":"tool","event_id":"sandbox-evt-1"}

@@ -1,0 +1,7 @@
+{"query":"临时记忆库","gold":["be280bd4c970"],"note":"合成：临时库"}
+{"query":"合成金标准","gold":["491a508a2dd1"],"note":"合成：门禁与个人标注分离"}
+{"query":"显式采纳","gold":["d0d73b8dfb19"],"note":"合成：观测不进默认检索"}
+{"query":"私钥块","gold":["8f41c899d063"],"note":"合成：统一打码"}
+{"query":"宿主事件号","gold":["1c5873759c47"],"note":"合成：捕获幂等"}
+{"query":"沙箱工程甲","gold":["9c2a91875b88","f33a0ae8b74b"],"note":"合成：多 gold，测 strict-all"}
+{"query":"中文长问句","gold":["64db2fed146d"],"note":"合成：精确优先"}

@@ -14,12 +14,13 @@
 # 字段：包路径 <TAB> 下限 <TAB> 目标
 # 新增包必须在此登记 —— 门禁会拒绝任何未登记（即无门槛）的包。
 
-github.com/v2camp/v2mem/internal/eval	97	98
+github.com/v2camp/v2mem/internal/eval	98	98
+github.com/v2camp/v2mem/internal/scrub	100	100
 github.com/v2camp/v2mem/internal/transcript	89	94
 github.com/v2camp/v2mem/internal/distill	86	92
-github.com/v2camp/v2mem/internal/similarity	96	97
+github.com/v2camp/v2mem/internal/similarity	97	97
 github.com/v2camp/v2mem/internal/harness	93	96
-github.com/v2camp/v2mem/internal/audit	86	90
+github.com/v2camp/v2mem/internal/audit	89	90
 github.com/v2camp/v2mem/internal/store	82	88
 github.com/v2camp/v2mem/cmd/mem	81	85
 TOTAL	83	88

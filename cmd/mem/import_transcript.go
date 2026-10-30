@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 	"github.com/v2camp/v2mem/internal/transcript"
 )
@@ -145,9 +146,7 @@ func importClaudeFile(st *store.Store, path string, opt importOpts) (imported, s
 			skipped++
 			continue
 		}
-		if !opt.NoScrub {
-			text = scrubSecrets(text)
-		}
+		text = scrub.Apply(text, opt.NoScrub)
 		text = truncateRunes(text, observeSummaryMaxRunes)
 		project := opt.Project
 		if project == "" {
@@ -161,6 +160,7 @@ func importClaudeFile(st *store.Store, path string, opt importOpts) (imported, s
 		res, err := st.AppendObservation(store.ObsInput{
 			SessionID: line.SessionID, Project: project, Harness: "claude",
 			Event: "import-transcript", ToolName: line.Role, Summary: text, RawRef: path,
+			Channel: store.ChannelImport,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "v2mem import-transcript: 写观测失败，已跳过该行: %v\n", err)

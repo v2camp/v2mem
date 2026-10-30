@@ -80,6 +80,12 @@ func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
 		switch o.Event {
 		case "post-tool-use":
 			sawPost = true
+			if o.Channel != store.ChannelTool {
+				t.Errorf("PostToolUse 默认 channel=tool，got %s", o.Channel)
+			}
+			if o.EventID != "tool:"+sid+":tu-1" {
+				t.Errorf("event_id 应来自 tool_use_id，got %s", o.EventID)
+			}
 			if strings.Contains(o.Summary, "supersecret") {
 				t.Errorf("摘要应抹掉密钥，got %s", o.Summary)
 			}
@@ -88,8 +94,14 @@ func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
 			}
 		case "stop":
 			sawStop = true
+			if o.Channel != store.ChannelAgent {
+				t.Errorf("Stop 默认 channel=agent，got %s", o.Channel)
+			}
 		case "session-end":
 			sawEnd = true
+			if o.Channel != store.ChannelAgent {
+				t.Errorf("SessionEnd 默认 channel=agent，got %s", o.Channel)
+			}
 		}
 	}
 	if !sawPost || !sawStop || !sawEnd || !sawRedacted {
@@ -434,5 +446,58 @@ func TestCmdInitRegistersStopWhereDocumented(t *testing.T) {
 	}
 	if _, ok := hooks["SessionEnd"]; ok {
 		t.Error("codex 官方事件表没有 SessionEnd，不应注册")
+	}
+}
+
+func TestHookEventIDReplayAndNoScrub(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	body := hookJSON(t, map[string]any{
+		"hook_event_name": "postToolUse", "cwd": proj, "session_id": "evt-sess",
+		"tool_name": "Shell", "event_id": "host-evt-9",
+		"tool_input": map[string]any{"command": "echo api_key=supersecret"},
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := withStdin(t, body, func() error {
+			return cmdHook([]string{"--db", db, "--harness", "cursor", "--dedup-window", "0", "--audit", "-"})
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	obs, err := st.ListObservations("evt-sess", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 1 || obs[0].EventID != "host-evt-9" || strings.Contains(obs[0].Summary, "supersecret") {
+		t.Fatalf("重放不得双写，且默认打码: %+v", obs)
+	}
+
+	raw := hookJSON(t, map[string]any{
+		"hook_event_name": "postToolUse", "cwd": proj, "session_id": "evt-sess",
+		"tool_name": "Shell", "event_id": "host-evt-raw",
+		"tool_input": map[string]any{"command": "echo api_key=supersecret"},
+	})
+	if _, err := withStdin(t, raw, func() error {
+		return cmdHook([]string{"--db", db, "--harness", "cursor", "--dedup-window", "0", "--no-scrub", "--audit", "-"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	obs, err = st.ListObservations("evt-sess", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saw bool
+	for _, o := range obs {
+		if o.EventID == "host-evt-raw" && strings.Contains(o.Summary, "supersecret") {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("--no-scrub 应保留密钥: %+v", obs)
 	}
 }

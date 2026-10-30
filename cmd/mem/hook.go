@@ -13,6 +13,7 @@ import (
 
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/harness"
+	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -50,6 +51,8 @@ type hookInput struct {
 	WorkspaceRoots []string        `json:"workspace_roots"`
 	ToolName       string          `json:"tool_name"`
 	ToolUseID      string          `json:"tool_use_id"`
+	EventID        string          `json:"event_id"`
+	Channel        string          `json:"channel"`
 	ToolInput      json.RawMessage `json:"tool_input"`
 	ToolOutput     json.RawMessage `json:"tool_output"`
 	TranscriptPath string          `json:"transcript_path"`
@@ -76,6 +79,7 @@ func cmdHook(args []string) error {
 	auditPath := fs.String("audit", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；\"-\" 表示关闭）")
 	dedupWindow := fs.Int("dedup-window", defaultDedupWindowSec,
 		"重复触发抑制窗口（秒）。同一事件被多处配置并行触发时只注入一次；0 关闭")
+	noScrub := fs.Bool("no-scrub", false, "关闭密钥打码（仅本地调试；默认打码观测摘要与审计 query）")
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 参数解析失败，已静默放过:", err)
@@ -122,7 +126,7 @@ func cmdHook(args []string) error {
 				_ = audit.Append(*auditPath, audit.Record{
 					TS: started.Unix(), Event: string(event),
 					Harness: harnessName(*harnessFlag, in), Project: project,
-					SessionID: in.sessionID(), Query: strings.TrimSpace(in.Prompt),
+					SessionID: in.sessionID(), Query: scrub.Apply(strings.TrimSpace(in.Prompt), *noScrub),
 					Suppressed: true, MS: time.Since(started).Milliseconds(),
 				})
 			}
@@ -132,7 +136,7 @@ func cmdHook(args []string) error {
 	}
 
 	if isObserveHook(event) {
-		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started)
+		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started, *noScrub)
 		if observeEventMayDistill(event) {
 			maybeSpawnDistill(c.db, in)
 		}
@@ -159,7 +163,7 @@ func cmdHook(args []string) error {
 	if *auditPath != "-" {
 		rec := audit.Record{
 			TS: started.Unix(), Event: string(event), Harness: harnessName(*harnessFlag, in),
-			Project: project, SessionID: in.sessionID(), Query: strings.TrimSpace(in.Prompt),
+			Project: project, SessionID: in.sessionID(), Query: scrub.Apply(strings.TrimSpace(in.Prompt), *noScrub),
 			Empty: strings.TrimSpace(text) == "", MS: time.Since(started).Milliseconds(),
 		}
 		for _, h := range injected {
@@ -461,7 +465,7 @@ func hookDedupKey(in hookInput, event harness.Event) string {
 	if event == harness.EventPostToolUse {
 		parts = append(parts, strings.TrimSpace(in.ToolName), strings.TrimSpace(in.ToolUseID))
 		if strings.TrimSpace(in.ToolUseID) == "" {
-			parts = append(parts, compactRaw(in.ToolInput, 120))
+			parts = append(parts, compactRaw(in.ToolInput, 120, false))
 		}
 	}
 	for _, part := range parts {

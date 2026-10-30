@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/harness"
+	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -26,13 +26,6 @@ const (
 	observeSourceMeta      = `{"source":"hook-observe"}`
 	observeSummaryMaxRunes = 400
 )
-
-var secretScrubbers = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(api[_-]?key|token|secret|password|authorization|passwd)\s*[:=]\s*\S+`),
-	regexp.MustCompile(`\bsk-[A-Za-z0-9_\-]{8,}\b`),
-	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
-	regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}`),
-}
 
 func isObserveHook(event harness.Event) bool {
 	switch event {
@@ -54,14 +47,9 @@ func positiveEnvInt(key string) int {
 	return n
 }
 
-func scrubSecrets(s string) string {
-	for _, re := range secretScrubbers {
-		s = re.ReplaceAllString(s, "[redacted]")
-	}
-	return s
-}
+func scrubSecrets(s string) string { return scrub.Text(s) }
 
-func compactRaw(raw json.RawMessage, max int) string {
+func compactRaw(raw json.RawMessage, max int, noScrub bool) string {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || s == "null" {
 		return ""
@@ -70,11 +58,11 @@ func compactRaw(raw json.RawMessage, max int) string {
 	if json.Unmarshal(raw, &asString) == nil {
 		s = asString
 	}
-	s = scrubSecrets(s)
+	s = scrub.Apply(s, noScrub)
 	return truncateRunes(strings.Join(strings.Fields(s), " "), max)
 }
 
-func buildObsSummary(event harness.Event, in hookInput) string {
+func buildObsSummary(event harness.Event, in hookInput, noScrub bool) string {
 	var b strings.Builder
 	switch event {
 	case harness.EventPostToolUse:
@@ -83,11 +71,11 @@ func buildObsSummary(event harness.Event, in hookInput) string {
 			name = "tool"
 		}
 		b.WriteString(name)
-		if s := compactRaw(in.ToolInput, 180); s != "" {
+		if s := compactRaw(in.ToolInput, 180, noScrub); s != "" {
 			b.WriteString(" ")
 			b.WriteString(s)
 		}
-		if s := compactRaw(in.ToolOutput, 120); s != "" {
+		if s := compactRaw(in.ToolOutput, 120, noScrub); s != "" {
 			b.WriteString(" → ")
 			b.WriteString(s)
 		}
@@ -104,10 +92,33 @@ func buildObsSummary(event harness.Event, in hookInput) string {
 	default:
 		b.WriteString(string(event))
 	}
-	return truncateRunes(scrubSecrets(b.String()), observeSummaryMaxRunes)
+	return truncateRunes(scrub.Apply(b.String(), noScrub), observeSummaryMaxRunes)
 }
 
-func appendObservationFailOpen(c common, harnessFlag string, event harness.Event, project string, in hookInput, auditPath string, started time.Time) {
+// observeEventID 取宿主事件号。显式 event_id 优先；PostToolUse 退到 tool_use_id。
+// 没有稳定 id 时返回空，只靠 (session, content_hash) 去重。
+func observeEventID(in hookInput, event harness.Event) string {
+	if id := strings.TrimSpace(in.EventID); id != "" {
+		return id
+	}
+	if event == harness.EventPostToolUse {
+		if id := strings.TrimSpace(in.ToolUseID); id != "" {
+			return "tool:" + in.sessionID() + ":" + id
+		}
+	}
+	return ""
+}
+
+func observeChannel(event harness.Event, explicit string) string {
+	ch, err := store.DefaultObsChannel(string(event), explicit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "v2mem hook: channel 无效，改用默认:", err)
+		ch, _ = store.DefaultObsChannel(string(event), "")
+	}
+	return ch
+}
+
+func appendObservationFailOpen(c common, harnessFlag string, event harness.Event, project string, in hookInput, auditPath string, started time.Time, noScrub bool) {
 	hname := harnessName(harnessFlag, in)
 	obs := store.ObsInput{
 		SessionID: in.sessionID(),
@@ -115,8 +126,10 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 		Harness:   hname,
 		Event:     string(event),
 		ToolName:  strings.TrimSpace(in.ToolName),
-		Summary:   buildObsSummary(event, in),
+		Summary:   buildObsSummary(event, in, noScrub),
 		MetaJSON:  observeSourceMeta,
+		Channel:   observeChannel(event, in.Channel),
+		EventID:   observeEventID(in, event),
 	}
 	if event != harness.EventPostToolUse {
 		obs.RawRef = strings.TrimSpace(in.TranscriptPath)
