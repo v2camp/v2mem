@@ -158,6 +158,19 @@ func TestSummarizeSeparatesReadAndWriteSides(t *testing.T) {
 	}
 }
 
+func TestObserveEventsAreNotReadsOrWrites(t *testing.T) {
+	s := Summarize([]Record{
+		{Event: "prompt-submit", Query: "q"},
+		{Event: "post-tool-use"},
+		{Event: "session-end"},
+		{Event: "obs-append", Source: "hook-observe"},
+		{Event: "manual-add", Mode: "create"},
+	})
+	if s.Retrievals != 1 || s.Writes != 1 || s.Observations != 3 {
+		t.Fatalf("观测侧不得混进读/写，got retrievals=%d writes=%d obs=%d", s.Retrievals, s.Writes, s.Observations)
+	}
+}
+
 // 写侧不应计入「空注入率」—— 它没有「注入」这个概念。
 func TestWriteOnlyLogHasNoEmptyInjectionRate(t *testing.T) {
 	s := Summarize([]Record{{Event: "manual-add", Mode: "create"}})

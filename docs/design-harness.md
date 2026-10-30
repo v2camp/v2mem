@@ -306,3 +306,13 @@ INSERT INTO hook_dedup(key, ts) VALUES(?, ?)
 ⚠️ **去重是防御，不该成为留冗余配置的理由**：它让工具对重复配置免疫，
 但冗余配置本身仍浪费一次进程启动。看到抑制数 >0 时，建议顺手清掉一处。
 
+### 12.14 Cursor 与观测事件（2026-10-30）
+
+`mem init --harness cursor` 写 `.cursor/hooks.json`（用户级 `~/.cursor/hooks.json`）：
+`version: 1`，扁平 `{command, timeout}`，事件为
+`sessionStart` / `beforeSubmitPrompt` / `postToolUse` / `preCompact` / `stop` / `sessionEnd`。
+注入走 stdout JSON 的 `additional_context`（`PreCompact` 与 `SessionStart` 共用 `renderHookContext`，
+预算可用 `MEM_PRECOMPACT_BUDGET`）。`postToolUse` / `stop` / `sessionEnd` 只写 `observations`。
+其余已确认有 Stop 的工具在原有两个注入事件之外追加注册；Codex / TraeCode 不注册 SessionEnd
+（官方事件表没有）。不启动常驻进程。
+

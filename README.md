@@ -6,7 +6,7 @@
 **轻量** —— 单文件二进制约 **11 MB**：零 CGO、零外部服务、零常驻进程，直接依赖只有 1 个
 （`modernc.org/sqlite`，纯 Go 转译）
 **快** —— 200 条记忆库检索平均 **~9 ms/次**（FTS5 + bm25：精确优先、空手才放宽）
-**多工具** —— 原生接入 **11 个 AI 工具**（Claude Code / Codex / TraeCode / WorkBuddy / CodeBuddy / Qoder …），
+**多工具** —— 原生接入 **12 个 AI 工具**（Claude Code / Codex / Cursor / TraeCode / WorkBuddy / CodeBuddy / Qoder …），
 另提供 **MCP server**，任何支持 MCP 的工具一行配置即接入
 **跨会话** —— 记忆持久在本地 SQLite，会话之间、工程之间共享，不依赖任何云服务
 **跨平台** —— mac / linux / windows 预编译单文件，同一套记忆三端通用
@@ -104,18 +104,20 @@ mem init              # 扫描本机 AI 工具 → 选择要注入钩子的工�
 
 | 等级 | 含义 | 覆盖的工具 |
 |:---|:---|:---|
-| `native` | 有原生 shell 钩子，事件触发即执行（**代码强制**） | Claude Code、TraeCode、TraeWork、CodeBuddy、WorkBuddy、Qoder / Qoder CN、QoderWork / QoderWork CN、Codex |
+| `native` | 有原生 shell 钩子，事件触发即执行（**代码强制**） | Claude Code、TraeCode、TraeWork、CodeBuddy、WorkBuddy、Qoder / Qoder CN、QoderWork / QoderWork CN、Codex、Cursor |
 | `bridge` | 通过官方桥接包复用他家钩子协议 | DeepSeek Harness（`dsh-hooks-claude-code`） |
 | `instruction` | 无原生钩子，把指令写进会话级文件靠模型遵守（**概率性**） | 兜底通道，`mem init --scope instruction` 可强制 |
 
 ```bash
-mem init                     # 扫描本机 → 显示 11 个入口（● = 已装）→ 让你选
+mem init                     # 扫描本机 → 显示 12 个入口（● = 已装）→ 让你选
 mem init --harness claude    # 直接指定
 mem init --dry-run           # 只看会写什么
 ```
 
 配置写入遵守四条纪律：**合并不覆盖**、**幂等**、**只备份一次**（`.v2mem.bak`）、**绝对路径**。
 个别工具需额外动作（Codex 首次要 trust 钩子、QoderWork 改完要重启等），`mem init` 会逐一打印。
+Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 MCP）。
+`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`；`mem search` 搜不到这些观测。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写。默认没有常驻进程。
 全部卸载：`mem uninstall --all`（或 `--harness <名字>` 单个），只摘掉带 `# v2mem` 标记的条目，不动你自己的配置。
 
 ### MCP server
@@ -158,7 +160,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 · `mem budget --file <文件> [--max-chars N]`（检查注入文件是否超预算，超限非零退出）
 · `mem notes`（读侧硬规则小字条：抽 `kind=rule`/全局高优先记忆，一行一条、幂等；hook 注入去重，`MEM_NO_NOTES=1` 回退到仅原始注入）
 
-**接入与钩子**：`mem harness`（列出 11 个工具入口）· `mem init`（写入钩子配置）· `mem uninstall`（反向移除，`--all` 一键）
+**接入与钩子**：`mem harness`（列出 12 个工具入口）· `mem init`（写入钩子配置）· `mem uninstall`（反向移除，`--all` 一键）
 · `mem hook`（钩子入口：读 stdin JSON、写 stdout；同一事件重复触发只注入一次，`--dedup-window` 默认 10s）
 
 **度量与评测**：`mem audit [--stats] [--tail N] [--hits=false]`（审计日志与读/写侧计数）· `mem eval`（**无参一键跑 `activity`，24h 窗口**）

@@ -212,6 +212,15 @@ func stripOursHooks(cfg map[string]any) bool {
 				kept = append(kept, g)
 				continue
 			}
+			// Cursor 的条目是扁平 {command, timeout}，没有嵌套 hooks 组。
+			if _, hasGroup := gm["hooks"]; !hasGroup {
+				if c, ok := gm["command"].(string); ok && isV2memHookCommand(c) {
+					changed = true
+					continue
+				}
+				kept = append(kept, g)
+				continue
+			}
 			hs, _ := gm["hooks"].([]any)
 			var keptHooks []any
 			groupChanged := false

@@ -77,6 +77,8 @@ gc 选项:
   --min-salience <f>    低于此重要性才淘汰（默认 0.2）
   --no-backup           跳过 gc 前的库备份
   --backup-dir <dir>    备份目录（默认 <库目录>/backup）
+  --obs                 只回收 observations（不删 memories）
+  --max-age <dur>       与 --obs 合用：观测保留时长（默认 720h）
 
 consolidate 选项:
   --threshold <f>       相似度阈值 0..1（默认 0.7）
@@ -85,7 +87,7 @@ consolidate 选项:
   --backup-dir <dir>    备份目录（默认 <库目录>/backup）
 
 hook 选项:
-  --event <e>           session-start|prompt-submit|stop|session-end（默认从 stdin 推断）
+  --event <e>           session-start|prompt-submit|pre-compact|post-tool-use|stop|session-end（默认从 stdin 推断）
   --harness <h>         指定工具，项目目录按其注入的环境变量取（默认依次尝试）
   --limit <n>           注入记忆条数上限（默认 3）
   --max-chars <n>       注入字符预算（默认 1200）
@@ -536,8 +538,14 @@ func cmdGC(args []string) error {
 	minSalience := fs.Float64("min-salience", 0.2, "低于此重要性才淘汰")
 	noBackup := fs.Bool("no-backup", false, "跳过 gc 前的库备份")
 	backupDir := fs.String("backup-dir", "", "备份目录（默认 <库目录>/backup）")
+	obsOnly := fs.Bool("obs", false, "只回收 observations，不删除 memories")
+	maxAge := fs.Duration("max-age", 720*time.Hour, "observations 保留时长（配合 --obs）")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	if *obsOnly {
+		return cmdGCObservations(c, *maxAge)
 	}
 
 	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
@@ -562,6 +570,24 @@ func cmdGC(args []string) error {
 		return printJSON(res)
 	}
 	fmt.Printf("已回收 过期=%d 衰减=%d，保留 %d\n", res.Expired, res.Decayed, res.Kept)
+	return nil
+}
+
+// cmdGCObservations 只删 observations。memories 不在这条路径上。
+func cmdGCObservations(c common, maxAge time.Duration) error {
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	res, err := st.GCObservations(maxAge, 50000)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(res)
+	}
+	fmt.Printf("已回收观测 %d 条，保留 %d（未改动 memories）\n", res.Deleted, res.Kept)
 	return nil
 }
 

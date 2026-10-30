@@ -83,6 +83,55 @@ CREATE TABLE IF NOT EXISTS hook_dedup (
 
 CREATE INDEX IF NOT EXISTS idx_hook_dedup_ts ON hook_dedup(ts);
 
+-- 观测缓冲与蒸馏隔离区（同库另表，不进 fts_mem / mem search）。
+-- hooks 只许写 observations；candidates / distill_runs 本波只建表，不接 distill/accept。
+-- 写失败不在这里处理：调用方把行落到 spool，下次 SessionStart 再灌回来。
+CREATE TABLE IF NOT EXISTS observations (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL,
+  project       TEXT NOT NULL DEFAULT '',
+  harness       TEXT NOT NULL DEFAULT '',
+  event         TEXT NOT NULL,            -- post-tool-use|stop|session-end|…
+  tool_name     TEXT NOT NULL DEFAULT '',
+  summary       TEXT NOT NULL DEFAULT '', -- 有界摘要，非全量 stdout
+  raw_ref       TEXT NOT NULL DEFAULT '', -- 可选外部路径，勿存密钥
+  content_hash  TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  meta_json     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS ix_obs_session ON observations(session_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_obs_project ON observations(project, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_obs_dedup ON observations(session_id, content_hash);
+
+CREATE TABLE IF NOT EXISTS candidates (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL DEFAULT '',
+  project       TEXT NOT NULL DEFAULT '',
+  kind          TEXT NOT NULL,
+  content       TEXT NOT NULL,
+  content_hash  TEXT NOT NULL,
+  status        TEXT NOT NULL,            -- pending|accepted|rejected|expired
+  source        TEXT NOT NULL,            -- distill|dream|import-proposal
+  salience      REAL NOT NULL DEFAULT 0.5,
+  obs_ids_json  TEXT NOT NULL DEFAULT '[]',
+  created_at    INTEGER NOT NULL,
+  decided_at    INTEGER,
+  memory_id     TEXT                       -- accept 后回填；本波无写入路径
+);
+CREATE INDEX IF NOT EXISTS ix_cand_status ON candidates(status, created_at);
+
+CREATE TABLE IF NOT EXISTS distill_runs (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL,
+  provider      TEXT NOT NULL,
+  status        TEXT NOT NULL,            -- ok|fail|skipped
+  error         TEXT NOT NULL DEFAULT '',
+  cand_count    INTEGER NOT NULL DEFAULT 0,
+  started_at    INTEGER NOT NULL,
+  finished_at   INTEGER NOT NULL,
+  UNIQUE(session_id, started_at)
+);
+
 -- M5b-0 模糊检索：每条记忆的 MinHash 签名（512B 小端 uint64 序列）。
 -- 与记忆同写同删（外键级联）；旧库缺签名的行由 Open 时一次性补齐（backfillSigs），
 -- 覆盖 import 直插等绕开 Add 的写入路径。

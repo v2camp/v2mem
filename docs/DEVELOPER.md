@@ -71,7 +71,7 @@ cmd/mem/            CLI 入口（命令名 mem）
 internal/
   store/            SQLite + FTS5、schema、生命周期、跨设备归并、相似归并
   similarity/       字符 n-gram + MinHash + 四条护栏（纯算法，无 IO）
-  harness/          11 个工具入口的接入注册表（纯数据）
+  harness/          12 个工具入口的接入注册表（纯数据）
   audit/            审计日志读写与汇总
   eval/             评测指标（纯函数，口径可独立测试）
 scripts/

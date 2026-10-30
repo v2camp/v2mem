@@ -39,9 +39,10 @@ if [ "$FORCE" = 1 ] && [ "$UPDATE" = 0 ]; then
   exit 2
 fi
 
-PROFILE="$(mktemp -t v2mem-cover)"
-TESTLOG="$(mktemp -t v2mem-cover-log)"
-NEWPOLICY="$(mktemp -t v2mem-policy)"
+# 模板必须自带 XXXXXX：GNU mktemp 不接受 macOS 的 `mktemp -t prefix`。
+PROFILE="$(mktemp "${TMPDIR:-/tmp}/v2mem-cover.XXXXXX")"
+TESTLOG="$(mktemp "${TMPDIR:-/tmp}/v2mem-cover-log.XXXXXX")"
+NEWPOLICY="$(mktemp "${TMPDIR:-/tmp}/v2mem-policy.XXXXXX")"
 trap 'rm -f "$PROFILE" "$TESTLOG" "$NEWPOLICY"' EXIT
 
 cd "$ROOT"

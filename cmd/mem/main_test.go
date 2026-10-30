@@ -159,7 +159,7 @@ func hookProjectDir(t *testing.T, name string) (dir string, project string) {
 	t.Helper()
 	for _, k := range []string{
 		"TRAE_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CODEBUDDY_PROJECT_DIR",
-		"QODER_PROJECT_DIR", "QODERCN_PROJECT_DIR",
+		"QODER_PROJECT_DIR", "QODERCN_PROJECT_DIR", "CURSOR_PROJECT_DIR",
 	} {
 		t.Setenv(k, "")
 	}
@@ -205,10 +205,13 @@ func TestCmdHookSessionStartTeachesRetrievalCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdHook: %v", err)
 	}
-	for _, want := range []string{"mem search", "mem add", "mem touch"} {
+	for _, want := range []string{"mem search", "mem add", "mem touch", "search / add"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("应教会模型使用 %q，got:\n%s", want, out)
 		}
+	}
+	if mcp, cli := strings.Index(out, "search / add"), strings.Index(out, "mem search"); mcp < 0 || cli < 0 || mcp > cli {
+		t.Errorf("MCP 工具名应写在 CLI 之前，got:\n%s", out)
 	}
 }
 
@@ -822,7 +825,7 @@ func TestCmdHarnessListCoversUserToolsAndShowsTier(t *testing.T) {
 	}
 	for _, want := range []string{
 		"claude", "traecode", "codebuddy", "qoder", "qoderwork", "codex", "dsh",
-		"workbuddy", "traework",
+		"workbuddy", "traework", "cursor",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("列表应含 %q，got:\n%s", want, out)

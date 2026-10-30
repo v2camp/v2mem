@@ -26,6 +26,8 @@ func TestGetResolvesNamesAndAliases(t *testing.T) {
 		"workbuddy":        "workbuddy",
 		"work-buddy":       "workbuddy",
 		"trae-work":        "traework",
+		"cursor":           "cursor",
+		"cursor-ide":       "cursor",
 	}
 	for in, want := range cases {
 		h, err := Get(in)
@@ -131,6 +133,11 @@ func TestFromEventNameNormalizesVariants(t *testing.T) {
 		"user_prompt_submit": EventPromptSubmit,
 		"Stop":               EventStop,
 		"SessionEnd":         EventSessionEnd,
+		"postToolUse":        EventPostToolUse,
+		"PostToolUse":        EventPostToolUse,
+		"preCompact":         EventPreCompact,
+		"beforeSubmitPrompt": EventPromptSubmit,
+		"sessionStart":       EventSessionStart,
 	}
 	for in, want := range cases {
 		got, ok := FromEventName(in)
@@ -273,6 +280,55 @@ func TestDesktopAppsAreNativeNotInstruction(t *testing.T) {
 		if !strings.Contains(joined, "待实机验证") {
 			t.Errorf("%s 的 Notes 应显式标注「待实机验证」（路径来自静态分析，未观测到真实触发）", c.name)
 		}
+	}
+}
+
+func TestRegisteredEventsFollowDocumentedSurface(t *testing.T) {
+	cur, err := Get("cursor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cur.RegisteredEvents()) != 6 {
+		t.Fatalf("cursor 应注册 6 个事件，got %d", len(cur.RegisteredEvents()))
+	}
+	if cur.HookEventName(EventPreCompact) != "preCompact" || cur.HookEventName(EventPromptSubmit) != "beforeSubmitPrompt" {
+		t.Fatalf("cursor 事件名应为 camelCase，pre=%s prompt=%s",
+			cur.HookEventName(EventPreCompact), cur.HookEventName(EventPromptSubmit))
+	}
+	codex, err := Get("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawStop := false
+	for _, ev := range codex.RegisteredEvents() {
+		if ev == EventSessionEnd {
+			t.Fatal("codex 官方事件表没有 SessionEnd")
+		}
+		if ev == EventStop {
+			sawStop = true
+		}
+	}
+	if !sawStop || codex.HookEventName(EventStop) != "Stop" {
+		t.Fatal("codex 应注册 PascalCase 的 Stop")
+	}
+	claude, err := Get("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stop, end bool
+	for _, ev := range claude.RegisteredEvents() {
+		stop = stop || ev == EventStop
+		end = end || ev == EventSessionEnd
+	}
+	if !stop || !end {
+		t.Fatal("claude 应同时注册 Stop 与 SessionEnd")
+	}
+	dsh, err := Get("dsh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dsh.RegisteredEvents()) != 2 {
+		t.Fatalf("dsh 只应保留注入对，got %d", len(dsh.RegisteredEvents()))
 	}
 }
 

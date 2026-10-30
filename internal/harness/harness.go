@@ -38,8 +38,17 @@ type Event string
 const (
 	EventSessionStart Event = "session-start"
 	EventPromptSubmit Event = "prompt-submit"
+	EventPostToolUse  Event = "post-tool-use"
+	EventPreCompact   Event = "pre-compact"
 	EventStop         Event = "stop"
 	EventSessionEnd   Event = "session-end"
+)
+
+// HookStyleClaude 是各家嵌套 hooks 组（PascalCase 事件名）。
+// HookStyleCursor 是 Cursor 的扁平 command 数组（camelCase，且要求 version）。
+const (
+	HookStyleClaude = ""
+	HookStyleCursor = "cursor"
 )
 
 // EventNames 把归一化事件映射到各 harness 的实际事件名。
@@ -48,8 +57,21 @@ const (
 var EventNames = map[Event]string{
 	EventSessionStart: "SessionStart",
 	EventPromptSubmit: "UserPromptSubmit",
+	EventPostToolUse:  "PostToolUse",
+	EventPreCompact:   "PreCompact",
 	EventStop:         "Stop",
 	EventSessionEnd:   "SessionEnd",
+}
+
+// CursorEventNames 是 Cursor hooks.json 的 camelCase 事件名。
+// 与 Claude 系不是同一套字符串，写错文件会被静默忽略。
+var CursorEventNames = map[Event]string{
+	EventSessionStart: "sessionStart",
+	EventPromptSubmit: "beforeSubmitPrompt",
+	EventPostToolUse:  "postToolUse",
+	EventPreCompact:   "preCompact",
+	EventStop:         "stop",
+	EventSessionEnd:   "sessionEnd",
 }
 
 // EventAliases 覆盖各家在 stdin 里可能给出的写法差异。
@@ -62,6 +84,11 @@ var EventAliases = map[string]Event{
 	"stop":               EventStop,
 	"sessionend":         EventSessionEnd,
 	"session-end":        EventSessionEnd,
+	"beforesubmitprompt": EventPromptSubmit,
+	"posttooluse":        EventPostToolUse,
+	"post-tool-use":      EventPostToolUse,
+	"precompact":         EventPreCompact,
+	"pre-compact":        EventPreCompact,
 }
 
 // FromEventName 把 harness 提交的 hook_event_name 归一化。
@@ -101,6 +128,12 @@ type Harness struct {
 	Verify string   `json:"verify,omitempty"`
 	Docs   string   `json:"docs"`
 	Notes  []string `json:"notes,omitempty"`
+
+	// ExtraEvents 是注入对之外、mem init 额外注册的事件。
+	// 只列文档确认存在的；Cursor 不走这里（见 HookStyle）。
+	ExtraEvents []Event `json:"extra_events,omitempty"`
+	// HookStyle 为空 = Claude 系嵌套组；cursor = 扁平 command 数组。
+	HookStyle string `json:"hook_style,omitempty"`
 }
 
 // registry 是全部已知 harness。顺序即展示顺序。
@@ -295,6 +328,49 @@ var registry = []Harness{
 			"⚠️ 待实机验证：路径取自应用包内文档，尚未观察到桌面端会话触发（验证方法见 Verify）",
 		},
 	},
+	{
+		Name:          "cursor",
+		Aliases:       []string{"cursor-ide"},
+		Label:         "Cursor",
+		Tier:          TierNative,
+		HookStyle:     HookStyleCursor,
+		GlobalConfig:  []string{"~/.cursor/hooks.json"},
+		ProjectConfig: []string{".cursor/hooks.json"},
+		ProjectEnv:    []string{"CURSOR_PROJECT_DIR", "CLAUDE_PROJECT_DIR"},
+		Verify:        "Cursor 的 Hooks 面板，或新开会话后 `mem audit --tail` 看 session-start / post-tool-use",
+		Docs:          "https://cursor.com/docs/hooks",
+		Notes: []string{
+			"hooks.json 是扁平 command 数组，version 必须为 1，事件名是 camelCase",
+			"sessionStart / preCompact / beforeSubmitPrompt 的注入走 stdout JSON 的 additional_context",
+			"postToolUse / stop / sessionEnd 只写 observations，不写 memories，也不启动常驻进程",
+		},
+	},
+}
+
+// applyExtraEvents 给「文档确认有 Stop / SessionEnd」的工具补上观测事件。
+//
+// 不在字面量里逐条写，是为了避免 11 份拷贝漂移。例外必须写在这里：
+//   - cursor：六事件由 HookStyle 决定，不走 ExtraEvents
+//   - dsh：桥接包只翻译 session-start / pre-step，不额外写它读的那份 Claude 配置
+//   - traecode / codex：官方事件表有 Stop，没有 SessionEnd
+func init() {
+	both := []Event{EventStop, EventSessionEnd}
+	stopOnly := map[string]bool{"traecode": true, "codex": true}
+	skip := map[string]bool{"cursor": true, "dsh": true}
+	for i := range registry {
+		h := &registry[i]
+		if skip[h.Name] || h.HookStyle == HookStyleCursor {
+			continue
+		}
+		if h.Tier != TierNative && h.Tier != TierBridge {
+			continue
+		}
+		if stopOnly[h.Name] {
+			h.ExtraEvents = []Event{EventStop}
+			continue
+		}
+		h.ExtraEvents = both
+	}
 }
 
 // All 返回全部 harness 的副本，顺序稳定。
@@ -383,6 +459,35 @@ func (h *Harness) ExistingGlobalConfigs() []string {
 		}
 	}
 	return out
+}
+
+// RegisteredEvents 是 mem init 要写进配置的事件，顺序稳定。
+//
+// 注入对始终在前。Cursor 另外注册观测与 PreCompact；其余工具只加 ExtraEvents
+// 里文档确认存在的 Stop / SessionEnd。
+func (h *Harness) RegisteredEvents() []Event {
+	if h.HookStyle == HookStyleCursor {
+		return []Event{
+			EventSessionStart,
+			EventPromptSubmit,
+			EventPostToolUse,
+			EventPreCompact,
+			EventStop,
+			EventSessionEnd,
+		}
+	}
+	out := []Event{EventSessionStart, EventPromptSubmit}
+	return append(out, h.ExtraEvents...)
+}
+
+// HookEventName 返回写进该工具配置文件的事件名。
+func (h *Harness) HookEventName(ev Event) string {
+	if h.HookStyle == HookStyleCursor {
+		if n, ok := CursorEventNames[ev]; ok {
+			return n
+		}
+	}
+	return EventNames[ev]
 }
 
 // ExpandHome 展开路径开头的 ~。
