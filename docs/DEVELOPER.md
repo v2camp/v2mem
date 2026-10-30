@@ -6,6 +6,7 @@
 
 ```bash
 make test        # go test ./...（CGO_ENABLED=0）
+make test-install # 安装脚本 dry-run / mock（不联网）
 make build       # → bin/mem
 make smoke       # 造一个临时库跑 add/search/stats
 make build-linux # 交叉编译（Go 内建，无需交叉工具链）
@@ -50,13 +51,30 @@ make cover-update # 用当前实测值刷新下限（棘轮：只允许上调；
 
 ### 远程发布版（使用者路径）
 
-`scripts/install.sh` 从 GitHub Releases 下载 `mem-$OS-$ARCH` 预编译产物，失败回退源码构建。升级=重跑同一行 curl。
+`scripts/install.sh` 优先下载 GitHub Release 上的预编译文件。`latest` 用
+`/releases/latest/download/<文件名>`，不是 `/releases/download/latest/…`。
+下载前会创建安装目录。下载失败或 `--from-source` 时浅克隆到临时目录，再
+`CGO_ENABLED=0 go build`（`curl|bash` 时没有仓库目录，不能在当前目录直接构建）。
+已有 `GOPROXY` / `GOSUMDB` 原样保留；国内模块超时可先
+`export GOPROXY=https://goproxy.cn,direct`。没有 `go` 或 `git` 时直接失败并说明原因。
+
+带参数：`curl -fsSL …/scripts/install.sh | bash -s -- --version vX.Y.Z`。
 
 ### 发版（对外）
 
-过 `make cover-gate` → `git tag vX.Y.Z` → 上传 `mem-darwin-{amd64,arm64}` /
-`mem-linux-{amd64,arm64}` / `mem-windows-amd64.exe` 到对应 Release
-→ 验证 `curl …/install.sh | bash --version vX.Y.Z`。
+main 推送会跑 `make cover-gate` 与 `make eval-gate`，通过后推导 tag 并推送，然后在**同一次**
+workflow 里交叉编译并上传（`GITHUB_TOKEN` 推上去的 tag 不会再触发一条 tag 流水线）。
+`eval-gate` 用 `gold/` 里的 content_hash 对**运行者自己的记忆库**打分；GitHub 托管 runner 上没有这份库，
+Recall 会是 0，自动打 tag 会停住。要发布二进制：推送已有 `vX.Y.Z`，或在 Actions 里对 `release` 填写 tag 后手动跑
+（tag 还不存在时，会在所选 ref 上创建）。这两条只再跑 `cover-gate`，不再跑 `eval-gate`。
+
+产物文件名：`mem-darwin-amd64`、`mem-darwin-arm64`、`mem-linux-amd64`、
+`mem-linux-arm64`、`mem-windows-amd64.exe`（`make release-assets` 写到 `dist/`）。
+
+验证：`curl -fsSL …/scripts/install.sh | bash -s -- --version vX.Y.Z`。
+脚本断言：`make test-install`。CI job `install-script` 额外跑 shellcheck。
+
+Windows 预编译只有 amd64；安装脚本只支持 Git Bash / MSYS，没有 Windows runner 实测。
 
 ## 目录结构
 
@@ -75,7 +93,9 @@ internal/
   audit/            审计日志读写与汇总
   eval/             评测指标（纯函数，口径可独立测试）
 scripts/
-  install.sh        curl 一键安装：下载预编译二进制，失败回退源码构建
+  install.sh        curl 一键安装：预编译下载，失败则浅克隆再构建
+  release-assets.sh 交叉编译五个 Release 文件
+  publish-release.sh 把 dist/ 上传到 GitHub Release
   cover-gate.sh     覆盖率门禁实现
 ```
 

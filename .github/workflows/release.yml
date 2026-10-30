@@ -1,19 +1,32 @@
 name: release
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 v0.2.0）。不存在则在当前 ref 上创建（先过 cover-gate）。"
+        required: true
+        type: string
+
+# contents: write 用于推 tag 与上传 Release assets。
+# gate-and-tag 用 GITHUB_TOKEN 推 tag 时，GitHub 不会再触发本 workflow 的 tag 事件，
+# 所以自动发版必须在同一次 job 里上传产物，不能指望 tag push 再跑一遍。
 permissions:
   contents: write
+
 jobs:
   gate-and-tag:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # 需要全部提交与 tag，供版本推导与 conventional commits 判断
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
       - name: cover gate
         run: make cover-gate
       - name: eval gate (recall5_min 不达标 → 本步失败 → 跳过打 tag)
@@ -29,3 +42,59 @@ jobs:
           git tag "${{ steps.ver.outputs.tag }}"
           git push origin "${{ steps.ver.outputs.tag }}"
           echo "打 tag ${{ steps.ver.outputs.tag }}"
+      - name: build release assets
+        run: bash scripts/release-assets.sh dist
+      - name: publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/publish-release.sh dist "${{ steps.ver.outputs.tag }}"
+
+  release-assets:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: resolve tag
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          case "$tag" in
+            v*.*.*) ;;
+            *) echo "::error::tag 必须形如 vX.Y.Z，得到: $tag"; exit 1 ;;
+          esac
+          if git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+            git checkout "$tag"
+            echo "create=0" >> "$GITHUB_OUTPUT"
+          else
+            if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+              echo "::error::tag $tag 在仓库里不存在"
+              exit 1
+            fi
+            echo "create=1" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: cover gate
+        run: make cover-gate
+      - name: create missing tag
+        if: steps.ver.outputs.create == '1'
+        run: |
+          git config user.email "ci@v2mem"
+          git config user.name "v2mem-ci"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+      - name: build release assets
+        run: bash scripts/release-assets.sh dist
+      - name: publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/publish-release.sh dist "${{ steps.ver.outputs.tag }}"
