@@ -777,6 +777,7 @@ func instructionBlock(_ string) string {
 		strings.TrimRight(renderKindCodes(), "\n"),
 		"",
 		"命中上表触发条件时必须先查库。若 `mem` 不可用，继续作答并说明未检索。",
+		"查已定记忆用 mem search，选项写在关键词前面。查刚才的操作痕迹时加上 --layer observation。",
 		"",
 		"### 任务收尾：mem 评测结论",
 		"",

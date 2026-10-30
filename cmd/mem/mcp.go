@@ -38,7 +38,7 @@ type mcpTool struct {
 var mcpTools = []mcpTool{
 	{
 		Name:        "search",
-		Description: "全文检索记忆库（FTS5 + bm25）。返回命中的记忆条目，按相关性排序。",
+		Description: "全文检索。layer=memory（默认）只查已定记忆；layer=observation 查近期操作痕迹；layer=both 两层交错并在每条带 layer。开场注入不会自动带痕迹，要查「刚才做了什么 / 改过哪个文件」时自己把 layer 设为 observation。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -46,6 +46,7 @@ var mcpTools = []mcpTool{
 				"limit":   map[string]any{"type": "number", "description": "返回条数，默认 10"},
 				"scope":   map[string]any{"type": "string", "description": "current=当前工程+全局 / global=只要全局 / all=跨工程（默认）"},
 				"project": map[string]any{"type": "string", "description": "限定工程（默认不限）"},
+				"layer":   map[string]any{"type": "string", "description": "memory=已定记忆（默认）/ observation=近期痕迹 / both=两层。别名 recent、all"},
 			},
 			"required": []string{"query"},
 		},
@@ -91,13 +92,14 @@ var mcpTools = []mcpTool{
 	},
 	{
 		Name:        "recall_context",
-		Description: "只读。按 query 检索并把类码与命中拼成一段可注入文本。有 hook 注入时不必每轮调用。不写库。",
+		Description: "只读。按 query 检索并把类码与命中拼成一段可注入文本。layer 与 search 相同，默认 memory。有 hook 注入时不必每轮调用。不写库。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"query":        map[string]any{"type": "string", "description": "检索词（必填）"},
 				"scope":        map[string]any{"type": "string", "description": "current|global|all，默认 current"},
 				"project":      map[string]any{"type": "string", "description": "限定工程"},
+				"layer":        map[string]any{"type": "string", "description": "memory|observation|both，默认 memory"},
 				"budget_chars": map[string]any{"type": "number", "description": "注入文本的字符预算，默认 1200"},
 			},
 			"required": []string{"query"},
@@ -267,9 +269,13 @@ func (s *mcpServer) toolSearch(id any, args map[string]any) map[string]any {
 	if scope == "current" && project == "" {
 		project = detectProject()
 	}
+	layer := argString(args, "layer")
+	if _, err := store.CanonicalLayer(layer); err != nil {
+		return mcpError(id, -32602, err.Error())
+	}
 
 	started := time.Now()
-	hits, err := s.st.Search(store.SearchQuery{Query: q, Project: project, Scope: scope, Limit: limit})
+	hits, err := s.st.Search(store.SearchQuery{Query: q, Project: project, Scope: scope, Limit: limit, Layer: layer})
 	if err != nil {
 		return mcpError(id, -32603, "search 失败: "+err.Error())
 	}
@@ -395,8 +401,12 @@ func (s *mcpServer) toolRecall(id any, args map[string]any) map[string]any {
 	if budget <= 0 {
 		return mcpError(id, -32602, "budget_chars 应为正数")
 	}
+	layer := argString(args, "layer")
+	if _, err := store.CanonicalLayer(layer); err != nil {
+		return mcpError(id, -32602, err.Error())
+	}
 	started := time.Now()
-	hits, err := s.st.Search(store.SearchQuery{Query: q, Project: project, Scope: scope, Limit: defaultHookLimit})
+	hits, err := s.st.Search(store.SearchQuery{Query: q, Project: project, Scope: scope, Limit: defaultHookLimit, Layer: layer})
 	if err != nil {
 		return mcpError(id, -32603, "recall_context 失败: "+err.Error())
 	}

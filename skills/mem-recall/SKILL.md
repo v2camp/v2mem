@@ -13,6 +13,8 @@ description: 按类码决定要不要查 v2mem。有 SessionStart 注入时不�
 - T task：要确认「上次做到哪 / 还剩什么」时
 
 优先 MCP：`search`，或只读 `recall_context`（`query` 必填）。
+`layer` 省略或 `memory` 查已定记忆。要确认刚才做了什么、改过哪个文件时，用 `layer=observation`。两层一起用 `both`。
 降级：`mem search --scope current --json "<关键词>"`
+近期痕迹：`mem search --layer observation --scope current --json "<关键词>"`
 
-已经有 hook 注入时，不必每轮再调。
+已经有 hook 注入时，不必每轮再查已定记忆。注入本身不带近期痕迹。

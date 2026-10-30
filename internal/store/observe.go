@@ -1,14 +1,17 @@
 package store
 
 import (
+	"database/sql"
+	"errors"
 	"strings"
 	"time"
 )
 
 // 观测缓冲与 memories 物理同库、逻辑隔离。
 //
-// hooks 只许走 AppendObservation。这里没有通往 memories 的写入，
-// mem search 只查 fts_mem，因此观测默认不进永久记忆、也不进检索。
+// hooks 只许走 AppendObservation。这里没有通往 memories 的写入。
+// 默认检索只查 fts_mem。痕迹要显式 layer=observation 或 both 才走 fts_obs。
+// 候选仍然不进任何检索。
 
 // Observation 是一条会话观测。Summary 是有界摘要，不是工具 stdout 全文。
 type Observation struct {
@@ -73,12 +76,13 @@ func (s *Store) AppendObservation(in ObsInput) (*ObsResult, error) {
 	hash := obsHash(event, in.ToolName, summary)
 	id := newID()
 	now := time.Now().Unix()
+	idx := observationIndexText(summary)
 
 	res, err := s.db.Exec(`INSERT OR IGNORE INTO observations(
-		id, session_id, project, harness, event, tool_name, summary, raw_ref,
+		id, session_id, project, harness, event, tool_name, summary, summary_idx, raw_ref,
 		content_hash, created_at, meta_json
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		id, in.SessionID, in.Project, in.Harness, event, in.ToolName, summary, in.RawRef,
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, in.SessionID, in.Project, in.Harness, event, in.ToolName, summary, idx, in.RawRef,
 		hash, now, meta)
 	if err != nil {
 		return nil, err
@@ -173,4 +177,183 @@ func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult,
 		n -= int(more)
 	}
 	return &ObsGCResult{Deleted: int(deleted), Kept: n}, nil
+}
+
+// observationIndexText 是痕迹的可检索形态。没有可索引字符时放一个占位，
+// 避免空串被每次打开都当成「还没回填」。
+func observationIndexText(summary string) string {
+	idx := indexText(summary)
+	if idx == "" {
+		return "-"
+	}
+	return idx
+}
+
+const (
+	obsFTSCreate = `CREATE VIRTUAL TABLE IF NOT EXISTS fts_obs USING fts5(
+		summary_idx,
+		content = 'observations',
+		content_rowid = 'rowid'
+	)`
+	obsTriggerAI = `CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations BEGIN
+		INSERT INTO fts_obs(rowid, summary_idx) VALUES (new.rowid, new.summary_idx);
+	END`
+	obsTriggerAD = `CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations BEGIN
+		INSERT INTO fts_obs(fts_obs, rowid, summary_idx) VALUES ('delete', old.rowid, old.summary_idx);
+	END`
+	obsTriggerAU = `CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE ON observations BEGIN
+		INSERT INTO fts_obs(fts_obs, rowid, summary_idx) VALUES ('delete', old.rowid, old.summary_idx);
+		INSERT INTO fts_obs(rowid, summary_idx) VALUES (new.rowid, new.summary_idx);
+	END`
+)
+
+// ensureObservationSearch 给旧库补 summary_idx，并让 fts_obs 与行数对齐。
+//
+// 触发器要等列存在再建：旧表没有 summary_idx 时，schema 里的触发器会建失败。
+// 回填时先摘掉 UPDATE 触发器，避免对一条还没进索引的旧行发 delete。
+func ensureObservationSearch(db *sql.DB) error {
+	if err := ensureColumn(db, "observations", "summary_idx", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	for _, stmt := range []string{obsFTSCreate, obsTriggerAI, obsTriggerAD, obsTriggerAU} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	var empty, obsN, ftsN int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM observations WHERE summary_idx = '' AND summary != ''`).Scan(&empty); err != nil {
+		return err
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM observations`).Scan(&obsN); err != nil {
+		return err
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM fts_obs`).Scan(&ftsN); err != nil {
+		return err
+	}
+	if empty == 0 && obsN == ftsN {
+		return nil
+	}
+	if _, err := db.Exec(`DROP TRIGGER IF EXISTS observations_au`); err != nil {
+		return err
+	}
+	rows, err := db.Query(`SELECT id, summary FROM observations WHERE summary_idx = '' AND summary != ''`)
+	if err != nil {
+		return err
+	}
+	type pair struct{ id, summary string }
+	var pending []pair
+	for rows.Next() {
+		var p pair
+		if err := rows.Scan(&p.id, &p.summary); err != nil {
+			rows.Close()
+			return err
+		}
+		pending = append(pending, p)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, p := range pending {
+		if _, err := db.Exec(`UPDATE observations SET summary_idx = ? WHERE id = ?`, observationIndexText(p.summary), p.id); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO fts_obs(fts_obs) VALUES('rebuild')`); err != nil {
+		return err
+	}
+	_, err = db.Exec(obsTriggerAU)
+	return err
+}
+
+// searchObservations 检索会话痕迹。不做 MinHash，不读 candidates。
+// kind 与 tag 只属于已定记忆；在这一层出现就是调用方用错了层。
+func (s *Store) searchObservations(q SearchQuery) ([]Hit, error) {
+	if q.Kind != "" || len(q.Tags) > 0 {
+		return nil, errors.New("kind 与 tag 只过滤已定记忆；查痕迹请用 layer=observation 并不要带 kind/tag，或改用 layer=both")
+	}
+	q.Query = strings.TrimSpace(q.Query)
+	if q.Query == "" {
+		return nil, errors.New("查询为空")
+	}
+	q.Query = s.ExpandQuery(q.Query, q.Project)
+	expr := queryExpr(q.Query)
+	if expr == "" {
+		return nil, errors.New("查询不含可检索内容（需至少含一个汉字或字母数字）")
+	}
+	if q.Limit <= 0 {
+		q.Limit = 10
+	}
+	hits, err := s.obsSearchWith(expr, q)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) == 0 && !q.NoBroadFallback {
+		if broad := queryExprBroad(q.Query); broad != "" && broad != expr {
+			hits, err = s.obsSearchWith("("+broad+")", q)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	for i := range hits {
+		hits[i].Layer = "observation"
+	}
+	return hits, nil
+}
+
+func (s *Store) obsSearchWith(expr string, q SearchQuery) ([]Hit, error) {
+	where, args := obsFilter(q)
+	args = append([]any{expr}, args...)
+	args = append(args, q.Limit)
+	sqlWhere := "fts_obs MATCH ?"
+	if where != "" {
+		sqlWhere += " AND " + where
+	}
+	rows, err := s.db.Query(
+		`SELECT o.id, o.summary, o.event, o.tool_name, o.project, o.created_at, bm25(fts_obs) AS rank
+		   FROM fts_obs
+		   JOIN observations o ON o.rowid = fts_obs.rowid
+		  WHERE `+sqlWhere+`
+		  ORDER BY rank ASC, o.created_at DESC
+		  LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Hit
+	for rows.Next() {
+		var h Hit
+		var event, tool string
+		if err := rows.Scan(&h.ID, &h.Content, &event, &tool, &h.Project, &h.UpdatedAt, &h.Rank); err != nil {
+			return nil, err
+		}
+		h.Kind = tool
+		if h.Kind == "" {
+			h.Kind = event
+		}
+		h.Layer = "observation"
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+func obsFilter(q SearchQuery) (string, []any) {
+	var where []string
+	var args []any
+	switch q.Scope {
+	case "current":
+		where = append(where, "(o.project = ? OR o.project = '')")
+		args = append(args, q.Project)
+	case "global":
+		where = append(where, "o.project = ''")
+	case "all":
+	default:
+		if q.Project != "" {
+			where = append(where, "o.project = ?")
+			args = append(args, q.Project)
+		}
+	}
+	return strings.Join(where, " AND "), args
 }

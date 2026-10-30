@@ -75,7 +75,8 @@ search 选项:
   --kind <k>       限定类型（默认不限）
   --tag <k=v>      限定标记，可重复，AND 语义（默认不限）
   --scope <s>      current=当前工程+全局；global=只要全局；all=跨工程（默认）
-  --no-fuzzy       关闭模糊检索（MinHash 签名 + RRF 融合，默认开启）
+  --layer <l>      memory=已定记忆（默认）；observation=近期痕迹；both=两层交错。别名 recent、all
+  --no-fuzzy       关闭模糊检索（MinHash 签名 + RRF 融合，默认开启；只作用于已定记忆）
 
 gc 选项:
   --max-idle <dur>      久未命中阈值（默认 720h，即 30 天）
@@ -217,7 +218,7 @@ func (s *stringSlice) Set(v string) error {
 func misplacedFlag(query string) string {
 	known := map[string]bool{
 		"--json": true, "--db": true, "--limit": true,
-		"--project": true, "--kind": true, "--tag": true, "--scope": true,
+		"--project": true, "--kind": true, "--tag": true, "--scope": true, "--layer": true,
 		"--no-fuzzy": true, "--no-audit": true, "--audit-file": true,
 	}
 	for _, tok := range strings.Fields(query) {
@@ -378,6 +379,7 @@ func cmdSearch(args []string) error {
 	project := fs.String("project", "", "限定工程")
 	kind := fs.String("kind", "", "限定类型")
 	scope := fs.String("scope", "", "作用域: current=当前工程+全局，global=只要全局，all=跨工程（默认）")
+	layer := fs.String("layer", "", "层: memory=已定记忆（默认），observation=近期痕迹，both=两层")
 	noFuzzy := fs.Bool("no-fuzzy", false, "关闭模糊检索（MinHash + RRF 融合）")
 	explain := fs.Bool("explain", false, "打印同义词展开诊断后退出")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl）")
@@ -407,6 +409,9 @@ func cmdSearch(args []string) error {
 	case "", "all", "current", "global":
 	default:
 		return fmt.Errorf("未知 --scope: %q（可选 current|global|all）", *scope)
+	}
+	if _, err := store.CanonicalLayer(*layer); err != nil {
+		return err
 	}
 	tagMap, err := parseTags(tags)
 	if err != nil {
@@ -442,6 +447,7 @@ func cmdSearch(args []string) error {
 		Scope:   *scope,
 		NoFuzzy: *noFuzzy,
 		Limit:   *limit,
+		Layer:   *layer,
 	})
 	if err != nil {
 		return err
@@ -480,7 +486,13 @@ func cmdSearch(args []string) error {
 		if proj == "" {
 			proj = "global"
 		}
-		fmt.Printf("%s  %s  [%s/%s]\n", shortID(h.ID), h.Content, h.Kind, proj)
+		kind := h.Kind
+		if h.Layer == "observation" {
+			kind = "observation:" + h.Kind
+		} else if h.Layer == "memory" {
+			kind = "memory:" + h.Kind
+		}
+		fmt.Printf("%s  %s  [%s/%s]\n", shortID(h.ID), oneLine(h.Content), kind, proj)
 	}
 	return nil
 }

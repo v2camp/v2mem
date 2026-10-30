@@ -14,13 +14,13 @@
 | 项 | 现状 |
 |:---|:---|
 | 写库路径 | 仅 3 条：CLI `mem add`（`cmd/mem/main.go:300`）、MCP `add` 工具（`cmd/mem/mcp.go:278`）、`mem ingest`（`cmd/mem/level1.go:94`） |
-| 钩子写永久库吗 | **否**。钩子仍不 `store.Add`。观测缓冲写入同库另表 `observations`（`source=hook-observe`），默认不进 `mem search` |
+| 钩子写永久库吗 | **否**。钩子仍不 `store.Add`。观测缓冲写入同库另表 `observations`（`source=hook-observe`）。默认 `mem search` 不看它；`layer=observation` 或 `both` 才查痕迹 |
 | 去重键 | `(content_hash, project)`，跨工程同句各自独立 —— 设计文档明示的既定语义，**不是 bug**（见 `design-dedup-merge` e2e） |
 | 那 208 条是谁 | 脚本紧凑循环调 `mem add` 灌入（对应 ~200 条检索基准）。**既非 hooks 自动灌，也非 LLM 逐条决策**——是第三类：无来源标记的批量写入 |
 
 ## 3. 原则（方案 A：写必由 LLM 决策）
 
-1. **永久记忆只经 LLM 明确决策写入**（CLI/MCP `add`、任务收尾总结）；**hooks 绝不 `store.Add` 进 Level 2**。观测只进 `observations`，默认不进检索。
+1. **永久记忆只经 LLM 明确决策写入**（CLI/MCP `add`、任务收尾总结）；**hooks 绝不 `store.Add` 进 Level 2**。观测只进 `observations`。默认检索不看它；`layer=observation` 或 `both` 才查痕迹。
 2. **短时记忆 = 会话注入文件（Level 1）**：由 LLM 在会话内显式维护，容量由 `mem budget` 守卫，机械化迁移交给 `mem ingest`。
 3. **长时记忆 = Level 2 事实库**：以 Harness 任务收尾总结为主写入。
 4. **批量 / bench / test / 搬运写入打 `source` 标记**：写侧审计带来源，用量统计默认排除非生产写入。
@@ -49,7 +49,7 @@
 
 | 态 | 谁写 | 落点 | 进 `mem search`？ |
 |:---|:---|:---|:---|
-| 观测 | hooks（失败则 spool） | `observations` | 否 |
+| 观测 | hooks（失败则 spool） | `observations` | 默认否；`--layer observation` 或 `both` 可搜 |
 | 蒸馏 | `mem distill`（规则或可选本地模型） | `candidates`，`status=pending`，`source=distill` | 否 |
 | 采纳 | `mem accept` | `memories`，`source=distill-accept`，并写 `edges.rel=derived_from`（dst 是候选 id） | 是 |
 
