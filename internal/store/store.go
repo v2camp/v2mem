@@ -7,6 +7,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -91,6 +92,19 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("迁移 provenance 列失败: %w", err)
 	}
+	if err := ensureColumn(db, "distill_runs", "window_key", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 distill_runs.window_key 失败: %w", err)
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_distill_window
+		ON distill_runs(session_id, window_key) WHERE window_key <> ''`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("建蒸馏窗口索引失败: %w", err)
+	}
+	if err := relaxEdgeDstFK(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 edges.dst 外键失败: %w", err)
+	}
 	st := &Store{db: db, path: path}
 	// 词库加载失败不致命：检索不该因辅助配置坏了而崩。
 	_ = st.reloadSynonyms()
@@ -130,7 +144,74 @@ func ensureColumn(db *sql.DB, table, column, ddl string) error {
 		return err
 	}
 	// 补列成功后补索引；列已存在时走索引创建也无妨（IF NOT EXISTS 幂等）。
-	_, err = db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS ix_mem_source ON memories(source)"))
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS ix_mem_source ON memories(source)`)
+	return err
+}
+
+// relaxEdgeDstFK 拆掉 edges.dst → memories 的外键。
+//
+// derived_from 的对端是候选 id，不是记忆。src 仍引用 memories 并级联删除。
+// 新库的 schema 已经是这个形状；这里只改第一波建出来的旧表。
+func relaxEdgeDstFK(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA foreign_key_list(edges)`)
+	if err != nil {
+		return err
+	}
+	dstFK := false
+	for rows.Next() {
+		var id, seq int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := rows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			rows.Close()
+			return err
+		}
+		if from == "dst" {
+			dstFK = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if !dstFK {
+		return nil
+	}
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return err
+	}
+	defer conn.ExecContext(ctx, `PRAGMA foreign_keys=ON`)
+	if _, err := conn.ExecContext(ctx, `BEGIN`); err != nil {
+		return err
+	}
+	stmts := []string{
+		`CREATE TABLE edges_dst_relaxed (
+		  src TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+		  dst TEXT NOT NULL,
+		  rel TEXT NOT NULL,
+		  valid_from INTEGER,
+		  valid_to INTEGER,
+		  PRIMARY KEY (src, dst, rel)
+		)`,
+		`INSERT INTO edges_dst_relaxed(src, dst, rel, valid_from, valid_to)
+		 SELECT src, dst, rel, valid_from, valid_to FROM edges`,
+		`DROP TABLE edges`,
+		`ALTER TABLE edges_dst_relaxed RENAME TO edges`,
+	}
+	for _, q := range stmts {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+			return err
+		}
+	}
+	_, err = conn.ExecContext(ctx, `COMMIT`)
 	return err
 }
 

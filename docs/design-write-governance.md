@@ -41,7 +41,25 @@
 - 写侧审计记录（`manual-add`）携带 `source`；空值回填 `human` 以兼容旧数据。
 - `mem eval activity`（及收尾结论）**默认排除 `source∈{bench,test}`**，用 `--include-bench` 放开。
 - **hooks 只读护栏**：钩子事件永不落入写侧计数（`manual-add`）；为防回归，测试里断言钩子不产生 write，且 `memories` 条数不变。
-- **观测缓冲**（2026-10-30）：`PostToolUse` / `Stop` / `SessionEnd` 只追加 `observations`。审计里触发事件与 `obs-append` 都留痕，但观测次数**只计成功写入的 `obs-append`**，触发事件不进读侧、写侧或该次数。写库失败落到库旁 `spool/*.jsonl`（默认即 `~/.v2mem/spool`），下次 `SessionStart` 有界 drain。默认无常驻进程。`candidates` / `distill_runs` 仅建空表，本波不跑 distill / accept。
+- **观测缓冲**（2026-10-30）：`PostToolUse` / `Stop` / `SessionEnd` 只追加 `observations`。审计里触发事件与 `obs-append` 都留痕，但观测次数**只计成功写入的 `obs-append`**，触发事件不进读侧、写侧或该次数。写库失败落到库旁 `spool/*.jsonl`（默认即 `~/.v2mem/spool`），下次 `SessionStart` 有界 drain。默认无常驻进程。
+
+### 观测 / 蒸馏 / 采纳
+
+三态同库不同表。hooks **仍然不写** `memories`。
+
+| 态 | 谁写 | 落点 | 进 `mem search`？ |
+|:---|:---|:---|:---|
+| 观测 | hooks（失败则 spool） | `observations` | 否 |
+| 蒸馏 | `mem distill`（规则或可选本地模型） | `candidates`，`status=pending`，`source=distill` | 否 |
+| 采纳 | `mem accept` | `memories`，`source=distill-accept`，并写 `edges.rel=derived_from`（dst 是候选 id） | 是 |
+
+- `mem distill` / `mem reject` / `import-transcript` **禁止** `INSERT memories`。LLM 超时或 JSON 不合规：写 `distill_runs` 失败行，不写候选，默认退出码 0；`--strict` 才非零。
+- 同一会话的同一批观测只蒸馏一次（`distill_runs.window_key`）。Stop 每轮都触发时不会放大噪声。
+- 无 `transcript_path` 的 Stop 不拉起 distill，观测仍保留。
+- 可选：`MEM_DISTILL_SPAWN=1` 时 Stop / SessionEnd 末尾 `Start` 一次 `mem distill --provider none`（非常驻）。默认不拉起。
+- `SessionStart` 在 spool drain 之后机会性跑 `distill --pending`，**只用规则抽取**，约 200ms 上限，失败不阻断注入。`MEM_NO_DISTILL=1` 关掉这一步。
+- `mem eval activity` 默认排除 `source∈{bench,test,distill-pending}`。观测侧另计 `obs / distill_ok / distill_fail / accept / reject`。有观测且无人采纳时结论为「有观测无采纳」。accept 计入写侧，`source=distill-accept`。
+- PreCompact 仍只重注入，不写观测、不蒸馏。见 [`design-harness.md`](./design-harness.md)。为何不照搬常驻 consolidate，见 [`design-anti-agentmemory.md`](./design-anti-agentmemory.md)。
 
 ## 6. 读低估：已知边界（接受，非缺陷）
 

@@ -117,13 +117,14 @@ mem init --dry-run           # 只看会写什么
 配置写入遵守四条纪律：**合并不覆盖**、**幂等**、**只备份一次**（`.v2mem.bak`）、**绝对路径**。
 个别工具需额外动作（Codex 首次要 trust 钩子、QoderWork 改完要重启等），`mem init` 会逐一打印。
 Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 MCP）。
-`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`；`mem search` 搜不到这些观测。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写。默认没有常驻进程。
+`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`；`mem search` 搜不到这些观测。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（仍不进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏。默认没有常驻进程。
 全部卸载：`mem uninstall --all`（或 `--harness <名字>` 单个），只摘掉带 `# v2mem` 标记的条目，不动你自己的配置。
 
 ### MCP server
 
-`mem mcp` 暴露 4 个工具：`search`（检索）、`add`（写入，相同内容自动覆盖）、
-`ls`（列出）、`touch`（记录命中）。在支持 MCP 的工具里加一行进程配置即可：
+`mem mcp` 暴露 5 个工具：`search`（检索）、`add`（写入，相同内容自动覆盖）、
+`ls`（列出）、`touch`（记录命中）、`recall_context`（只读，把类码和命中拼成一段文本；`query` 必填）。
+没有 `accept` / `distill`。在支持 MCP 的工具里加一行进程配置即可：
 
 ```json
 { "mcpServers": { "v2mem": { "command": "mem", "args": ["mcp"] } } }
@@ -134,6 +135,7 @@ Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 M
 - 其余工具看各自的 MCP 配置格式，指向同一个 `mem mcp` 即可
 
 MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval activity` 的评测样本。
+没有 hook 时，把 `skills/mem-recall`、`skills/mem-remember`、`skills/mem-distill` 拷到 `~/.cursor/skills/`（或项目 `.cursor/skills/`）。`mem init` 不写 skills。
 
 ---
 
@@ -159,6 +161,9 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 **Level 1 文件运维**：`mem ingest <文件.md...>`（把既有 md 机械化搬进库，幂等；写侧治理含 `--source harness-summary` 锚定"任务收尾汇总"双路径写）
 · `mem budget --file <文件> [--max-chars N]`（检查注入文件是否超预算，超限非零退出）
 · `mem notes`（先输出类码表 P/D/X/T，再输出硬规则小字条：`kind=rule`/全局高优先，一行一条、幂等；hook 注入去重，`MEM_NO_NOTES=1` 回退到仅原始注入）
+· `mem distill --provider none`（从观测抽候选，**不**写永久记忆）· `mem candidates ls` · `mem accept` / `mem reject`
+· `mem import-transcript --file <claude.jsonl>`（默认只写观测；`--into both` 再跑规则蒸馏，仍须 accept）
+· `mem gc --candidates`（pending 14 天过期，已采纳行 90 天后删除，不动记忆）
 
 **接入与钩子**：`mem harness`（列出 12 个工具入口）· `mem init`（写入钩子配置）· `mem uninstall`（反向移除，`--all` 一键）
 · `mem hook`（钩子入口：读 stdin JSON、写 stdout；同一事件重复触发只注入一次，`--dedup-window` 默认 10s）
@@ -227,6 +232,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-harness-memory-replace.md`](./docs/design-harness-memory-replace.md) | 使用者/开发者 | 用 v2mem 接替 harness 记忆(workbuddy/traeWork/原生)：读瘦身/写收录/git同步/版本CI门禁 |
 | [`docs/design-synonym-library.md`](./docs/design-synonym-library.md) | 使用者/开发者 | 同义词词库：起步配置/查询期展开/有效迭代闭环/初始化 agent 提取管线/自动维护闭环（§8：LLM 提取 × 试用回测） |
 | [`docs/design-provenance.md`](./docs/design-provenance.md) | 使用者/开发者 | 记忆溯源：`provenance` 字段走向、ALTER 迁移、ingest 写入、sync 传播与后续资产/词库联动设想 |
+| [`docs/design-anti-agentmemory.md`](./docs/design-anti-agentmemory.md) | 所有者 / 开发者 | 为何不照搬常驻 iii 与 54 个 MCP 工具；默认零常驻 |
 
 设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
 `design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 ·

@@ -39,9 +39,11 @@ CREATE TABLE IF NOT EXISTS tags (
 );
 CREATE INDEX IF NOT EXISTS ix_tags_kv ON tags(key, value);
 
+-- dst 不再外键到 memories：derived_from 的对端是 candidate id（或 obs id），
+-- 不是记忆。src 仍级联删除。旧库由 Open 里的 relaxEdgeDstFK 拆掉 dst 外键。
 CREATE TABLE IF NOT EXISTS edges (
   src        TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-  dst        TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  dst        TEXT NOT NULL,
   rel        TEXT NOT NULL,
   valid_from INTEGER,
   valid_to   INTEGER,
@@ -84,7 +86,7 @@ CREATE TABLE IF NOT EXISTS hook_dedup (
 CREATE INDEX IF NOT EXISTS idx_hook_dedup_ts ON hook_dedup(ts);
 
 -- 观测缓冲与蒸馏隔离区（同库另表，不进 fts_mem / mem search）。
--- hooks 只许写 observations；candidates / distill_runs 本波只建表，不接 distill/accept。
+-- hooks 只许写 observations。candidates 由 distill / import 写入，accept 才进 memories。
 -- 写失败不在这里处理：调用方把行落到 spool，下次 SessionStart 再灌回来。
 CREATE TABLE IF NOT EXISTS observations (
   id            TEXT PRIMARY KEY,
@@ -116,9 +118,13 @@ CREATE TABLE IF NOT EXISTS candidates (
   obs_ids_json  TEXT NOT NULL DEFAULT '[]',
   created_at    INTEGER NOT NULL,
   decided_at    INTEGER,
-  memory_id     TEXT                       -- accept 后回填；本波无写入路径
+  memory_id     TEXT                       -- accept 后回填
 );
 CREATE INDEX IF NOT EXISTS ix_cand_status ON candidates(status, created_at);
+-- 同一会话里相同内容的 pending/accepted 不双插。rejected 不占这个键，允许改写后再来。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_cand_hash
+  ON candidates(session_id, content_hash)
+  WHERE status IN ('pending', 'accepted');
 
 CREATE TABLE IF NOT EXISTS distill_runs (
   id            TEXT PRIMARY KEY,
@@ -129,8 +135,11 @@ CREATE TABLE IF NOT EXISTS distill_runs (
   cand_count    INTEGER NOT NULL DEFAULT 0,
   started_at    INTEGER NOT NULL,
   finished_at   INTEGER NOT NULL,
+  window_key    TEXT NOT NULL DEFAULT '', -- 观测集合的去重键；失败行为空，允许重试
   UNIQUE(session_id, started_at)
 );
+-- ux_distill_window 不放在这里：旧库的 distill_runs 还没有 window_key，
+-- 索引要等 Open 里 ensureColumn 之后再建。
 
 -- M5b-0 模糊检索：每条记忆的 MinHash 签名（512B 小端 uint64 序列）。
 -- 与记忆同写同删（外键级联）；旧库缺签名的行由 Open 时一次性补齐（backfillSigs），

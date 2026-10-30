@@ -133,11 +133,15 @@ func cmdHook(args []string) error {
 
 	if isObserveHook(event) {
 		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started)
+		if observeEventMayDistill(event) {
+			maybeSpawnDistill(c.db, in)
+		}
 		return nil
 	}
 
 	if event == harness.EventSessionStart {
 		drainSpoolFailOpen(c.db, *auditPath)
+		distillPendingFailOpen(c.db, *auditPath)
 	}
 
 	budget := *maxChars

@@ -36,6 +36,11 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem consolidate [选项]           相似知识归并（近重复聚簇，留 1 条）
   mem export [路径.jsonl]          导出为 JSONL（省略路径则写标准输出）
   mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
+  mem import-transcript [选项]     从 Claude 会话 JSONL 回填观测（默认不写 memories）
+  mem distill [选项]                从观测抽出候选（不写 memories）
+  mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
+  mem reject <id|前缀>             拒绝候选
+  mem candidates ls [选项]         列出隔离区候选
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
   mem harness [--json]              列出各工具的接入方式与检测结果
@@ -45,7 +50,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem budget --file <文件>          检查 Level 1 文件是否超出注入预算
   mem audit  [--stats]             审计日志：钩子激活次数、空注入率、可评测样本数
   mem eval   recall|write|activity      评测：检索准不准（recall）／记录准不准（write）／用量视图（activity）
-  mem mcp                           MCP server（stdio）：把 search/add/ls/touch 暴露给支持 MCP 的工具
+  mem mcp                           MCP server（stdio）：把 search/add/ls/touch/recall_context 暴露给支持 MCP 的工具
   mem stats  [选项]                 库概览
   mem help
 
@@ -79,6 +84,7 @@ gc 选项:
   --backup-dir <dir>    备份目录（默认 <库目录>/backup）
   --obs                 只回收 observations（不删 memories）
   --max-age <dur>       与 --obs 合用：观测保留时长（默认 720h）
+  --candidates          只回收候选：pending 超 14 天标过期，accepted 超 90 天删除（不删 memories）
 
 consolidate 选项:
   --threshold <f>       相似度阈值 0..1（默认 0.7）
@@ -105,8 +111,9 @@ hook 选项:
 // 清单有两个出处就一定会漂移，所以把它抽成一处。
 var knownSubcommands = []string{
 	"add", "search", "ls", "stats", "touch", "forget", "notes", "lexicon", "gc", "consolidate",
-	"export", "import", "sync", "hook", "harness", "init", "uninstall", "ingest",
+	"export", "import", "import-transcript", "sync", "hook", "harness", "init", "uninstall", "ingest",
 	"budget", "audit", "eval", "mcp", "help",
+	"distill", "accept", "reject", "candidates",
 }
 
 func main() {
@@ -141,6 +148,16 @@ func main() {
 		err = cmdExport(os.Args[2:])
 	case "import":
 		err = cmdImport(os.Args[2:])
+	case "import-transcript":
+		err = cmdImportTranscript(os.Args[2:])
+	case "distill":
+		err = cmdDistill(os.Args[2:])
+	case "accept":
+		err = cmdAccept(os.Args[2:])
+	case "reject":
+		err = cmdReject(os.Args[2:])
+	case "candidates":
+		err = cmdCandidates(os.Args[2:])
 	case "sync":
 		err = cmdSync(os.Args[2:])
 	case "hook":
@@ -539,13 +556,20 @@ func cmdGC(args []string) error {
 	noBackup := fs.Bool("no-backup", false, "跳过 gc 前的库备份")
 	backupDir := fs.String("backup-dir", "", "备份目录（默认 <库目录>/backup）")
 	obsOnly := fs.Bool("obs", false, "只回收 observations，不删除 memories")
+	candOnly := fs.Bool("candidates", false, "只回收候选，不删除 memories")
 	maxAge := fs.Duration("max-age", 720*time.Hour, "observations 保留时长（配合 --obs）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	if *obsOnly && *candOnly {
+		return errors.New("--obs 与 --candidates 不能同时使用")
+	}
 	if *obsOnly {
 		return cmdGCObservations(c, *maxAge)
+	}
+	if *candOnly {
+		return cmdGCCandidates(c)
 	}
 
 	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
@@ -588,6 +612,23 @@ func cmdGCObservations(c common, maxAge time.Duration) error {
 		return printJSON(res)
 	}
 	fmt.Printf("已回收观测 %d 条，保留 %d（未改动 memories）\n", res.Deleted, res.Kept)
+	return nil
+}
+
+func cmdGCCandidates(c common) error {
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	res, err := st.GCCandidates(14*24*time.Hour, 90*24*time.Hour)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(res)
+	}
+	fmt.Printf("候选过期 %d，删除已采纳行 %d（未改动 memories）\n", res.Expired, res.Deleted)
 	return nil
 }
 
