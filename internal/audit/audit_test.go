@@ -158,6 +158,23 @@ func TestSummarizeSeparatesReadAndWriteSides(t *testing.T) {
 	}
 }
 
+func TestDistillAcceptRejectCounters(t *testing.T) {
+	s := Summarize([]Record{
+		{Event: "obs-append"},
+		{Event: "distill", Mode: "ok", Provider: "none", Count: 2},
+		{Event: "distill", Mode: "fail", Provider: "openai"},
+		{Event: "distill", Mode: "skipped"},
+		{Event: "accept", Source: "distill-accept", Mode: "create"},
+		{Event: "reject"},
+	})
+	if s.Observations != 1 || s.DistillOK != 1 || s.DistillFail != 1 || s.Accepts != 1 || s.Rejects != 1 {
+		t.Fatalf("观测侧计数不对: %+v", s)
+	}
+	if s.Writes != 1 || s.Creates != 1 || s.Retrievals != 0 {
+		t.Fatalf("accept 应计入写侧且蒸馏不算检索: %+v", s)
+	}
+}
+
 func TestObserveAppendCountedOnceNotWithTrigger(t *testing.T) {
 	s := Summarize([]Record{
 		{Event: "prompt-submit", Query: "q"},

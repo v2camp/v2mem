@@ -132,8 +132,8 @@ scripts/
   MCP stdio 只是 newline-delimited JSON-RPC 2.0 的一个小子集（`initialize` /
   `tools/list` / `tools/call` / `ping`），自实现约 250 行且可纯函数单测；
   引 mcp-go 会破坏单文件轻量卖点，换来的流式/采样能力当前用不上
-- **工具面刻意最小**：只暴露记忆本身的四种操作（`search`/`add`/`ls`/`touch`）。
-  评测/运维（audit、eval、gc、consolidate）不进工具面，保持工具语义干净
+- **工具面刻意最小**：`search` / `add` / `ls` / `touch`，外加只读 `recall_context`。
+  没有 `accept` / `distill`。评测/运维（audit、eval、gc、consolidate）不进工具面
 - **审计复用**：MCP 的检索/写入与 CLI 共享 `manual-search`/`manual-add` 埋点，
   MCP 通道的使用也会进入 `mem eval activity` 的评测样本，不会被悄悄漏掉
 - **测试分层**：协议纯函数（`dispatch`）直接喂 map 断言响应；传输层（`serve`）

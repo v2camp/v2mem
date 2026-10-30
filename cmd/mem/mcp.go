@@ -89,6 +89,20 @@ var mcpTools = []mcpTool{
 			"required": []string{"id"},
 		},
 	},
+	{
+		Name:        "recall_context",
+		Description: "只读。按 query 检索并把类码与命中拼成一段可注入文本。有 hook 注入时不必每轮调用。不写库。",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query":        map[string]any{"type": "string", "description": "检索词（必填）"},
+				"scope":        map[string]any{"type": "string", "description": "current|global|all，默认 current"},
+				"project":      map[string]any{"type": "string", "description": "限定工程"},
+				"budget_chars": map[string]any{"type": "number", "description": "注入文本的字符预算，默认 1200"},
+			},
+			"required": []string{"query"},
+		},
+	},
 }
 
 func cmdMCP(args []string) error {
@@ -225,6 +239,8 @@ func (s *mcpServer) callTool(id any, name string, args map[string]any) map[strin
 		return s.toolLS(id, args)
 	case "touch":
 		return s.toolTouch(id, args)
+	case "recall_context":
+		return s.toolRecall(id, args)
 	default:
 		return mcpError(id, -32602, "unknown tool: "+name)
 	}
@@ -354,6 +370,64 @@ func (s *mcpServer) toolTouch(id any, args map[string]any) map[string]any {
 		return mcpError(id, -32603, "touch 失败: "+err.Error())
 	}
 	return toolResult(id, map[string]string{"id": full, "touched": "true"}, false)
+}
+
+// toolRecall 是 search 的编排糖：返回一段可注入文本，不写库。
+func (s *mcpServer) toolRecall(id any, args map[string]any) map[string]any {
+	q := argString(args, "query")
+	if q == "" {
+		return mcpError(id, -32602, "recall_context 需要非空的 query")
+	}
+	scope := argString(args, "scope")
+	if scope == "" {
+		scope = "current"
+	}
+	switch scope {
+	case "all", "current", "global":
+	default:
+		return mcpError(id, -32602, fmt.Sprintf("scope 可选 current|global|all，got %q", scope))
+	}
+	project := argString(args, "project")
+	if scope == "current" && project == "" {
+		project = detectProject()
+	}
+	budget := argInt(args, "budget_chars", defaultHookBudget)
+	if budget <= 0 {
+		return mcpError(id, -32602, "budget_chars 应为正数")
+	}
+	started := time.Now()
+	hits, err := s.st.Search(store.SearchQuery{Query: q, Project: project, Scope: scope, Limit: defaultHookLimit})
+	if err != nil {
+		return mcpError(id, -32603, "recall_context 失败: "+err.Error())
+	}
+	if s.auditFile != "-" {
+		rec := audit.Record{
+			TS: started.Unix(), Event: "manual-search", Project: project,
+			Query: q, Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
+		}
+		for _, h := range hits {
+			rec.Hashes = append(rec.Hashes, h.ID)
+			rec.Kinds = append(rec.Kinds, h.Kind)
+		}
+		s.auditAppend(rec)
+	}
+	text := recallText(hits, budget)
+	return toolResult(id, map[string]string{"text": text}, false)
+}
+
+func recallText(hits []store.Hit, budget int) string {
+	var b strings.Builder
+	b.WriteString(renderKindCodes())
+	if len(hits) == 0 {
+		line := "（无命中）\n"
+		if runeLen(b.String())+runeLen(line) <= budget {
+			b.WriteString(line)
+		}
+		return b.String()
+	}
+	block, _ := formatHits("相关记忆", hits, budget-runeLen(b.String()))
+	b.WriteString(block)
+	return b.String()
 }
 
 // ---------- 协议辅助 ----------

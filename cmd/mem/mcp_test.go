@@ -89,10 +89,37 @@ func TestMCPToolsList(t *testing.T) {
 			t.Errorf("工具 %v 缺 inputSchema", tl["name"])
 		}
 	}
-	for _, want := range []string{"search", "add", "ls", "touch"} {
+	for _, want := range []string{"search", "add", "ls", "touch", "recall_context"} {
 		if !names[want] {
 			t.Errorf("工具清单缺 %s，got %v", want, names)
 		}
+	}
+	if len(names) != 5 {
+		t.Fatalf("工具面应为 5，got %v", names)
+	}
+	for _, banned := range []string{"accept", "distill", "reject"} {
+		if names[banned] {
+			t.Errorf("MCP 不得暴露 %s", banned)
+		}
+	}
+}
+
+func TestMCPRecallContext(t *testing.T) {
+	s, db := newMCPServer(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "demo", "--kind", "decision",
+		"检索预算默认走类码"}); err != nil {
+		t.Fatal(err)
+	}
+	errResp := s.callTool(1, "recall_context", map[string]any{"query": "  "})
+	if errResp["error"] == nil {
+		t.Fatal("空 query 应报错")
+	}
+	result := mcpCall(t, s, "recall_context", map[string]any{
+		"query": "类码", "project": "demo", "scope": "all", "budget_chars": 800,
+	})
+	text := mcpText(result)
+	if !strings.Contains(text, "P preference") || !strings.Contains(text, "类码") {
+		t.Fatalf("recall 应含类码与命中，got %s", text)
 	}
 }
 
@@ -189,13 +216,13 @@ func TestMCPCallRejectsBadArgs(t *testing.T) {
 		name string
 		args map[string]any
 	}{
-		{"search", map[string]any{}},                        // 缺 query
-		{"search", map[string]any{"query": "q", "scope": "bogus"}}, // 非法 scope
-		{"search", map[string]any{"query": "q", "limit": 0}}, // limit 非正
-		{"add", map[string]any{"content": ""}},              // content 为空
+		{"search", map[string]any{}},                                            // 缺 query
+		{"search", map[string]any{"query": "q", "scope": "bogus"}},              // 非法 scope
+		{"search", map[string]any{"query": "q", "limit": 0}},                    // limit 非正
+		{"add", map[string]any{"content": ""}},                                  // content 为空
 		{"add", map[string]any{"content": "x", "global": true, "project": "p"}}, // 互斥
-		{"add", map[string]any{"content": "x", "salience": 2}}, // salience 越界
-		{"touch", map[string]any{}},                         // 缺 id
+		{"add", map[string]any{"content": "x", "salience": 2}},                  // salience 越界
+		{"touch", map[string]any{}},                                             // 缺 id
 	}
 	for _, c := range cases {
 		resp := s.dispatch(mcpReq(1, "tools/call", map[string]any{"name": c.name, "arguments": c.args}))

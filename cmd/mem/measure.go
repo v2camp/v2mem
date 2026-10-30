@@ -700,7 +700,7 @@ func cmdEvalActivity(args []string) error {
 		}
 		// 写侧治理：bench/test 属程序化灌库（基准/测试），默认不计入用量视图。
 		// --include-bench 放开。读侧（batch/read 事件）无 source，不受影响。
-		if !*includeBench && (r.Source == "bench" || r.Source == "test") {
+		if !*includeBench && (r.Source == "bench" || r.Source == "test" || r.Source == "distill-pending") {
 			continue
 		}
 		if *scope == "session" {
@@ -737,6 +737,8 @@ func cmdEvalActivity(args []string) error {
 	fmt.Printf("）\n")
 	fmt.Printf("日志      : %s\n\n", p)
 	fmt.Printf("活动      : 读侧 %d 次 / 写侧 %d 次\n", s.Retrievals, s.Writes)
+	fmt.Printf("观测侧    : obs %d / distill_ok %d / distill_fail %d / accept %d / reject %d\n",
+		s.Observations, s.DistillOK, s.DistillFail, s.Accepts, s.Rejects)
 	if *includeBench {
 		fmt.Printf("（已含 bench/test 来源的写侧 —— 默认排除）\n")
 	}
@@ -759,11 +761,17 @@ func cmdEvalActivity(args []string) error {
 // activityVerdict 给出可直接写进交付物的一句话结论。
 // 「只查未记」与「只记未查」是两种不同的故障，必须分开说。
 func activityVerdict(s audit.Summary) string {
+	observed := s.Observations > 0 || s.DistillOK > 0 || s.DistillFail > 0
 	switch {
 	case s.Total == 0:
 		return "本次任务未使用记忆库（窗口内既无检索也无记录活动）"
+	case s.Retrievals == 0 && s.Writes == 0 && s.Accepts == 0 && observed:
+		return fmt.Sprintf("有观测无采纳：观测 %d 次，蒸馏成功 %d / 失败 %d，尚无采纳",
+			s.Observations, s.DistillOK, s.DistillFail)
 	case s.Retrievals == 0:
 		return fmt.Sprintf("只记未查：记录 %d 条但一次未检索 —— 记忆被写入却没被用上", s.Writes)
+	case s.Writes == 0 && s.Accepts == 0 && observed:
+		return fmt.Sprintf("只查未记：检索 %d 次但未沉淀任何新事实 —— 这次任务没有留下可复用的东西；有观测无采纳", s.Retrievals)
 	case s.Writes == 0:
 		return fmt.Sprintf("只查未记：检索 %d 次但未沉淀任何新事实 —— 这次任务没有留下可复用的东西", s.Retrievals)
 	}

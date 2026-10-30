@@ -41,9 +41,12 @@ type Record struct {
 	// 它本身是度量：能看出「重复触发」在真实环境里是否真的发生。
 	Suppressed bool  `json:"suppressed,omitempty"`
 	MS         int64 `json:"ms"`
-	// Source 仅写侧使用：标记写入来源（human|llm|ingest|harness-summary|bench|test）。
-	// 用量视图默认排除 bench/test，避免程序化灌库污染统计。
+	// Source 仅写侧使用：标记写入来源（human|llm|ingest|harness-summary|bench|test|distill-accept）。
+	// 用量视图默认排除 bench/test/distill-pending，避免程序化灌库污染统计。
 	Source string `json:"source,omitempty"`
+	// Provider / Count 用于 distill / accept / reject。
+	Provider string `json:"provider,omitempty"`
+	Count    int    `json:"count,omitempty"`
 }
 
 // Path 返回默认审计日志路径（与库同目录，便于一起备份/清理）。
@@ -198,8 +201,12 @@ type Summary struct {
 	Suppressed   int `json:"suppressed"`   // 被幂等去重抑制的重复触发次数（>0 说明配置存在重复）
 	Writes       int `json:"writes"`       // 写侧：manual-add / manual-forget
 	Observations int `json:"observations"` // 观测侧：仅成功写入的 obs-append
-	Creates      int `json:"creates"`      // 其中新增
-	Overwrites   int `json:"overwrites"`   // 其中命中「相同知识覆盖」→ 可算重复记录率
+	DistillOK    int `json:"distill_ok"`
+	DistillFail  int `json:"distill_fail"`
+	Accepts      int `json:"accepts"`
+	Rejects      int `json:"rejects"`
+	Creates      int `json:"creates"`    // 其中新增
+	Overwrites   int `json:"overwrites"` // 其中命中「相同知识覆盖」→ 可算重复记录率
 }
 
 // isWriteEvent 判定事件属于写侧。写侧没有 query，「空注入率」不适用于它。
@@ -248,7 +255,21 @@ func Summarize(rs []Record) Summary {
 			// 被抑制的触发没有注入任何内容，不计入读侧活动
 			continue
 		}
-		if isWriteEvent(r.Event) {
+		switch {
+		case r.Event == "accept":
+			s.Accepts++
+			s.Writes++
+			s.Creates++
+		case r.Event == "reject":
+			s.Rejects++
+		case r.Event == "distill":
+			switch r.Mode {
+			case "ok":
+				s.DistillOK++
+			case "fail":
+				s.DistillFail++
+			}
+		case isWriteEvent(r.Event):
 			s.Writes++
 			switch r.Mode {
 			case "create":
@@ -256,11 +277,11 @@ func Summarize(rs []Record) Summary {
 			case "overwrite":
 				s.Overwrites++
 			}
-		} else if isObserveEvent(r.Event) {
+		case isObserveEvent(r.Event):
 			s.Observations++
-		} else if isObserveTrigger(r.Event) {
+		case isObserveTrigger(r.Event):
 			// 触发事件与随后的 obs-append 成对出现，次数只记在 obs-append 上。
-		} else {
+		default:
 			s.Retrievals++
 		}
 	}
