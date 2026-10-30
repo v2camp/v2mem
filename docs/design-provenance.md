@@ -75,3 +75,7 @@ store.AddInput{..., Provenance: &store.Provenance{
 - 写入：`ingest` 后可读到 `provenance.file` 与 `line`；`add` 未传时为空。
 - sync：跨库 sync 后 provenance 随记录到达目标库，冲突时按约定规则。
 - 门禁：`make cover-gate` 通过，新列相关命中率达标。
+
+## 8. 与 channel 的分工
+
+`provenance` 回答「来自哪个文件第几行」。`channel`（`user|agent|tool|import`）回答「谁写的」，和 `source` 并存。约定与捕获幂等见 [`design-write-governance.md`](./design-write-governance.md) §10。channel 随 export/import 传播：本地为空才采纳对端，不参与内容冲突判定。

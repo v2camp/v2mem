@@ -64,9 +64,9 @@ make cover-update # 用当前实测值刷新下限（棘轮：只允许上调；
 
 main 推送会跑 `make cover-gate` 与 `make eval-gate`，通过后推导 tag 并推送，然后在**同一次**
 workflow 里交叉编译并上传（`GITHUB_TOKEN` 推上去的 tag 不会再触发一条 tag 流水线）。
-`eval-gate` 用 `gold/` 里的 content_hash 对**运行者自己的记忆库**打分；GitHub 托管 runner 上没有这份库，
-Recall 会是 0，自动打 tag 会停住。要发布二进制：推送已有 `vX.Y.Z`，或在 Actions 里对 `release` 填写 tag 后手动跑
-（tag 还不存在时，会在所选 ref 上创建）。这两条只再跑 `cover-gate`，不再跑 `eval-gate`。
+`eval-gate` 把 `eval/sandbox` 灌进临时库再打分，**不读** `~/.v2mem/mem.db`。`gold/` 里的个人标注只给本机
+`mem eval recall --gold-dir gold`，不参与发版。推送已有 `vX.Y.Z`，或在 Actions 里对 `release` 填写 tag 后手动跑
+（tag 还不存在时，会在所选 ref 上创建）时，只再跑 `cover-gate`，不再跑 `eval-gate`。
 
 产物文件名：`mem-darwin-amd64`、`mem-darwin-arm64`、`mem-linux-amd64`、
 `mem-linux-arm64`、`mem-windows-amd64.exe`（`make release-assets` 写到 `dist/`）。

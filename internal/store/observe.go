@@ -13,6 +13,12 @@ import (
 // 默认检索只查 fts_mem。痕迹要显式 layer=observation 或 both 才走 fts_obs。
 // 候选仍然不进任何检索。
 
+// 观测去重原因。没有 HTTP 状态码：Created=true 是首次落库，Duplicate=true 是重放。
+const (
+	DupEventID     = "event_id"
+	DupContentHash = "content_hash"
+)
+
 // Observation 是一条会话观测。Summary 是有界摘要，不是工具 stdout 全文。
 type Observation struct {
 	ID        string `json:"id"`
@@ -26,6 +32,8 @@ type Observation struct {
 	Hash      string `json:"hash"`
 	CreatedAt int64  `json:"created_at"`
 	MetaJSON  string `json:"meta_json"`
+	Channel   string `json:"channel,omitempty"`
+	EventID   string `json:"event_id,omitempty"`
 }
 
 // ObsInput 是追加一条观测的参数。MetaJSON 空则落成 {}。
@@ -38,13 +46,21 @@ type ObsInput struct {
 	Summary   string `json:"summary"`
 	RawRef    string `json:"raw_ref"`
 	MetaJSON  string `json:"meta_json"`
+	Channel   string `json:"channel,omitempty"`
+	EventID   string `json:"event_id,omitempty"`
 }
 
-// ObsResult 描述追加结果。Created=false 表示命中 (session_id, content_hash) 去重。
+// ObsResult 描述追加结果。
+//
+// Created=false 且 Duplicate=true：没有新行。
+// DupReason=event_id 表示宿主事件重放，已有行的摘要不改（先写赢）。
+// DupReason=content_hash 表示同会话相同摘要，即使这次带了另一个 event_id 也不再插。
 type ObsResult struct {
-	ID      string `json:"id"`
-	Created bool   `json:"created"`
-	Hash    string `json:"hash"`
+	ID        string `json:"id"`
+	Created   bool   `json:"created"`
+	Duplicate bool   `json:"duplicate"`
+	DupReason string `json:"dup_reason,omitempty"`
+	Hash      string `json:"hash"`
 }
 
 // ObsGCResult 是一次观测回收的结果。不触及 memories。
@@ -59,7 +75,10 @@ func obsHash(event, tool, summary string) string {
 	return HashOf(event + "\n" + tool + "\n" + summary)
 }
 
-// AppendObservation 追加一条观测。相同 (session, hash) 不双插。
+// AppendObservation 追加一条观测。
+//
+// 先看 event_id（非空且已存在则直接返回，不改已有行），再插入。
+// 插入被唯一约束挡住时：event_id 冲突仍是重放；否则是同会话 content_hash 冲突。
 func (s *Store) AppendObservation(in ObsInput) (*ObsResult, error) {
 	summary := strings.TrimSpace(in.Summary)
 	if summary == "" {
@@ -73,17 +92,29 @@ func (s *Store) AppendObservation(in ObsInput) (*ObsResult, error) {
 		meta = "{}"
 	}
 	event := strings.TrimSpace(in.Event)
+	eventID := strings.TrimSpace(in.EventID)
+	ch, err := DefaultObsChannel(event, in.Channel)
+	if err != nil {
+		return nil, err
+	}
 	hash := obsHash(event, in.ToolName, summary)
+	if eventID != "" {
+		if res, ok, err := s.obsByEventID(eventID); err != nil {
+			return nil, err
+		} else if ok {
+			return res, nil
+		}
+	}
 	id := newID()
 	now := time.Now().Unix()
 	idx := observationIndexText(summary)
 
 	res, err := s.db.Exec(`INSERT OR IGNORE INTO observations(
 		id, session_id, project, harness, event, tool_name, summary, summary_idx, raw_ref,
-		content_hash, created_at, meta_json
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		content_hash, created_at, meta_json, channel, event_id
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		id, in.SessionID, in.Project, in.Harness, event, in.ToolName, summary, idx, in.RawRef,
-		hash, now, meta)
+		hash, now, meta, ch, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -94,14 +125,35 @@ func (s *Store) AppendObservation(in ObsInput) (*ObsResult, error) {
 	if n > 0 {
 		return &ObsResult{ID: id, Created: true, Hash: hash}, nil
 	}
-	var existing string
+	if eventID != "" {
+		if dup, ok, err := s.obsByEventID(eventID); err != nil {
+			return nil, err
+		} else if ok {
+			return dup, nil
+		}
+	}
+	var existing, existingHash string
 	err = s.db.QueryRow(
-		`SELECT id FROM observations WHERE session_id = ? AND content_hash = ?`,
-		in.SessionID, hash).Scan(&existing)
+		`SELECT id, content_hash FROM observations WHERE session_id = ? AND content_hash = ?`,
+		in.SessionID, hash).Scan(&existing, &existingHash)
 	if err != nil {
 		return nil, err
 	}
-	return &ObsResult{ID: existing, Created: false, Hash: hash}, nil
+	return &ObsResult{ID: existing, Created: false, Duplicate: true, DupReason: DupContentHash, Hash: existingHash}, nil
+}
+
+func (s *Store) obsByEventID(eventID string) (*ObsResult, bool, error) {
+	var id, hash string
+	err := s.db.QueryRow(
+		`SELECT id, content_hash FROM observations WHERE event_id = ?`, eventID,
+	).Scan(&id, &hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &ObsResult{ID: id, Created: false, Duplicate: true, DupReason: DupEventID, Hash: hash}, true, nil
 }
 
 // ListObservations 按时间顺序列出观测。sessionID 为空则不限会话。
@@ -110,7 +162,7 @@ func (s *Store) ListObservations(sessionID string, limit int) ([]Observation, er
 		limit = 50
 	}
 	q := `SELECT id, session_id, project, harness, event, tool_name, summary, raw_ref,
-	             content_hash, created_at, meta_json
+	             content_hash, created_at, meta_json, channel, event_id
 	        FROM observations`
 	var args []any
 	if sessionID != "" {
@@ -128,14 +180,21 @@ func (s *Store) ListObservations(sessionID string, limit int) ([]Observation, er
 
 	var out []Observation
 	for rows.Next() {
-		var o Observation
-		if err := rows.Scan(&o.ID, &o.SessionID, &o.Project, &o.Harness, &o.Event,
-			&o.ToolName, &o.Summary, &o.RawRef, &o.Hash, &o.CreatedAt, &o.MetaJSON); err != nil {
+		o, err := scanObservation(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+func scanObservation(row interface{ Scan(...any) error }) (Observation, error) {
+	var o Observation
+	err := row.Scan(&o.ID, &o.SessionID, &o.Project, &o.Harness, &o.Event,
+		&o.ToolName, &o.Summary, &o.RawRef, &o.Hash, &o.CreatedAt, &o.MetaJSON,
+		&o.Channel, &o.EventID)
+	return o, err
 }
 
 // GCObservations 删掉超过 maxAge 的观测，再把条数压到 maxKeep。

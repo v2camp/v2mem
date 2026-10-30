@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -53,7 +54,7 @@ var mcpTools = []mcpTool{
 	},
 	{
 		Name:        "add",
-		Description: "写入一条记忆（一条只写一个原子事实；相同内容自动覆盖，不会重复）。content 必填。记作来源 source=llm。",
+		Description: "写入一条记忆（一条只写一个原子事实；相同内容自动覆盖，不会重复）。content 必填。默认 source=llm、channel=agent，写入前打码密钥。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -62,6 +63,7 @@ var mcpTools = []mcpTool{
 				"project":  map[string]any{"type": "string", "description": "工程标记，默认取当前 git 仓库名"},
 				"global":   map[string]any{"type": "boolean", "description": "写入全局记忆（对所有工程生效），与 project 互斥"},
 				"salience": map[string]any{"type": "number", "description": "重要性 0..1，默认 0.5"},
+				"channel":  map[string]any{"type": "string", "description": "写时通道 user|agent|tool|import，默认 agent"},
 			},
 			"required": []string{"content"},
 		},
@@ -283,7 +285,7 @@ func (s *mcpServer) toolSearch(id any, args map[string]any) map[string]any {
 	if s.auditFile != "-" {
 		rec := audit.Record{
 			TS: started.Unix(), Event: "manual-search", Project: project,
-			Query: q, Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
+			Query: scrub.Text(q), Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
 		}
 		for _, h := range hits {
 			rec.Hashes = append(rec.Hashes, h.ID)
@@ -318,9 +320,11 @@ func (s *mcpServer) toolAdd(id any, args map[string]any) map[string]any {
 		return mcpError(id, -32602, "salience 应落在 [0,1]")
 	}
 
+	content = scrub.Text(content)
+	channel := argString(args, "channel")
 	res, err := s.st.Add(store.AddInput{
 		Content: content, Kind: kind, Project: project,
-		Tool: "mcp", Source: "llm", Salience: salience,
+		Tool: "mcp", Source: "llm", Channel: channel, Salience: salience,
 	})
 	if err != nil {
 		return mcpError(id, -32603, "add 失败: "+err.Error())
@@ -413,7 +417,7 @@ func (s *mcpServer) toolRecall(id any, args map[string]any) map[string]any {
 	if s.auditFile != "-" {
 		rec := audit.Record{
 			TS: started.Unix(), Event: "manual-search", Project: project,
-			Query: q, Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
+			Query: scrub.Text(q), Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
 		}
 		for _, h := range hits {
 			rec.Hashes = append(rec.Hashes, h.ID)

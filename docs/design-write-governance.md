@@ -98,3 +98,32 @@ MCP `add` 的 schema 声明 `required:["content"]`；写侧一律带 `source`（
   退化同步写（宁可慢一次也不丢观测）。CLI/hook 等短命进程保留同步写 —— 进程退出前必须落盘，
   异步在此场景只会增加丢记录风险。
 - **写失败静默**：审计只是观测，任何写失败都不得影响注入或宿主会话。
+
+## 10. channel、打码、event_id（2026-10-30）
+
+`channel` 与 `source` 并存。`source` 是写入链路，`channel` 是谁产生的内容，取值 `user|agent|tool|import`。空字符串只表示迁移前的旧行。非法值在 CLI / `Add` 上拒绝。钩子不阻断宿主：无效 channel 打到 stderr，改用下表默认。
+
+| 写路径 | 默认 channel | source |
+|:---|:---|:---|
+| hook PostToolUse | `tool` | meta `hook-observe` |
+| hook Stop / SessionEnd | `agent` | 同上 |
+| MCP `add` | `agent` | `llm` |
+| CLI `mem add` | `user` | `human`（可用 `--channel`） |
+| `ingest` | `import` | `ingest` |
+| `import-transcript` | `import` | 观测事件名 `import-transcript` |
+| distill 候选 | `agent` | `distill` |
+| `accept` | 沿用候选；候选为空则 `agent` | `distill-accept` |
+
+首次写入后 channel 不改，和 `origin_device` 一样。导入时只在本地 channel 为空才补上。
+
+密钥打码在 `internal/scrub`。观测摘要、候选正文、`mem add`、审计 query 走同一套规则（赋值形态的 key/token/password、`sk-`、AKIA、Bearer、PEM 私钥块、URL 里的 user:password）。检索用的查询原文不打码。`--no-scrub` 只给本地调试；MCP 没有这个开关。
+
+捕获幂等有两层，都没有 HTTP：
+
+| 层 | 键 | 窗口 | 语义 |
+|:---|:---|:---|:---|
+| `hook_dedup` | 事件 + 会话 + 提问 + 目录；PostToolUse 再加 tool_use_id | 默认 10 秒 | 并行配置只注入一次 stdout。失败则照常注入 |
+| `observations.event_id` | 宿主事件号 | 永久 | 同一 id 再写：不插新行，`Duplicate=true`，`DupReason=event_id`，已有摘要不改 |
+| `(session_id, content_hash)` | 事件 + 工具 + 摘要 | 永久 | 没有 event_id，或摘要相同但 event_id 不同：不插新行，`DupReason=content_hash` |
+
+`event_id` 来自 stdin 的 `event_id`；否则 PostToolUse 用 `tool:<session>:<tool_use_id>`。Stop / SessionEnd 通常没有稳定 id，只靠 content_hash。spool 行带上 event_id，drain 再走 `AppendObservation`，重放得到 duplicate。`Created=true` 是首次落库。没有 201/200。

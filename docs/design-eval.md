@@ -373,3 +373,29 @@ README、测试全部同步移除。
 5. 测试：activity 视图的粒度过滤（period / session / task）、四态结论口径复用、
    「读不到日志≠无活动」红线；覆盖门禁照旧（cmd/mem 81.5% ≥ 81%）
 
+## 17. 沙箱门禁与收据（2026-10-30）
+
+发布门禁不再打个人库。`make eval-gate` 等价于：
+
+```
+mem eval recall --sandbox eval/sandbox --k 5 --receipts eval/receipts
+```
+
+临时库灌入 `eval/sandbox/seed.jsonl`（合成记忆 + 一条合成观测），金标准是同目录的 `*.gold.jsonl`。`gold/` 只给本机 `--gold-dir`，hash 对不上别人的库，不参与 `recall5_min`。
+
+口径在 §15.4 之上多一项，仍然宏平均：
+
+| 项 | 口径 |
+|:---|:---|
+| StrictAll@k | 一条样本的**每个** gold 都落在前 k 才记 1。单 gold 时等于「中了没有」；多 gold 时 Recall 可以是 0.5 而 StrictAll 是 0 |
+| 门槛 | 门禁仍只看 Recall@5 ≥ `eval-policy.txt`。StrictAll 进收据，不单独挡发版 |
+
+收据三件套（目录 `eval/receipts/`，gitignore）：
+
+| 文件 | 内容 |
+|:---|:---|
+| `manifest.json` | 数据集指纹、git sha、Go 版本、`release_gate`、声明「开发评测，非竞品排名」 |
+| `scores.ndjson` | Recall@k、MRR、EmptyRate、StrictAll@k 分列 |
+| `evidence.ndjson` | 查询的 sha256、gold 前缀、返回的 content_hash。没有正文，没有查询原文 |
+
+这是开发评测，不是和别的记忆系统比名次。

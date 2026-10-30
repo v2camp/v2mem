@@ -20,11 +20,14 @@
 起步集从 `~/.v2mem/audit.jsonl` 的真实会话查询里挑选，人工核对 `mem audit --tail`
 还原出的内容后标注。**禁止**用 20 条 `--auto` 自召回当金标准。
 
-## 版本化管理
+## 和个人库的关系
 
-- 文件命名 `v<N>-seed.gold.jsonl`，与发布 tag 对齐；改动随代码进 repo 版本化。
-- 发版门禁（`make eval-gate`）读的是 `eval-policy.txt` 的 `recall5_min`，
-  用 `--gold-dir gold` 合并本目录全部 `*.gold.jsonl` 后评 Recall@5。
+这里的 hash 来自某份本机记忆库。托管 CI 上没有那份库。
 
-> 起步期 gold 为空目录时，`eval-gate` 会因「目录下无 *.gold.jsonl」判定 RED ——
-> 这是**fail-closed**：没有标注金标准就不允许发版，等补齐真实样本后再放行。
+**发布门禁不读本目录。** `make eval-gate` 用 [`eval/sandbox`](../eval/sandbox/README.md) 的合成 seed + 金标准，灌进临时库。本目录只留给本机：
+
+```
+mem eval recall --gold-dir gold --k 5
+```
+
+那一步打的是 `--db`（默认 `~/.v2mem/mem.db`），和发版无关。

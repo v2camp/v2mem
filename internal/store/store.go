@@ -92,6 +92,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("迁移 provenance 列失败: %w", err)
 	}
+	if err := ensureCaptureSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 channel/event_id 失败: %w", err)
+	}
 	if err := ensureColumn(db, "distill_runs", "window_key", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("迁移 distill_runs.window_key 失败: %w", err)
@@ -149,6 +153,27 @@ func ensureColumn(db *sql.DB, table, column, ddl string) error {
 	}
 	// 补列成功后补索引；列已存在时走索引创建也无妨（IF NOT EXISTS 幂等）。
 	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS ix_mem_source ON memories(source)`)
+	return err
+}
+
+// ensureCaptureSchema 给旧库补 channel / event_id。
+//
+// event_id 的部分唯一索引不能写进 schema.sql：旧库还没有这一列时，
+// 建表脚本会先于 ALTER 执行，索引会直接让 Open 失败。
+func ensureCaptureSchema(db *sql.DB) error {
+	cols := []struct{ table, column, ddl string }{
+		{"memories", "channel", "TEXT NOT NULL DEFAULT ''"},
+		{"observations", "channel", "TEXT NOT NULL DEFAULT ''"},
+		{"observations", "event_id", "TEXT NOT NULL DEFAULT ''"},
+		{"candidates", "channel", "TEXT NOT NULL DEFAULT ''"},
+	}
+	for _, c := range cols {
+		if err := ensureColumn(db, c.table, c.column, c.ddl); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_obs_event
+		ON observations(event_id) WHERE event_id <> ''`)
 	return err
 }
 
@@ -411,6 +436,7 @@ type AddInput struct {
 	Tool       string            // claude-code|workbuddy|cursor|cli
 	Device     string            // 来源设备，默认取 hostname
 	Source     string            // human|llm|ingest|harness-summary|bench|test（写侧治理；空回填 human）
+	Channel    string            // user|agent|tool|import；空则按 source 取默认。与 source 并存
 	Tags       map[string]string // 多机/多工具/多工程标记
 	Salience   float64           // 重要性 0..1
 	TTL        time.Duration     // 硬过期，0 表示不过期
@@ -484,6 +510,11 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	if in.Source == "" {
 		in.Source = "human"
 	}
+	ch, err := DefaultChannel(in.Channel, in.Source)
+	if err != nil {
+		return nil, err
+	}
+	in.Channel = ch
 
 	h := HashOf(in.Content)
 	idx := indexText(in.Content)
@@ -528,10 +559,10 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 			`INSERT INTO memories
 			   (id, content, content_idx, kind, content_hash, project, salience,
 			    created_at, updated_at, last_seen_at, expires_at,
-			    origin_device, origin_tool, source, provenance, access_count)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
+			    origin_device, origin_tool, source, channel, provenance, access_count)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
 			id, in.Content, idx, in.Kind, h, in.Project, in.Salience,
-			now, now, now, expires, in.Device, in.Tool, in.Source, nullable(provJSON),
+			now, now, now, expires, in.Device, in.Tool, in.Source, in.Channel, nullable(provJSON),
 		); err != nil {
 			return nil, err
 		}

@@ -41,8 +41,8 @@ cover-update:
 
 # ---------- 发布 / 评测门禁 ----------
 
-# 发布门禁：跑正式版 eval（gold 金标准集）并与 eval-policy.txt 的 recall5_min 比。
-# 不达标 → 脚本打印 RED 并返回非零（CI 借此阻止发版）。只判据，不推导版本。
+# 发布门禁：沙箱夹具（eval/sandbox，临时库）的 Recall@5 对比 eval-policy.txt。
+# 不读个人 mem.db。不达标 → 脚本打印 RED 并返回非零。只判据，不推导版本。
 eval-gate:
 	@./scripts/release-eval.sh --gate-only
 

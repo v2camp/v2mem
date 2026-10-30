@@ -77,6 +77,69 @@ func TestScoreUsesMacroAverage(t *testing.T) {
 	}
 }
 
+func TestStrictAllRequiresEveryGold(t *testing.T) {
+	cases := []GoldCase{
+		{Query: "只中一半", Gold: []string{"aaaa1111", "bbbb2222"}},
+		{Query: "全中", Gold: []string{"cccc3333", "dddd4444"}},
+	}
+	retrieved := [][]string{
+		{"aaaa1111ffff", "zzzz"},
+		{"xxxx", "dddd4444ffff", "cccc3333ffff"},
+	}
+	rep := Score(cases, retrieved, 5)
+	// Recall 宏平均：(1/2 + 2/2) / 2 = 0.75
+	if got := rep.RecallAtK; got < 0.749 || got > 0.751 {
+		t.Errorf("Recall 应=0.75，got %v", got)
+	}
+	// StrictAll：第一条 0，第二条 1 → 0.5
+	if got := rep.StrictAllAtK; got != 0.5 {
+		t.Errorf("StrictAll@k 应=0.5，got %v", got)
+	}
+	if rep.Results[0].StrictAll {
+		t.Error("只命中一个 gold 时 strict_all 应为 false")
+	}
+	if !rep.Results[1].StrictAll {
+		t.Error("两个 gold 都在前 k 时 strict_all 应为 true")
+	}
+	if len(rep.Results[0].Returned) != 2 {
+		t.Errorf("应保留返回哈希，got %v", rep.Results[0].Returned)
+	}
+}
+
+func TestStrictAllRespectsK(t *testing.T) {
+	cases := []GoldCase{{Query: "a", Gold: []string{"aaaa1111", "bbbb2222"}}}
+	retrieved := [][]string{{"aaaa1111", "zzzz", "bbbb2222"}}
+	if got := Score(cases, retrieved, 2).StrictAllAtK; got != 0 {
+		t.Errorf("第二个 gold 在 k 之外，StrictAll 应为 0，got %v", got)
+	}
+	if got := Score(cases, retrieved, 3).StrictAllAtK; got != 1 {
+		t.Errorf("k=3 时应全部命中，got %v", got)
+	}
+}
+
+func TestStrictAllFalseOnEmptyGold(t *testing.T) {
+	rep := Score([]GoldCase{{Query: "空", Gold: nil}, {Query: "空白前缀", Gold: []string{""}}}, [][]string{{"aaaa"}, {"bbbb"}}, 5)
+	if rep.StrictAllAtK != 0 {
+		t.Fatalf("空 gold 的 StrictAll 应为 0，got %v", rep.StrictAllAtK)
+	}
+	if rep.Results[0].StrictAll || rep.Results[1].StrictAll {
+		t.Fatalf("两条都不应 strict_all: %+v", rep.Results)
+	}
+}
+
+func TestLoadGoldMissingFile(t *testing.T) {
+	if _, err := LoadGold(filepath.Join(t.TempDir(), "missing.jsonl")); err == nil {
+		t.Fatal("缺文件应报错")
+	}
+}
+
+func TestSortByRecallZeroGold(t *testing.T) {
+	got := SortByRecall([]CaseResult{{Query: "无分母", Gold: 0, Hit: 1}, {Query: "差", Gold: 1, Hit: 0}})
+	if got[0].Query != "无分母" && got[0].Query != "差" {
+		t.Fatalf("零分母应排在召回率 0 的一侧，got %+v", got)
+	}
+}
+
 func TestScoreOnEmptyInputs(t *testing.T) {
 	rep := Score(nil, nil, 5)
 	if rep.Cases != 0 || rep.RecallAtK != 0 || rep.MRR != 0 {

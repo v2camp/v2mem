@@ -24,20 +24,23 @@ type GoldCase struct {
 
 // CaseResult 是单条样本的结果。
 type CaseResult struct {
-	Query     string `json:"query"`
-	Gold      int    `json:"gold"`
-	Hit       int    `json:"hit"`
-	FirstRank int    `json:"first_rank"` // 0 表示未命中
+	Query     string   `json:"query"`
+	Gold      int      `json:"gold"`
+	Hit       int      `json:"hit"`
+	FirstRank int      `json:"first_rank"` // 0 表示未命中
+	StrictAll bool     `json:"strict_all"` // 该样本的全部 gold 都落在前 k
+	Returned  []string `json:"returned,omitempty"`
 }
 
 // Report 是一次评测的结果。
 type Report struct {
-	K         int          `json:"k"`
-	Cases     int          `json:"cases"` // 有效样本数（分母）
-	RecallAtK float64      `json:"recall_at_k"`
-	MRR       float64      `json:"mrr"`
-	EmptyRate float64      `json:"empty_rate"` // 检索完全无结果的样本比例
-	Results   []CaseResult `json:"results,omitempty"`
+	K            int          `json:"k"`
+	Cases        int          `json:"cases"` // 有效样本数（分母）
+	RecallAtK    float64      `json:"recall_at_k"`
+	MRR          float64      `json:"mrr"`
+	EmptyRate    float64      `json:"empty_rate"`      // 检索完全无结果的样本比例
+	StrictAllAtK float64      `json:"strict_all_at_k"` // 多 gold 时必须全部命中；宏平均
+	Results      []CaseResult `json:"results,omitempty"`
 }
 
 // Score 计算指标。
@@ -49,6 +52,8 @@ type Report struct {
 //   - 命中判定用哈希前缀匹配；gold 前缀长度由调用方保证（建议 ≥8）。
 //   - N 是**有效样本数**；gold 不在库中的样本必须先由 Validate 剔除，
 //     且剔除数必须上报 —— 静默剔除等于篡改分母。
+//   - StrictAll@k 宏平均：一条样本只有在**每个** gold 都至少命中前 k 里的一条时才记 1。
+//     单 gold 时它与「是否命中」重合；多 gold 时 Recall 可以是 0.5 而 StrictAll 仍是 0。
 func Score(cases []GoldCase, retrieved [][]string, k int) *Report {
 	rep := &Report{K: k, Cases: len(cases)}
 	if len(cases) == 0 {
@@ -62,7 +67,7 @@ func Score(cases []GoldCase, retrieved [][]string, k int) *Report {
 				top = top[:k]
 			}
 		}
-		res := CaseResult{Query: c.Query, Gold: len(c.Gold)}
+		res := CaseResult{Query: c.Query, Gold: len(c.Gold), Returned: append([]string(nil), top...)}
 		if len(top) == 0 {
 			rep.EmptyRate++
 		}
@@ -74,11 +79,15 @@ func Score(cases []GoldCase, retrieved [][]string, k int) *Report {
 				}
 			}
 		}
+		res.StrictAll = allGoldPresent(top, c.Gold)
 		if c.Gold != nil {
 			rep.RecallAtK += float64(res.Hit) / float64(len(c.Gold))
 		}
 		if res.FirstRank > 0 {
 			rep.MRR += 1 / float64(res.FirstRank)
+		}
+		if res.StrictAll {
+			rep.StrictAllAtK++
 		}
 		rep.Results = append(rep.Results, res)
 	}
@@ -86,6 +95,7 @@ func Score(cases []GoldCase, retrieved [][]string, k int) *Report {
 	rep.RecallAtK /= n
 	rep.MRR /= n
 	rep.EmptyRate /= n
+	rep.StrictAllAtK /= n
 	return rep
 }
 
@@ -96,6 +106,29 @@ func matchesGold(hash string, gold []string) bool {
 		}
 	}
 	return false
+}
+
+// allGoldPresent 要求每个 gold 前缀都在 top 里有至少一条哈希。
+func allGoldPresent(top, gold []string) bool {
+	if len(gold) == 0 {
+		return false
+	}
+	for _, g := range gold {
+		if g == "" {
+			return false
+		}
+		found := false
+		for _, h := range top {
+			if strings.HasPrefix(h, g) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // Validate 剔除 gold 不在库中的样本，并返回被剔除的原因。
