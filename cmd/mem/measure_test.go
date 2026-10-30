@@ -654,28 +654,26 @@ func flagsAfterPositional(cmd string) string {
 //
 // 这个用例把「选项必须在位置参数之前」固化成不变量。
 func TestGuidanceCommandsAreExecutable(t *testing.T) {
-	blocks := map[string]string{
-		"hook 注入的用法提示":      hintBlock(),
-		"指令级接入块(workbuddy)": instructionBlock("workbuddy"),
-		"指令级接入块(traework)":  instructionBlock("traework"),
+	hintCmds := extractMemCommands(hintBlock())
+	if len(hintCmds) < 3 {
+		t.Fatalf("hintBlock 应给出可执行命令，got %d", len(hintCmds))
 	}
-	total := 0
-	for name, block := range blocks {
-		cmds := extractMemCommands(block)
-		if len(cmds) == 0 {
-			t.Errorf("%s 里没抽到任何 mem 命令 —— 抽取器失效，这个用例就成了空转", name)
-			continue
+	for _, c := range hintCmds {
+		if bad := flagsAfterPositional(c); bad != "" {
+			t.Errorf("hint 的命令把选项写在了位置参数之后：\n  %s\n  违规选项: %s", c, bad)
 		}
-		for _, c := range cmds {
-			total++
+	}
+	// 指令块改成类码表之后不再放命令清单。若以后又写回 mem 命令，选项顺序仍然要合法。
+	for _, name := range []string{"workbuddy", "traework"} {
+		block := instructionBlock(name)
+		if !strings.Contains(block, "P preference") {
+			t.Errorf("%s 指令块应含类码表", name)
+		}
+		for _, c := range extractMemCommands(block) {
 			if bad := flagsAfterPositional(c); bad != "" {
-				t.Errorf("%s 的命令把选项写在了位置参数之后，实际执行会失败：\n  %s\n  违规选项: %s",
-					name, c, bad)
+				t.Errorf("%s 指令块的命令把选项写在了位置参数之后：\n  %s\n  违规选项: %s", name, c, bad)
 			}
 		}
-	}
-	if total < 6 {
-		t.Errorf("至少应校验 6 条命令，实际 %d 条（抽取器可能漏了）", total)
 	}
 }
 

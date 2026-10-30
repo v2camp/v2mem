@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -95,22 +96,81 @@ func TestCmdNotesPrintsOneLinePerRule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdNotes: %v", err)
 	}
-	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("应恰好 2 行，got %d: %q", len(lines), out)
+	if !strings.HasPrefix(out, "P preference ") {
+		t.Fatalf("notes 应以类码表开头，got %q", out)
 	}
-	if strings.TrimSpace(lines[0]) != "规则甲" && strings.TrimSpace(lines[0]) != "规则乙" {
-		t.Errorf("第一行应为其中一条规则，got %q", lines[0])
+	for _, rule := range []string{"规则甲", "规则乙"} {
+		if !strings.Contains(out, rule) {
+			t.Errorf("应包含硬规则 %q，got %q", rule, out)
+		}
+	}
+	codeEnd := strings.Index(out, "T task ")
+	if codeEnd < 0 {
+		t.Fatal("缺 T 类码行")
+	}
+	rest := out[codeEnd:]
+	nl := strings.Index(rest, "\n")
+	rulesPart := rest[nl+1:]
+	if strings.Contains(rulesPart, "P preference") {
+		t.Errorf("硬规则段不应再出现类码，got %q", rulesPart)
 	}
 
-	// 空库提示
+	// 空库：仍有类码表，并提示没有硬规则
 	emptyDB := testDB(t)
 	emptyOut, err := captureStdout(t, func() error { return cmdNotes([]string{"--db", emptyDB}) })
 	if err != nil {
 		t.Fatalf("cmdNotes empty: %v", err)
 	}
-	if !strings.Contains(emptyOut, "没有硬规则") {
-		t.Errorf("空库应提示无规则，got %q", emptyOut)
+	if !strings.Contains(emptyOut, "没有硬规则") || !strings.Contains(emptyOut, "P preference") {
+		t.Errorf("空库应有类码并提示无规则，got %q", emptyOut)
+	}
+}
+
+func TestNotesJSONSplitsCodesAndRules(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "--global", "--kind", "rule", "规则甲"}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(t, func() error { return cmdNotes([]string{"--db", db, "--json"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `"codes"`) || !strings.Contains(out, `"rules"`) {
+		t.Fatalf("json 应分 codes/rules 两块，got %s", out)
+	}
+	if !strings.Contains(out, `"code":"P"`) || !strings.Contains(out, "规则甲") {
+		t.Fatalf("json 应含类码与规则，got %s", out)
+	}
+}
+
+func TestNotesCombinedBudgetTruncatesRules(t *testing.T) {
+	db := testDB(t)
+	long := strings.Repeat("规", 300)
+	for i := 0; i < 12; i++ {
+		content := fmt.Sprintf("规则%d %s", i, long)
+		if err := cmdAdd([]string{"--db", db, "--global", "--kind", "rule", content}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := runNotes(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runeLen(out) > notesBudgetRunes {
+		t.Fatalf("类码+硬规则合计 %d > %d", runeLen(out), notesBudgetRunes)
+	}
+	if !strings.HasPrefix(out, "P preference ") {
+		t.Fatalf("截断后仍应保留完整类码表，got prefix %q", out[:40])
+	}
+	if strings.Count(out, "规则") >= 12 {
+		t.Fatal("12 条超长规则应被合计预算截断，否则断言没有咬住")
+	}
+	out2, err := runNotes(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != out2 {
+		t.Fatal("截断后仍应幂等")
 	}
 }
 
