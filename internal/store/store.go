@@ -112,6 +112,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("补齐 MinHash 签名失败: %w", err)
 	}
+	if err := ensureObservationSearch(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("补齐观测检索失败: %w", err)
+	}
 	return st, nil
 }
 
@@ -571,6 +575,10 @@ type SearchQuery struct {
 	// NoFuzzy 关闭模糊检索（MinHash + RRF 融合，调试/对照用）。默认开启。
 	NoFuzzy bool
 	Limit   int
+	// Layer 选择检索哪一层。空和 memory 只查已定记忆（默认，hook 注入用这个）。
+	// observation 只查会话痕迹。both 两层都查，命中带 Layer。
+	// recent 是 observation 的别名，all 是 both 的别名。
+	Layer string
 }
 
 // Hit 是一条检索结果。
@@ -581,17 +589,83 @@ type Hit struct {
 	Project   string  `json:"project"`
 	Salience  float64 `json:"salience"`
 	UpdatedAt int64   `json:"updated_at"`
+	// Layer 标出命中来自哪一层。默认的记忆检索留空，避免旧输出多一个字段。
+	// observation 与 both 会写成 memory 或 observation。
+	Layer string `json:"layer,omitempty"`
 	// Rank 是排序分：单路（无模糊检索）时为 bm25（越小越相关）；
 	// 融合后为 RRF 名次（1 起，越小越相关）。语义方向始终一致。
 	Rank float64 `json:"rank"`
 }
 
-// Search 走 FTS5 全文检索，并叠加模糊检索融合（M5b-0）。已过期的记忆自动排除。
+// CanonicalLayer 把层名收成 memory、observation、both 之一。
+func CanonicalLayer(s string) (string, error) {
+	switch strings.TrimSpace(strings.ToLower(s)) {
+	case "", "memory":
+		return "memory", nil
+	case "observation", "recent":
+		return "observation", nil
+	case "both", "all":
+		return "both", nil
+	default:
+		return "", fmt.Errorf("未知 layer %q（可选 memory|observation|both）", s)
+	}
+}
+
+// interleaveLayers 把两层结果交错到 limit 条。记忆在前，痕迹紧跟，
+// 避免其中一层占满限额后另一层完全看不见。
+func interleaveLayers(mem, obs []Hit, limit int) []Hit {
+	if limit <= 0 {
+		limit = 10
+	}
+	out := make([]Hit, 0, limit)
+	for i := 0; len(out) < limit && (i < len(mem) || i < len(obs)); i++ {
+		if i < len(mem) {
+			h := mem[i]
+			h.Layer = "memory"
+			out = append(out, h)
+			if len(out) == limit {
+				break
+			}
+		}
+		if i < len(obs) {
+			h := obs[i]
+			h.Layer = "observation"
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// Search 按层检索。默认只查已定记忆。observation 查会话痕迹，both 两层交错。
 //
-// 管线：精确表达式（bm25）与模糊候选（MinHash 签名估计 Jaccard）做 RRF 融合，
+// 记忆管线：精确表达式（bm25）与模糊候选（MinHash 签名估计 Jaccard）做 RRF 融合，
 // 结果为空才退化为「全 OR + bm25」（精确优先、空手才放宽，§15.5）。
+// 痕迹层只用同一套 FTS 表达式，不做 MinHash，也不把候选或推测写进 memories。
 // bm25 返回负值，ORDER BY rank ASC 即「最相关在前」。
 func (s *Store) Search(q SearchQuery) ([]Hit, error) {
+	layer, err := CanonicalLayer(q.Layer)
+	if err != nil {
+		return nil, err
+	}
+	q.Layer = layer
+	if layer == "observation" {
+		return s.searchObservations(q)
+	}
+	hits, err := s.searchMemories(q)
+	if err != nil || layer == "memory" {
+		return hits, err
+	}
+	obsQ := q
+	obsQ.Kind = ""
+	obsQ.Tags = nil
+	obs, err := s.searchObservations(obsQ)
+	if err != nil {
+		return nil, err
+	}
+	return interleaveLayers(hits, obs, q.Limit), nil
+}
+
+func (s *Store) searchMemories(q SearchQuery) ([]Hit, error) {
 	q.Query = strings.TrimSpace(q.Query)
 	if q.Query == "" {
 		return nil, errors.New("查询为空")

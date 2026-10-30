@@ -85,9 +85,12 @@ CREATE TABLE IF NOT EXISTS hook_dedup (
 
 CREATE INDEX IF NOT EXISTS idx_hook_dedup_ts ON hook_dedup(ts);
 
--- 观测缓冲与蒸馏隔离区（同库另表，不进 fts_mem / mem search）。
+-- 观测缓冲与蒸馏隔离区（同库另表，不进 fts_mem）。
 -- hooks 只许写 observations。candidates 由 distill / import 写入，accept 才进 memories。
 -- 写失败不在这里处理：调用方把行落到 spool，下次 SessionStart 再灌回来。
+-- summary_idx 是痕迹层的可检索形态，规则与 memories.content_idx 相同。
+-- fts_obs 与触发器在 Open 里补齐：旧库先 ALTER 出 summary_idx，再建索引。
+-- 默认 mem search 仍只查 memories；--layer observation|both 才查这张表。
 CREATE TABLE IF NOT EXISTS observations (
   id            TEXT PRIMARY KEY,
   session_id    TEXT NOT NULL,
@@ -96,6 +99,7 @@ CREATE TABLE IF NOT EXISTS observations (
   event         TEXT NOT NULL,            -- post-tool-use|stop|session-end|…
   tool_name     TEXT NOT NULL DEFAULT '',
   summary       TEXT NOT NULL DEFAULT '', -- 有界摘要，非全量 stdout
+  summary_idx   TEXT NOT NULL DEFAULT '', -- 一元组+二元组，供 fts_obs
   raw_ref       TEXT NOT NULL DEFAULT '', -- 可选外部路径，勿存密钥
   content_hash  TEXT NOT NULL,
   created_at    INTEGER NOT NULL,

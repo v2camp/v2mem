@@ -124,13 +124,13 @@ mem init --dry-run           # 只看会写什么
 配置写入遵守四条纪律：**合并不覆盖**、**幂等**、**只备份一次**（`.v2mem.bak`）、**绝对路径**。
 个别工具需额外动作（Codex 首次要 trust 钩子、QoderWork 改完要重启等），`mem init` 会逐一打印。
 Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 MCP）。
-`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`；`mem search` 搜不到这些观测。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（仍不进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏。默认没有常驻进程。
+`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`。这些痕迹可以用 `mem search --layer observation` 查到，默认的 `mem search` 和开场注入仍然只看已定记忆。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（候选仍不进检索，要 `mem accept` 才进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏。默认没有常驻进程。
 全部卸载：`mem uninstall --all`（或 `--harness <名字>` 单个），只摘掉带 `# v2mem` 标记的条目，不动你自己的配置。
 
 ### MCP server
 
-`mem mcp` 暴露 5 个工具：`search`（检索）、`add`（写入，相同内容自动覆盖）、
-`ls`（列出）、`touch`（记录命中）、`recall_context`（只读，把类码和命中拼成一段文本；`query` 必填）。
+`mem mcp` 暴露 5 个工具：`search`（检索；`layer` 为 `memory` / `observation` / `both`，默认只查已定记忆）、`add`（写入，相同内容自动覆盖）、
+`ls`（列出）、`touch`（记录命中）、`recall_context`（只读，把类码和命中拼成一段文本；`query` 必填，`layer` 与 search 相同）。
 没有 `accept` / `distill`。在支持 MCP 的工具里加一行进程配置即可：
 
 ```json
@@ -153,7 +153,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | 命令 | 说明 |
 |:---|:---|
 | `mem add [--kind K] [--project P \| --global] [--tag k=v] [--salience F] [--ttl DUR] "<事实>"` | 写入一条记忆。**相同内容自动覆盖**（按归一化后的 hash），不会重复 |
-| `mem search [--limit N] [--scope S] [--project P] [--kind K] [--tag k=v] "<查询>"` | 全文检索（FTS5 + bm25）。`--scope`：`current`（本工程+全局，按当前目录推断工程）/ `global` / `all`（默认） |
+| `mem search [--limit N] [--scope S] [--layer L] [--project P] [--kind K] [--tag k=v] "<查询>"` | 全文检索（FTS5 + bm25）。`--layer`：`memory`（已定记忆，默认）/ `observation`（近期痕迹）/ `both`（两层交错）。`--scope`：`current`（本工程+全局，按当前目录推断工程）/ `global` / `all`（默认） |
 | `mem ls [--project P] [--kind K] [--tag k=v] [--scope S] [--limit N]` | **列出库里的记忆**（不需要查询词）。默认跨工程、按工程分组 |
 | `mem touch <id\|前缀>` | 记录一次命中：刷新 `last_seen_at`、累加 `access_count`。衰减机制的输入 |
 

@@ -604,7 +604,7 @@ func extractMemCommands(text string) []string {
 // 否则会把 `--scope current` 里的 current 误当成位置参数（这是第一版的错）。
 var valueFlags = map[string]bool{
 	"--db": true, "--limit": true, "--project": true, "--kind": true, "--tag": true,
-	"--scope": true, "--salience": true, "--ttl": true, "--tool": true, "--device": true,
+	"--scope": true, "--layer": true, "--salience": true, "--ttl": true, "--tool": true, "--device": true,
 	"--harness": true, "--event": true, "--max-chars": true, "--min-runes": true,
 	"--k": true, "--auto": true, "--gold": true, "--gold-dir": true, "--session": true, "--file": true,
 	"--threshold": true, "--max-idle": true, "--min-salience": true,

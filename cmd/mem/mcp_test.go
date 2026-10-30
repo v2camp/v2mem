@@ -104,6 +104,30 @@ func TestMCPToolsList(t *testing.T) {
 	}
 }
 
+func TestMCPSearchObservationLayer(t *testing.T) {
+	s, _ := newMCPServer(t)
+	if _, err := s.st.AppendObservation(store.ObsInput{
+		SessionID: "s", Project: "demo", Event: "post-tool-use", ToolName: "Edit",
+		Summary: "Edit routes/billing.ts 还剩两条路由",
+	}); err != nil {
+		t.Fatalf("AppendObservation: %v", err)
+	}
+
+	miss := mcpCall(t, s, "search", map[string]any{"query": "billing"})
+	if strings.Contains(mcpText(miss), "billing") {
+		t.Fatalf("默认 search 不应返回痕迹，got %s", mcpText(miss))
+	}
+	hit := mcpCall(t, s, "search", map[string]any{"query": "billing", "layer": "observation"})
+	text := mcpText(hit)
+	if !strings.Contains(text, "billing") || !strings.Contains(text, "observation") {
+		t.Fatalf("observation 层应返回痕迹，got %s", text)
+	}
+	bad := s.callTool(1, "search", map[string]any{"query": "billing", "layer": "graph"})
+	if bad["error"] == nil {
+		t.Fatal("未知 layer 应报错")
+	}
+}
+
 func TestMCPRecallContext(t *testing.T) {
 	s, db := newMCPServer(t)
 	if err := cmdAdd([]string{"--db", db, "--project", "demo", "--kind", "decision",

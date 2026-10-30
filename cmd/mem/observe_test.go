@@ -105,6 +105,24 @@ func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
 	if !strings.Contains(searchOut, "无结果") {
 		t.Errorf("mem search 不应搜到观测，got:\n%s", searchOut)
 	}
+	layered, err := captureStdout(t, func() error {
+		return cmdSearch([]string{"--db", db, "--layer", "observation", "观测标记香蕉"})
+	})
+	if err != nil {
+		t.Fatalf("cmdSearch observation: %v", err)
+	}
+	if !strings.Contains(layered, "观测标记香蕉") || !strings.Contains(layered, "observation:") {
+		t.Errorf("痕迹层应搜到观测，got:\n%s", layered)
+	}
+	injected, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "观测标记香蕉"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "cursor"})
+	})
+	if err != nil {
+		t.Fatalf("prompt hook: %v", err)
+	}
+	if strings.Contains(injected, "观测标记香蕉") {
+		t.Errorf("随问注入应只带已定记忆，got:\n%s", injected)
+	}
 
 	rs, err := audit.Read(ap, 0)
 	if err != nil {

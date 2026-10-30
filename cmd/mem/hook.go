@@ -412,9 +412,11 @@ func formatHits(title string, hits []store.Hit, budget int) (string, int) {
 // hintBlock 是「钩子」本体：告诉模型还有 Level 2 可查，并给出可直接执行的命令。
 // 命令必须写全，模型不会去猜参数。
 func hintBlock() string {
-	return "需要时可检索本库（按需查询，不要凭空断言历史决策）：\n" +
+	return "需要时可检索本库（按需查询，不要凭空断言）：\n" +
 		"  优先 MCP 工具 search / add / touch（query 或 content 必填；一条事实一个 add）\n" +
+		"  search 的 layer：memory=已定记忆（默认），observation=近期痕迹，both=两层\n" +
 		"  mem search --scope current --json \"<关键词>\"\n" +
+		"  mem search --layer observation --scope current --json \"<关键词>\"\n" +
 		"  mem add --kind decision|pitfall|preference|fact \"<原子事实>\"\n" +
 		"  mem touch <id前8位>\n"
 }
