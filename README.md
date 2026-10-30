@@ -158,7 +158,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 
 **Level 1 文件运维**：`mem ingest <文件.md...>`（把既有 md 机械化搬进库，幂等；写侧治理含 `--source harness-summary` 锚定"任务收尾汇总"双路径写）
 · `mem budget --file <文件> [--max-chars N]`（检查注入文件是否超预算，超限非零退出）
-· `mem notes`（读侧硬规则小字条：抽 `kind=rule`/全局高优先记忆，一行一条、幂等；hook 注入去重，`MEM_NO_NOTES=1` 回退到仅原始注入）
+· `mem notes`（先输出类码表 P/D/X/T，再输出硬规则小字条：`kind=rule`/全局高优先，一行一条、幂等；hook 注入去重，`MEM_NO_NOTES=1` 回退到仅原始注入）
 
 **接入与钩子**：`mem harness`（列出 12 个工具入口）· `mem init`（写入钩子配置）· `mem uninstall`（反向移除，`--all` 一键）
 · `mem hook`（钩子入口：读 stdin JSON、写 stdout；同一事件重复触发只注入一次，`--dedup-window` 默认 10s）

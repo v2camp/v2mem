@@ -301,16 +301,18 @@ func filterRulesCoveredByNotes(st *store.Store, hits []store.Hit) []store.Hit {
 // 它的作用正是告诉模型「还有多级记忆可查」，被截断就失去了钩子的意义。
 func sessionStartContext(st *store.Store, project string, limit, maxChars int) (string, []store.Hit) {
 	hint := hintBlock()
+	codes := renderKindCodes()
 	head := fmt.Sprintf("[v2mem] 本机有跨会话的本地记忆库（Level 2，正文不进上下文）。当前工程：%s\n",
 		orGlobal(project))
 
-	budget := maxChars - runeLen(head) - runeLen(hint)
+	budget := maxChars - runeLen(head) - runeLen(hint) - runeLen(codes)
 	if budget < 0 {
 		budget = 0
 	}
 
 	var sb strings.Builder
 	sb.WriteString(head)
+	sb.WriteString(codes)
 	var injected []store.Hit
 
 	// 跨工程硬规则

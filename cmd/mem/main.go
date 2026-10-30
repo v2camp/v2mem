@@ -30,7 +30,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem ls     [选项]                列出库里的记忆（无需查询词；可按工程/类型/标记过滤）
   mem touch  <id|前缀>             记录命中，刷新 last_seen_at 并累加 access_count
   mem forget <id|前缀>             删除一条记忆
-  mem notes  [选项]                输出硬规则小字条（一行一条，幂等）
+  mem notes  [选项]                先输出类码表，再输出硬规则小字条（幂等）
   mem lexicon init --project <X> [--terms "词A,词B"]   从该工程记忆提取同义词写入 synonyms.txt（--dry-run 预览；--auto 实验性 bigram 提取）
   mem gc     [选项]                回收：TTL 到期 + 久未命中且低重要性
   mem consolidate [选项]           相似知识归并（近重复聚簇，留 1 条）

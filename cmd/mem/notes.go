@@ -60,18 +60,53 @@ func collectRules(st *store.Store) ([]store.Hit, error) {
 	return rules, nil
 }
 
-// renderNotes 生成 notes 的纯文本：一行一条硬规则。
-func renderNotes(st *store.Store) (string, error) {
+// notesBudgetRunes 是类码表与硬规则小字条的合计上限。
+// 类码是常数，硬规则是可变部分；超预算时只截硬规则，不截类码。
+const notesBudgetRunes = 2048
+
+// notesView 把两段分开，供 --json 结构化输出。不得靠解析文本切分。
+type notesView struct {
+	Codes []kindCode `json:"codes"`
+	Rules []string   `json:"rules"`
+	Text  string     `json:"-"`
+}
+
+// buildNotes 先类码表、再硬规则。两段都按稳定键，多次运行逐字节一致。
+func buildNotes(st *store.Store) (notesView, error) {
 	rules, err := collectRules(st)
+	if err != nil {
+		return notesView{}, err
+	}
+	var sb strings.Builder
+	sb.WriteString(renderKindCodes())
+	used := runeLen(sb.String())
+	var kept []string
+	for _, r := range rules {
+		line := oneLine(r.Content)
+		if line == "" {
+			continue
+		}
+		next := line + "\n"
+		if used+runeLen(next) > notesBudgetRunes {
+			break
+		}
+		sb.WriteString(next)
+		used += runeLen(next)
+		kept = append(kept, line)
+	}
+	if kept == nil {
+		kept = []string{}
+	}
+	return notesView{Codes: append([]kindCode(nil), kindCodes...), Rules: kept, Text: sb.String()}, nil
+}
+
+// renderNotes 生成 notes 的纯文本：先类码表，再一行一条硬规则。
+func renderNotes(st *store.Store) (string, error) {
+	view, err := buildNotes(st)
 	if err != nil {
 		return "", err
 	}
-	var sb strings.Builder
-	for _, r := range rules {
-		sb.WriteString(oneLine(r.Content))
-		sb.WriteByte('\n')
-	}
-	return sb.String(), nil
+	return view.Text, nil
 }
 
 // runNotes 是 notes 的库级入口与测试接缝：打开库并渲染硬规则小字条。
@@ -93,26 +128,24 @@ func cmdNotes(args []string) error {
 		return err
 	}
 
-	text, err := runNotes(c.db)
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	view, err := buildNotes(st)
 	if err != nil {
 		return err
 	}
 	if c.json {
-		var lines []string
-		for _, l := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-			if strings.TrimSpace(l) != "" {
-				lines = append(lines, l)
-			}
-		}
-		if lines == nil {
-			lines = []string{}
-		}
-		return printJSON(lines)
+		return printJSON(struct {
+			Codes []kindCode `json:"codes"`
+			Rules []string   `json:"rules"`
+		}{Codes: view.Codes, Rules: view.Rules})
 	}
-	if text == "" {
+	fmt.Print(view.Text)
+	if len(view.Rules) == 0 {
 		fmt.Println("（没有硬规则小字条）")
-		return nil
 	}
-	fmt.Print(text)
 	return nil
 }
