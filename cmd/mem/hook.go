@@ -20,13 +20,15 @@ import (
 //
 //  1. **绝不阻断宿主**。钩子跑在用户会话的关键路径上，记忆系统出问题不该让会话中断。
 //     因此本文件所有分支都返回 nil，异常一律写 stderr 后静默放过。
+//     观测事件只写 observations（或失败时写 spool），绝不 store.Add。
 //  2. **stdout 只放要注入模型的内容**。诊断信息走 stderr —— CodeBuddy 文档明确
 //     「stderr 仅作为 fallback，调试日志可安全写入 stderr，不会污染给 Agent 的反馈」，
 //     其余各家对退出码 0 时的 stderr 也都只做展示。
 //  3. **每轮注入有字符预算**。Level 1 是每轮都要注入的，不做预算会随记忆增长吃掉上下文。
-//  4. **一条命令通吃**。SessionStart / UserPromptSubmit 在 Claude Code、TraeCode、
-//     CodeBuddy、Qoder、QoderWork、Codex 六家都支持「stdout 纯文本被注入上下文」，
-//     故输出格式取纯文本这个最大公约数，不按 harness 分支渲染。
+//  4. **注入格式按宿主分叉**。Claude 系的 SessionStart / UserPromptSubmit 是 stdout 纯文本。
+//     Cursor 的 sessionStart / beforeSubmitPrompt / preCompact 要 JSON
+//     `{"additional_context":"..."}`，纯文本不会被当成注入。
+//     观测事件（postToolUse / stop / sessionEnd）不写 stdout。
 const (
 	defaultHookLimit = 3
 	// defaultHookBudget 是注入内容的字符预算。取 1200 是权衡：
@@ -39,12 +41,28 @@ const (
 // hookInput 是各 harness 经 stdin 传来的 JSON。
 // 字段取自多家官方文档的公共交集，未列出的字段一律忽略。
 type hookInput struct {
-	EventName      string   `json:"hook_event_name"`
-	Cwd            string   `json:"cwd"`
-	Prompt         string   `json:"prompt"`
-	Source         string   `json:"source"`
-	SessionID      string   `json:"session_id"`
-	WorkspaceRoots []string `json:"workspace_roots"`
+	EventName      string          `json:"hook_event_name"`
+	Cwd            string          `json:"cwd"`
+	Prompt         string          `json:"prompt"`
+	Source         string          `json:"source"`
+	SessionID      string          `json:"session_id"`
+	ConversationID string          `json:"conversation_id"`
+	WorkspaceRoots []string        `json:"workspace_roots"`
+	ToolName       string          `json:"tool_name"`
+	ToolUseID      string          `json:"tool_use_id"`
+	ToolInput      json.RawMessage `json:"tool_input"`
+	ToolOutput     json.RawMessage `json:"tool_output"`
+	TranscriptPath string          `json:"transcript_path"`
+	Status         string          `json:"status"`
+	Reason         string          `json:"reason"`
+}
+
+// sessionID 优先用 session_id，Cursor 有时只给 conversation_id。
+func (in hookInput) sessionID() string {
+	if s := strings.TrimSpace(in.SessionID); s != "" {
+		return s
+	}
+	return strings.TrimSpace(in.ConversationID)
 }
 
 func cmdHook(args []string) error {
@@ -104,7 +122,7 @@ func cmdHook(args []string) error {
 				_ = audit.Append(*auditPath, audit.Record{
 					TS: started.Unix(), Event: string(event),
 					Harness: harnessName(*harnessFlag, in), Project: project,
-					SessionID: in.SessionID, Query: strings.TrimSpace(in.Prompt),
+					SessionID: in.sessionID(), Query: strings.TrimSpace(in.Prompt),
 					Suppressed: true, MS: time.Since(started).Milliseconds(),
 				})
 			}
@@ -113,17 +131,31 @@ func cmdHook(args []string) error {
 		}
 	}
 
-	text, injected := renderHookContext(c, event, project, in.Prompt, *limit, *maxChars)
-	if text != "" {
-		fmt.Print(text)
+	if isObserveHook(event) {
+		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started)
+		return nil
 	}
+
+	if event == harness.EventSessionStart {
+		drainSpoolFailOpen(c.db, *auditPath)
+	}
+
+	budget := *maxChars
+	if event == harness.EventPreCompact {
+		if n := positiveEnvInt("MEM_PRECOMPACT_BUDGET"); n > 0 {
+			budget = n
+		}
+	}
+
+	text, injected := renderHookContext(c, event, project, in.Prompt, *limit, budget)
+	writeHookStdout(*harnessFlag, event, text)
 
 	// 审计：为「用户会话 → mem 查询」沉淀真实样本。写失败必须静默 ——
 	// 这条在宿主会话关键链上，审计问题绝不能让会话收到错误。
 	if *auditPath != "-" {
 		rec := audit.Record{
 			TS: started.Unix(), Event: string(event), Harness: harnessName(*harnessFlag, in),
-			Project: project, SessionID: in.SessionID, Query: strings.TrimSpace(in.Prompt),
+			Project: project, SessionID: in.sessionID(), Query: strings.TrimSpace(in.Prompt),
 			Empty: strings.TrimSpace(text) == "", MS: time.Since(started).Milliseconds(),
 		}
 		for _, h := range injected {
@@ -209,7 +241,7 @@ func renderHookContext(c common, event harness.Event, project, prompt string, li
 	if err != nil {
 		// 库打不开时仍告诉模型「有这么个库」，否则用户会以为记忆系统不存在
 		fmt.Fprintln(os.Stderr, "v2mem hook: 打开记忆库失败:", err)
-		if event == harness.EventSessionStart {
+		if event == harness.EventSessionStart || event == harness.EventPreCompact {
 			return fmt.Sprintf("[v2mem] 本地分层记忆库（Level 2）。当前工程：%s\n%s",
 				orGlobal(project), hintBlock()), nil
 		}
@@ -218,7 +250,7 @@ func renderHookContext(c common, event harness.Event, project, prompt string, li
 	defer st.Close()
 
 	switch event {
-	case harness.EventSessionStart:
+	case harness.EventSessionStart, harness.EventPreCompact:
 		return sessionStartContext(st, project, limit, maxChars)
 	case harness.EventPromptSubmit:
 		return promptSubmitContext(st, project, prompt, limit, maxChars)
@@ -375,9 +407,10 @@ func formatHits(title string, hits []store.Hit, budget int) (string, int) {
 // 命令必须写全，模型不会去猜参数。
 func hintBlock() string {
 	return "需要时可检索本库（按需查询，不要凭空断言历史决策）：\n" +
-		"  mem search --scope current --json \"<关键词>\"   # 查历史决策 / 踩坑 / 约定（关键词必填）\n" +
-		"  mem add --kind decision|pitfall|preference|fact \"<原子事实>\"   # 记下新学到的事实（正文必填，一条一个事实）\n" +
-		"  mem touch <id前8位>   # 命中后反馈，供过期机制参考\n"
+		"  优先 MCP 工具 search / add / touch（query 或 content 必填；一条事实一个 add）\n" +
+		"  mem search --scope current --json \"<关键词>\"\n" +
+		"  mem add --kind decision|pitfall|preference|fact \"<原子事实>\"\n" +
+		"  mem touch <id前8位>\n"
 }
 
 func orGlobal(project string) string {
@@ -413,7 +446,17 @@ const defaultDedupWindowSec = 10
 // 不含 `--limit/--max-chars` 等同理：它们是本工具的旋钮，不该影响「是否为同一事件」。
 func hookDedupKey(in hookInput, event harness.Event) string {
 	h := sha256.New()
-	for _, part := range []string{string(event), in.SessionID, strings.TrimSpace(in.Prompt), in.Cwd} {
+	parts := []string{string(event), in.sessionID(), strings.TrimSpace(in.Prompt), in.Cwd}
+	// PostToolUse 在同一会话里会连续发生。键里只有事件+会话+提问时，
+	// 10 秒窗口会把不同工具调用收成一次，观测被吞掉。
+	// 补上工具名和 tool_use_id：同一次调用的并行配置仍然撞键，不同调用则分开。
+	if event == harness.EventPostToolUse {
+		parts = append(parts, strings.TrimSpace(in.ToolName), strings.TrimSpace(in.ToolUseID))
+		if strings.TrimSpace(in.ToolUseID) == "" {
+			parts = append(parts, compactRaw(in.ToolInput, 120))
+		}
+	}
+	for _, part := range parts {
 		_, _ = io.WriteString(h, part)
 		_, _ = h.Write([]byte{0}) // 分隔符，避免字段拼接歧义
 	}

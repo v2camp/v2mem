@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,11 @@ func TestMain(m *testing.M) {
 	origProfile, hadProfile := os.LookupEnv("USERPROFILE")
 	_ = os.Setenv("HOME", home)
 	_ = os.Setenv("USERPROFILE", home)
+	// 同步测试把远端分支写死为 main。本机 git 未设 init.defaultBranch 时
+	// 空仓库落在 master，push main 会报 refspec 不匹配。钉在测试 HOME 里，不改用户配置。
+	if _, err := exec.LookPath("git"); err == nil {
+		_ = exec.Command("git", "config", "--global", "init.defaultBranch", "main").Run()
+	}
 
 	code := m.Run()
 

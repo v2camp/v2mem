@@ -73,6 +73,9 @@ func cmdAudit(args []string) error {
 		ratio = fmt.Sprintf("%.0f%%", float64(s.Retrievals)/float64(s.Writes)*100)
 	}
 	fmt.Printf("读侧/写侧 : %d / %d 次（读/写比 %s）\n", s.Retrievals, s.Writes, ratio)
+	if s.Observations > 0 {
+		fmt.Printf("观测侧    : %d 次（仅成功写入的 obs-append；触发事件见下方按事件，不进永久记忆）\n", s.Observations)
+	}
 	if s.Writes > 0 {
 		fmt.Printf("写侧构成  : 新增 %d，命中覆盖 %d（重复记录率 %.0f%%）\n",
 			s.Creates, s.Overwrites,

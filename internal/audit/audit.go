@@ -194,16 +194,35 @@ type Summary struct {
 
 	// 读/写两侧分别计数 —— 回答「这套东西到底用起来了没有」要看这两个数，
 	// 而不是看总次数：只有写侧增长说明只记不查，只有读侧增长说明只查不记。
-	Retrievals int `json:"retrievals"` // 读侧：session-start / prompt-submit / manual-search
-	Suppressed int `json:"suppressed"` // 被幂等去重抑制的重复触发次数（>0 说明配置存在重复）
-	Writes     int `json:"writes"`     // 写侧：manual-add / manual-forget
-	Creates    int `json:"creates"`    // 其中新增
-	Overwrites int `json:"overwrites"` // 其中命中「相同知识覆盖」→ 可算重复记录率
+	Retrievals   int `json:"retrievals"`   // 读侧：session-start / prompt-submit / manual-search
+	Suppressed   int `json:"suppressed"`   // 被幂等去重抑制的重复触发次数（>0 说明配置存在重复）
+	Writes       int `json:"writes"`       // 写侧：manual-add / manual-forget
+	Observations int `json:"observations"` // 观测侧：仅成功写入的 obs-append
+	Creates      int `json:"creates"`      // 其中新增
+	Overwrites   int `json:"overwrites"`   // 其中命中「相同知识覆盖」→ 可算重复记录率
 }
 
 // isWriteEvent 判定事件属于写侧。写侧没有 query，「空注入率」不适用于它。
 func isWriteEvent(e string) bool {
 	return e == "manual-add" || e == "manual-forget"
+}
+
+// isObserveEvent 判定事件计入观测侧次数。
+//
+// 只认成功写入的 obs-append。post-tool-use / stop / session-end 仍写进日志
+// （按事件能看见），但与 obs-append 是同一次成功写入的两条记录，再计入就会约 ×2。
+// 它们也不是读侧检索。
+func isObserveEvent(e string) bool {
+	return e == "obs-append"
+}
+
+// isObserveTrigger 是观测钩子的触发记录。留在 ByEvent，不进读/写/观测次数。
+func isObserveTrigger(e string) bool {
+	switch e {
+	case "post-tool-use", "stop", "session-end":
+		return true
+	}
+	return false
 }
 
 // Summarize 汇总。WithQuery 是「能拿来评测的样本数」——
@@ -237,6 +256,10 @@ func Summarize(rs []Record) Summary {
 			case "overwrite":
 				s.Overwrites++
 			}
+		} else if isObserveEvent(r.Event) {
+			s.Observations++
+		} else if isObserveTrigger(r.Event) {
+			// 触发事件与随后的 obs-append 成对出现，次数只记在 obs-append 上。
 		} else {
 			s.Retrievals++
 		}

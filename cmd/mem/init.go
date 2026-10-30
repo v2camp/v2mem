@@ -206,7 +206,7 @@ func initOne(h *harness.Harness, opts initOptions) error {
 		cmd = withMarker(cmd)
 	}
 
-	changed, err := upsertHooksConfig(target, cmd, opts.dryRun)
+	changed, err := writeHooksFor(h, target, cmd, opts.dryRun)
 	if err != nil {
 		return err
 	}
@@ -214,7 +214,7 @@ func initOne(h *harness.Harness, opts initOptions) error {
 	fmt.Printf("harness : %s（%s，%s）\n", h.Name, h.LabelOrName(), h.Tier)
 	fmt.Printf("文件    : %s%s\n", target, map[bool]string{true: "（新建）", false: ""}[isNew])
 	fmt.Printf("命令    : %s\n", cmd)
-	fmt.Printf("事件    : %s、%s\n", harness.EventNames[harness.EventSessionStart], harness.EventNames[harness.EventPromptSubmit])
+	fmt.Printf("事件    : %s\n", formatRegisteredEvents(h))
 	reportWriteResult(opts.dryRun, changed)
 	// 只在写「用户级」配置时才提示未检测到 —— 项目级写入本就该在项目里新建文件，
 	// 那时报「未检测到配置目录」纯属误导。
@@ -442,14 +442,14 @@ func initAtExplicitFile(h *harness.Harness, path, command string, dryRun, instru
 	} else {
 		cmd = withMarker(cmd)
 	}
-	changed, err := upsertHooksConfig(path, cmd, dryRun)
+	changed, err := writeHooksFor(h, path, cmd, dryRun)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("harness : %s（%s，%s · 指定文件）\n", h.Name, h.LabelOrName(), h.Tier)
 	fmt.Printf("文件    : %s\n", path)
 	fmt.Printf("命令    : %s\n", cmd)
-	fmt.Printf("事件    : %s、%s\n", harness.EventNames[harness.EventSessionStart], harness.EventNames[harness.EventPromptSubmit])
+	fmt.Printf("事件    : %s\n", formatRegisteredEvents(h))
 	reportWriteResult(dryRun, changed)
 	printFollowUp(h, false)
 	return nil
@@ -525,54 +525,53 @@ func withMarker(cmd string) string {
 	return cmd + "  " + hookMarker
 }
 
-// upsertHooksConfig 合并写入 hooks 配置，返回是否发生了改动。
-func upsertHooksConfig(path, command string, dryRun bool) (changed bool, err error) {
-	var cfg map[string]any
-	raw, readErr := os.ReadFile(path)
+func registeredEventNames(h *harness.Harness) []string {
+	evs := h.RegisteredEvents()
+	names := make([]string, 0, len(evs))
+	for _, ev := range evs {
+		names = append(names, h.HookEventName(ev))
+	}
+	return names
+}
+
+func formatRegisteredEvents(h *harness.Harness) string {
+	return strings.Join(registeredEventNames(h), "、")
+}
+
+func writeHooksFor(h *harness.Harness, path, command string, dryRun bool) (bool, error) {
+	names := registeredEventNames(h)
+	if h.HookStyle == harness.HookStyleCursor {
+		return upsertCursorHooksConfig(path, command, names, dryRun)
+	}
+	return upsertHooksConfig(path, command, names, dryRun)
+}
+
+// loadConfigFile 读一份 JSON 配置。解析失败直接返回，绝不拿空对象覆盖用户文件。
+func loadConfigFile(path string) (cfg map[string]any, raw []byte, readErr error, err error) {
+	raw, readErr = os.ReadFile(path)
 	switch {
 	case readErr == nil:
 		if len(strings.TrimSpace(string(raw))) > 0 {
-			if err := json.Unmarshal(raw, &cfg); err != nil {
-				// 绝不拿默认值盖掉解析不了的用户文件
-				return false, fmt.Errorf("现有配置文件不是合法 JSON，已中止以免覆盖：%s: %w", path, err)
+			if err = json.Unmarshal(raw, &cfg); err != nil {
+				return nil, raw, readErr, fmt.Errorf("现有配置文件不是合法 JSON，已中止以免覆盖：%s: %w", path, err)
 			}
 		}
 	case os.IsNotExist(readErr):
-		// 首次写入
 	default:
-		return false, readErr
+		return nil, nil, readErr, readErr
 	}
 	if cfg == nil {
 		cfg = map[string]any{}
 	}
+	return cfg, raw, readErr, nil
+}
 
-	hooks, _ := cfg["hooks"].(map[string]any)
-	if hooks == nil {
-		hooks = map[string]any{}
-	}
-
-	for _, ev := range []harness.Event{harness.EventSessionStart, harness.EventPromptSubmit} {
-		name := harness.EventNames[ev]
-		groups := withoutOurs(hooks[name])
-		groups = append(groups, map[string]any{
-			"hooks": []any{
-				map[string]any{
-					"type":    "command",
-					"command": command,
-					"timeout": hookTimeoutSec,
-				},
-			},
-		})
-		hooks[name] = groups
-	}
-	cfg["hooks"] = hooks
-
+func writeConfigFile(path string, cfg map[string]any, raw []byte, readErr error, dryRun bool) (bool, error) {
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return false, err
 	}
 	out = append(out, '\n')
-
 	if dryRun {
 		fmt.Printf("--- 将写入 %s ---\n%s", path, out)
 		return false, nil
@@ -594,6 +593,61 @@ func upsertHooksConfig(path, command string, dryRun bool) (changed bool, err err
 	return true, nil
 }
 
+// upsertHooksConfig 合并写入 Claude 系 hooks 配置（嵌套 hooks 组），返回是否发生了改动。
+func upsertHooksConfig(path, command string, eventNames []string, dryRun bool) (changed bool, err error) {
+	cfg, raw, readErr, err := loadConfigFile(path)
+	if err != nil {
+		return false, err
+	}
+
+	hooks, _ := cfg["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+	}
+
+	for _, name := range eventNames {
+		groups := withoutOurs(hooks[name])
+		groups = append(groups, map[string]any{
+			"hooks": []any{
+				map[string]any{
+					"type":    "command",
+					"command": command,
+					"timeout": hookTimeoutSec,
+				},
+			},
+		})
+		hooks[name] = groups
+	}
+	cfg["hooks"] = hooks
+	return writeConfigFile(path, cfg, raw, readErr, dryRun)
+}
+
+// upsertCursorHooksConfig 写入 Cursor 的扁平 hooks.json。
+// 事件名是 camelCase；每条是 {command, timeout}，不是 Claude 的嵌套组。
+func upsertCursorHooksConfig(path, command string, eventNames []string, dryRun bool) (bool, error) {
+	cfg, raw, readErr, err := loadConfigFile(path)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := cfg["version"]; !ok {
+		cfg["version"] = 1
+	}
+	hooks, _ := cfg["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+	}
+	for _, name := range eventNames {
+		kept := withoutOursFlat(hooks[name])
+		kept = append(kept, map[string]any{
+			"command": command,
+			"timeout": hookTimeoutSec,
+		})
+		hooks[name] = kept
+	}
+	cfg["hooks"] = hooks
+	return writeConfigFile(path, cfg, raw, readErr, dryRun)
+}
+
 // withoutOurs 摘掉本工具上次写入的 hook 组，实现幂等与可升级。
 func withoutOurs(v any) []any {
 	groups, _ := v.([]any)
@@ -609,6 +663,27 @@ func withoutOurs(v any) []any {
 			continue
 		}
 		kept = append(kept, g)
+	}
+	return kept
+}
+
+// withoutOursFlat 摘掉 Cursor 扁平数组里上次写入的 command。
+func withoutOursFlat(v any) []any {
+	items, _ := v.([]any)
+	kept := make([]any, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			kept = append(kept, item)
+			continue
+		}
+		if c, _ := m["command"].(string); c != "" && m["hooks"] == nil && isV2memHookCommand(c) {
+			continue
+		}
+		if hs, _ := m["hooks"].([]any); len(hs) > 0 && allOurs(hs) {
+			continue
+		}
+		kept = append(kept, item)
 	}
 	return kept
 }

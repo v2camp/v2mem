@@ -14,13 +14,13 @@
 | 项 | 现状 |
 |:---|:---|
 | 写库路径 | 仅 3 条：CLI `mem add`（`cmd/mem/main.go:300`）、MCP `add` 工具（`cmd/mem/mcp.go:278`）、`mem ingest`（`cmd/mem/level1.go:94`） |
-| 钩子是写吗 | **否**。钩子（`prompt-submit`/`session-start`/`manual-search`）只做读侧注入，从不写库 |
+| 钩子写永久库吗 | **否**。钩子仍不 `store.Add`。观测缓冲写入同库另表 `observations`（`source=hook-observe`），默认不进 `mem search` |
 | 去重键 | `(content_hash, project)`，跨工程同句各自独立 —— 设计文档明示的既定语义，**不是 bug**（见 `design-dedup-merge` e2e） |
 | 那 208 条是谁 | 脚本紧凑循环调 `mem add` 灌入（对应 ~200 条检索基准）。**既非 hooks 自动灌，也非 LLM 逐条决策**——是第三类：无来源标记的批量写入 |
 
 ## 3. 原则（方案 A：写必由 LLM 决策）
 
-1. **永久记忆只经 LLM 明确决策写入**（CLI/MCP `add`、任务收尾总结）；**hooks 永远只读注入，绝不自动写**。
+1. **永久记忆只经 LLM 明确决策写入**（CLI/MCP `add`、任务收尾总结）；**hooks 绝不 `store.Add` 进 Level 2**。观测只进 `observations`，默认不进检索。
 2. **短时记忆 = 会话注入文件（Level 1）**：由 LLM 在会话内显式维护，容量由 `mem budget` 守卫，机械化迁移交给 `mem ingest`。
 3. **长时记忆 = Level 2 事实库**：以 Harness 任务收尾总结为主写入。
 4. **批量 / bench / test / 搬运写入打 `source` 标记**：写侧审计带来源，用量统计默认排除非生产写入。
@@ -40,7 +40,8 @@
 - `store.AddInput` 增加 `Source string`；取值建议：`harness-summary`（收尾总结）/ `human`（人工 CLI）/ `llm`（LLM 经 MCP）/ `ingest`（机械化搬运）/ `bench` / `test`。
 - 写侧审计记录（`manual-add`）携带 `source`；空值回填 `human` 以兼容旧数据。
 - `mem eval activity`（及收尾结论）**默认排除 `source∈{bench,test}`**，用 `--include-bench` 放开。
-- **hooks 只读护栏**：新增断言/文档，确保钩子事件永不落入写侧计数；为防回归，测试里断言「钩子触发的 read 事件不产生 write」。
+- **hooks 只读护栏**：钩子事件永不落入写侧计数（`manual-add`）；为防回归，测试里断言钩子不产生 write，且 `memories` 条数不变。
+- **观测缓冲**（2026-10-30）：`PostToolUse` / `Stop` / `SessionEnd` 只追加 `observations`。审计里触发事件与 `obs-append` 都留痕，但观测次数**只计成功写入的 `obs-append`**，触发事件不进读侧、写侧或该次数。写库失败落到库旁 `spool/*.jsonl`（默认即 `~/.v2mem/spool`），下次 `SessionStart` 有界 drain。默认无常驻进程。`candidates` / `distill_runs` 仅建空表，本波不跑 distill / accept。
 
 ## 6. 读低估：已知边界（接受，非缺陷）
 
@@ -50,7 +51,8 @@
 
 - 纯新增字段（`source` 空值=旧数据），无破坏；现有库不动。
 - bench 既有数据**不删除**，仅统计层面默认排除。
-- 回滚：撤掉 source 分支的统计过滤即可，DB 无 schema 变更。
+- 回滚：撤掉 source 分支的统计过滤即可；`source` 列本身可留。
+- 观测三表（`observations` / `candidates` / `distill_runs`）由 `CREATE TABLE IF NOT EXISTS` 在 Open 时补上，不改 `memories` 的列。
 
 ## 8. 测试面
 

@@ -306,3 +306,22 @@ INSERT INTO hook_dedup(key, ts) VALUES(?, ?)
 ⚠️ **去重是防御，不该成为留冗余配置的理由**：它让工具对重复配置免疫，
 但冗余配置本身仍浪费一次进程启动。看到抑制数 >0 时，建议顺手清掉一处。
 
+### 12.14 Cursor 与观测事件（2026-10-30）
+
+`mem init --harness cursor` 写 `.cursor/hooks.json`（用户级 `~/.cursor/hooks.json`）：
+`version: 1`，扁平 `{command, timeout}`，事件为
+`sessionStart` / `beforeSubmitPrompt` / `postToolUse` / `preCompact` / `stop` / `sessionEnd`。
+注入走 stdout JSON 的 `additional_context`（`PreCompact` 与 `SessionStart` 共用 `renderHookContext`，
+预算可用 `MEM_PRECOMPACT_BUDGET`）。`postToolUse` / `stop` / `sessionEnd` 只写 `observations`。
+
+**本波注册范围（钉死，不按「文档里出现过这个名字」外推）**：
+
+| 事件 | 谁注册 |
+|:---|:---|
+| `postToolUse` / `preCompact` | **仅 Cursor** |
+| `Stop` | 除 Cursor、dsh 以外、事件表里有 Stop 的 native 工具 |
+| `SessionEnd` | 上述里面事件表确认有 SessionEnd 的；**Codex、TraeCode 不注册**（表上没有） |
+| dsh | 仍只有 SessionStart / UserPromptSubmit（桥接包不翻译 Stop） |
+
+Claude 等的 PostToolUse 字段本波未逐家核销 stdin，所以不给它们加 `ExtraEvents`。不启动常驻进程。
+

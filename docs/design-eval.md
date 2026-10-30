@@ -350,10 +350,12 @@ README、测试全部同步移除。
 
 ### 16.5 连带变化与明确不做
 
-- `mem init` **保持只写两个事件**（SessionStart / UserPromptSubmit）；报告钩子不做。
-  `harness.go` 里已建模的 `EventStop` / `EventSessionEnd` 保留归一化能力，暂不消费。
-- **明确不做**：Stop / SessionEnd ＋ `transcript_path` 机械搬运（沿用 §15.13 判断——
+- `mem init` 在 2026-09-17 **只写两个注入事件**（SessionStart / UserPromptSubmit）；报告钩子不做。
+  2026-10-30 起，支持的 harness 额外注册 Stop（及文档确认有的 SessionEnd），只为写入观测缓冲，
+  仍然不写 `memories`、不跑报告钩子。详见 `design-write-governance.md`。
+- **明确不做**：Stop / SessionEnd ＋ `transcript_path` 机械搬运进永久库（沿用 §15.13 判断——
   transcript_path 各家可用性不一，TraeCode / TraeWork 没有；Stop 每轮触发放大噪声）。
+  观测摘要可以记路径引用，不把 transcript 灌进 Level 2。
 - **诚实边界**：没有 task-start/finish 这类确定性任务边界的项目，任务级自动退化为
   session / period 级；「记」的语义判断依赖模型的事实不变——那是核心能力，不归评测层。
 
