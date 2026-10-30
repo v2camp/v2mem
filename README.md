@@ -52,22 +52,29 @@ v2mem 有两条安装路径，二选一即可：
 | **本地开发软链**（推荐给开发者） | 跟着代码走，改完即生效 | `make build` → `bin/mem`，软链到 PATH | 重新 `make build`，软链自动跟随 |
 
 ```bash
-# 远程发布版（推荐）—— 从 GitHub Releases 下载预编译二进制，失败自动回退源码构建
+# 远程发布版（推荐）—— 下载预编译二进制；失败则浅克隆到临时目录再构建
 curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh | bash
-#   --dir ~/bin     指定安装目录（默认 ~/.local/bin）
-#   --version v0.1.0 指定版本 tag（默认 latest；未传入时拉最新发布）
-#   --from-source   跳过下载，强制源码构建
+# 参数要写在 bash -s -- 后面（写在 bash 后的 --version 是 bash 自己的选项）：
+#   curl -fsSL …/install.sh | bash -s -- --version v0.1.0 --dir ~/bin
+#   --from-source   跳过下载。默认克隆 main；--version 指定 tag 时克隆该 tag
+# 国内模块超时：export GOPROXY=https://goproxy.cn,direct 后再跑
+# （脚本不改写已有的 GOPROXY / GOSUMDB；机器上没有 go 会直接说明原因）
 
 # 本地开发软链 —— 让 $GOBIN 里的 mem 指向仓库构建产物，值随代码变
 make build                                                   # → bin/mem
 ln -sf "$PWD/bin/mem" "$(go env GOPATH)/bin/mem"             # 覆盖式软链
 ```
 
-预编译产物：`mem-darwin-amd64|arm64`、`mem-linux-amd64|arm64`、`mem-windows-amd64.exe`。
+预编译文件名：`mem-darwin-amd64`、`mem-darwin-arm64`、`mem-linux-amd64`、`mem-linux-arm64`、`mem-windows-amd64.exe`。
+`latest` 下载 `…/releases/latest/download/<文件名>`；`--version vX.Y.Z` 下载 `…/releases/download/vX.Y.Z/<文件名>`。
+
+这些文件由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `vX.Y.Z` tag，或于 Actions 里手动跑 `release` 时上传。main 上自动打 tag 仍先过 `eval-gate`；托管 runner 没有金标准对应的记忆库时这一步会失败，不会上传。推 tag 或手动跑 workflow 只再要求覆盖率门禁。某个版本的 Release 里还没有这些文件时，安装脚本回退到源码构建（需要本机已有 `git` 和 `go`）。
+
+Windows 只有 amd64 预编译，且脚本要在 Git Bash / MSYS 里跑（cmd.exe 不行）。默认 `~/.local/bin` 通常不在 Windows Path 中，请加 `--dir`。这条路径没有在 Windows runner 上实测。
 
 > ⚠️ **两条路径会互相覆盖**：`make install`（`go install`）会在 `$GOPATH/bin` 写入**真实文件**，覆盖已存在的软链。
 > 想回发布版就重跑 curl 安装；想回开发软链就重跑上面的 `ln -sf`。发布版与软链处于不同安装目录，互不冲突。
-> **发布版依赖已打 tag 并上传产物**（当前仓库尚未执行）；打 tag / 传产物见 `docs/DEVELOPER.md`。
+> 发版步骤见 [`docs/DEVELOPER.md`](./docs/DEVELOPER.md)。
 
 ---
 

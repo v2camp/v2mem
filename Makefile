@@ -12,6 +12,10 @@ install:
 test:
 	CGO_ENABLED=0 go test ./...
 
+# 安装脚本：dry-run / mock curl·git·go，不访问网络。
+test-install:
+	bash scripts/test-install.sh
+
 # 端到端测试（黑盒）：跑真实二进制，覆盖 安装→初始化→使用→维护→优化→评测→卸载 全生命周期动线。
 # 独立于 go test ./...（e2e 目录带 build tag，默认构建不参与覆盖统计）。
 test-e2e:
@@ -56,6 +60,10 @@ release:
 	git tag "$$TAG"; \
 	echo "已打 tag $$TAG（推送远端：git push origin $$TAG）"
 
+# 发布用的五个预编译文件（名字与 scripts/install.sh 一致），输出到 dist/。
+release-assets:
+	bash scripts/release-assets.sh dist
+
 # 交叉编译示例：Go 内建支持，无需交叉工具链
 build-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/$(BIN)-linux-amd64 $(PKG)
@@ -82,4 +90,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test cover cover-gate cover-update build-linux build-win smoke clean eval-gate release-dry release
+.PHONY: build install test test-install cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate release-dry release
