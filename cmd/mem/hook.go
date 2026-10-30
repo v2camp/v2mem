@@ -25,9 +25,10 @@ import (
 //     「stderr 仅作为 fallback，调试日志可安全写入 stderr，不会污染给 Agent 的反馈」，
 //     其余各家对退出码 0 时的 stderr 也都只做展示。
 //  3. **每轮注入有字符预算**。Level 1 是每轮都要注入的，不做预算会随记忆增长吃掉上下文。
-//  4. **一条命令通吃**。SessionStart / UserPromptSubmit 在 Claude Code、TraeCode、
-//     CodeBuddy、Qoder、QoderWork、Codex 六家都支持「stdout 纯文本被注入上下文」，
-//     故输出格式取纯文本这个最大公约数，不按 harness 分支渲染。
+//  4. **注入格式按宿主分叉**。Claude 系的 SessionStart / UserPromptSubmit 是 stdout 纯文本。
+//     Cursor 的 sessionStart / beforeSubmitPrompt / preCompact 要 JSON
+//     `{"additional_context":"..."}`，纯文本不会被当成注入。
+//     观测事件（postToolUse / stop / sessionEnd）不写 stdout。
 const (
 	defaultHookLimit = 3
 	// defaultHookBudget 是注入内容的字符预算。取 1200 是权衡：

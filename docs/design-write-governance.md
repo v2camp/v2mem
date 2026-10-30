@@ -41,7 +41,7 @@
 - 写侧审计记录（`manual-add`）携带 `source`；空值回填 `human` 以兼容旧数据。
 - `mem eval activity`（及收尾结论）**默认排除 `source∈{bench,test}`**，用 `--include-bench` 放开。
 - **hooks 只读护栏**：钩子事件永不落入写侧计数（`manual-add`）；为防回归，测试里断言钩子不产生 write，且 `memories` 条数不变。
-- **观测缓冲**（2026-10-30）：`PostToolUse` / `Stop` / `SessionEnd` 只追加 `observations`。审计事件 `post-tool-use` / `stop` / `session-end` / `obs-append` 算观测侧，不算读侧或写侧。写库失败落到库旁 `spool/*.jsonl`（默认即 `~/.v2mem/spool`），下次 `SessionStart` 有界 drain。默认无常驻进程。`candidates` / `distill_runs` 仅建空表，本波不跑 distill / accept。
+- **观测缓冲**（2026-10-30）：`PostToolUse` / `Stop` / `SessionEnd` 只追加 `observations`。审计里触发事件与 `obs-append` 都留痕，但观测次数**只计成功写入的 `obs-append`**，触发事件不进读侧、写侧或该次数。写库失败落到库旁 `spool/*.jsonl`（默认即 `~/.v2mem/spool`），下次 `SessionStart` 有界 drain。默认无常驻进程。`candidates` / `distill_runs` 仅建空表，本波不跑 distill / accept。
 
 ## 6. 读低估：已知边界（接受，非缺陷）
 

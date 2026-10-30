@@ -125,6 +125,17 @@ func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
 			t.Errorf("审计应见到 %s，got %+v", ev, rs)
 		}
 	}
+	sum := audit.Summarize(rs)
+	appends := 0
+	for _, r := range rs {
+		if r.Event == "obs-append" {
+			appends++
+		}
+	}
+	if sum.Observations != appends || sum.Writes != 0 {
+		t.Fatalf("观测次数应等于 obs-append（%d），不得把触发事件再算进去，got obs=%d writes=%d",
+			appends, sum.Observations, sum.Writes)
+	}
 }
 
 func TestCmdHookStopDedupesBySessionContent(t *testing.T) {

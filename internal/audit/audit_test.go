@@ -158,16 +158,24 @@ func TestSummarizeSeparatesReadAndWriteSides(t *testing.T) {
 	}
 }
 
-func TestObserveEventsAreNotReadsOrWrites(t *testing.T) {
+func TestObserveAppendCountedOnceNotWithTrigger(t *testing.T) {
 	s := Summarize([]Record{
 		{Event: "prompt-submit", Query: "q"},
 		{Event: "post-tool-use"},
+		{Event: "stop"},
 		{Event: "session-end"},
+		{Event: "obs-append", Source: "hook-observe"},
 		{Event: "obs-append", Source: "hook-observe"},
 		{Event: "manual-add", Mode: "create"},
 	})
-	if s.Retrievals != 1 || s.Writes != 1 || s.Observations != 3 {
-		t.Fatalf("观测侧不得混进读/写，got retrievals=%d writes=%d obs=%d", s.Retrievals, s.Writes, s.Observations)
+	if s.Retrievals != 1 || s.Writes != 1 {
+		t.Fatalf("触发事件不得进读侧或写侧，got retrievals=%d writes=%d", s.Retrievals, s.Writes)
+	}
+	if s.Observations != 2 {
+		t.Fatalf("观测次数应等于成功的 obs-append（2），不得把触发事件再算一遍，got %d", s.Observations)
+	}
+	if s.ByEvent["post-tool-use"] != 1 || s.ByEvent["session-end"] != 1 || s.ByEvent["obs-append"] != 2 {
+		t.Fatalf("按事件仍应看见触发与 obs-append，got %+v", s.ByEvent)
 	}
 }
 

@@ -145,6 +145,8 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 	if auditPath == "-" {
 		return
 	}
+	// 触发事件（post-tool-use / stop / session-end）始终留痕，方便 mem audit 按事件查看。
+	// 观测次数只认下面的 obs-append：成功插入一行才写，避免与触发事件双计。
 	rec := audit.Record{
 		TS: started.Unix(), Event: string(event), Harness: hname,
 		Project: project, SessionID: in.sessionID(),
