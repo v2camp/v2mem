@@ -272,11 +272,15 @@ func notesEnabled() bool {
 	return strings.TrimSpace(os.Getenv("MEM_NO_NOTES")) == ""
 }
 
-// filterRulesCoveredByNotes 去掉已被 notes 小字条覆盖的规则类细节条。
+// filterRulesCoveredByNotes 去掉「已在开场注入里出现过」的规则细节条。
 //
-// 注入分工：硬规则的红线内容以小字条形式（mem notes）从库外单独提供给模型，
-// 若再把同一条规则塞进每轮的检索/硬规则注入里，同一知识会在上下文重复出现，
-// 白占预算。故对规则条的注入做一次过滤 —— 内容已在 notes 里的就不再重复注入。
+// 注入分工（**只有 SessionStart / PreCompact 承载 notes 正文**）：
+// 硬规则的红线内容由 sessionStartContext 的「跨工程硬规则」段注入一次，
+// 等价于 `mem notes` 的规则段。每轮 prompt-submit 若再检索出同一条 rule，
+// 同一知识就在上下文里重复出现、白占预算，故在**检索侧**过滤掉。
+//
+// 注意：本函数只给检索侧用。开场注入侧若也调用它，规则将无处可去
+// （钩子不注入 notes 文本），等于静默丢规则 —— 见 sessionStartContext 的注释。
 //
 // 失败开放：notes 读不出来时判不了「是否被覆盖」，宁可多注入也不漏 ——
 // 与钩子「绝不漏注入」的同一条原则。MEM_NO_NOTES 置位时这里原样返回。
@@ -323,9 +327,14 @@ func sessionStartContext(st *store.Store, project string, limit, maxChars int) (
 	sb.WriteString(codes)
 	var injected []store.Hit
 
-	// 跨工程硬规则
+	// 跨工程硬规则。
+	//
+	// 🔴 这里**不能**按 notes 去重（filterRulesCoveredByNotes）：notes 的规则正文
+	// 只有 `mem notes` 命令会产出，钩子从不注入它；若在此把 kind=rule 过滤掉，
+	// 那条红线就再也没有进入上下文的通道，只能靠人记得手工把 notes 粘到 L1 文件里。
+	// 正确的分工是：本节=notes 的规则段（开场注入一次），每轮检索侧再去重。
 	if raw, err := st.List(store.ListQuery{Scope: "global", Limit: limit}); err == nil && len(raw) > 0 {
-		hits := filterRulesCoveredByNotes(st, raw)
+		hits := raw
 		if block, used := formatHits("硬规则（跨工程，务必遵守）", hits, budget); block != "" {
 			sb.WriteString(block)
 			budget -= used

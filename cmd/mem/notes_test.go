@@ -235,8 +235,10 @@ func TestHookDedupsRuleAndMEMNoNotesReverts(t *testing.T) {
 	}
 }
 
-// 回退同时作用于会话起始：硬规则段在 MEM_NO_NOTES 下不被 notes 去重。
-func TestHookSessionStartDedupRespectsEnv(t *testing.T) {
+// 开场注入侧**不做** notes 去重：notes 的规则正文只由这段注入承载，
+// 若在此过滤，规则将没有任何进入上下文的通道（去重只在每轮检索侧做）。
+// MEM_NO_NOTES 只影响检索侧，对开场注入无差别 —— 两种模式都必须能注入。
+func TestHookSessionStartInjectsRuleRegardlessOfNotesEnv(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
 	ruleContent := "全局红线：数据库不放代码目录"
@@ -244,17 +246,15 @@ func TestHookSessionStartDedupRespectsEnv(t *testing.T) {
 		t.Fatalf("cmdAdd: %v", err)
 	}
 
-	// 默认去重生效：SessionStart 的硬规则段不重复注入同一 rule
 	out, err := withStdin(t, hookStdin("SessionStart", proj, ""),
 		func() error { return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0"}) })
 	if err != nil {
 		t.Fatalf("cmdHook: %v", err)
 	}
-	if strings.Contains(out, ruleContent) {
-		t.Errorf("SessionStart 默认不应重复注入已被 notes 覆盖的 rule，got:\n%s", out)
+	if !strings.Contains(out, ruleContent) {
+		t.Errorf("SessionStart 必须注入硬规则正文（notes 的规则段由它承载），got:\n%s", out)
 	}
 
-	// 回退后恢复
 	t.Setenv("MEM_NO_NOTES", "1")
 	outNoNotes, err := withStdin(t, hookStdin("SessionStart", proj, ""),
 		func() error { return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0"}) })
@@ -262,6 +262,6 @@ func TestHookSessionStartDedupRespectsEnv(t *testing.T) {
 		t.Fatalf("cmdHook no-notes: %v", err)
 	}
 	if !strings.Contains(outNoNotes, ruleContent) {
-		t.Errorf("MEM_NO_NOTES 置位应恢复原始注入，got:\n%s", outNoNotes)
+		t.Errorf("MEM_NO_NOTES 置位后开局注入同样应含该规则，got:\n%s", outNoNotes)
 	}
 }

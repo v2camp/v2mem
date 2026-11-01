@@ -195,6 +195,29 @@ func TestCmdHookSessionStartInjectsHardRulesAndProjectMemory(t *testing.T) {
 	}
 }
 
+// 回归：默认（notes 启用）时，kind=rule 的跨工程硬规则必须出现在 SessionStart 注入里。
+//
+// 规则正文只由开场注入承载（钩子从不调用 `mem notes`）。若开场侧也按 notes 去重，
+// 规则就整条消失 —— 这正是修复前的实际行为。
+func TestCmdHookSessionStartInjectsKindRuleByDefault(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	const rule = "commit 前必跑 make cover-gate"
+	if err := cmdAdd([]string{"--db", db, "--global", "--kind", "rule", rule}); err != nil {
+		t.Fatalf("cmdAdd rule: %v", err)
+	}
+
+	out, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if !strings.Contains(out, rule) {
+		t.Errorf("SessionStart 应注入 kind=rule 的硬规则正文，got:\n%s", out)
+	}
+}
+
 // 钩子只是「告诉模型还有多级记忆可查」——必须给出可执行的检索指令，否则模型不会去查。
 func TestCmdHookSessionStartTeachesRetrievalCommands(t *testing.T) {
 	db := testDB(t)
