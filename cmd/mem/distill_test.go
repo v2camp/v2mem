@@ -1,12 +1,16 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/distill"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -396,5 +400,241 @@ func TestImportTranscriptDirSinceAndDryRun(t *testing.T) {
 	}
 	if err := cmdImportTranscript([]string{"--db", db, "--into", "nope"}); err == nil {
 		t.Fatal("非法 --into 应失败")
+	}
+}
+
+// ---------- P0：错误语义与写入成功计数 ----------
+
+// execSQL 直接对库执行 DDL。命令层测试需要制造「写库失败」，
+// 而 store 既没有、也不该暴露这种口子，所以测试自己开连接。
+func execSQL(t *testing.T, db, stmt string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(stmt); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// decodeJSONOut 解析命令的 --json 输出。
+func decodeJSONOut(t *testing.T, out string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(out), &m); err != nil {
+		t.Fatalf("JSON 输出不可解析: %v\n%s", err, out)
+	}
+	return m
+}
+
+func num(m map[string]any, key string) float64 {
+	if v, ok := m[key].(float64); ok {
+		return v
+	}
+	return -1
+}
+
+// --json 必须能区分 ok / empty / fail 三种结局。
+// 旧实现只输出 {"candidates":N}，失败与「合法 0 条」长得一模一样。
+func TestDistillJSONDistinguishesTriState(t *testing.T) {
+	db := testDB(t)
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []store.ObsInput{
+		{SessionID: "s-ok", Event: "post-tool-use", Summary: "决策：JSON 要能看出成功"},
+		{SessionID: "s-empty", Event: "stop", Summary: "stop status=completed"},
+		{SessionID: "s-fail", Event: "post-tool-use", Summary: "决策：模型不可用要能看出来"},
+	} {
+		if _, err := st.AppendObservation(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+
+	out, err := captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--session", "s-ok", "--provider", "none", "--json", "--audit-file", "-"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeJSONOut(t, out)
+	if got["status"] != "ok" || num(got, "inserted") != 1 || num(got, "failed") != 0 {
+		t.Fatalf("成功应为 ok/inserted=1，got %v", got)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--session", "s-empty", "--provider", "none", "--json", "--audit-file", "-"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = decodeJSONOut(t, out)
+	if got["status"] != "empty" {
+		t.Fatalf("合法 0 条应为 empty，got %v", got)
+	}
+	if num(got, "inserted") != 0 || num(got, "failed") != 0 || num(got, "failed_sessions") != 0 {
+		t.Fatalf("empty 不应计失败，got %v", got)
+	}
+
+	// 缺 key ⇒ 模型不可用 ⇒ fail，且与 empty 明确不同。
+	t.Setenv("OPENAI_API_KEY", "")
+	out, err = captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--session", "s-fail", "--provider", "openai", "--json", "--audit-file", "-"})
+	})
+	if err != nil {
+		t.Fatalf("默认 fail-open，不该以 error 返回: %v", err)
+	}
+	got = decodeJSONOut(t, out)
+	if got["status"] != "fail" || num(got, "failed_sessions") != 1 {
+		t.Fatalf("模型不可用应为 fail，got %v", got)
+	}
+	if err := cmdDistill([]string{"--db", db, "--session", "s-fail", "--provider", "openai", "--strict", "--audit-file", "-"}); err == nil {
+		t.Fatal("--strict 下 fail 必须非零退出")
+	}
+}
+
+// 部分落库时必须同时报 inserted 与 failed。
+// 只报一个数都会说谎：报了 inserted 会掩盖丢数据，报 failed 会让人以为一条没成。
+func TestDistillPartialInsertReportsBothCounts(t *testing.T) {
+	db := testDB(t)
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []store.ObsInput{
+		{SessionID: "s", Event: "post-tool-use", Summary: "决策：甲条要进库"},
+		{SessionID: "s", Event: "post-tool-use", Summary: "报错：乙条会写失败"},
+	} {
+		if _, err := st.AppendObservation(o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 只让含「乙」的候选插入失败，制造「一条成一条败」。
+	execSQL(t, db, `CREATE TRIGGER fail_cand BEFORE INSERT ON candidates
+		WHEN NEW.content LIKE '%乙%' BEGIN SELECT RAISE(ABORT, 'boom'); END`)
+	st.Close()
+
+	out, err := captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--session", "s", "--provider", "none", "--json", "--audit-file", "-"})
+	})
+	if err != nil {
+		t.Fatalf("默认 fail-open，不该以 error 返回: %v", err)
+	}
+	got := decodeJSONOut(t, out)
+	if got["status"] != "partial" {
+		t.Fatalf("部分落库应为 partial，got %v", got)
+	}
+	if num(got, "inserted") != 1 || num(got, "failed") != 1 {
+		t.Fatalf("必须同时报 inserted=1 failed=1，got %v", got)
+	}
+	if err := cmdDistill([]string{"--db", db, "--session", "s", "--provider", "none", "--strict", "--audit-file", "-"}); err == nil {
+		t.Fatal("--strict 下部分失败必须非零退出（沉默的成功就是谎报）")
+	}
+
+	st, err = store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	list, err := st.ListCandidates("pending", "s", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || !strings.Contains(list[0].Content, "甲") {
+		t.Fatalf("失败的候选不应落库，成功的应在，got %+v", list)
+	}
+	// 部分失败不能占窗口，否则丢掉的那条永远补不回来。
+	done, err := st.DistillWindowDone("s", distill.WindowKey(observationIDs(t, st, "s")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done {
+		t.Fatal("partial 不得占住蒸馏窗口")
+	}
+}
+
+// observationIDs 取会话观测 id（按时间正序，与 distillOne 一致），用于算窗口键。
+func observationIDs(t *testing.T, st *store.Store, session string) []string {
+	t.Helper()
+	obs, err := st.ObservationsForDistill(session, 0, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, len(obs))
+	for i, o := range obs {
+		ids[i] = o.ID
+	}
+	return ids
+}
+
+// --all-pending 中途失败时，已采纳的结果不能被丢掉。
+// 旧实现第一条失败就 return，但前面几条其实已经落库（审计也写了），
+// 于是审计数 > 用户看到数。
+func TestAcceptAllPendingKeepsSuccessesOnFailure(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ kind, content string }{
+		{"decision", "决定：坏的一条"},
+		{"decision", "决定：好的一条"},
+		{"task", "待办：好的另一条"},
+	} {
+		if _, err := st.InsertCandidate(store.CandidateInput{
+			SessionID: "s", Kind: c.kind, Content: c.content, Source: "distill",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	execSQL(t, db, `CREATE TRIGGER fail_mem BEFORE INSERT ON memories
+		WHEN NEW.content LIKE '%坏%' BEGIN SELECT RAISE(ABORT, 'boom'); END`)
+	st.Close()
+
+	out, err := captureStdout(t, func() error {
+		return cmdAccept([]string{"--db", db, "--all-pending", "--session", "s", "--audit-file", ap})
+	})
+	if err == nil {
+		t.Fatal("有一个候选采纳失败时应返回错误")
+	}
+	if n := strings.Count(out, "已采纳"); n != 2 {
+		t.Fatalf("已成功的 2 条必须照常打印，got %d:\n%s", n, out)
+	}
+	if countAllMemories(t, db) != 2 {
+		t.Fatalf("已成功的候选必须留在库里，got %d", countAllMemories(t, db))
+	}
+	rs, err := audit.Read(ap, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepts := 0
+	for _, r := range rs {
+		if r.Event == "accept" {
+			accepts++
+		}
+	}
+	// 审计数与用户看到的一致：不许出现「审计 3 条、只打印 0 条」。
+	if accepts != 2 || accepts != strings.Count(out, "已采纳") {
+		t.Fatalf("审计=%d 打印=%d，应都等于 2", accepts, strings.Count(out, "已采纳"))
+	}
+
+	// 剩下的失败项重试仍失败，但 --json 要把失败单独列出来。
+	out, err = captureStdout(t, func() error {
+		return cmdAccept([]string{"--db", db, "--all-pending", "--session", "s", "--json", "--audit-file", "-"})
+	})
+	if err == nil {
+		t.Fatal("仍有失败时应返回错误")
+	}
+	got := decodeJSONOut(t, out)
+	if num(got, "inserted") != 0 || num(got, "failed_count") != 1 {
+		t.Fatalf("JSON 应区分成功与失败，got %v", got)
+	}
+	if failed, ok := got["failed"].([]any); !ok || len(failed) != 1 {
+		t.Fatalf("failed 应列出失败项，got %v", got["failed"])
 	}
 }

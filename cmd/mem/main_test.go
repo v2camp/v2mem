@@ -740,7 +740,8 @@ func TestCmdAddRejectsGlobalCombinedWithProject(t *testing.T) {
 	}
 }
 
-// M5b-0：--no-fuzzy 关闭模糊检索，措辞不同的近亲不再进入结果。
+// M5b-0：--no-fuzzy 关闭模糊检索。P0 之后 broad 路常开，措辞不同的近亲仍可能
+// 由 broad 带回，但不得越过精确命中——关掉的是模糊路的贡献，不是召回本身。
 func TestCmdSearchNoFuzzyFlagDisablesFuzzy(t *testing.T) {
 	db := testDB(t)
 	if err := cmdAdd([]string{"--db", db, "日志怎么放进记忆库里"}); err != nil {
@@ -766,8 +767,13 @@ func TestCmdSearchNoFuzzyFlagDisablesFuzzy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdSearch --no-fuzzy: %v", err)
 	}
-	if strings.Contains(noFuzzyOut, "日志怎么放进记忆库里") {
-		t.Errorf("--no-fuzzy 应关闭模糊检索，got: %q", noFuzzyOut)
+	target := strings.Index(noFuzzyOut, "日志怎么搬进记忆库里")
+	near := strings.Index(noFuzzyOut, "日志怎么放进记忆库里")
+	if target < 0 {
+		t.Errorf("--no-fuzzy 不该丢掉精确命中的条目，got: %q", noFuzzyOut)
+	}
+	if near >= 0 && near < target {
+		t.Errorf("--no-fuzzy 时近亲只能由 broad 排在后位，got: %q", noFuzzyOut)
 	}
 }
 

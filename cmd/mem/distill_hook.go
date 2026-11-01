@@ -94,7 +94,7 @@ func distillPendingFailOpen(db, auditPath string) {
 			fmt.Fprintln(os.Stderr, "v2mem hook: distill pending 到达时间上限，剩余留到下次")
 			return
 		}
-		if _, _, err := distillOne(st, distillJob{
+		if _, err := distillOne(st, distillJob{
 			Session: sid, Provider: "none", Audit: auditPath, DB: db,
 			Model: "rules", Timeout: time.Second,
 		}); err != nil {

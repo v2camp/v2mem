@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/store"
@@ -499,5 +500,66 @@ func TestHookEventIDReplayAndNoScrub(t *testing.T) {
 	}
 	if !saw {
 		t.Fatalf("--no-scrub 应保留密钥: %+v", obs)
+	}
+}
+
+// spool 是兜底路径，兜底失败必须能被看见。
+// 旧实现没有大小上限：库长期不可写时 spool 会一直长，最后把磁盘写满。
+func TestAppendSpoolSizeLimitIsVisible(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "mem.db")
+	path := spoolFile(db, "big")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, spoolMaxBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := appendSpool(db, store.ObsInput{SessionID: "big", Event: "stop", Summary: "写不进去了"})
+	if err == nil || !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("超过上限必须报错而不是继续追加，got %v", err)
+	}
+	// 正常容量下写入必须落盘且带换行（JSONL 追加的前提）。
+	okPath := spoolFile(db, "ok")
+	if err := appendSpool(db, store.ObsInput{SessionID: "ok", Event: "stop", Summary: "正常一条"}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(okPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(string(b), "\n") || !strings.Contains(string(b), "正常一条") {
+		t.Fatalf("spool 应为 JSONL，got %q", string(b))
+	}
+}
+
+// 坏行丢弃是对的（不挡后面的），但必须计数上报 —— 静默丢弃等于把观测丢失藏起来。
+func TestDrainSpoolCountsDroppedLines(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "mem.db")
+	path := spoolFile(db, "s")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	good, err := json.Marshal(store.ObsInput{SessionID: "s", Event: "stop", Summary: "一条好观测"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "这不是 JSON\n" + string(good) + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	done, dropped, err := drainOneSpool(st, path, "-", 10, time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done != 1 || dropped != 1 {
+		t.Fatalf("应补写 1 条并上报 1 条坏行，got done=%d dropped=%d", done, dropped)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("drain 完成后 spool 文件应删除")
 	}
 }

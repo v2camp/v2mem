@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/v2camp/v2mem/internal/similarity"
+	"modernc.org/sqlite"
 )
 
 // 候选是蒸馏 / 导入的隔离区。默认不进 fts_mem，mem search 看不见。
@@ -97,6 +101,24 @@ func unmarshalObsIDs(s string) []string {
 	return ids
 }
 
+// isUniqueViolation 用驱动的结构化错误码判断唯一约束冲突。
+//
+// 为什么不用 strings.Contains(err.Error(), "UNIQUE")：错误文案不是 API。
+// SQLite 升级、本地化、包装层次变化都会让这句话对不上；一旦对不上，
+// 「重复插入（本应去重）」会被当成真失败上报，蒸馏的成功计数就变成了谎话。
+func isUniqueViolation(err error) bool {
+	var se *sqlite.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	const (
+		sqliteConstraint       = 19   // SQLITE_CONSTRAINT：驱动未给扩展码时的退化情形
+		sqliteConstraintUnique = 2067 // SQLITE_CONSTRAINT_UNIQUE
+	)
+	code := se.Code()
+	return code == sqliteConstraintUnique || code == sqliteConstraint
+}
+
 // InsertCandidate 写入一条 pending 候选。同会话同内容已有 pending/accepted 时不双插。
 func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 	in.Content = strings.TrimSpace(in.Content)
@@ -146,14 +168,19 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 		id, in.SessionID, in.Project, in.Kind, in.Content, hash, in.Source, in.Channel,
 		in.Salience, marshalObsIDs(in.ObsIDs), now)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			err = s.db.QueryRow(
-				`SELECT id FROM candidates WHERE session_id = ? AND content_hash = ?`,
-				in.SessionID, hash).Scan(&existing)
-			if err != nil {
+		if isUniqueViolation(err) {
+			// 并发插入命中部分唯一索引（status IN pending/accepted）：按去重处理。
+			// 查不到对应行说明冲突来自别处（比如触发器 ABORT），原样把插入错误报上去，
+			// 不能为了「去重」把真实故障吞成 sql.ErrNoRows。
+			var found string
+			if qerr := s.db.QueryRow(
+				`SELECT id FROM candidates
+				  WHERE session_id = ? AND content_hash = ? AND status IN ('pending','accepted')
+				  ORDER BY created_at DESC, id DESC LIMIT 1`,
+				in.SessionID, hash).Scan(&found); qerr != nil {
 				return nil, err
 			}
-			c, gerr := s.candidateByID(existing)
+			c, gerr := s.candidateByID(found)
 			if gerr != nil {
 				return nil, gerr
 			}
@@ -272,35 +299,127 @@ func (s *Store) AcceptCandidate(idOrPrefix string) (*AcceptResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.Status == "accepted" && c.MemoryID != "" {
+	if c.Status == "accepted" {
+		if c.MemoryID == "" {
+			return nil, fmt.Errorf("候选 %s 已采纳但缺少 memory_id，不能采纳", c.ID)
+		}
+		// 幂等重放：这里必须**补边**而不是直接返回。
+		// 旧实现直接 return，若上次在「更新候选」与「插边」之间失败，
+		// 再调用永远走这条路，derived_from 就永久缺失，且候选已 accepted 再也修不回来。
+		if err := s.ensureDerivedEdge(c.MemoryID, c.ID); err != nil {
+			return nil, err
+		}
 		return &AcceptResult{Candidate: *c, MemoryID: c.MemoryID, Hash: c.Hash, Already: true}, nil
 	}
 	if c.Status != "pending" {
 		return nil, fmt.Errorf("候选 %s 状态为 %s，不能采纳", c.ID, c.Status)
 	}
-	added, err := s.Add(AddInput{
-		Content: c.Content, Kind: c.Kind, Project: c.Project,
-		Source: "distill-accept", Channel: c.Channel, Salience: c.Salience, Tool: "distill",
-	})
+	return s.acceptTx(c)
+}
+
+// acceptTx 在一个事务里完成「写 memories + 回填候选 + 补 derived_from 边」。
+//
+// 为什么要单事务：三步原来各自独立提交，中间任何一步失败都会留下半状态——
+// 记忆写了但候选还 pending（下次重跑会重复写），或候选 accepted 但边没插（溯源丢失）。
+// 半状态是**不可自动修复**的，所以只能靠事务整体回滚来避免。
+//
+// 注意：这里没有调用 s.Add —— Add 自己开事务，无法与外层合并；
+// 因此把 Add 的「相同知识覆盖 / 新增」语义在此重写一遍，包含内容索引与签名，
+// 保证 accept 出来的记忆与直接 add 出来的形态一致。
+func (s *Store) acceptTx(c *Candidate) (*AcceptResult, error) {
+	source := "distill-accept"
+	channel, err := DefaultChannel(c.Channel, source)
 	if err != nil {
 		return nil, err
 	}
+	salience := c.Salience
+	if salience <= 0 || salience > 1 {
+		salience = 0.5
+	}
+	device, _ := os.Hostname()
+	hash := HashOf(c.Content)
+	idx := indexText(c.Content)
 	now := time.Now().Unix()
-	if _, err := s.db.Exec(
-		`UPDATE candidates SET status='accepted', decided_at=?, memory_id=? WHERE id=?`,
-		now, added.ID, c.ID); err != nil {
+
+	tx, err := s.db.Begin()
+	if err != nil {
 		return nil, err
 	}
-	if _, err := s.db.Exec(
+	defer tx.Rollback()
+
+	var id string
+	created := false
+	err = tx.QueryRow(
+		`SELECT id FROM memories WHERE content_hash = ? AND project = ?`, hash, c.Project,
+	).Scan(&id)
+	switch {
+	case err == nil:
+		// 相同知识覆盖：刷新时间戳、累加命中、salience 取较大值（与 Add 一致）。
+		if _, err = tx.Exec(
+			`UPDATE memories SET content = ?, content_idx = ?, updated_at = ?, last_seen_at = ?,
+			        access_count = access_count + 1, salience = MAX(salience, ?),
+			        origin_tool = ?, source = ?
+			 WHERE id = ?`,
+			c.Content, idx, now, now, salience, "distill", source, id); err != nil {
+			return nil, err
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		created = true
+		id = newID()
+		if _, err = tx.Exec(
+			`INSERT INTO memories
+			   (id, content, content_idx, kind, content_hash, project, salience,
+			    created_at, updated_at, last_seen_at, expires_at,
+			    origin_device, origin_tool, source, channel, provenance, access_count)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,NULL,0)`,
+			id, c.Content, idx, c.Kind, hash, c.Project, salience,
+			now, now, now, device, "distill", source, channel); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, err
+	}
+
+	// 签名与新内容同事务写入，否则 MinHash 检索会漏掉这条记忆。
+	if _, err = tx.Exec(
+		`INSERT OR REPLACE INTO mem_sigs(memory_id, sig) VALUES (?, ?)`,
+		id, encodeSig(similarity.Sign(c.Content))); err != nil {
+		return nil, err
+	}
+	// 只允许 pending → accepted：并发重复采纳时第二个事务不会覆盖第一个回填的 memory_id。
+	res, err := tx.Exec(
+		`UPDATE candidates SET status='accepted', decided_at=?, memory_id=?
+		  WHERE id=? AND status='pending'`, now, id, c.ID)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		return nil, fmt.Errorf("候选 %s 状态已变化，未采纳", c.ID)
+	}
+	// INSERT OR IGNORE：边是幂等的，重放/补边都不该报错。
+	if _, err = tx.Exec(
 		`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
-		added.ID, c.ID); err != nil {
+		id, c.ID); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	updated, err := s.candidateByID(c.ID)
 	if err != nil {
 		return nil, err
 	}
-	return &AcceptResult{Candidate: *updated, MemoryID: added.ID, Hash: added.Hash, Already: !added.Created}, nil
+	return &AcceptResult{Candidate: *updated, MemoryID: id, Hash: hash, Already: !created}, nil
+}
+
+// ensureDerivedEdge 幂等补一条 derived_from 边（src=记忆，dst=候选）。
+func (s *Store) ensureDerivedEdge(memoryID, candidateID string) error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
+		memoryID, candidateID)
+	return err
 }
 
 // RejectCandidate 把 pending 候选标成 rejected。不写 memories。
@@ -360,6 +479,9 @@ func (s *Store) GCCandidates(pendingAge, acceptedAge time.Duration) (*CandGCResu
 }
 
 // DistillWindowDone 报告这个会话的观测窗口是否已经成功蒸馏过。
+//
+// empty 也算「已处理」：模型明确说了没有事实，重跑同一窗口只会再烧一次推理，
+// 结果仍然是空。所以空结果同样要占住窗口，否则空会话会被无限重复蒸馏。
 func (s *Store) DistillWindowDone(sessionID, windowKey string) (bool, error) {
 	if sessionID == "" || windowKey == "" {
 		return false, nil
@@ -367,7 +489,7 @@ func (s *Store) DistillWindowDone(sessionID, windowKey string) (bool, error) {
 	var n int
 	err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM distill_runs
-		  WHERE session_id = ? AND window_key = ? AND status = 'ok'`,
+		  WHERE session_id = ? AND window_key = ? AND status IN ('ok','empty')`,
 		sessionID, windowKey).Scan(&n)
 	if err != nil {
 		return false, err
@@ -387,7 +509,9 @@ func (s *Store) SaveDistillRun(r DistillRun) error {
 	if r.FinishedAt == 0 {
 		r.FinishedAt = now
 	}
-	if r.Status != "ok" {
+	// 只有「拿到了确定结论」的运行才占窗口：ok 和 empty 都是确定结论，
+	// fail / partial / skipped 都留空，让下轮还能重试。
+	if r.Status != "ok" && r.Status != "empty" {
 		r.WindowKey = ""
 	}
 	for i := 0; i < 3; i++ {
@@ -415,6 +539,7 @@ func (s *Store) SaveDistillRun(r DistillRun) error {
 }
 
 // SessionsNeedingDistill 返回「有观测、且比上次成功蒸馏更新」的会话。
+// empty 与 ok 一样算成功：空结果不会因为重跑而变出事实。
 func (s *Store) SessionsNeedingDistill(limit int) ([]string, error) {
 	if limit <= 0 {
 		limit = 20
@@ -424,7 +549,7 @@ func (s *Store) SessionsNeedingDistill(limit int) ([]string, error) {
 		  FROM observations o
 		  LEFT JOIN (
 		    SELECT session_id, MAX(finished_at) AS fin
-		      FROM distill_runs WHERE status = 'ok' GROUP BY session_id
+		      FROM distill_runs WHERE status IN ('ok','empty') GROUP BY session_id
 		  ) d ON d.session_id = o.session_id
 		 WHERE o.session_id <> ''
 		 GROUP BY o.session_id

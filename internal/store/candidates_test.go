@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -395,5 +396,186 @@ func TestSearchUnaffectedByCandidateVolume(t *testing.T) {
 	}
 	if len(hits) != 0 {
 		t.Fatalf("候选不得被检索，got %+v", hits)
+	}
+}
+
+// 采纳必须在单事务里完成：任一步失败都不能留下半状态。
+// 这里让「插 derived_from 边」失败（前面的写记忆、回填候选都已执行），
+// 断言整笔回滚；去掉故障后重试必须一次成功，且不产生重复记忆或悬空边。
+func TestAcceptRollsBackOnMidFailureAndIsRepairable(t *testing.T) {
+	s := newTestStore(t)
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Project: "p", Kind: "decision",
+		Content: "决定：采纳要么全成要么全不成", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(
+		`CREATE TRIGGER fail_edges BEFORE INSERT ON edges
+		 BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptCandidate(res.Candidate.ID); err == nil {
+		t.Fatal("补边失败时采纳必须报错")
+	}
+	var memories, edges int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&memories); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM edges`).Scan(&edges); err != nil {
+		t.Fatal(err)
+	}
+	if memories != 0 || edges != 0 {
+		t.Fatalf("失败必须整笔回滚，memories=%d edges=%d", memories, edges)
+	}
+	c, err := s.candidateByID(res.Candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Status != "pending" || c.MemoryID != "" {
+		t.Fatalf("回滚后候选应仍是 pending 且无 memory_id，got %+v", c)
+	}
+
+	if _, err := s.db.Exec(`DROP TRIGGER fail_edges`); err != nil {
+		t.Fatal(err)
+	}
+	acc, err := s.AcceptCandidate(res.Candidate.ID)
+	if err != nil {
+		t.Fatalf("故障排除后应能修复: %v", err)
+	}
+	if acc.Candidate.Status != "accepted" || acc.MemoryID == "" {
+		t.Fatalf("修复后应采纳成功，got %+v", acc)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&memories); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM edges WHERE src=? AND dst=? AND rel='derived_from'`,
+		acc.MemoryID, res.Candidate.ID).Scan(&edges); err != nil {
+		t.Fatal(err)
+	}
+	if memories != 1 || edges != 1 {
+		t.Fatalf("应恰好 1 条记忆 1 条边，memories=%d edges=%d", memories, edges)
+	}
+	// 悬空边：每条 derived_from 的 src 都必须能在 memories 里找到。
+	var dangling int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM edges e LEFT JOIN memories m ON m.id = e.src
+		  WHERE e.rel='derived_from' AND m.id IS NULL`).Scan(&dangling); err != nil {
+		t.Fatal(err)
+	}
+	if dangling != 0 {
+		t.Fatalf("不得有悬空边，got %d", dangling)
+	}
+}
+
+// 已采纳的候选再次调用必须补回缺失的边。
+// 旧实现直接 return，边一旦丢失就永久缺失，且因为状态已是 accepted 再也修不回来。
+func TestAcceptAlreadyRepairsMissingEdge(t *testing.T) {
+	s := newTestStore(t)
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Kind: "pitfall", Content: "报错：边丢了就补回来", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.AcceptCandidate(res.Candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM edges WHERE src=?`, first.MemoryID); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.AcceptCandidate(res.Candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Already || again.MemoryID != first.MemoryID {
+		t.Fatalf("重复采纳应幂等，got %+v", again)
+	}
+	var edges int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM edges WHERE src=? AND dst=? AND rel='derived_from'`,
+		first.MemoryID, res.Candidate.ID).Scan(&edges); err != nil {
+		t.Fatal(err)
+	}
+	if edges != 1 {
+		t.Fatalf("重放应补回边，got %d", edges)
+	}
+}
+
+// 唯一冲突必须靠驱动错误码识别，而不是错误文案。
+// 用例同时验证「真实冲突被认出来」和「仅仅文案像 UNIQUE 的 error 不被误判」。
+func TestUniqueViolationDetectedByErrorCode(t *testing.T) {
+	s := newTestStore(t)
+	ins := func() error {
+		_, err := s.db.Exec(`INSERT INTO candidates(
+			id, session_id, project, kind, content, content_hash, status, source, salience, obs_ids_json, created_at
+		) VALUES (?, 's', '', 'decision', '同一条', ?, 'pending', 'distill', 0.5, '[]', 1)`,
+			newID(), HashOf("同一条"))
+		return err
+	}
+	if err := ins(); err != nil {
+		t.Fatal(err)
+	}
+	err := ins()
+	if err == nil {
+		t.Fatal("同会话同内容应触发唯一约束")
+	}
+	if !isUniqueViolation(err) {
+		t.Fatalf("应识别为唯一冲突，got %v", err)
+	}
+	if isUniqueViolation(errors.New("UNIQUE constraint failed: candidates.session_id")) {
+		t.Fatal("不应再凭文案判重")
+	}
+	if isUniqueViolation(nil) {
+		t.Fatal("nil 不应判为唯一冲突")
+	}
+}
+
+// rejected 不占唯一键：拒绝过的内容允许重新进入 pending。
+func TestInsertCandidateAfterRejectIsNew(t *testing.T) {
+	s := newTestStore(t)
+	first, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Kind: "task", Content: "待办：拒绝后还能再来", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RejectCandidate(first.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Kind: "task", Content: "待办：拒绝后还能再来", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Created || again.Candidate.ID == first.Candidate.ID {
+		t.Fatalf("拒绝后应允许重新插入，got %+v", again)
+	}
+}
+
+// empty 结果也要占住窗口：否则空会话每次启动都被重新蒸馏。
+func TestEmptyRunClaimsWindow(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SaveDistillRun(DistillRun{
+		SessionID: "s", Provider: "none", Status: "empty", WindowKey: "w-empty",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done, err := s.DistillWindowDone("s", "w-empty")
+	if err != nil || !done {
+		t.Fatalf("empty 应占窗口，done=%v err=%v", done, err)
+	}
+	if err := s.SaveDistillRun(DistillRun{
+		SessionID: "s", Provider: "none", Status: "fail", WindowKey: "w-fail",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done, err = s.DistillWindowDone("s", "w-fail")
+	if err != nil || done {
+		t.Fatalf("fail 不应占窗口，done=%v err=%v", done, err)
 	}
 }

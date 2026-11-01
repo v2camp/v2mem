@@ -128,8 +128,11 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 | **过期机制** | 三种并存：① 硬 TTL（`expires_at`）② 久用衰减（`gc --max-idle` + `--min-salience`）③ 被取代（`superseded_by`，从检索中隐去但保留可追溯） | ✅ |
 | **基于标记的归并** | 跨设备 JSONL 导入的字段级规则：tags 并集、`created_at` 取最早、`updated_at`/`last_seen_at` 取较晚、`access_count`/`salience` 取 max、`expires_at` NULL 优先。详见 §7.2 | ✅ |
 
-**相似归并的准确性来自护栏而非阈值**（实现细节见 §11.10）。检索排序当前为
-`bm25 ASC, salience DESC, last_seen_at DESC`；RRF 融合向量路排名留待 M5b ⏳。
+**相似归并的准确性来自护栏而非阈值**（实现细节见 §11.10）。检索现在是**三路召回 + 加权 RRF**：
+精确 / 放宽 / 模糊三路各自取候选池后统一融合，融合分母只统计**真正产出结果的流**（单信号时
+不被稀释）；同等相关时按 Ebbinghaus 派生分 `Decayed`（λ=0.01/天）决定先后。
+派生分**只算不写回**——写回会被 sync 的 `MAX(salience)` 抬回旧值且无法幂等，
+三条理由见 `internal/store/decay.go` 顶部。向量路排名留待 M5b ⏳。
 
 ## 6. 检索接口与 Level 1 钩子契约
 

@@ -2,6 +2,7 @@ package distill
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -233,5 +234,126 @@ func TestCompleteOllamaFailOpen(t *testing.T) {
 	_, err := completeOllama(ctx, "missing-model-for-test", "hi")
 	if err == nil {
 		t.Fatal("不存在的本地模型应失败")
+	}
+}
+
+// ---------- 三态与类型化错误 ----------
+
+// llmOpt 构造一个「一定走 LLM 分支」的选项，Complete 由用例给定。
+func llmOpt(complete func(context.Context, ModelSpec, string) (string, error)) Options {
+	return Options{
+		Provider: "openai",
+		Getenv: func(k string) string {
+			if k == "OPENAI_API_KEY" {
+				return "k"
+			}
+			return ""
+		},
+		Complete: complete,
+	}
+}
+
+// 0 条不是失败。模型明确「没有可抽取的事实」时必须是 empty，
+// 否则调用方只能把合法空结果也报成故障。
+func TestRunZeroFactsIsEmptyNotFail(t *testing.T) {
+	cases := map[string]string{
+		"空输出":        "",
+		"空数组":        "[]",
+		"全是不合规 kind": `[{"kind":"fact","content":"不该要"}]`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			out := Run([]Observation{{ID: "1", Summary: "x"}}, llmOpt(
+				func(context.Context, ModelSpec, string) (string, error) { return raw, nil }))
+			if out.Status != StatusEmpty {
+				t.Fatalf("应判 empty，got %+v", out)
+			}
+			if out.Failed() || out.Error != "" || out.Err != nil || len(out.Facts) != 0 {
+				t.Fatalf("empty 不应带错误，got %+v", out)
+			}
+		})
+	}
+}
+
+// 规则抽取抽不到同样是 empty：观测里真的没有可记的事实。
+func TestRunRulesZeroFactsIsEmpty(t *testing.T) {
+	out := Run([]Observation{{ID: "1", Summary: "stop status=completed"}}, Options{Provider: "none"})
+	if out.Status != StatusEmpty || out.Failed() {
+		t.Fatalf("规则抽不到应为 empty，got %+v", out)
+	}
+}
+
+// 坏响应与模型不可用必须是两个可区分的原因，否则调用方无法决定
+// 「换个 prompt」还是「重试/降级」。
+func TestRunTypedErrorsAreDistinguishable(t *testing.T) {
+	bad := Run([]Observation{{ID: "1", Summary: "x"}}, llmOpt(
+		func(context.Context, ModelSpec, string) (string, error) { return "这不是 JSON", nil }))
+	if bad.Status != StatusFail || !errors.Is(bad.Err, ErrBadResponse) {
+		t.Fatalf("坏响应应 ErrBadResponse，got %+v", bad)
+	}
+	if errors.Is(bad.Err, ErrLLMUnavailable) || errors.Is(bad.Err, ErrNoFacts) {
+		t.Fatalf("坏响应不应同时命中其它原因: %v", bad.Err)
+	}
+
+	down := Run([]Observation{{ID: "1", Summary: "x"}}, llmOpt(
+		func(context.Context, ModelSpec, string) (string, error) {
+			return "", errors.New("connection refused")
+		}))
+	if down.Status != StatusFail || !errors.Is(down.Err, ErrLLMUnavailable) {
+		t.Fatalf("连接失败应 ErrLLMUnavailable，got %+v", down)
+	}
+	if !strings.Contains(down.Error, "connection refused") {
+		t.Fatalf("Error 应保留底层原因，got %q", down.Error)
+	}
+
+	// 缺 key / 未知 provider 也属于「模型不可用」。
+	noKey := Run(nil, Options{Provider: "openai", Getenv: func(string) string { return "" }})
+	if !errors.Is(noKey.Err, ErrLLMUnavailable) {
+		t.Fatalf("缺 key 应 ErrLLMUnavailable，got %v", noKey.Err)
+	}
+	unknown := Run(nil, Options{Provider: "nope"})
+	if !errors.Is(unknown.Err, ErrLLMUnavailable) {
+		t.Fatalf("未知 provider 应 ErrLLMUnavailable，got %v", unknown.Err)
+	}
+}
+
+func TestRunTimeoutIsUnavailable(t *testing.T) {
+	out := Run([]Observation{{ID: "1", Summary: "x"}}, Options{
+		Provider: "openai",
+		Timeout:  20 * time.Millisecond,
+		Getenv: func(k string) string {
+			if k == "OPENAI_API_KEY" {
+				return "k"
+			}
+			return ""
+		},
+		Complete: func(ctx context.Context, _ ModelSpec, _ string) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		},
+	})
+	if !errors.Is(out.Err, ErrLLMUnavailable) {
+		t.Fatalf("超时应 ErrLLMUnavailable，got %v", out.Err)
+	}
+}
+
+func TestParseFactsErrorKinds(t *testing.T) {
+	for _, raw := range []string{"", "   ", "[]", `[{"kind":"fact","content":"x"}]`} {
+		if _, err := ParseFacts(raw); !errors.Is(err, ErrNoFacts) {
+			t.Fatalf("%q 应 ErrNoFacts，got %v", raw, err)
+		}
+	}
+	for _, raw := range []string{"这不是 JSON", `{"kind":"decision",`} {
+		if _, err := ParseFacts(raw); !errors.Is(err, ErrBadResponse) {
+			t.Fatalf("%q 应 ErrBadResponse，got %v", raw, err)
+		}
+	}
+	if _, err := ParseFacts("[1,2]"); !errors.Is(err, ErrBadResponse) {
+		t.Fatalf("数组元素类型不对应 ErrBadResponse，got %v", err)
+	}
+	// 坏行与好行混排：好行留下，不因为坏行判失败。
+	facts, err := ParseFacts("前言\n" + `{"kind":"task","content":"还剩一步"}` + "\n{坏的}")
+	if err != nil || len(facts) != 1 {
+		t.Fatalf("混排应留下好行，got %+v %v", facts, err)
 	}
 }

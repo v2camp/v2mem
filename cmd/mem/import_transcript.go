@@ -67,33 +67,32 @@ func cmdImportTranscript(args []string) error {
 	}
 	defer st.Close()
 
-	imported := 0
-	skipped := 0
-	sessions := map[string]bool{}
+	var stats importStats
+	stats.Sessions = map[string]bool{}
+	var fileErrs []error
 	for _, path := range files {
-		n, sk, sess, err := importClaudeFile(st, path, importOpts{
+		got, err := importClaudeFile(st, path, importOpts{
 			Project: *project, Since: sinceUnix, Dry: *dry, Limit: *limit,
-			NoScrub: *noScrub, Already: imported,
+			NoScrub: *noScrub, Already: stats.Written,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "v2mem import-transcript: %s: %v（已跳过该文件）\n", path, err)
+			// 文件级失败必须影响退出码：整份 transcript 没进来是数据丢失，
+			// 不能靠 stderr 一句话就让调用方以为成功。
+			fileErrs = append(fileErrs, fmt.Errorf("%s: %w", path, err))
 			continue
 		}
-		imported += n
-		skipped += sk
-		for s := range sess {
-			sessions[s] = true
-		}
-		if *limit > 0 && imported >= *limit {
+		stats.add(got)
+		if *limit > 0 && stats.Written >= *limit {
 			break
 		}
-		fmt.Fprintf(os.Stderr, "v2mem import-transcript: %s 导入 %d 行\n", path, n)
+		fmt.Fprintf(os.Stderr, "v2mem import-transcript: %s 导入 %d 行\n", path, got.Written)
 	}
 
 	candN := 0
 	if (*into == "both" || *into == "candidates") && !*dry {
-		for sid := range sessions {
-			_, n, err := distillOne(st, distillJob{
+		for sid := range stats.Sessions {
+			rep, err := distillOne(st, distillJob{
 				Session: sid, Provider: "none", Audit: "-", DB: c.db,
 				Model: "rules", Timeout: time.Second,
 			})
@@ -101,16 +100,56 @@ func cmdImportTranscript(args []string) error {
 				fmt.Fprintf(os.Stderr, "v2mem import-transcript: 会话 %s 规则蒸馏失败，已放过: %v\n", sid, err)
 				continue
 			}
-			candN += n
+			candN += rep.Inserted
 		}
 	}
 	if c.json {
-		return printJSON(map[string]any{
-			"observations": imported, "skipped": skipped, "candidates": candN, "into": *into, "dry_run": *dry,
-		})
+		if err := printJSON(map[string]any{
+			// observations 保留旧字段名（= written），新字段把四类结局拆开。
+			"observations": stats.Written,
+			"written":      stats.Written,
+			"duplicate":    stats.Duplicate,
+			"empty":        stats.Empty,
+			"filtered":     stats.Filtered,
+			"failed":       stats.Failed,
+			"skipped":      stats.Duplicate + stats.Empty + stats.Filtered,
+			"candidates":   candN,
+			"files_failed": len(fileErrs),
+			"into":         *into,
+			"dry_run":      *dry,
+		}); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("观测 %d 行，重复 %d，空行 %d，超出时间窗 %d，写失败 %d，候选 %d（未写 memories）\n",
+			stats.Written, stats.Duplicate, stats.Empty, stats.Filtered, stats.Failed, candN)
 	}
-	fmt.Printf("观测 %d 行，跳过 %d，候选 %d（未写 memories）\n", imported, skipped, candN)
-	return nil
+	return errors.Join(fileErrs...)
+}
+
+// importStats 是导入的账目。
+//
+// 为什么必须拆开：旧实现只有一个 skipped 计数器，把「重复」「空内容」「since 过滤」
+// 「写库失败」全塞在一起。于是「写库失败 100 条」和「100 条重复」在输出上完全一样，
+// 数据丢失被伪装成正常的幂等跳过。
+type importStats struct {
+	Written   int // 真正新建的观测行数（dry-run 时为「本应写入」）
+	Duplicate int // 内容已存在，命中幂等去重
+	Empty     int // 正文为空
+	Filtered  int // 早于 --since
+	Failed    int // 写库失败（真实的错误，不是跳过）
+	Sessions  map[string]bool
+}
+
+func (s *importStats) add(o importStats) {
+	s.Written += o.Written
+	s.Duplicate += o.Duplicate
+	s.Empty += o.Empty
+	s.Filtered += o.Filtered
+	s.Failed += o.Failed
+	for sid := range o.Sessions {
+		s.Sessions[sid] = true
+	}
 }
 
 type importOpts struct {
@@ -122,28 +161,28 @@ type importOpts struct {
 	Already int
 }
 
-func importClaudeFile(st *store.Store, path string, opt importOpts) (imported, skipped int, sessions map[string]bool, err error) {
+func importClaudeFile(st *store.Store, path string, opt importOpts) (importStats, error) {
+	stats := importStats{Sessions: map[string]bool{}}
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, nil, err
+		return stats, err
 	}
 	defer f.Close()
 	lines, err := transcript.ParseClaudeJSONL(f)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return 0, 0, nil, err
+		return stats, err
 	}
-	sessions = map[string]bool{}
 	for _, line := range lines {
-		if opt.Limit > 0 && opt.Already+imported >= opt.Limit {
+		if opt.Limit > 0 && opt.Already+stats.Written >= opt.Limit {
 			break
 		}
 		if opt.Since > 0 && line.At > 0 && line.At < opt.Since {
-			skipped++
+			stats.Filtered++
 			continue
 		}
 		text := strings.TrimSpace(line.Text)
 		if text == "" {
-			skipped++
+			stats.Empty++
 			continue
 		}
 		text = scrub.Apply(text, opt.NoScrub)
@@ -152,9 +191,9 @@ func importClaudeFile(st *store.Store, path string, opt importOpts) (imported, s
 		if project == "" {
 			project = line.Project
 		}
-		sessions[line.SessionID] = true
 		if opt.Dry {
-			imported++
+			stats.Written++
+			stats.Sessions[line.SessionID] = true
 			continue
 		}
 		res, err := st.AppendObservation(store.ObsInput{
@@ -164,16 +203,20 @@ func importClaudeFile(st *store.Store, path string, opt importOpts) (imported, s
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "v2mem import-transcript: 写观测失败，已跳过该行: %v\n", err)
-			skipped++
+			// 写失败单独计数：这不是「跳过」，是丢数据。
+			stats.Failed++
 			continue
 		}
+		// 会话标记必须放在写库成功之后。原来放在写之前，写失败的行也会把会话
+		// 推进到规则蒸馏，蒸馏读到的是不完整的历史，候选与观测对不上。
+		stats.Sessions[line.SessionID] = true
 		if res.Created {
-			imported++
+			stats.Written++
 		} else {
-			skipped++
+			stats.Duplicate++
 		}
 	}
-	return imported, skipped, sessions, nil
+	return stats, nil
 }
 
 func jsonlFiles(dir string) ([]string, error) {
