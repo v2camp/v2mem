@@ -241,22 +241,26 @@ func TestHarnessesWithoutEnvAreMarked(t *testing.T) {
 //
 // 起因：两者最初都按「官方文档未发布钩子配置」判为 instruction（靠模型遵守指令，概率性）。
 // 真相要从**应用包本身**看：
-//   - WorkBuddy 内置 CodeBuddy CLI 与文档，用户级钩子就是 ~/.codebuddy/settings.json；
-//     其内置插件 hooks.json 也是 CodeBuddy 格式。→ 与 codebuddy 共用配置。
+//   - WorkBuddy 的 agent 运行时是内置的 CodeBuddy CLI（钩子格式一致），故为 native；
+//     但**用户级配置**不在 ~/.codebuddy/settings.json，而在 ~/.workbuddy/settings.json
+//     —— 内置 CLI 取 <WORKBUDDY_CONFIG_DIR>/settings.json，桌面端把该变量设成 ~/.workbuddy。
+//     2026-11-01 实机对照已验证（写错文件 1.5 天零触发，写对文件立刻触发）。
 //   - TraeWork(TRAE SOLO) 的 workbench JS 资产表直接声明 .trae/hooks.json（项目级）
 //     与 hooks.json（全局），harness dylib 内含同一套事件与 HookExecContext 字段。
 //
 // 教训：判断某工具支不支持钩子，**不要只看它的官方文档或它自己的 settings.json**，
-// 要看他内置的 Agent 运行时是谁的。
+// 要看他内置的 Agent 运行时是谁的；而「配置文件在哪」必须实机验证 ——
+// 运行时同构不代表配置路径同构。
 func TestDesktopAppsAreNativeNotInstruction(t *testing.T) {
 	cases := []struct {
 		name       string
 		projectCfg string
 		globalCfg  string
 		projectEnv string
+		observed   bool // 是否已在本机观察到真实会话触发
 	}{
-		{"workbuddy", ".codebuddy/settings.json", "~/.codebuddy/settings.json", "CODEBUDDY_PROJECT_DIR"},
-		{"traework", ".trae/hooks.json", "~/.trae-cn/hooks.json", "TRAE_PROJECT_DIR"},
+		{"workbuddy", ".codebuddy/settings.json", "~/.workbuddy/settings.json", "CODEBUDDY_PROJECT_DIR", true},
+		{"traework", ".trae/hooks.json", "~/.trae-cn/hooks.json", "TRAE_PROJECT_DIR", false},
 	}
 	for _, c := range cases {
 		h, err := Get(c.name)
@@ -275,10 +279,20 @@ func TestDesktopAppsAreNativeNotInstruction(t *testing.T) {
 		if !hasPath(h.ProjectEnv, c.projectEnv) {
 			t.Errorf("%s 项目目录环境变量应含 %q（钩子靠它定位工程），got %v", c.name, c.projectEnv, h.ProjectEnv)
 		}
-		// 待实机验证的表述必须留着 —— 静态分析不等于观察到真实触发
 		joined := strings.Join(h.Notes, " ")
-		if !strings.Contains(joined, "待实机验证") {
-			t.Errorf("%s 的 Notes 应显式标注「待实机验证」（路径来自静态分析，未观测到真实触发）", c.name)
+		if c.observed {
+			// 已实测的就不该再挂着「待实机验证」，否则下次排查会把已验证的结论当猜测
+			if strings.Contains(joined, "待实机验证") {
+				t.Errorf("%s 已实机验证，Notes 不应再写「待实机验证」：%s", c.name, joined)
+			}
+			if !strings.Contains(joined, "实测") {
+				t.Errorf("%s 的 Notes 应记录实测结论（写哪个文件才生效）", c.name)
+			}
+			continue
+		}
+		// 未实测的必须显式标注 —— 静态分析不等于观察到真实触发
+		if !strings.Contains(joined, "待实机验证") && !strings.Contains(joined, "面板未暴露") {
+			t.Errorf("%s 的 Notes 应显式标注未实机验证（路径来自静态分析）", c.name)
 		}
 	}
 }

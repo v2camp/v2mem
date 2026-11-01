@@ -306,26 +306,30 @@ var registry = []Harness{
 		Aliases: []string{"work-buddy", "wb"},
 		Label:   "WorkBuddy",
 		Tier:    TierNative,
-		// 证据取自应用包本身。决定权**不在**应用自己的 ~/.workbuddy/settings.json
-		// （那份只有 IM 通道绑定与凭据、无 hooks 段），而在它内置的 CodeBuddy 运行时：
-		//   · WorkBuddy.app 内自带 CodeBuddy CLI 及中文文档，hooks.md 明确列出
-		//     用户级 ~/.codebuddy/settings.json、项目级 <项目根>/.codebuddy/settings.json、
-		//     项目本地 <项目根>/.codebuddy/settings.local.json
-		//   · 内置插件 sheetagent 的 hooks/hooks.json 就是 CodeBuddy 格式
-		//     （type:command + ${CODEBUDDY_PLUGIN_ROOT}）
-		//   · 环境变量 ${CODEBUDDY_PROJECT_DIR} / ${CODEBUDDY_PLUGIN_ROOT} / ${CODEBUDDY_SKILL_DIR}
-		// 故与 codebuddy 共用同一份用户级配置：写一处，两个工具都生效。
-		GlobalConfig:  []string{"~/.codebuddy/settings.json"},
+		// 证据分两轮，结论要一起看：
+		//
+		// 第一轮（应用包静态分析，判定 Tier）：WorkBuddy 的 agent 运行时确实是内置的
+		// CodeBuddy CLI —— 应用包内自带该 CLI 与中文 hooks 文档，内置插件 hooks.json
+		// 也是 CodeBuddy 格式（type:command + ${CODEBUDDY_PLUGIN_ROOT}），环境变量是
+		// ${CODEBUDDY_PROJECT_DIR}。所以它是 native，不是 instruction。
+		//
+		// 第二轮（本机实机观测，判定**用户级配置文件在哪**）：不是 ~/.codebuddy/settings.json。
+		// 内置 CLI 的用户设置取自 <config dir>/settings.json，而桌面端把
+		// WORKBUDDY_CONFIG_DIR 设成了 ~/.workbuddy。2026-11-01 实测：同样的 hooks 写在
+		// ~/.codebuddy/settings.json 挂机 1.5 天，审计 0 条 hook 事件；改写到
+		// ~/.workbuddy/settings.json 后，同一份 CLI 立刻产出 prompt-submit /
+		// session-start / stop。A/B 对照：WORKBUDDY_CONFIG_DIR 指向哪个目录，
+		// 读的就是哪个目录下的 settings.json。
+		GlobalConfig:  []string{"~/.workbuddy/settings.json"},
 		ProjectConfig: []string{".codebuddy/settings.json", ".codebuddy/settings.local.json"},
 		ProjectEnv:    []string{"CODEBUDDY_PROJECT_DIR"},
 		Verify:        "新开一个 WorkBuddy 会话，再 `mem audit --tail 5` 看是否出现 prompt-submit 记录",
 		Docs:          "https://www.workbuddy.cn/docs/workbuddy/Overview",
 		Notes: []string{
-			"🔴 原判为指令级是错的：不该只看应用自己的 settings.json，要看他内置的 Agent 运行时",
-			"与 codebuddy 共用 ~/.codebuddy/settings.json —— 无需单独安装",
-			"⚠️ 两者共用同一运行时（WorkBuddy 内置 CodeBuddy），故钩子侧无法区分二者；配置里保留运行时本名 codebuddy 作为标签，审计中的 harness 字段也会是 codebuddy —— 这是事实而非缺陷，二者钩子行为完全一致",
+			"🔴 运行时是内置 CodeBuddy CLI（故 native），但用户级配置在 ~/.workbuddy/settings.json —— 与 codebuddy 那份同名文件不是一份",
+			"实测（2026-11-01）：写 ~/.codebuddy/settings.json 永不触发；写 ~/.workbuddy/settings.json 立刻触发。判据是 WORKBUDDY_CONFIG_DIR",
+			"项目级仍按 .codebuddy/settings.json 寻址；桌面端项目级配置是否生效尚未单独验证",
 			"兜底通道仍在：`mem init --scope instruction` 把指令写进 AGENTS.md，但那是概率性的",
-			"⚠️ 待实机验证：路径取自应用包内文档，尚未观察到桌面端会话触发（验证方法见 Verify）",
 		},
 	},
 	{

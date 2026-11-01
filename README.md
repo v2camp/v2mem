@@ -221,8 +221,10 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 
 1. **向量检索（M5b）暂缓**：`sqlite-vec` 的 Go 绑定当前不可用（锁在落后 18 个小版本的驱动上，
    唯一能编译的组合运行时报 wazero 特性错）。建议先做零成本替代项：复用已实现的 MinHash 签名 + RRF 融合（§13）
-2. **WorkBuddy / TraeWork 钩子路径来自应用包静态分析**（尚未观察到真实会话触发）。
-   验证：用一次后看 `mem audit --tail 5` 是否出现 `prompt-submit` 记录
+2. **TraeWork 钩子路径来自应用包静态分析**（面板未暴露 hooks 选项，尚未观察到真实会话触发）。
+   验证：用一次后看 `mem audit --tail 5` 是否出现 `prompt-submit` 记录。
+   WorkBuddy 已实机验证：用户级钩子读 `~/.workbuddy/settings.json`，**不是** `~/.codebuddy/settings.json`
+   （判据 `WORKBUDDY_CONFIG_DIR`；写错文件的症状是「配置正确但审计零记录」）
 3. **检索退化是启发式**：只在精确表达式 0 命中时才放宽，不做更聪明的查询改写
 4. **审计日志记录提问原文**，见上文「数据与隐私」
 
