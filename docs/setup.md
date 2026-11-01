@@ -45,12 +45,13 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 | codex | codex-cli | Codex CLI | native | `~/.codex/hooks.json` | — |
 | dsh | deepseek-harness | DeepSeek Harness | bridge | 复用 `~/.claude/settings.json` | — |
 | traework | trae-work, tw, trae-solo | TraeWork（原 TRAE SOLO） | native | `~/.trae-local` / `~/.trae-cn` / `~/.trae/hooks.json` | ⚠️ 面板未暴露 |
-| workbuddy | work-buddy, wb | WorkBuddy | native | `~/.codebuddy/settings.json`（共用） | ⚠️ 待实机验证 |
+| workbuddy | work-buddy, wb | WorkBuddy | native | `~/.workbuddy/settings.json` | ✅ 已验证生效（内置 CLI 实测） |
 
 关键事实：
 - **traecode 已验证**：面板启用 + 提问后，审计出现 `prompt-submit/session-start | traecode`——读侧注入闭环打通。
 - **traework 面板未暴露 hooks 选项**：应用包内确含 `global_hooks_enabled`、`import_claude_folders` 等运行时开关（静态分析证据），但设置界面没有 hooks 入口——用户实测不可配。hooks 能力在运行时存在，可能只是未出面板或需开关开启。⚠️ 待进一步验证。
-- **workbuddy ≡ codebuddy**：共用 `~/.codebuddy/settings.json`，审计中 harness 字段会是 `codebuddy`（事实而非缺陷）。
+- **workbuddy ≠ codebuddy 的配置**：运行时同是内置 CodeBuddy CLI，但用户级配置读的是 `<WORKBUDDY_CONFIG_DIR>/settings.json`
+  = `~/.workbuddy/settings.json`。写 `~/.codebuddy/settings.json` 永远不触发（2026-11-01 实测：挂机 1.5 天，审计 0 条）。
 - **traecode 会额外读 claude 的同份配置**：给 claude 配 hooks 会顺带覆盖 TraeCode。
 - **dsh**：原生非 shell hook（Cordis 插件），本工具不产出插件代码，只在池用官方桥接包 `dsh-hooks-claude-code` / `dsh-hooks-codex`。Tier 也因此记为 `bridge`。
 
@@ -68,10 +69,14 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 
 ### 3A.2 WorkBuddy（内置 CodeBuddy 运行时）
 
-- 用户级 hooks：`~/.codebuddy/settings.json`。
-- **唯一生效路径**：`/hooks` 面板审查确认后应用；直接编辑 settings.json 的外部修改不生效。
-- 注意全局开关：settings.json 里存在 `"disableAllHooks": true` 会禁用全部；frontmatter hooks 需 `allowUntrustedFrontmatterHooks: true`（普通 command hooks 不受此项限制）。
-- 已开会话不一定即时生效，需新建会话。
+- 用户级 hooks：`~/.workbuddy/settings.json` 的 `hooks` 段（**不是** `~/.codebuddy/settings.json`）。
+  判据是 `WORKBUDDY_CONFIG_DIR`：内置 CLI 读 `<该变量>/settings.json`，桌面端把它设成 `~/.workbuddy`。
+- **实测（2026-11-01）**：直接写入该文件，内置 CLI 启动即执行钩子（审计出现
+  `prompt-submit` / `session-start` / `stop`），无需 `/hooks` 面板确认。
+  反向对照：同一份钩子写在 `~/.codebuddy/settings.json`，挂机 1.5 天审计 0 条。
+- 注意全局开关：`"disableAllHooks": true` 会禁用全部；frontmatter hooks 需
+  `allowUntrustedFrontmatterHooks: true`（普通 command hooks 不受此项限制）。
+- 已开会话不即时生效，需新建会话（每轮由新进程读取设置）。
 
 ### 3A.3 其他支持 MCP 的宿主
 

@@ -22,7 +22,7 @@
 | Codex CLI | native | SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PermissionRequest / PreCompact / PostCompact / SubagentStart / SubagentStop / Stop | **无（只走 stdin `cwd`）** | `~/.codex/hooks.json`（或 config.toml 的 `[hooks]`） | developers.openai.com/codex/hooks |
 | DeepSeek Harness (dsh) | **bridge** | Cordis 扩展点：`agent/session-start`、`agent/pre-step`、`tools/pre-execute`、`tools/post-execute`、`session/event` | 插件内 `ctx` | 无 hooks.json；桥接包读 `~/.claude/settings.json` | dsh 官方文档 |
 | TraeWork（TRAE SOLO） | **native**（更正，原判 instruction） | 同名 6 事件 | `TRAE_PROJECT_DIR` / `CLAUDE_PROJECT_DIR` | `<项目>/.trae/hooks.json`；全局为数据目录下 `hooks.json` | 应用包内证据，见 §12.13 |
-| WorkBuddy | **native**（更正，原判 instruction） | 同 CodeBuddy | `CODEBUDDY_PROJECT_DIR` | `~/.codebuddy/settings.json`（与 CodeBuddy 共用） | 应用包内证据，见 §12.13 |
+| WorkBuddy | **native**（更正，原判 instruction） | 同 CodeBuddy | `CODEBUDDY_PROJECT_DIR` | `~/.workbuddy/settings.json`（**不是** codebuddy 那份） | 实机对照已验证，见 §12.13 |
 
 用户点名的 8 个入口 → 注册表名的映射（有测试固化）：
 `trae work→traework`、`trae code→traecode`、`work buddy→workbuddy`、`code buddy→codebuddy`、
@@ -247,18 +247,19 @@ grep -o -E '.{80}hooks\.json.{80}' ".../workbench.desktop.main.solo-lite-slim.js
 | 应用包内含 CodeBuddy CLI 及中文文档 | `hooks.md` 明确列出用户级 `~/.codebuddy/settings.json`、项目级 `<项目根>/.codebuddy/settings.json`、项目本地 `.codebuddy/settings.local.json` |
 | 内置插件用的是 CodeBuddy 格式 | `builtin-plugins/sheetagent/hooks/hooks.json` → `type:"command"` + `${CODEBUDDY_PLUGIN_ROOT}` |
 | 环境变量 | `CODEBUDDY_PROJECT_DIR` / `CODEBUDDY_PLUGIN_ROOT` / `CODEBUDDY_SKILL_DIR` |
-| 结论 | WorkBuddy 的 Agent 运行时**就是 CodeBuddy**，故与 `codebuddy` 共用同一份用户级配置 |
+| 结论（Tier） | Agent 运行时**就是 CodeBuddy**，故判 native |
+| 结论（配置路径） | ❌ 不是共用 `~/.codebuddy/settings.json`：内置 CLI 读 `<WORKBUDDY_CONFIG_DIR>/settings.json`，桌面端把该变量设成 `~/.workbuddy` |
+| 实机对照（2026-11-01） | 写 `~/.codebuddy/settings.json` 挂机 1.5 天 → 审计 **0** 条 hook 事件；改写 `~/.workbuddy/settings.json` → 同一份 CLI 立即产出 `prompt-submit` / `session-start` / `stop`。A/B：`WORKBUDDY_CONFIG_DIR` 指哪个目录就读哪个目录 |
 
 **两点必须讲清**：
 
-1. **两者共用同一运行时**，故钩子侧无法区分 WorkBuddy 与 CodeBuddy Code。配置里保留运行时本名
-   `codebuddy` 作为标签，审计中的 `harness` 字段也会是 `codebuddy`。这是事实而非缺陷。
-2. **路径与事件来自静态分析，尚未观察到真实会话触发。** 验证方法：
-   用一次之后 `mem audit --tail 5` 看是否出现 `prompt-submit` 记录；有即生效。
-   注册表的 `Notes` 里保留了「⚠️ 待实机验证」，并有测试断言这句话必须在。
+1. **运行时同构 ≠ 配置路径同构。** 判 native 看运行时是对的，判「配置写哪」必须实机验证。
+   本案的教训是：静态分析只到「它用什么钩子实现」，到不了「它从哪个文件读配置」。
+2. **v2mem 因此给 workbuddy 单列一份 `GlobalConfig`**（`~/.workbuddy/settings.json`），
+   不再与 `codebuddy` 共用。项目级仍按 `.codebuddy/settings.json` 寻址，桌面端项目级是否生效未单独验证。
 
 **已安装**：TraeWork 项目级 → `<repo>/.trae/hooks.json`（该目录已被本仓库 gitignore，属本地文件）；
-WorkBuddy → 复用 `~/.codebuddy/settings.json`（无需单独安装）。
+WorkBuddy → `~/.workbuddy/settings.json`（`mem init --harness workbuddy` 写入，勿手改）。
 
 **副作用（留给用户判断）**：既然两者原生钩子已就位，写进 `AGENTS.md` 的指令块就是**冗余兜底**，
 代价 +344 tokens/轮。**待实机验证钩子确实触发后**，可考虑移除那一块省 token；
