@@ -74,6 +74,9 @@ Windows 只有 amd64 预编译，且脚本要在 Git Bash / MSYS 里跑（cmd.ex
 
 > ⚠️ **两条路径会互相覆盖**：`make install`（`go install`）会在 `$GOPATH/bin` 写入**真实文件**，覆盖已存在的软链。
 > 想回发布版就重跑 curl 安装；想回开发软链就重跑上面的 `ln -sf`。发布版与软链处于不同安装目录，互不冲突。
+> ⚠️ **worktree 里构建不生效**：软链固定指向主仓库的 `bin/mem`，在 `.worktree/<任务>/` 下 `make build`
+> 只更新该 worktree 自己的产物。要验证分支行为，得在该 worktree 里重跑一次上面的 `ln -sf`（`$PWD` 即该 worktree），
+> 切回主仓库后再跑一次。也因此**分支合入 main 并清理后要重建主分支**，否则验证到的仍是旧二进制（见 `AGENTS.md` 任务流程）。
 > 发版步骤见 [`docs/DEVELOPER.md`](./docs/DEVELOPER.md)。
 
 ---

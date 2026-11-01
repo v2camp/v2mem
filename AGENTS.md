@@ -3,6 +3,7 @@
 ## 任务流程
 
 本仓库的任务在独立 git worktree 中开发（一任务一分支一 worktree，全部建于 `.worktree/` 下），收尾时合入 main 并清理 worktree 与分支。
+**合入并清理后，必须询问是否跑 `make build`**：`$(go env GOPATH)/bin/mem` 是指向主仓库 `bin/mem` 的软链，worktree 里的构建产物它看不到——不重建，验证到的就是旧二进制。
 版本管理规则：发版在 main 打语义化 tag（vX.Y.Z），只打在通过 `make cover-gate` 的提交上。
 
 ## 设计权威
