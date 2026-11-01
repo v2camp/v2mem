@@ -44,9 +44,14 @@ type Record struct {
 	// Source 仅写侧使用：标记写入来源（human|llm|ingest|harness-summary|bench|test|distill-accept）。
 	// 用量视图默认排除 bench/test/distill-pending，避免程序化灌库污染统计。
 	Source string `json:"source,omitempty"`
-	// Provider / Count 用于 distill / accept / reject。
+	// Provider / Count / Failed 用于 distill / accept / reject。
 	Provider string `json:"provider,omitempty"`
-	Count    int    `json:"count,omitempty"`
+	// Count 不用 omitempty：蒸馏/采纳失败时 Count=0，字段消失会让「0 条」和
+	// 「这条记录没写计数」在后处理里无法区分——统计工具会把缺失当成「不适用」。
+	Count int `json:"count"`
+	// Failed 是本次批量操作中未能落库的条数。与 Count 并存才能看出「部分成功」：
+	// 只有 Count 时，inserted=3/failed=7 与 inserted=3/failed=0 长得一模一样。
+	Failed int `json:"failed,omitempty"`
 }
 
 // Path 返回默认审计日志路径（与库同目录，便于一起备份/清理）。

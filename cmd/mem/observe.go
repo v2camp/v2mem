@@ -25,6 +25,10 @@ const (
 	spoolDrainBudget       = 200 * time.Millisecond
 	observeSourceMeta      = `{"source":"hook-observe"}`
 	observeSummaryMaxRunes = 400
+	// spoolMaxBytes 是单个 spool 文件的上限。
+	// 无上限时，库长期不可写会让 spool 无限增长，把磁盘写满 ——
+	// 本来是「兜底」的机制反而成了新的故障源。
+	spoolMaxBytes = 8 << 20
 )
 
 func isObserveHook(event harness.Event) bool {
@@ -235,12 +239,22 @@ func appendSpool(db string, obs store.ObsInput) error {
 		return err
 	}
 	defer f.Close()
+	// 先看体量再写：超限就明确报错，让 hook 把「观测彻底丢了」打到 stderr，
+	// 而不是默默继续追加到把盘写满。
+	if fi, serr := f.Stat(); serr == nil && fi.Size() >= spoolMaxBytes {
+		return fmt.Errorf("spool 文件已达上限 %d 字节，拒绝继续写: %s", spoolMaxBytes, path)
+	}
 	b, err := json.Marshal(obs)
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(append(b, '\n'))
-	return err
+	if _, err = f.Write(append(b, '\n')); err != nil {
+		return err
+	}
+	// fsync 而不是只 Write：spool 的全部意义就是「宿主崩溃后还能补写」。
+	// 只写页缓存的话，进程被强杀/掉电时这条兜底记录一起消失，等于没兜住。
+	// 代价是一次 fsync，但这条路径本来就只在写库失败时才走。
+	return f.Sync()
 }
 
 // drainSpoolFailOpen 把上次写库失败留下的观测补进 observations。
@@ -267,7 +281,12 @@ func drainSpoolFailOpen(db, auditPath string) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
 		}
-		n, derr := drainOneSpool(st, filepath.Join(dir, e.Name()), auditPath, left, deadline)
+		n, dropped, derr := drainOneSpool(st, filepath.Join(dir, e.Name()), auditPath, left, deadline)
+		if dropped > 0 {
+			// 坏行丢掉是对的（不挡后面的），但必须让人知道丢了——
+			// 静默丢弃等于把「观测丢失」伪装成「本来就少」。
+			fmt.Fprintf(os.Stderr, "v2mem hook: spool %s 丢弃 %d 行无法解析的数据\n", e.Name(), dropped)
+		}
 		if derr != nil {
 			fmt.Fprintln(os.Stderr, "v2mem hook: spool drain 失败，已跳过:", derr)
 			return
@@ -276,13 +295,12 @@ func drainSpoolFailOpen(db, auditPath string) {
 	}
 }
 
-func drainOneSpool(st *store.Store, path, auditPath string, left int, deadline time.Time) (int, error) {
+func drainOneSpool(st *store.Store, path, auditPath string, left int, deadline time.Time) (done, dropped int, err error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	var kept []string
-	done := 0
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -294,7 +312,8 @@ func drainOneSpool(st *store.Store, path, auditPath string, left int, deadline t
 		}
 		var in store.ObsInput
 		if err := json.Unmarshal([]byte(line), &in); err != nil {
-			continue // 坏行丢掉，不挡后面的
+			dropped++ // 坏行丢掉，不挡后面的；但要计数上报
+			continue
 		}
 		res, err := st.AppendObservation(in)
 		if err != nil {
@@ -311,8 +330,8 @@ func drainOneSpool(st *store.Store, path, auditPath string, left int, deadline t
 		}
 	}
 	if len(kept) == 0 {
-		return done, os.Remove(path)
+		return done, dropped, os.Remove(path)
 	}
 	body := strings.Join(kept, "\n") + "\n"
-	return done, os.WriteFile(path, []byte(body), 0o600)
+	return done, dropped, os.WriteFile(path, []byte(body), 0o600)
 }

@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS distill_runs (
   id            TEXT PRIMARY KEY,
   session_id    TEXT NOT NULL,
   provider      TEXT NOT NULL,
-  status        TEXT NOT NULL,            -- ok|fail|skipped
+  status        TEXT NOT NULL,            -- ok|empty|partial|fail|skipped（empty=合法 0 条）
   error         TEXT NOT NULL DEFAULT '',
   cand_count    INTEGER NOT NULL DEFAULT 0,
   started_at    INTEGER NOT NULL,

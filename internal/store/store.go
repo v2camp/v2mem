@@ -626,6 +626,30 @@ type Hit struct {
 	// Rank 是排序分：单路（无模糊检索）时为 bm25（越小越相关）；
 	// 融合后为 RRF 名次（1 起，越小越相关）。语义方向始终一致。
 	Rank float64 `json:"rank"`
+	// Score 是融合总分：加权 RRF 按「本次真正产出结果的流」归一化后的值，越大越相关，
+	// 与 Rank 互为反序。只有走过融合的记忆检索才填，痕迹层与未融合路径留空。
+	Score float64 `json:"score,omitempty"`
+	// Signals 记录各路召回对本条的贡献，用途是回答「这条凭什么排在这里」：
+	// 只有 broad 贡献的条目不该盖过精确命中，排序异常时先看这里而不是反推名次。
+	// 三项已按同一分母归一化，之和即 Score。
+	Signals *HitSignals `json:"signals,omitempty"`
+	// Decayed 是 salience 按 Ebbinghaus 曲线算到「此刻」的派生分，只用于排序。
+	//
+	// 为什么不写回 memories.salience：没有 last_decayed_at 列，写回会以「已衰减值」
+	// 为下一次的起点而重复衰减；且 sync 的归并是 MAX(salience, ?)，任何一次重复
+	// 写入或对端同步都会把衰减结果抬回旧值（见 decay.go 顶部三条理由）。
+	//
+	// 为什么单独成字段而不覆盖 Salience：cmd/mem/notes.go 用 Salience >= 0.8 判
+	// 「硬规则」，派生分若写进那个字段，全局红线会随时间静默消失。
+	Decayed float64 `json:"decayed,omitempty"`
+}
+
+// HitSignals 是一条命中在一条召回路上的贡献分。字段缺省表示该路没有召回这条，
+// 而不是召回了但得零分——两者的区别正是排查排序时最需要的信息。
+type HitSignals struct {
+	Precise float64 `json:"precise,omitempty"`
+	Broad   float64 `json:"broad,omitempty"`
+	Fuzzy   float64 `json:"fuzzy,omitempty"`
 }
 
 // CanonicalLayer 把层名收成 memory、observation、both 之一。
@@ -669,8 +693,9 @@ func interleaveLayers(mem, obs []Hit, limit int) []Hit {
 
 // Search 按层检索。默认只查已定记忆。observation 查会话痕迹，both 两层交错。
 //
-// 记忆管线：精确表达式（bm25）与模糊候选（MinHash 签名估计 Jaccard）做 RRF 融合，
-// 结果为空才退化为「全 OR + bm25」（精确优先、空手才放宽，§15.5）。
+// 记忆管线：精确（bm25）、放宽（全 OR + bm25）、模糊（MinHash 签名估计 Jaccard）
+// 三路常开，各自出候选池后加权 RRF 融合，且精确命中一律前置（§15.5）。
+// 精度由「权重 + 精确前置」保证，召回由三路叠加保证，两者不再互相牺牲。
 // 痕迹层只用同一套 FTS 表达式，不做 MinHash，也不把候选或推测写进 memories。
 // bm25 返回负值，ORDER BY rank ASC 即「最相关在前」。
 func (s *Store) Search(q SearchQuery) ([]Hit, error) {
@@ -696,6 +721,17 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 	return interleaveLayers(hits, obs, q.Limit), nil
 }
 
+// searchMemories 三路常开召回，融合后截断到 limit。
+//
+// 三路各自独立出候选池：precise（词组内 AND）、broad（全 OR）、fuzzy（MinHash）。
+// 旧的「精确空手才放宽」把 broad 当成精确的兜底，代价是「精确只中 1 条、broad 本该
+// 补足 10 条」时结果直接只剩 1 条——精度优先被当成了召回塌陷的借口。现在把召回与
+// 排序拆开：三路都进池负责召回，加权 RRF 负责排序，精度由权重与「精确命中前置」保证。
+//
+// TODO(痕迹层)：observation 仍走「精确 + 空手才 broad」的旧路径（observe.go 的
+// searchObservations），本次未同步改造。痕迹层要与记忆层同一套融合语义需要单独任务。
+//
+// 注：SearchQuery.NoBroadFallback 沿用旧字段名，在这里的语义已变为「关闭 broad 路」。
 func (s *Store) searchMemories(q SearchQuery) ([]Hit, error) {
 	q.Query = strings.TrimSpace(q.Query)
 	if q.Query == "" {
@@ -711,38 +747,42 @@ func (s *Store) searchMemories(q SearchQuery) ([]Hit, error) {
 	}
 	now := time.Now().Unix()
 
-	precise, err := s.searchWith(expr, q, now)
+	// 每路先取 limit*factor 条入池，融合后再截断到 limit。
+	// 各路的 bm25 / Jaccard 名次不同源，若只取 limit 条，「单路排名靠后、但多路同时
+	// 命中」的条目会在融合前就被砍掉，融合也就失去了交叉名次的意义。
+	pool := q
+	pool.Limit = q.Limit * recallPoolFactor
+
+	precise, err := s.searchWith(expr, pool, now)
 	if err != nil {
 		return nil, err
 	}
-	// M5b-0：查询足够长时才做模糊匹配——短查询的 Jaccard 估计方差不可接受。
-	// 模糊候选与精确结果融合：精确命中时也不放弃「措辞不同但相似」的召回。
-	var fuzzy []Hit
-	if !q.NoFuzzy && similarity.EnoughShingles(q.Query) {
-		if fuzzy, err = s.fuzzySearch(q, now); err != nil {
-			return nil, err
-		}
-	}
-	hits := capLimit(rrfFuse(precise, fuzzy), q.Limit)
+	streams := []recallStream{{name: streamPrecise, weight: weightPrecise, hits: precise}}
 
-	// 精确表达式无命中时退化为「全 OR + bm25 排序」。
-	//
-	// 为什么必须退化：自然语言长问句没有空格，会被当成**一个词组**，
-	// 而词组内是 AND —— 要求全部 bigram 都出现在同一条记忆里，对真实提问过严。
-	// 实测「日志怎么搬进记忆库」命中 0 条，而「日志 记忆库」命中 3 条。
-	// 退化保留精度优先（先试精确），只在完全空手时才放宽。
-	// 退化结果同样与模糊候选融合（模糊候选总能被 broad 召回，融合负责排序）。
-	if len(hits) == 0 && !q.NoBroadFallback {
-		if broad := queryExprBroad(q.Query); broad != "" && broad != expr {
-			broad = "(" + broad + ")"
-			b, err := s.searchWith(broad, q, now)
+	// broad 常开：只要它比精确表达式更宽就独立召回，不再等精确空手。
+	// 外面那层括号让 OR 表达式作为一个整体参与 MATCH 的分组；
+	// 单字查询时两者等价（"(" + t + ")" == expr），跳过以免同一路被算两遍。
+	if !q.NoBroadFallback {
+		if widened := queryExprBroad(q.Query); widened != "" && "("+widened+")" != expr {
+			broad, err := s.searchWith("("+widened+")", pool, now)
 			if err != nil {
 				return nil, err
 			}
-			hits = capLimit(rrfFuse(b, fuzzy), q.Limit)
+			streams = append(streams, recallStream{name: streamBroad, weight: weightBroad, hits: broad})
 		}
 	}
-	return hits, nil
+
+	// M5b-0：查询足够长时才做模糊匹配——短查询的 Jaccard 估计方差不可接受。
+	// 模糊路与另两路并行召回，负责「措辞不同但相似」；它的名次从不越过精确命中。
+	if !q.NoFuzzy && similarity.EnoughShingles(q.Query) {
+		fuzzy, err := s.fuzzySearch(pool, now)
+		if err != nil {
+			return nil, err
+		}
+		streams = append(streams, recallStream{name: streamFuzzy, weight: weightFuzzy, hits: fuzzy})
+	}
+
+	return capLimit(fuseRecall(streams), q.Limit), nil
 }
 
 func capLimit(hits []Hit, n int) []Hit {
@@ -798,11 +838,12 @@ func (s *Store) searchWith(expr string, q SearchQuery, now int64) ([]Hit, error)
 
 	rows, err := s.db.Query(
 		`SELECT m.id, m.content, m.kind, m.project, m.salience, m.updated_at,
-		        bm25(fts_mem) AS rank
+		        bm25(fts_mem) AS rank,
+		        `+DecaySQLExprFor("m.", now)+` AS decayed
 		   FROM fts_mem
 		   JOIN memories m ON m.rowid = fts_mem.rowid
 		  WHERE `+strings.Join(where, " AND ")+`
-		  ORDER BY rank ASC, m.salience DESC, m.last_seen_at DESC
+		  ORDER BY rank ASC, decayed DESC, m.salience DESC, m.last_seen_at DESC
 		  LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
@@ -812,7 +853,7 @@ func (s *Store) searchWith(expr string, q SearchQuery, now int64) ([]Hit, error)
 	var out []Hit
 	for rows.Next() {
 		var h Hit
-		if err := rows.Scan(&h.ID, &h.Content, &h.Kind, &h.Project, &h.Salience, &h.UpdatedAt, &h.Rank); err != nil {
+		if err := rows.Scan(&h.ID, &h.Content, &h.Kind, &h.Project, &h.Salience, &h.UpdatedAt, &h.Rank, &h.Decayed); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -832,11 +873,12 @@ const fuzzyCandidateCap = 40
 //
 // 与 BM25 的差异：BM25 要求词项交集，签名估计字符 3-gram 的 Jaccard——
 // 插字、删字、改序仍保留相当比例的 3-gram，而 bigram 精确匹配会失败。
-// 候选按相似度降序返回（Rank 字段暂存相似度），供 rrfFuse 只按名次融合。
+// 候选按相似度降序返回（Rank 字段暂存相似度），供 fuseRecall 只按名次融合。
 func (s *Store) fuzzySearch(q SearchQuery, now int64) ([]Hit, error) {
 	parts, filterArgs := searchWhereParts(q, now)
 	rows, err := s.db.Query(
-		`SELECT m.id, m.content, m.kind, m.project, m.salience, m.updated_at, ms.sig
+		`SELECT m.id, m.content, m.kind, m.project, m.salience, m.updated_at, ms.sig,
+		        `+DecaySQLExprFor("m.", now)+` AS decayed
 		   FROM mem_sigs ms
 		   JOIN memories m ON m.id = ms.memory_id
 		  WHERE `+strings.Join(parts, " AND "), filterArgs...)
@@ -850,7 +892,7 @@ func (s *Store) fuzzySearch(q SearchQuery, now int64) ([]Hit, error) {
 	for rows.Next() {
 		var h Hit
 		var sig []byte
-		if err := rows.Scan(&h.ID, &h.Content, &h.Kind, &h.Project, &h.Salience, &h.UpdatedAt, &sig); err != nil {
+		if err := rows.Scan(&h.ID, &h.Content, &h.Kind, &h.Project, &h.Salience, &h.UpdatedAt, &sig, &h.Decayed); err != nil {
 			return nil, err
 		}
 		if len(sig) == 0 {
@@ -873,48 +915,138 @@ func (s *Store) fuzzySearch(q SearchQuery, now int64) ([]Hit, error) {
 		}
 		return cands[i].ID < cands[j].ID
 	})
-	if len(cands) > fuzzyCandidateCap {
-		cands = cands[:fuzzyCandidateCap]
+	// 与别的路共用同一个入池上限（limit*factor），各路池子深度才可比
+	capN := fuzzyCandidateCap
+	if q.Limit > 0 && q.Limit < capN {
+		capN = q.Limit
+	}
+	if len(cands) > capN {
+		cands = cands[:capN]
 	}
 	return cands, nil
 }
 
 // rrfK 是 RRF 的分母常数（k + rank）。取 60 是通行做法：对名次差异不敏感，
-// 两路都出现的文档显著领先只出现在单路的文档。
+// 多路都出现的文档显著领先只出现在单路的文档。
 const rrfK = 60
 
-// rrfFuse 用倒数排名融合多路检索结果（Reciprocal Rank Fusion）。
-// 只依赖名次不依赖分数，因此 bm25 与 Jaccard 可以同场排序。
-// 输出按融合分降序；同分按「出现的路数多者先、先见顺序先」破平，完全确定。
-// 融合后 Rank 字段改写为名次（1 起，越小越相关）。
-func rrfFuse(lists ...[]Hit) []Hit {
-	type entry struct {
-		hit   Hit
-		score float64
-		first int
-		seen  int
+// recallPoolFactor 是每路召回池相对最终条数的倍数。各路名次不同源，
+// 池子必须比 limit 深才能让「单路靠后、多路重合」的条目进入融合。
+const recallPoolFactor = 4
+
+// 召回路名。既是 HitSignals 的归类依据，也让「谁把这条带回来的」可被直接读出。
+const (
+	streamPrecise = "precise"
+	streamBroad   = "broad"
+	streamFuzzy   = "fuzzy"
+)
+
+// 各召回路权重。依据是**证据强度**，不是调参手感：
+//   - precise 要求查询词组内全部 bigram 同时出现（AND），命中即强证据，取 1.0 作基准；
+//   - broad 只要求任一词项出现（OR），一条记忆可能仅凭一个常见 bigram 就进候选，
+//     单凭它不足以证明相关，故按 0.8 折；
+//   - fuzzy 是 MinHash 对 3-gram Jaccard 的**估计**，有采样误差、对短文本尤其敏感，
+//     且字面相似不等于语义相关（可能意思相反），权重最低取 0.6。
+//
+// 这三条把权重的作用域限制在「同层内调次序」：精确命中始终前置（见 fuseRecall），
+// 缺席的流不占分母（见 fuseDenominator），所以权重取值不会把精度契约交给调参。
+const (
+	weightPrecise = 1.0
+	weightBroad   = 0.8
+	weightFuzzy   = 0.6
+)
+
+// recallStream 是一路召回的全部产物：路名、权重、已按名次排好的候选。
+type recallStream struct {
+	name   string
+	weight float64
+	hits   []Hit
+}
+
+// fuseDenominator 是融合分的归一化分母：只累计**真正产出结果**的流的权重。
+//
+// 为什么不能固定用三路权重之和（2.4）：若某次查询只有 precise 有结果，固定分母会把
+// 每条分数压到 1/2.4，于是「单信号」与「三信号」两次查询的分数量纲不同，
+// 任何跨查询复用的阈值（注入门槛、置信度展示）都会失准。只对在场的流归一化，
+// 单信号时分数退化为 1/(k+rank)，与未融合的单路检索完全同量纲。
+func fuseDenominator(streams []recallStream) float64 {
+	var sum float64
+	for _, st := range streams {
+		if len(st.hits) > 0 {
+			sum += st.weight
+		}
 	}
-	idx := map[string]*entry{}
+	return sum
+}
+
+// fuseRecall 用「加权 RRF + 自适应分母」融合多路检索结果（Reciprocal Rank Fusion）。
+// 只依赖名次不依赖分数，因此 bm25 与 Jaccard 可以同场排序。
+//
+// 排序主键有两条，顺序不可颠倒：
+//  1. 是否被 precise 命中。精确命中是「查询词组整体出现」的强证据，只靠 broad/fuzzy
+//     进来的条目一律不得越过它。这一条不能只靠分数：broad+fuzzy 双路第 1 的得分
+//     （0.8+0.6）会高于只被 precise 单路命中的第 1 名（1.0），若按分排序就会越位。
+//  2. 融合分降序；同分按「出现的路数多者先、先见顺序先」破平，完全确定。
+//
+// 融合后 Rank 改写为名次（1 起，越小越相关），方向与单路 bm25 一致；
+// Score / Signals 只是明细，不改变 Rank 与 Salience 的既有语义。
+func fuseRecall(streams []recallStream) []Hit {
+	denom := fuseDenominator(streams)
+	if denom == 0 {
+		return nil
+	}
+	type entry struct {
+		hit     Hit
+		signals HitSignals
+		exact   bool
+		first   int
+		seen    int
+	}
+	idx := make(map[string]*entry, 8)
 	var order []*entry
-	for _, list := range lists {
-		for i, h := range list {
+	for _, st := range streams {
+		for i, h := range st.hits {
 			e, ok := idx[h.ID]
 			if !ok {
+				// 首次出现的路决定保留哪些原始字段：precise 在前，
+				// 其 bm25 名次比后出现的路的名次更能解释排位。
 				e = &entry{hit: h, first: len(order)}
 				idx[h.ID] = e
 				order = append(order, e)
 			}
-			e.score += 1 / float64(rrfK+i+1)
+			contrib := st.weight / float64(rrfK+i+1) / denom
+			switch st.name {
+			case streamPrecise:
+				e.signals.Precise += contrib
+				e.exact = true
+			case streamBroad:
+				e.signals.Broad += contrib
+			case streamFuzzy:
+				e.signals.Fuzzy += contrib
+			}
 			e.seen++
 		}
 	}
+	for _, e := range order {
+		e.hit.Score = e.signals.Precise + e.signals.Broad + e.signals.Fuzzy
+		e.hit.Signals = &e.signals
+	}
 	sort.Slice(order, func(i, j int) bool {
 		a, b := order[i], order[j]
-		if a.score != b.score {
-			return a.score > b.score
+		if a.exact != b.exact {
+			return a.exact
+		}
+		if a.hit.Score != b.hit.Score {
+			return a.hit.Score > b.hit.Score
 		}
 		if a.seen != b.seen {
 			return a.seen > b.seen
+		}
+		// 相关性完全打平时，用 Ebbinghaus 派生分决定先看哪条：常被命中、最近用过的
+		// 更可能仍然成立。放在 first 之前，是因为 first 依赖召回顺序（SQL 细节的
+		// 副产物），而派生分是可解释的；否则同一个查询在不同库大小下顺序会漂。
+		if a.hit.Decayed != b.hit.Decayed {
+			return a.hit.Decayed > b.hit.Decayed
 		}
 		return a.first < b.first
 	})
@@ -1035,7 +1167,15 @@ func (s *Store) GC(maxIdle time.Duration, minSalience float64) (*GCResult, error
 	if err != nil {
 		return nil, err
 	}
-	decayed, err := del(`last_seen_at < ? AND salience < ?`, now-int64(maxIdle.Seconds()), minSalience)
+	// 判据从「静态 salience < 阈值」换成「按 Ebbinghaus 算到此刻的派生分 < 阈值」。
+	// 这是一处**显式的语义变化**：重要性从此随时间衰减——一条 salience=0.9 的记忆
+	// 若长期不被命中，派生分会跌破门槛而被回收。这正是遗忘曲线的意图，不是副作用。
+	// maxIdle 仍然保留为硬门槛：派生分再低，也必须闲置满 maxIdle 才进入候选，
+	// 否则刚写入的低声望记忆会在同一次 gc 里被立刻清掉。
+	// 下限 floor(0.05) 起作用的前提是它低于 minSalience(默认 0.2)——若调用方把
+	// minSalience 调到 floor 之下，回收会退化为「按闲置时间删除」（见 decay.go）。
+	cutoff := now - int64(maxIdle.Seconds())
+	decayed, err := del(`last_seen_at < ? AND `+DecaySQLExpr(now)+` < ?`, cutoff, minSalience)
 	if err != nil {
 		return nil, err
 	}

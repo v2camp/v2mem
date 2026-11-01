@@ -1,7 +1,13 @@
 // Package distill 从观测里抽出候选事实。
 //
 // 它不写库。调用方把 Fact 放进 candidates；禁止在这里插入 memories。
-// provider=none 用规则。LLM 失败时 Outcome.Status=fail 且 Facts 为空，由调用方决定退出码。
+// provider=none 用规则。
+//
+// 三种结局必须分得清：Status=ok（有事实）、Status=empty（合法 0 条）、
+// Status=fail（模型不可用 / 超时 / 响应坏）。把 empty 并进 fail 会让调用方
+// 无法区分「模型说没有」和「模型没跑」，只能二选一地误报或漏报。
+// 失败的结构化原因放在 Outcome.Err，用 errors.Is 判断 ErrLLMUnavailable /
+// ErrBadResponse / ErrNoFacts。
 package distill
 
 import (
@@ -9,6 +15,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,6 +28,31 @@ import (
 const (
 	DefaultModel   = "qwen2.5:7b"
 	DefaultTimeout = 45 * time.Second
+)
+
+// 蒸馏的四种状态。为什么要有 empty：
+//
+// 「模型说没有可抽取的事实」和「模型压根没跑起来」是两件完全不同的事。
+// 旧实现把两者都压成 fail + Facts 为空，调用方无法区分，于是只能把
+// 合法的 0 条也当成故障——要么误报失败，要么为了不误报而把真失败也放过。
+// 把 empty 显式拆出来，调用方才能对 fail 做告警、对 empty 记账后放过。
+const (
+	StatusOK      = "ok"      // 成功，Facts 非空
+	StatusEmpty   = "empty"   // 成功，但模型明确表示没有可抽取的事实（合法 0 条）
+	StatusFail    = "fail"    // 模型不可用 / 超时 / 响应不可解析
+	StatusSkipped = "skipped" // 没有可蒸馏的观测，或窗口已蒸馏过
+)
+
+// 类型化错误。为什么不用裸 error：
+//
+// 调用方需要按「原因」决定行为，而不是按错误文案做字符串匹配：
+//   - ErrLLMUnavailable：模型没起来 / 没配 key / 超时 → 值得重试或降级到规则
+//   - ErrBadResponse：模型说话了，但说的不是 JSON → 改 prompt 或换模型
+//   - ErrNoFacts：响应合法、只是没有事实 → 不是故障，记账后跳过
+var (
+	ErrLLMUnavailable = errors.New("模型不可用")
+	ErrBadResponse    = errors.New("模型响应不可解析")
+	ErrNoFacts        = errors.New("没有可抽取的事实")
 )
 
 // Observation 是蒸馏读到的一条观测。只取摘要，不取工具 stdout 全文。
@@ -40,12 +72,24 @@ type Fact struct {
 	Rationale string   `json:"rationale"`
 }
 
-// Outcome 是一次蒸馏的结果。Status 取 ok|fail|skipped。
+// Outcome 是一次蒸馏的结果。Status 取 ok|empty|fail|skipped。
+//
+// Error 是给人看的文本，Err 是给代码判断的结构化原因（errors.Is/As 用）。
+// 两者并存：日志要能读，调用方要能分支。
 type Outcome struct {
 	Provider string
 	Status   string
 	Error    string
+	Err      error
 	Facts    []Fact
+}
+
+// Failed 报告这次蒸馏是否真的失败。empty 是成功的一种，不算失败。
+func (o Outcome) Failed() bool { return o.Status == StatusFail }
+
+// failOutcome 统一构造失败结果，保证 Status/Error/Err 三者一致。
+func failOutcome(provider string, err error) Outcome {
+	return Outcome{Provider: provider, Status: StatusFail, Error: err.Error(), Err: err}
 }
 
 // Options 控制蒸馏。Complete 非空时替代真实 LLM，便于测试超时与坏 JSON。
@@ -100,11 +144,16 @@ func Run(obs []Observation, opt Options) Outcome {
 	}
 	name, spec, err := resolve(opt)
 	if err != nil {
-		return Outcome{Provider: name, Status: "fail", Error: err.Error()}
+		// 解析不出 provider = 模型不可用。这不是「抽到 0 条」。
+		return failOutcome(name, fmt.Errorf("%w: %w", ErrLLMUnavailable, err))
 	}
 	if name == "none" {
 		facts := ExtractRules(obs)
-		return Outcome{Provider: "none", Status: "ok", Facts: facts}
+		if len(facts) == 0 {
+			// 规则抽不到也是合法 0 条：观测里确实没有决策/踩坑/偏好/待办。
+			return Outcome{Provider: "none", Status: StatusEmpty}
+		}
+		return Outcome{Provider: "none", Status: StatusOK, Facts: facts}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opt.Timeout)
 	defer cancel()
@@ -114,16 +163,17 @@ func Run(obs []Observation, opt Options) Outcome {
 	}
 	raw, err := complete(ctx, spec, promptFor(obs))
 	if err != nil {
-		return Outcome{Provider: name, Status: "fail", Error: err.Error()}
+		// 超时、连不上、HTTP 非 2xx：一律归为「模型不可用」，与「响应坏」分开。
+		return failOutcome(name, fmt.Errorf("%w: %w", ErrLLMUnavailable, err))
 	}
 	facts, err := ParseFacts(raw)
 	if err != nil {
-		return Outcome{Provider: name, Status: "fail", Error: err.Error()}
+		if errors.Is(err, ErrNoFacts) {
+			return Outcome{Provider: name, Status: StatusEmpty}
+		}
+		return failOutcome(name, err)
 	}
-	if len(facts) == 0 {
-		return Outcome{Provider: name, Status: "fail", Error: "模型没有返回合规事实"}
-	}
-	return Outcome{Provider: name, Status: "ok", Facts: facts}
+	return Outcome{Provider: name, Status: StatusOK, Facts: facts}
 }
 
 func resolve(opt Options) (string, ModelSpec, error) {
@@ -239,24 +289,34 @@ func promptFor(obs []Observation) string {
 	return b.String()
 }
 
-// ParseFacts 解析 JSONL 或单个 JSON 数组。不合规行跳过；一行都合规失败才报错。
+// ParseFacts 解析 JSONL 或单个 JSON 数组。
+//
+// 三种结局分开表达，调用方据此区分「没事实」和「模型坏了」：
+//   - 解析成功且有合规事实 → (facts, nil)
+//   - 响应合法但 0 条（空输出 / [] / 全部被过滤）→ ErrNoFacts
+//   - 响应根本不像 JSON（坏 JSON、纯散文）→ ErrBadResponse
 func ParseFacts(raw string) ([]Fact, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil, fmt.Errorf("模型输出为空")
+		// 空输出是 prompt 明确允许的「没有事实」，不是坏响应。
+		return nil, fmt.Errorf("%w: 模型输出为空", ErrNoFacts)
 	}
 	if strings.HasPrefix(raw, "[") {
 		var arr []Fact
 		if err := json.Unmarshal([]byte(raw), &arr); err != nil {
-			return nil, fmt.Errorf("JSON 不合规: %w", err)
+			return nil, fmt.Errorf("%w: JSON 数组不合规: %w", ErrBadResponse, err)
 		}
 		return filterFacts(arr)
 	}
 	var facts []Fact
-	var bad int
+	var bad, lines int
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || !strings.Contains(line, "{") {
+		if line == "" {
+			continue
+		}
+		lines++
+		if !strings.Contains(line, "{") {
 			continue
 		}
 		start := strings.Index(line, "{")
@@ -272,11 +332,14 @@ func ParseFacts(raw string) ([]Fact, error) {
 		}
 		facts = append(facts, f)
 	}
-	kept, err := filterFacts(facts)
-	if err != nil && bad > 0 && len(facts) == 0 {
-		return nil, fmt.Errorf("JSON 不合规")
+	if len(facts) == 0 {
+		// 有内容却一条对象都没解析出来：模型说了话，但不是我们约定的格式。
+		if bad > 0 || lines > 0 {
+			return nil, fmt.Errorf("%w: 响应里没有可解析的 JSON 行", ErrBadResponse)
+		}
+		return nil, fmt.Errorf("%w: 模型输出为空", ErrNoFacts)
 	}
-	return kept, err
+	return filterFacts(facts)
 }
 
 func filterFacts(in []Fact) ([]Fact, error) {
@@ -300,7 +363,8 @@ func filterFacts(in []Fact) ([]Fact, error) {
 		out = append(out, f)
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("没有合规事实")
+		// JSON 是完整的，只是没有一条满足 kind/内容要求 —— 合法 0 条。
+		return nil, fmt.Errorf("%w: 没有一条合规事实", ErrNoFacts)
 	}
 	return out, nil
 }

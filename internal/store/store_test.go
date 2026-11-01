@@ -532,10 +532,13 @@ func TestSearchScopeAllIgnoresProjectArgument(t *testing.T) {
 	}
 }
 
-// ---------- M7: 自然语言长问句的召回退化 ----------
+// ---------- M7: 自然语言长问句的召回 ----------
 //
 // 实测缺陷（由 mem eval 的审计日志暴露）：用户用自然语言提问时命中 0 条，
 // 因为长问句没有空格 → 被当成一个词组 → 词组内 AND 要求全部 bigram 都出现。
+//
+// 当时的修法是「精确空手才退化为全 OR」；P0 改为 broad 常开（三路各自出候选池），
+// 所以本用例现在的职责是：精确空手时，结果**不依赖**任何门控就直接来自 broad 路。
 
 func TestSearchFindsLongNaturalLanguageQuestion(t *testing.T) {
 	s := newTestStore(t)
@@ -543,7 +546,8 @@ func TestSearchFindsLongNaturalLanguageQuestion(t *testing.T) {
 	addWith(t, s, AddInput{Content: "记忆库数据固定放 ~/.v2mem 目录，代码与数据分离", Project: "p1"})
 
 	const q = "日志怎么搬进记忆库"
-	// 先固化「精确表达式确实空手」这一前提，否则下面的断言可能因别的原因通过
+	// 先固化「精确表达式确实空手」这一前提，否则下面的断言可能因别的原因通过。
+	// NoBroadFallback 现在的作用是关掉 broad 路，等价于只看精确路。
 	exact, err := s.Search(SearchQuery{Query: q, Scope: "all", Limit: 5, NoBroadFallback: true})
 	if err != nil {
 		t.Fatalf("Search exact: %v", err)
@@ -557,56 +561,111 @@ func TestSearchFindsLongNaturalLanguageQuestion(t *testing.T) {
 		t.Fatalf("Search: %v", err)
 	}
 	if len(hits) == 0 {
-		t.Fatal("长问句应通过退化召回拿到结果，got 0（这正是修复前的问题）")
+		t.Fatal("长问句应由 broad 路常开召回，got 0（这正是修复前的问题）")
 	}
 	if !strings.Contains(hits[0].Content, "mem ingest") {
 		t.Errorf("最相关的那条应排在前，got %q", hits[0].Content)
 	}
+	if hits[0].Signals == nil || hits[0].Signals.Broad <= 0 {
+		t.Errorf("这条只可能来自 broad 路，明细应记在 broad 上，got %+v", hits[0].Signals)
+	}
 }
 
-// 退化只在空手时发生：精确有结果时不得放宽到 broad（否则精度会悄悄下降）。
+// 精确命中不越位，且 broad 常开后不再「有精确就丢放宽」。
 //
 // 构造要点：AND 只作用在**同一段连续汉字**内（词组内），词组之间是 OR。
-// 所以要让「精确能中、放宽会多中」，必须用**单段无空格的长查询**，
-// 让那些 bigram 的 AND 恰好只被一条记忆满足。
+// 用单段无空格的长查询，让那些 bigram 的 AND 恰好只被 A 满足，B 只能被 broad/fuzzy 召回。
 //
-// M5b-0 之后契约更新：模糊融合（MinHash + RRF）可以把「措辞不同但相似」的
-// 候选作为**排在后位**的补充带进结果，但不得超越精确命中的条目——
-// 精度优先的判据从「禁止出现」变为「禁止越位」，由 RRF 的双路加权保证。
+// P0 之前这个场景只会返回 A（broad 被「精确非空」门控住）；现在 B 也该进来，
+// 但必须排在 A 之后 —— 精度优先的判据是「禁止越位」而不是「禁止出现」。
 func TestSearchFuzzyDoesNotOutrankExactMatches(t *testing.T) {
 	s := newTestStore(t)
 	// A 含完整 bigram 链（记忆/忆库/库不/不能/能放/放同/同步/步目/目录）
-	addWith(t, s, AddInput{Content: "记忆库不能放同步目录", Project: "p1"})
+	idA := addWith(t, s, AddInput{Content: "记忆库不能放同步目录", Project: "p1"})
 	// B 是 A 的后缀，缺 记忆/忆库/库不 三个 bigram —— 放宽后会命中，精确不会
-	addWith(t, s, AddInput{Content: "不能放同步目录", Project: "p1"})
+	idB := addWith(t, s, AddInput{Content: "不能放同步目录", Project: "p1"})
 
 	hits, err := s.Search(SearchQuery{Query: "记忆库不能放同步目录", Scope: "all", Limit: 5})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(hits) == 0 {
-		t.Fatal("精确表达式本应命中 A")
+	ids := hitIDs(hits)
+	if len(ids) < 2 {
+		t.Fatalf("放宽路常开后 B 也应被召回，got %v", ids)
 	}
-	if hits[0].Content != "记忆库不能放同步目录" {
-		t.Errorf("精确命中必须保持最前，got %q", hits[0].Content)
+	if ids[0] != idA {
+		t.Errorf("精确命中必须保持最前，got %v", ids)
+	}
+	if !containsID(ids, idB) {
+		t.Errorf("仅靠放宽/模糊命中的 B 应排在后面出现，got %v", ids)
 	}
 }
 
-// 退化不得改变可见性规则：被取代/过期的记忆仍不得出现。
+// 放宽路不得改变可见性规则：被取代/过期的记忆仍不得出现。
+// 配一条同样能被 broad 召回的有效记忆当对照，避免「0 条」是因为压根没召回。
 func TestBroadFallbackKeepsVisibilityRules(t *testing.T) {
 	s := newTestStore(t)
 	id := addWith(t, s, AddInput{Content: "一条会被取代的长记忆内容用于测试", Project: "p1"})
 	setColumn(t, s, id, "superseded_by", "someone-else")
+	addWith(t, s, AddInput{Content: "另一条长记忆内容用于测试", Project: "p1"})
+
 	hits, err := s.Search(SearchQuery{Query: "这条长记忆怎么找", Scope: "all", Limit: 5})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(hits) != 0 {
-		t.Errorf("退化路径也必须遵守 superseded 过滤，got %d 条", len(hits))
+	// 对照记忆证明 broad 路确实在工作：能被召回，且只有它
+	if len(hits) != 1 {
+		t.Fatalf("只应剩下对照记忆，got %+v", hits)
+	}
+	if hits[0].Content != "另一条长记忆内容用于测试" {
+		t.Errorf("被取代的记忆不得由 broad/fuzzy 路带回，got %q", hits[0].Content)
 	}
 }
 
-// 单字查询走通（退化表达式的边界）。
+// P0 的核心行为：精确与放宽**同时非空**（旧实现里不可能出现），两路各自贡献候选，
+// 精确命中的排在前面，明细里能看出每条是被哪一路带回来的。
+//
+// 这是本次改造的判定性用例：旧代码在「精确非空」时会直接返回，B 根本不会出现。
+func TestSearchPreciseAndBroadBothContribute(t *testing.T) {
+	s := newTestStore(t)
+	idA := addWith(t, s, AddInput{Content: "记忆库不能放同步目录", Project: "p1"})
+	idB := addWith(t, s, AddInput{Content: "不能放同步目录", Project: "p1"})
+
+	hits, err := s.Search(SearchQuery{Query: "记忆库不能放同步目录", Scope: "all", Limit: 5})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("精确与放宽两路应各出候选，共 2 条，got %d: %v", len(hits), hitIDs(hits))
+	}
+	byID := map[string]Hit{hits[0].ID: hits[0], hits[1].ID: hits[1]}
+
+	a, ok := byID[idA]
+	if !ok {
+		t.Fatalf("精确命中的 A 必须出现，got %v", hitIDs(hits))
+	}
+	b, ok := byID[idB]
+	if !ok {
+		t.Fatalf("放宽命中的 B 必须出现（旧实现到这里会缺），got %v", hitIDs(hits))
+	}
+	if a.Signals == nil || a.Signals.Precise <= 0 {
+		t.Errorf("A 应带精确路贡献，got %+v", a.Signals)
+	}
+	if b.Signals == nil || b.Signals.Broad <= 0 {
+		t.Errorf("B 应带放宽路贡献，got %+v", b.Signals)
+	}
+	if b.Signals.Precise != 0 {
+		t.Errorf("B 缺三个 bigram，不该有精确路贡献，got %+v", b.Signals)
+	}
+	if hits[0].ID != idA {
+		t.Errorf("精确命中必须排最前，got %v", hitIDs(hits))
+	}
+	if hits[0].Rank >= hits[1].Rank {
+		t.Errorf("Rank 应是 1 起的名次且随顺序递增，got %v", hits[0].Rank)
+	}
+}
+
+// 单字查询：broad 表达式与精确表达式等价，不得重复计入同一路（会虚高分数）。
 func TestSearchSingleRuneQueryStillWorks(t *testing.T) {
 	s := newTestStore(t)
 	addWith(t, s, AddInput{Content: "库不放同步目录", Project: "p1"})
@@ -615,7 +674,11 @@ func TestSearchSingleRuneQueryStillWorks(t *testing.T) {
 		t.Fatalf("Search: %v", err)
 	}
 	if len(hits) != 1 {
-		t.Errorf("单字应能命中 1 条，got %d", len(hits))
+		t.Fatalf("单字应能命中 1 条，got %d", len(hits))
+	}
+	// 只有 precise + fuzzy（若有）计分：broad 与 precise 等价时应被跳过
+	if hits[0].Signals != nil && hits[0].Signals.Broad != 0 {
+		t.Errorf("等价表达式不该被当成独立一路重复计分，got %+v", hits[0].Signals)
 	}
 }
 
