@@ -2,6 +2,7 @@
 
 > 关联：[`VALUE.md`](./VALUE.md) 红线、[`design-write-governance.md`](./design-write-governance.md) 三态。
 > 对照对象：[agent-memory.dev](https://www.agent-memory.dev/)。这里只写取舍，不写它的实现。
+> **全面架构参考（可借鉴机制清单、mem0 对照、两边踩过的坑）见 [`design-ref-landscape.md`](./design-ref-landscape.md)。**
 
 v2mem 默认**零常驻、无 HTTP、无 iii**。可以借鉴的是事件模型、离线 spool、import-jsonl、PreCompact 重注入、secret scrub。实现留在 Go 单二进制里：同库另表 + CLI。
 

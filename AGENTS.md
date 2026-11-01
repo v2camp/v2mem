@@ -17,6 +17,18 @@
 
 提交前跑 `make cover-gate`（阈值单一真理源：`coverage-policy.txt`）。
 
+## 运行观测（装好之后不再重复检查安装）
+
+判据表在 `docs/ops-watch.md`，可执行形态是 `scripts/watch-v2mem.sh`；**改判据必须同步改两处**。
+
+1. **安装只校验一次**：首次 / 换机 / 升级 WorkBuddy 或 mem 之后跑 I 组检查。通过后不再重复排查安装，
+   后续会话交给钩子自动运行（`native`，代码强制，不靠模型自觉）。
+2. **稳态运行不干预**：`SessionStart` 注入类码表、`UserPromptSubmit` 按 query 检索、`Stop`/`SessionEnd`
+   落观测。不要为"让它记住"而手动塞上下文，也不要为"确认它在跑"而每轮查审计。
+3. **观测走定时任务**：每 12h 跑 `scripts/watch-v2mem.sh --window 12h`。只有 `FAIL` 需要人介入，
+   `WARN` 观察，`INFO` 忽略（冷启动期库 < 20 条时，R2/R4 按设计降级为 `INFO`）。
+4. **判据错误自查**：`session-start` 的 `empty` 恒为 false，只有 `prompt-submit` 的 `empty` 反映检索质量。
+
 ## 文档纪律（AI 友好，硬约束）
 
 文档通常会被整体读入 AI 上下文，越长越容易超限、丢弃或稀释关键信息。以下为硬下限之外的硬上限：
