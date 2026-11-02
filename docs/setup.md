@@ -1,6 +1,6 @@
 # 安装与接入规范（setup guide）
 
-- 日期：2026-09-18
+- 日期：2026-09-18（最近更新 2026-11-02：补录 WorkBuddy 接入实机验证）
 - 状态：草案待复核
 - 关联：`docs/DEVELOPER.md`（本地开发部署）、`docs/design-harness-memory-replace.md`（读/写接入）、`docs/design-workbuddy.md`、`docs/design-harness.md`
 
@@ -12,6 +12,9 @@
 
 > ### 合规接入五守则
 > 1. **不绕过宿主面板**：接入=「产出合规配置 + 引导用户在宿主面板里确认启用」，而不是直接写宿主数据目录。
+>    ⚠️ **是否需要面板确认因宿主而异，以 §3A 的实测为准**：TRAE 要开「已配置的 Hooks」总开关；
+>    WorkBuddy 的 hooks 不需要面板（内置 CLI 读文件即执行），只有 MCP 需要在连接器页开开关。
+>    不要用一个宿主的结论去推断另一个。
 > 2. **一份配置、一种 schema**：对目标宿主按官方 JSON schema 产出，先校验再提示。
 > 3. **引导而非静默**：安装后必须给出「请到 <宿主路径> 执行 <动作>」的可操作清单；不假设外部生效。
 > 4. **只读护栏**：读侧（hooks/MCP 读取）绝不因被触发而往 memories 写内容（见 `TestCmdHookReadOnly`）。
@@ -52,6 +55,9 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 - **traework 面板未暴露 hooks 选项**：应用包内确含 `global_hooks_enabled`、`import_claude_folders` 等运行时开关（静态分析证据），但设置界面没有 hooks 入口——用户实测不可配。hooks 能力在运行时存在，可能只是未出面板或需开关开启。⚠️ 待进一步验证。
 - **workbuddy ≠ codebuddy 的配置**：运行时同是内置 CodeBuddy CLI，但用户级配置读的是 `<WORKBUDDY_CONFIG_DIR>/settings.json`
   = `~/.workbuddy/settings.json`。写 `~/.codebuddy/settings.json` 永远不触发（2026-11-01 实测：挂机 1.5 天，审计 0 条）。
+- **WorkBuddy 已完整接入（2026-11-02）**：hooks 四事件写 `~/.workbuddy/settings.json`、MCP 走连接器开关，
+  两条通道同时生效；`watch-v2mem.sh` 的 I1–I4 全 PASS，24h 窗口 R1 命中 196 个事件。
+  接入步骤与故障对照见 §3A.2。
 - **traecode 会额外读 claude 的同份配置**：给 claude 配 hooks 会顺带覆盖 TraeCode。
 - **dsh**：原生非 shell hook（Cordis 插件），本工具不产出插件代码，只在池用官方桥接包 `dsh-hooks-claude-code` / `dsh-hooks-codex`。Tier 也因此记为 `bridge`。
 
@@ -90,12 +96,37 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 
 - 用户级 hooks：`~/.workbuddy/settings.json` 的 `hooks` 段（**不是** `~/.codebuddy/settings.json`）。
   判据是 `WORKBUDDY_CONFIG_DIR`：内置 CLI 读 `<该变量>/settings.json`，桌面端把它设成 `~/.workbuddy`。
-- **实测（2026-11-01）**：直接写入该文件，内置 CLI 启动即执行钩子（审计出现
-  `prompt-submit` / `session-start` / `stop`），无需 `/hooks` 面板确认。
-  反向对照：同一份钩子写在 `~/.codebuddy/settings.json`，挂机 1.5 天审计 0 条。
-- 注意全局开关：`"disableAllHooks": true` 会禁用全部；frontmatter hooks 需
-  `allowUntrustedFrontmatterHooks: true`（普通 command hooks 不受此项限制）。
-- 已开会话不即时生效，需新建会话（每轮由新进程读取设置）。
+- 与 TRAE 的关键差异：**hooks 不需要面板确认**——内置 CLI 读到文件即执行。MCP 则相反，必须开面板开关（见第 4 步）。
+
+**一次性接入清单（按序执行）**
+
+1. `mem init --harness workbuddy`：写入 4 个事件（SessionStart / UserPromptSubmit / Stop / SessionEnd），
+   条目带 `# v2mem`，首次备份为 `settings.json.v2mem.bak`。
+   该文件约 43KB、含 IM 凭据的加密信封，**幂等性已实测**：重复执行 4/4 事件不重复、12 个顶层键完整保留。
+2. 检查没有 `"disableAllHooks": true`（它为真时全部钩子都不执行，包括 WorkBuddy 自带插件）。
+3. **新开会话**：每轮由新进程读取设置，已开的会话不生效。
+4. MCP（可选，与 hooks 相互独立）：在 `~/.workbuddy/mcp.json` 加 `v2mem` 只是**声明，不会激活**。
+   必须到「专家·技能·连接器 → 连接器页 → 右上角自定义连接器」，或「侧边栏 插件 → MCP 服务器」
+   把 v2mem 开关打开。开启后 `~/.workbuddy/mcp-approvals.json` 出现 `<sha256>::v2mem`，
+   会话内即可看到 `mcp__v2mem__search / add / ls / touch / recall_context`。
+5. 验收（只读）：
+   ```bash
+   mem audit --tail 5                     # 应有 session-start | workbuddy、prompt-submit | workbuddy
+   scripts/watch-v2mem.sh --window 24h    # I1/I2 PASS、R1 ≥1
+   ```
+
+**故障对照（2026-11-01 / 11-02 实机）**
+
+| 现象 | 根因 | 处理 |
+|:---|:---|:---|
+| 审计零 hook 事件，但配置语法正确、`mem hook` 手工可跑 | 钩子写进了 `~/.codebuddy/settings.json`（同名文件，运行时不同源） | 移到 `$WORKBUDDY_CONFIG_DIR/settings.json`，再新开会话 |
+| 配置刚改完，当前会话仍无注入 | 会话进程建于改配置之前 | 新开会话；**不要**反复改配置 |
+| 连 WorkBuddy 自带插件的钩子也不跑 | `"disableAllHooks": true` | 去掉该键 |
+| MCP 工具列表里没有 v2mem | 只写了 `mcp.json`，未开连接器开关 | 第 4 步；此故障**不影响** hooks 注入 |
+| hooks 有注入但 MCP 不可用（或反之） | 两条通道相互独立 | 分开排查，不要用一条推断另一条 |
+
+> 判定"是否真的在跑"只看审计：`session-start` / `prompt-submit` 带 `harness=workbuddy`。
+> 本机 2026-11-02 的 24h 巡检为 196 个事件（session-start 38 / prompt-submit 79），R1 PASS。
 
 ### 3A.3 其他支持 MCP 的宿主
 
