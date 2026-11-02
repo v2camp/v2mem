@@ -48,7 +48,7 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 | workbuddy | work-buddy, wb | WorkBuddy | native | `~/.workbuddy/settings.json` | ✅ 已验证生效（内置 CLI 实测） |
 
 关键事实：
-- **traecode 已验证**：面板启用 + 提问后，审计出现 `prompt-submit/session-start | traecode`——读侧注入闭环打通。
+- **traecode 已验证**：2026-11-02 面板启用（本地自动运行）+ 提问后，审计出现 `prompt-submit | traecode`，`hook_dedup` 同步落库——读侧注入与写侧闭环均已打通。
 - **traework 面板未暴露 hooks 选项**：应用包内确含 `global_hooks_enabled`、`import_claude_folders` 等运行时开关（静态分析证据），但设置界面没有 hooks 入口——用户实测不可配。hooks 能力在运行时存在，可能只是未出面板或需开关开启。⚠️ 待进一步验证。
 - **workbuddy ≠ codebuddy 的配置**：运行时同是内置 CodeBuddy CLI，但用户级配置读的是 `<WORKBUDDY_CONFIG_DIR>/settings.json`
   = `~/.workbuddy/settings.json`。写 `~/.codebuddy/settings.json` 永远不触发（2026-11-01 实测：挂机 1.5 天，审计 0 条）。
@@ -62,10 +62,29 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 ### 3A.1 TRAE（TRAE SOLO CN / Trae CN）
 
 - 全局 hooks：`~/.trae-cn/hooks.json`；项目 hooks：`$PROJECT/.trae/hooks.json`。
-- **唯一生效路径**：应用内「设置 > Hooks > 全局 > 勾选已启用 + 运行方式」→ 保存后在会话触发。
-- 运行方式建议 **本地自动运行**（沙箱可能限制 mem 访问）。
-- 日志：设置 > Hooks > 查看日志（输出面板 "Agent Hooks"）。
 - 事件：支持 SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / Notification；stdout 纯文本注入**仅适用于前两个**。
+
+**一次性接入清单（按序执行，缺一不可）**
+
+1. `mem init --harness traecode`：写入 `~/.trae-cn/hooks.json`，自动备份旧文件，条目带 `# v2mem`。
+2. 打开「设置 > Hooks > 全局」，确认事件条目在列，并打开 **已配置的 Hooks** 总开关。
+3. **运行方式选「本地自动运行」**。选 Sandbox 会出现“读得到、写不进”的半接入状态。
+4. 完全退出 Trae 或新建会话，发一句普通提问并结束该轮（已开会话不即时生效）。
+5. 验收（只读）：
+   ```bash
+   mem audit --tail 5    # 应出现 prompt-submit | traecode 和 stop | traecode
+   ```
+   或看「设置 > Hooks > 查看日志」（输出面板 "Agent Hooks"）。
+
+**故障对照（2026-11-02 实机）**
+
+| 现象 | 根因 | 处理 |
+|:---|:---|:---|
+| 日志 `ExecEnv: Sandbox`，stderr 报 `attempt to write a readonly database (8)` 或 `spool: operation not permitted` | 钩子跑在沙箱，`~/.v2mem` 禁写；注入仍成功，但审计/观测为 0 | 第 3 步改为「本地自动运行」；或在沙箱配置放行 `~/.v2mem` |
+| 配置存在但审计无 `traecode` | 总开关未开，或旧会话未重建 | 完成第 2、4 步 |
+| 审计只有 `workbuddy`/`codebuddy` | 写错了宿主文件 | Trae 只读 `~/.trae-cn/hooks.json` |
+
+- MCP 可选：`mem mcp` 与 hooks 共用同一二进制和库，不冲突，也不是 hooks 接入的前置条件。
 
 ### 3A.2 WorkBuddy（内置 CodeBuddy 运行时）
 

@@ -87,6 +87,44 @@ else
   add I4 WARN "MCP 进程未运行" "空闲时无进程属正常；若本次会话要用 MCP 工具则需重启会话"
 fi
 
+# I5 Trae 钩子执行环境：Sandbox 会"读得到、写不进"（审计/观测为 0）
+TRAE_HOOKS="$HOME/.trae-cn/hooks.json"
+if [ -f "$TRAE_HOOKS" ] && grep -q '# v2mem' "$TRAE_HOOKS" 2>/dev/null; then
+  HOOK_LOG=""
+  for d in "$HOME/Library/Application Support/Trae CN/logs" \
+           "$HOME/Library/Application Support/Trae/logs" \
+           "$HOME/.config/Trae CN/logs" \
+           "$HOME/.config/Trae/logs"; do
+    [ -d "$d" ] || continue
+    f=$(ls -t "$d"/*/Modular/agent-hooks.log 2>/dev/null | head -1)
+    if [ -n "$f" ]; then HOOK_LOG="$f"; break; fi
+  done
+  if [ -z "$HOOK_LOG" ]; then
+    add I5 INFO "Trae 钩子尚未触发" "未找到 agent-hooks.log；面板启用并新建会话后再查"
+  else
+    HOOK_ENV=$(awk -v RS='--- Hook Execution Start ---' '
+      {
+        cmd=0; env=""
+        n=split($0, a, "\n")
+        for (i=1; i<=n; i++) {
+          if (a[i] ~ /Command:/ && a[i] ~ /--harness traecode/) cmd=1
+          if (cmd && a[i] ~ /ExecEnv:/) {
+            e=a[i]; sub(/.*ExecEnv: /, "", e); gsub(/[^A-Za-z]/, "", e); env=e
+          }
+        }
+      }
+      END { print env }
+    ' "$HOOK_LOG" 2>/dev/null)
+    case "$HOOK_ENV" in
+      Host)    add I5 PASS "Trae 钩子本地运行" "ExecEnv=Host，审计/观测可写" ;;
+      Sandbox) add I5 WARN "Trae 钩子在沙箱运行" "读侧注入可用，但 ~/.v2mem 禁写；面板运行方式改「本地自动运行」" ;;
+      *)       add I5 INFO "Trae 钩子环境未知" "日志未匹配到 traecode 执行块：${HOOK_LOG##*/}" ;;
+    esac
+  fi
+else
+  add I5 INFO "未接入 Trae" "$TRAE_HOOKS 无 v2mem 条目，跳过"
+fi
+
 # ---------- 运行态：解析 audit.jsonl ----------
 AUDIT="$V2MEM_DIR/audit.jsonl"
 A_EVENTS=0; A_PROMPT=0; A_PROMPT_EMPTY=0; A_SS=0; A_OBS=0; A_ADD=0; A_MS=0

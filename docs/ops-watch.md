@@ -74,6 +74,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **I2** | 钩子四事件齐全 | `settings.json` 中 `mem hook` 覆盖的事件数 | 4 | 1–3 | 0 |
 | **I3** | MCP 已批准 | `mcp-approvals.json` 有 `*::v2mem` | 有 | 无 | — |
 | **I4** | MCP 进程 | `pgrep -f "mem mcp"` | ≥1 | 0 | — |
+| **I5** | Trae 钩子执行环境 | `agent-hooks.log` 中 traecode 块的 `ExecEnv` | `Host` | `Sandbox`（读得到、写不进） | 未匹配到 traecode 块时 `INFO` |
 | **R1** | 钩子被真实触发 | 窗口内审计事件数 | ≥1 | — | 0 |
 | **R2** | 检索命中率 | `1 - prompt-submit.empty 占比` | ≥30% | 10–30% | <10% |
 | **R3** | 检索延迟 | 窗口内 `ms` 均值 | <50ms | 50–200ms | >200ms |
@@ -112,6 +113,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | R7 持续增长 | 写库失败 | 查 `~/.v2mem` 权限与磁盘；spool 会在下次 SessionStart 重试 |
 | R6 下降 | 非预期删除 | 查 `mem gc` / `mem consolidate` 是否自动跑过；库被外部删除后重建也走这条 |
 | I2 掉到 1–3 | 宿主升级覆盖配置 | 重跑 `mem init --harness workbuddy`（幂等、带备份） |
+| I5 = WARN（`ExecEnv: Sandbox`） | Trae 钩子跑在沙箱，`~/.v2mem` 禁写 | Hooks 面板运行方式改「本地自动运行」；或在沙箱配置放行 `~/.v2mem` |
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
