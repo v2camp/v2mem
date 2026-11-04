@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "source": {
+    "id": "fixture-session",
+    "generations": [
+      1,
+      2
+    ],
+    "primary": "events-v1.jsonl",
+    "rotated": "events-v2.jsonl"
+  },
+  "expected": {
+    "v1_events": 240,
+    "v2_events": 10,
+    "same_second_events": 20,
+    "duplicate_summary_seqs": [
+      20,
+      21
+    ],
+    "long_output_seq": 100,
+    "long_output_min_chars": 12000,
+    "final_assistant_seq": 240,
+    "spool_segments": 4,
+    "concurrent_writers": 4,
+    "deleted_source": true
+  },
+  "baseline": {
+    "memories": 9,
+    "observations": 19,
+    "candidates": 0,
+    "distill_runs": 19,
+    "distill_empty": 13,
+    "distill_ok": 6
+  },
+  "regressions": [
+    "latest-200-window",
+    "same-second-watermark",
+    "duplicate-summary-dedup",
+    "source-rotation",
+    "deleted-source-replay",
+    "concurrent-spool-append-drain",
+    "read-pool-no-backfill"
+  ]
+}

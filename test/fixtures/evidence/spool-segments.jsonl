@@ -1,0 +1,4 @@
+{"segment":"session-0001.jsonl","writer":"append-a","state":"ready","records":3}
+{"segment":"session-0002.jsonl","writer":"append-b","state":"ready","records":3}
+{"segment":"session-0003.jsonl","writer":"drain-a","state":"leased","records":2}
+{"segment":"session-0004.jsonl","writer":"drain-b","state":"leased","records":2}

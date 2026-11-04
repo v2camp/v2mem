@@ -127,3 +127,28 @@ MCP `add` 的 schema 声明 `required:["content"]`；写侧一律带 `source`（
 | `(session_id, content_hash)` | 事件 + 工具 + 摘要 | 永久 | 没有 event_id，或摘要相同但 event_id 不同：不插新行，`DupReason=content_hash` |
 
 `event_id` 来自 stdin 的 `event_id`；否则 PostToolUse 用 `tool:<session>:<tool_use_id>`。Stop / SessionEnd 通常没有稳定 id，只靠 content_hash。spool 行带上 event_id，drain 再走 `AppendObservation`，重放得到 duplicate。`Created=true` 是首次落库。没有 201/200。
+
+---
+
+## 11. Host adapter 探针结论（2026-11-04，阶段 0）
+
+**结论：`host_safe=false`。阶段 2 自动调度默认禁用 Host executor，只使用 Local LLM 或保留 backlog；Host 仅允许显式调用。**
+
+本机可用事实：
+
+| 项 | 观察 |
+|:---|:---|
+| 宿主 CLI | `/Users/wanghui/.local/bin/codebuddy` 存在，支持 `-p/--print`、`--session-id`、`--tools`、`--no-session-persistence` |
+| 历史探针 | 2026-11-02 的零额度探针证明 `codebuddy -p probe --port <n>` 在模型调用前即可触发 native hooks；HOME 隔离会使 hooks 不运行，故探针必须用配置副本 |
+| 当前 hook 配置 | `~/.workbuddy/settings.json` 的 SessionStart / UserPromptSubmit / Stop / SessionEnd 都是同一条 `mem hook --harness workbuddy`，没有 Proposal run/depth 标记 |
+| 当前 Proposal 代码 | `distill_hook.go` 只有默认关闭的 `MEM_DISTILL_SPAWN`，没有子会话 origin_run_id、深度上限或「Proposal 子会话不触发新 Proposal」判定 |
+
+因此，**从 Stop 里拉起子 Agent 做 Proposal，会再次触发同一组 hooks，存在递归与自蒸馏风险**。在阶段 2 落地以下五项前，不得把 Host 放进自动调度：
+
+1. `V2MEM_PROPOSAL_RUN_ID` / `V2MEM_PROPOSAL_DEPTH` 环境标记；
+2. 派生会话 `origin_run_id`；
+3. 深度上限 1；
+4. Proposal 子会话事件可归档但 `proposal_eligible=false`；
+5. Hook 检测到 Proposal 环境时禁止再次 spawn distill。
+
+阶段 2 的契约测试通过并把结论改为 `host_safe=true` 后，再按「Host 优先、Local 兜底」启用；否则按「Local 优先、Host 显式」运行。
