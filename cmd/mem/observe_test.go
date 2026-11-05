@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/evidence"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -21,7 +24,7 @@ func hookJSON(t *testing.T, fields map[string]any) string {
 	return string(b)
 }
 
-func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
+func TestObserveHookWritesBufferNotMemories(t *testing.T) {
 	db := testDB(t)
 	proj, name := hookProjectDir(t, "demo-repo")
 	if err := cmdAdd([]string{"--db", db, "--project", name, "--kind", "fact", "唯一的永久记忆"}); err != nil {
@@ -75,8 +78,10 @@ func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
 	}
 	var sawPost, sawStop, sawEnd, sawRedacted bool
 	for _, o := range obs {
-		if !strings.Contains(o.MetaJSON, "hook-observe") {
-			t.Errorf("观测 source 应为 hook-observe，got %s", o.MetaJSON)
+		// T1.2 起观测是 canonical 证据行：meta 由 evidence 写 proposal_eligible，
+		// 不再带 hook-observe 标记；来源改由 event_uid/source_id 表达。
+		if !strings.Contains(o.MetaJSON, "proposal_eligible") {
+			t.Errorf("证据行 meta 应带 proposal_eligible，got %s", o.MetaJSON)
 		}
 		switch o.Event {
 		case "post-tool-use":
@@ -84,8 +89,8 @@ func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
 			if o.Channel != store.ChannelTool {
 				t.Errorf("PostToolUse 默认 channel=tool，got %s", o.Channel)
 			}
-			if o.EventID != "tool:"+sid+":tu-1" {
-				t.Errorf("event_id 应来自 tool_use_id，got %s", o.EventID)
+			if o.EventID != "" {
+				t.Errorf("证据行不再写 event_id（身份在 event_uid），got %s", o.EventID)
 			}
 			if strings.Contains(o.Summary, "supersecret") {
 				t.Errorf("摘要应抹掉密钥，got %s", o.Summary)
@@ -107,6 +112,11 @@ func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
 	}
 	if !sawPost || !sawStop || !sawEnd || !sawRedacted {
 		t.Fatalf("观测事件不全 post=%v stop=%v end=%v redacted=%v", sawPost, sawStop, sawEnd, sawRedacted)
+	}
+	// 宿主事件号成为证据身份：同一 tool_use_id 重放不会再插一行。
+	src := observeSourceID("cursor", sid)
+	if _, ok, err := st.LookupEvidence(src+":tool:tu-1", src, 0, 0); err != nil || !ok {
+		t.Fatalf("PostToolUse 应以 tool_use_id 作证据身份，got ok=%v err=%v", ok, err)
 	}
 
 	searchOut, err := captureStdout(t, func() error {
@@ -169,14 +179,17 @@ func TestCmdHookObserveWritesBufferNotMemories(t *testing.T) {
 	}
 }
 
-func TestCmdHookStopDedupesBySessionContent(t *testing.T) {
+// T1.2 的身份语义：
+//   - 同一宿主事件（有 event_id）重放 → 一行；
+//   - 同摘要、无 id 的两次真实 Stop → 两行（内容去重不再吞并不同事件）。
+func TestObserveStopKeepsSameSummaryEventsApart(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
-	in := hookJSON(t, map[string]any{
+	noID := hookJSON(t, map[string]any{
 		"hook_event_name": "Stop", "cwd": proj, "session_id": "same", "status": "completed",
 	})
 	for i := 0; i < 2; i++ {
-		if _, err := withStdin(t, in, func() error {
+		if _, err := withStdin(t, noID, func() error {
 			return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
 		}); err != nil {
 			t.Fatalf("hook #%d: %v", i, err)
@@ -191,8 +204,33 @@ func TestCmdHookStopDedupesBySessionContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListObservations: %v", err)
 	}
+	if len(obs) != 2 {
+		t.Fatalf("同摘要不同 event_uid 必须共存，got %d", len(obs))
+	}
+	for _, o := range obs {
+		if o.Summary != "stop status=completed" {
+			t.Fatalf("两条摘要应相同（被内容去重吞并才算失败），got %q", o.Summary)
+		}
+	}
+
+	// 宿主给了 id：同一 id 重放必须只留一行。
+	withID := hookJSON(t, map[string]any{
+		"hook_event_name": "Stop", "cwd": proj, "session_id": "same-id",
+		"status": "completed", "event_id": "stop-1",
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := withStdin(t, withID, func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
+		}); err != nil {
+			t.Fatalf("hook 重放 #%d: %v", i, err)
+		}
+	}
+	obs, err = st.ListObservations("same-id", 10)
+	if err != nil {
+		t.Fatalf("ListObservations: %v", err)
+	}
 	if len(obs) != 1 {
-		t.Fatalf("同一会话相同 Stop 应只留 1 条，got %d", len(obs))
+		t.Fatalf("同一 event_id 重放应只留 1 条，got %d", len(obs))
 	}
 }
 
@@ -248,7 +286,7 @@ func TestCmdHookPreCompactInjectsAndHonoursBudget(t *testing.T) {
 	}
 }
 
-func TestCmdHookSpoolDrainsOnSessionStart(t *testing.T) {
+func TestSpoolDrainsOnSessionStart(t *testing.T) {
 	dir := t.TempDir()
 	db := filepath.Join(dir, "mem.db")
 	if err := os.MkdirAll(db, 0o755); err != nil {
@@ -265,9 +303,9 @@ func TestCmdHookSpoolDrainsOnSessionStart(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("写库失败的 hook 仍应返回 nil: %v", err)
 	}
-	matches, err := filepath.Glob(filepath.Join(dir, "spool", "*.jsonl"))
+	matches, err := filepath.Glob(filepath.Join(dir, "spool", "spool-sess", "seg-*.jsonl"))
 	if err != nil || len(matches) != 1 {
-		t.Fatalf("应落下 spool 文件，got %v err %v", matches, err)
+		t.Fatalf("应落下 spool/<session>/seg-*.jsonl，got %v err %v", matches, err)
 	}
 	fi, err := os.Stat(matches[0])
 	if err != nil {
@@ -275,6 +313,9 @@ func TestCmdHookSpoolDrainsOnSessionStart(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0o600 {
 		t.Errorf("spool 文件权限应为 0600，got %o", fi.Mode().Perm())
+	}
+	if tmp, _ := filepath.Glob(filepath.Join(dir, "spool", "spool-sess", "*.tmp")); len(tmp) != 0 {
+		t.Errorf("tmp 必须先 rename 掉，残留 %v", tmp)
 	}
 
 	if err := os.RemoveAll(db); err != nil {
@@ -450,7 +491,7 @@ func TestCmdInitRegistersStopWhereDocumented(t *testing.T) {
 	}
 }
 
-func TestHookEventIDReplayAndNoScrub(t *testing.T) {
+func TestObserveEventIDReplayAndNoScrub(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
 	body := hookJSON(t, map[string]any{
@@ -474,8 +515,12 @@ func TestHookEventIDReplayAndNoScrub(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(obs) != 1 || obs[0].EventID != "host-evt-9" || strings.Contains(obs[0].Summary, "supersecret") {
+	src := observeSourceID("cursor", "evt-sess")
+	if len(obs) != 1 || strings.Contains(obs[0].Summary, "supersecret") {
 		t.Fatalf("重放不得双写，且默认打码: %+v", obs)
+	}
+	if rec, ok, err := st.LookupEvidence(src+":event:host-evt-9", src, 0, 0); err != nil || !ok || rec.EventUID != src+":event:host-evt-9" {
+		t.Fatalf("宿主 event_id 应成为证据身份，got ok=%v err=%v", ok, err)
 	}
 
 	raw := hookJSON(t, map[string]any{
@@ -488,78 +533,385 @@ func TestHookEventIDReplayAndNoScrub(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	obs, err = st.ListObservations("evt-sess", 10)
-	if err != nil {
-		t.Fatal(err)
+	rec, ok, err := st.LookupEvidence(src+":event:host-evt-raw", src, 0, 0)
+	if err != nil || !ok {
+		t.Fatalf("--no-scrub 那条应可查到，ok=%v err=%v", ok, err)
 	}
-	var saw bool
-	for _, o := range obs {
-		if o.EventID == "host-evt-raw" && strings.Contains(o.Summary, "supersecret") {
-			saw = true
+	if !strings.Contains(rec.Summary, "supersecret") {
+		t.Fatalf("--no-scrub 应保留密钥: %+v", rec)
+	}
+}
+
+// ---------- T1.2：transcript 增量、管道事件、spool 契约 ----------
+
+func writeClaudeTranscript(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("写 transcript: %v", err)
+	}
+}
+
+// Stop 必须是 marker，同时把 transcript 的用户/助手/工具事件按原生顺序补成独立证据；
+// 最后一条助手结论必须自己占一行（不能被塞进 stop 摘要）。
+func TestObserveStopCapturesTranscriptIncrementally(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	path := filepath.Join(t.TempDir(), "tx.jsonl")
+	sid := "tx-sess"
+	writeClaudeTranscript(t, path,
+		`{"type":"user","uuid":"u1","sessionId":"`+sid+`","timestamp":"2026-11-06T00:00:00Z","cwd":"/work/demo","message":{"role":"user","content":"需求：把证据写全"}}`,
+		`{"type":"assistant","uuid":"a1","sessionId":"`+sid+`","timestamp":"2026-11-06T00:00:01Z","cwd":"/work/demo","message":{"role":"assistant","content":[{"type":"text","text":"先看代码"},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}`,
+		`{"type":"user","uuid":"u2","sessionId":"`+sid+`","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"a.txt"}]}}`,
+		`{"type":"assistant","uuid":"a2","sessionId":"`+sid+`","timestamp":"2026-11-06T00:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"结论：T1.2 按事件身份归档"}]}}`,
+	)
+	stop := hookJSON(t, map[string]any{
+		"hook_event_name": "Stop", "cwd": proj, "session_id": sid,
+		"status": "completed", "transcript_path": path,
+	})
+	runStop := func() {
+		t.Helper()
+		if _, err := withStdin(t, stop, func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
+		}); err != nil {
+			t.Fatalf("Stop: %v", err)
 		}
 	}
-	if !saw {
-		t.Fatalf("--no-scrub 应保留密钥: %+v", obs)
-	}
-}
+	runStop()
 
-// spool 是兜底路径，兜底失败必须能被看见。
-// 旧实现没有大小上限：库长期不可写时 spool 会一直长，最后把磁盘写满。
-func TestAppendSpoolSizeLimitIsVisible(t *testing.T) {
-	db := filepath.Join(t.TempDir(), "mem.db")
-	path := spoolFile(db, "big")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, make([]byte, spoolMaxBytes), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	err := appendSpool(db, store.ObsInput{SessionID: "big", Event: "stop", Summary: "写不进去了"})
-	if err == nil || !strings.Contains(err.Error(), "上限") {
-		t.Fatalf("超过上限必须报错而不是继续追加，got %v", err)
-	}
-	// 正常容量下写入必须落盘且带换行（JSONL 追加的前提）。
-	okPath := spoolFile(db, "ok")
-	if err := appendSpool(db, store.ObsInput{SessionID: "ok", Event: "stop", Summary: "正常一条"}); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(okPath)
+	st, err := store.Open(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(string(b), "\n") || !strings.Contains(string(b), "正常一条") {
-		t.Fatalf("spool 应为 JSONL，got %q", string(b))
+	defer st.Close()
+	src := transcriptSourceID("claude", sid)
+	order := []string{"tx:u1", "tx:a1#0", "tx:tool_use:toolu_1", "tx:tool_result:toolu_1", "tx:a2#0"}
+	var lastSeq int
+	for _, uid := range order {
+		rec, ok, err := st.LookupEvidence(uid, src, 0, 0)
+		if err != nil || !ok {
+			t.Fatalf("证据 %s 缺失（ok=%v err=%v）", uid, ok, err)
+		}
+		if rec.Seq <= lastSeq {
+			t.Fatalf("原生行序被破坏：%s seq=%d 不大于前一条 %d", uid, rec.Seq, lastSeq)
+		}
+		lastSeq = rec.Seq
 	}
-}
+	final, ok, err := st.LookupEvidence("tx:a2#0", src, 0, 0)
+	if err != nil || !ok {
+		t.Fatalf("最后一条助手结论必须是独立证据: ok=%v err=%v", ok, err)
+	}
+	if final.Seq != lastSeq || !strings.Contains(final.Summary, "按事件身份归档") {
+		t.Fatalf("最后一条应为该源的末条且带结论正文: %+v", final)
+	}
+	if final.EventType != "assistant-text" {
+		t.Fatalf("助手结论事件类型应为 assistant-text，got %s", final.EventType)
+	}
 
-// 坏行丢弃是对的（不挡后面的），但必须计数上报 —— 静默丢弃等于把观测丢失藏起来。
-func TestDrainSpoolCountsDroppedLines(t *testing.T) {
-	db := filepath.Join(t.TempDir(), "mem.db")
-	path := spoolFile(db, "s")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		t.Fatal(err)
+	// stop marker 自己一行，且不重复承载结论正文。
+	markerSrc := observeSourceID("claude", sid)
+	if _, ok, err := st.LookupEvidence(markerSrc+":syn", markerSrc, 0, 0); err != nil || ok {
+		t.Fatalf("stop marker 身份不该被猜出来: ok=%v err=%v", ok, err)
 	}
-	good, err := json.Marshal(store.ObsInput{SessionID: "s", Event: "stop", Summary: "一条好观测"})
+	obs, err := st.ListObservations(sid, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := "这不是 JSON\n" + string(good) + "\n"
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	markers := 0
+	for _, o := range obs {
+		if o.Event == "stop" {
+			markers++
+			if strings.Contains(o.Summary, "按事件身份归档") {
+				t.Errorf("stop marker 不该承载结论正文: %q", o.Summary)
+			}
+		}
+	}
+	if markers != 1 {
+		t.Fatalf("Stop 应留下 1 条 marker，got %d", markers)
+	}
+	if len(obs) != 6 {
+		t.Fatalf("首轮应有 5 条转录证据 + 1 条 marker，got %d", len(obs))
+	}
+
+	// 追加一行后再 Stop：只补新增的那条。
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
 		t.Fatal(err)
+	}
+	extra := `{"type":"assistant","uuid":"a3","sessionId":"` + sid + `","message":{"role":"assistant","content":[{"type":"text","text":"补充：增量只读新行"}]}}` + "\n"
+	if _, err := f.WriteString(extra); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	runStop()
+	obs, err = st.ListObservations(sid, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 6 条转录 + 2 条 stop marker（两次真实 Stop 各一条）。
+	if len(obs) != 8 {
+		t.Fatalf("增量应只补 1 条转录 + 1 条 marker，got %d: %+v", len(obs), obs)
+	}
+	if _, ok, _ := st.LookupEvidence("tx:a3#0", src, 0, 0); !ok {
+		t.Fatal("新增行应被增量解析到")
+	}
+}
+
+// 记忆工具自身与 MCP 管道事件照常归档，但不得作为 Proposal 的种子。
+func TestObservePipelineToolsArchivedButIneligible(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	cases := []struct {
+		tool     string
+		eligible bool
+	}{
+		{"mcp__v2mem__search", false},
+		{"ToolSearch", false},
+		{"ListMcpResources", false},
+		{"Bash", true},
+	}
+	for _, tc := range cases {
+		in := hookJSON(t, map[string]any{
+			"hook_event_name": "postToolUse", "cwd": proj, "session_id": "pipe-sess",
+			"tool_name": tc.tool, "event_id": "evt-" + tc.tool,
+			"tool_input": map[string]any{"command": "echo pipe"},
+		})
+		if _, err := withStdin(t, in, func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
+		}); err != nil {
+			t.Fatalf("%s: %v", tc.tool, err)
+		}
 	}
 	st, err := store.Open(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	done, dropped, err := drainOneSpool(st, path, "-", 10, time.Now().Add(time.Second))
+	src := observeSourceID("claude", "pipe-sess")
+	for _, tc := range cases {
+		rec, ok, err := st.LookupEvidence(src+":event:evt-"+tc.tool, src, 0, 0)
+		if err != nil || !ok {
+			t.Fatalf("%s 应被归档: ok=%v err=%v", tc.tool, ok, err)
+		}
+		if rec.ProposalEligible != tc.eligible {
+			t.Errorf("%s ProposalEligible=%v want %v", tc.tool, rec.ProposalEligible, tc.eligible)
+		}
+	}
+	obs, err := st.ListObservations("pipe-sess", 10)
+	if err != nil || len(obs) != len(cases) {
+		t.Fatalf("管道事件不得被丢弃，got %d err=%v", len(obs), err)
+	}
+}
+
+// 库打不开时 cmd/mem 自己写 spool；格式必须能被 evidence.Engine 的 drain 读懂。
+func TestSpoolSegmentContractDrainsViaEngine(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "mem.db")
+	ev := evidence.RawEvent{
+		EventUID: "evt:test:contract", SourceID: "hook:claude:s", SessionID: "sess-a",
+		Project: "demo", Harness: "claude", EventType: "stop",
+		OccurredAtNS: time.Now().UnixNano(), Raw: []byte("spool 契约正文"),
+	}
+	if err := spoolEvidence(db, ev); err != nil {
+		t.Fatalf("spoolEvidence: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(spoolDir(db), "sess-a", "seg-*.jsonl"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("段路径应为 spool/<session>/seg-*.jsonl，got %v err %v", matches, err)
+	}
+	if tmp, _ := filepath.Glob(filepath.Join(spoolDir(db), "sess-a", "*.tmp")); len(tmp) != 0 {
+		t.Fatalf("tmp 必须先 rename 掉，残留 %v", tmp)
+	}
+
+	e, err := evidence.Open(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if done != 1 || dropped != 1 {
-		t.Fatalf("应补写 1 条并上报 1 条坏行，got done=%d dropped=%d", done, dropped)
+	defer e.Close()
+	res, err := e.DrainSpool(10)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("drain 完成后 spool 文件应删除")
+	if res.Drained != 1 || res.Files != 1 {
+		t.Fatalf("drain 计数不对: %+v", res)
+	}
+	if _, err := os.Stat(matches[0]); !os.IsNotExist(err) {
+		t.Fatal("成功 drain 后段应删除")
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ref, ok, err := st.LookupEvidence(ev.EventUID, ev.SourceID, 0, 0)
+	if err != nil || !ok || !strings.Contains(ref.Summary, "spool 契约正文") {
+		t.Fatalf("drain 后应可查到证据: %+v ok=%v err=%v", ref, ok, err)
+	}
+}
+
+// 段数上限必须可见：兜底路径静默把磁盘写满比丢观测更糟。
+func TestSpoolSegmentLimitIsVisible(t *testing.T) {
+	old := spoolMaxSegments
+	spoolMaxSegments = 2
+	t.Cleanup(func() { spoolMaxSegments = old })
+
+	db := filepath.Join(t.TempDir(), "mem.db")
+	for i := 0; i < 2; i++ {
+		if err := spoolEvidence(db, evidence.RawEvent{
+			EventUID: "evt:limit:" + strconv.Itoa(i), SourceID: "s", SessionID: "lim",
+			Raw: []byte("段"),
+		}); err != nil {
+			t.Fatalf("第 %d 段: %v", i, err)
+		}
+	}
+	err := spoolEvidence(db, evidence.RawEvent{
+		EventUID: "evt:limit:2", SourceID: "s", SessionID: "lim", Raw: []byte("段"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("超过段数上限必须报错，got %v", err)
+	}
+}
+
+// drain 认领 .processing、成功删除、失败恢复，坏行计数上报。
+func TestSpoolDrainClaimsAndReportsDropped(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "mem.db")
+	if err := spoolEvidence(db, evidence.RawEvent{
+		EventUID: "evt:drain:1", SourceID: "s", SessionID: "dr", Raw: []byte("好行一"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessDir := filepath.Join(spoolDir(db), "dr")
+	// 坏行 + 一条 stale .processing：坏行要计数，stale 要被认领。
+	if err := os.WriteFile(filepath.Join(sessDir, "seg-bad.jsonl"), []byte("这不是 JSON\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := `{"v":1,"event_uid":"evt:drain:2","source_id":"s","occurred_at_ns":1,"session_id":"dr","event_type":"stop","raw":"` +
+		"c3RhbGU=" + `"}` + "\n"
+	if err := os.WriteFile(filepath.Join(sessDir, "seg-stale.jsonl.processing"), []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res := drainSpoolFailOpen(db, "-")
+	if res.Drained != 2 || res.Dropped != 1 || res.Files != 3 || res.Restored != 0 {
+		t.Fatalf("drain 计数不对: %+v", res)
+	}
+	if left, _ := filepath.Glob(filepath.Join(sessDir, "seg-*")); len(left) != 0 {
+		t.Fatalf("成功后不应残留段: %v", left)
+	}
+
+	// 库不可用：段必须原样留着，不能删。
+	if err := spoolEvidence(db, evidence.RawEvent{
+		EventUID: "evt:drain:3", SourceID: "s", SessionID: "dr", Raw: []byte("留着"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(db, 0o755); err != nil { // 库路径变成目录 → 打不开
+		t.Fatal(err)
+	}
+	drainSpoolFailOpen(db, "-")
+	if left, _ := filepath.Glob(filepath.Join(sessDir, "seg-*.jsonl")); len(left) != 1 {
+		t.Fatalf("打不开库时段必须保留，got %v", left)
+	}
+}
+
+// 并发 append/drain 不丢行：段是原子落盘 + rename 认领，绝不读全文件重写。
+func TestSpoolConcurrentAppendDrainKeepsEveryRow(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "mem.db")
+	const writers, perWriter = 4, 25
+	sid := "conc"
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				ev := evidence.RawEvent{
+					EventUID: "evt:conc:" + strconv.Itoa(w) + ":" + strconv.Itoa(i),
+					SourceID: "hook:test:" + sid, SessionID: sid,
+					EventType: "post-tool-use",
+					Raw:       []byte("并发行 " + strconv.Itoa(w) + "-" + strconv.Itoa(i)),
+				}
+				if err := spoolEvidence(db, ev); err != nil {
+					t.Errorf("spool 写失败: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	// 两个 drain 进程同时抢；报错（锁冲突）就等下一轮，不放弃。
+	var dg sync.WaitGroup
+	stop := make(chan struct{})
+	for d := 0; d < 2; d++ {
+		dg.Add(1)
+		go func() {
+			defer dg.Done()
+			e, err := evidence.Open(db)
+			if err != nil {
+				return
+			}
+			defer e.Close()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := e.DrainSpool(10); err != nil {
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	dg.Wait()
+
+	// 收尾：把剩余段补完。
+	e, err := evidence.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		res, err := e.DrainSpool(100)
+		if err != nil {
+			if time.Now().After(deadline) {
+				t.Fatalf("收尾 drain 卡住: %v", err)
+			}
+			continue
+		}
+		if res.Drained == 0 && res.Files == 0 {
+			break
+		}
+	}
+	left, _ := filepath.Glob(filepath.Join(spoolDir(db), sid, "seg-*"))
+	if len(left) != 0 {
+		t.Fatalf("收尾后不应残留段: %v", left)
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	obs, err := st.ListObservations(sid, writers*perWriter+10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != writers*perWriter {
+		t.Fatalf("并发 append/drain 丢行或重复：got %d want %d", len(obs), writers*perWriter)
+	}
+	seen := map[string]bool{}
+	for _, o := range obs {
+		if seen[o.Summary] {
+			t.Fatalf("同一行被写了两次: %q", o.Summary)
+		}
+		seen[o.Summary] = true
 	}
 }

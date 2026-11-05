@@ -156,3 +156,78 @@ func TestImportTranscriptFileFailureSetsExitCode(t *testing.T) {
 		t.Fatalf("错误应指明文件，got %v", err)
 	}
 }
+
+// 同摘要、不同事件身份必须共存：证据身份来自宿主 uuid，不是内容 hash。
+func TestImportTranscriptKeepsSameSummaryApart(t *testing.T) {
+	db := testDB(t)
+	path := filepath.Join(t.TempDir(), "dup.jsonl")
+	body := strings.Join([]string{
+		`{"type":"user","uuid":"x1","sessionId":"dup","message":{"role":"user","content":"决策：同摘要"}}`,
+		`{"type":"user","uuid":"x2","sessionId":"dup","message":{"role":"user","content":"决策：同摘要"}}`,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdImportTranscript([]string{"--db", db, "--file", path}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	src := transcriptSourceID("claude", "dup")
+	for _, uid := range []string{"tx:x1", "tx:x2"} {
+		rec, ok, err := st.LookupEvidence(uid, src, 0, 0)
+		if err != nil || !ok {
+			t.Fatalf("%s 应独立成条: ok=%v err=%v", uid, ok, err)
+		}
+		if rec.Summary != "决策：同摘要" {
+			t.Fatalf("摘要应一致（被内容去重吞并才会失败）: %+v", rec)
+		}
+	}
+	obs, err := st.ListObservations("dup", 10)
+	if err != nil || len(obs) != 2 {
+		t.Fatalf("同摘要不同身份应共存，got %d err=%v", len(obs), err)
+	}
+}
+
+// 记忆工具自身与 MCP 管道事件：照常归档，但 ProposalEligible=false。
+func TestImportTranscriptPipelineToolIneligible(t *testing.T) {
+	db := testDB(t)
+	path := filepath.Join(t.TempDir(), "pipe.jsonl")
+	body := strings.Join([]string{
+		`{"type":"assistant","uuid":"p1","sessionId":"pipe","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mem","name":"mcp__v2mem__search","input":{"query":"x"}}]}}`,
+		`{"type":"user","uuid":"p2","sessionId":"pipe","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mem","content":"[]"}]}}`,
+		`{"type":"assistant","uuid":"p3","sessionId":"pipe","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls"}}]}}`,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdImportTranscript([]string{"--db", db, "--file", path}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	src := transcriptSourceID("claude", "pipe")
+	cases := map[string]bool{
+		"tx:tool_use:toolu_mem":    false,
+		"tx:tool_result:toolu_mem": false,
+		"tx:tool_use:toolu_bash":   true,
+	}
+	for uid, want := range cases {
+		rec, ok, err := st.LookupEvidence(uid, src, 0, 0)
+		if err != nil || !ok {
+			t.Fatalf("%s 应被归档: ok=%v err=%v", uid, ok, err)
+		}
+		if rec.ProposalEligible != want {
+			t.Errorf("%s ProposalEligible=%v want %v", uid, rec.ProposalEligible, want)
+		}
+	}
+	if obs, err := st.ListObservations("pipe", 10); err != nil || len(obs) != 3 {
+		t.Fatalf("管道事件也必须归档，got %d err=%v", len(obs), err)
+	}
+}
