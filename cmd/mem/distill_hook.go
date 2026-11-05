@@ -23,11 +23,25 @@ func defaultStartDistill(db, session string) error {
 	if strings.HasSuffix(exe, ".test") {
 		return fmt.Errorf("测试二进制不拉起 distill")
 	}
-	cmd := exec.Command(exe, "distill", "--session", session, "--provider", "none", "--db", db)
+	args := []string{"distill"}
+	if proposalHookEnabled() {
+		args = append(args, "--proposal", "--executor", "auto", "--max-bundles", "1")
+	} else {
+		args = append(args, "--session", session, "--provider", "none")
+	}
+	args = append(args, "--db", db)
+	cmd := exec.Command(exe, args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	return cmd.Start()
+}
+
+// proposalHookEnabled 是旧规则蒸馏与 T2 Proposal 的显式切换点。
+// 默认保持旧行为；设置 MEM_PROPOSAL_HOOK=1 后，Stop/SessionStart 改拉起
+// 基于连续 Evidence Bundle 的 Proposal 路径。默认不在 Hook 内起模型进程。
+func proposalHookEnabled() bool {
+	return strings.TrimSpace(os.Getenv("MEM_PROPOSAL_HOOK")) == "1"
 }
 
 // maybeSpawnDistill 在 Stop / SessionEnd 末尾可选地拉起规则蒸馏。
@@ -36,11 +50,21 @@ func maybeSpawnDistill(db string, in hookInput) {
 	if strings.TrimSpace(os.Getenv("MEM_DISTILL_SPAWN")) != "1" {
 		return
 	}
+	sid := in.sessionID()
+	if proposalHookEnabled() {
+		if sid == "" {
+			fmt.Fprintln(os.Stderr, "v2mem hook: 无 session_id，跳过 proposal")
+			return
+		}
+		if err := startDistillProc(db, sid); err != nil {
+			fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 proposal 失败，已放过:", err)
+		}
+		return
+	}
 	if strings.TrimSpace(in.TranscriptPath) == "" {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 无 transcript_path，跳过 distill")
 		return
 	}
-	sid := in.sessionID()
 	if sid == "" {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 无 session_id，跳过 distill")
 		return
@@ -75,6 +99,12 @@ func maybeSpawnDistill(db string, in hookInput) {
 // 只用 provider none，有时间上限，失败不阻断注入，不写 memories。
 func distillPendingFailOpen(db, auditPath string) {
 	if strings.TrimSpace(os.Getenv("MEM_NO_DISTILL")) == "1" {
+		return
+	}
+	if proposalHookEnabled() {
+		if err := startDistillProc(db, ""); err != nil {
+			fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 proposal pending 失败，已放过:", err)
+		}
 		return
 	}
 	st, err := store.Open(db)
