@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/recall"
 	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
@@ -29,7 +30,9 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem add    [选项] "<原子事实>"    写入一条记忆（相同内容自动覆盖）
   mem search [选项] "<查询>"        全文检索（FTS5 / bm25）
   mem ls     [选项]                列出库里的记忆（无需查询词；可按工程/类型/标记过滤）
-  mem touch  <id|前缀>             记录命中，刷新 last_seen_at 并累加 access_count
+  mem touch  <id|前缀>             记录一次采纳（adopted 兼容别名）
+  mem show   <id|前缀>             深查：正文 + 溯源 + 最近读侧轨迹
+  mem feedback <trace> <id|前缀> --adopted|--negative [--reason "..."]  给一次供给落反馈
   mem forget <id|前缀>             删除一条记忆
   mem notes  [选项]                先输出类码表，再输出硬规则小字条（幂等）
   mem lexicon init --project <X> [--terms "词A,词B"]   从该工程记忆提取同义词写入 synonyms.txt（--dry-run 预览；--auto 实验性 bigram 提取）
@@ -97,6 +100,14 @@ consolidate 选项:
   --no-backup           跳过归并前的库备份
   --backup-dir <dir>    备份目录（默认 <库目录>/backup）
 
+show 选项:
+  --traces <n>     附带最近多少条读侧轨迹（默认 5）
+
+feedback 选项:
+  --adopted        采纳（唯一会更新 adopted_count / last_adopted_at 的反馈）
+  --negative       否定这次供给（只改轨迹，不动记忆）
+  --reason <s>     反馈原因（可选，便于事后标注）
+
 hook 选项:
   --event <e>           session-start|prompt-submit|pre-compact|post-tool-use|stop|session-end（默认从 stdin 推断）
   --harness <h>         指定工具，项目目录按其注入的环境变量取（默认依次尝试）
@@ -115,9 +126,9 @@ hook 选项:
 // 起因：新增 `mem report` 时漏了同步测试里的清单，护栏立刻报警 ——
 // 清单有两个出处就一定会漂移，所以把它抽成一处。
 var knownSubcommands = []string{
-	"add", "search", "ls", "stats", "touch", "forget", "notes", "lexicon", "gc", "consolidate",
-	"export", "import", "import-transcript", "sync", "hook", "harness", "init", "uninstall", "ingest",
-	"budget", "audit", "eval", "mcp", "help",
+	"add", "search", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
+	"gc", "consolidate", "export", "import", "import-transcript", "sync", "hook", "harness",
+	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
 	"distill", "accept", "reject", "candidates",
 }
 
@@ -139,6 +150,10 @@ func main() {
 		err = cmdStats(os.Args[2:])
 	case "touch":
 		err = cmdTouch(os.Args[2:])
+	case "show":
+		err = cmdShow(os.Args[2:])
+	case "feedback":
+		err = cmdFeedback(os.Args[2:])
 	case "forget":
 		err = cmdForget(os.Args[2:])
 	case "notes":
@@ -505,8 +520,8 @@ func cmdSearch(args []string) error {
 	return nil
 }
 
-// cmdTouch 记录一次命中：刷新 last_seen_at、累加 access_count。
-// 这是衰减机制的输入——常被命中的记忆不会被淘汰。
+// cmdTouch 是 adopted 的兼容别名：刷新 last_seen_at/access_count，
+// 并累加 adopted_count / last_adopted_at。读侧检索、列举、注入都不会自动调用它。
 func cmdTouch(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("touch", flag.ContinueOnError)
@@ -525,15 +540,205 @@ func cmdTouch(args []string) error {
 	}
 	defer st.Close()
 
-	full, err := st.Touch(id)
+	full, adopted, err := st.Adopt(id)
 	if err != nil {
 		return err
 	}
 	if c.json {
-		return printJSON(map[string]string{"id": full, "touched": "true"})
+		return printJSON(map[string]any{"id": full, "touched": "true", "adopted_count": adopted})
 	}
-	fmt.Printf("已记录命中 %s\n", shortID(full))
+	fmt.Printf("已记录采纳 %s（累计 %d 次）\n", shortID(full), adopted)
 	return nil
+}
+
+// cmdShow 深查一条记忆：正文、溯源与最近的读侧供给轨迹。
+func cmdShow(args []string) error {
+	var c common
+	fs := flag.NewFlagSet("show", flag.ContinueOnError)
+	c.register(fs)
+	traces := fs.Int("traces", 5, "附带最近多少条读侧轨迹")
+	flags, pos := reorderFlags(args, map[string]bool{"--db": true, "--traces": true})
+	if err := fs.Parse(flags); err != nil {
+		return err
+	}
+	id := strings.TrimSpace(strings.Join(pos, " "))
+	if id == "" {
+		return errors.New("缺少 ID，用法: mem show <id|前缀>")
+	}
+	if *traces < 0 {
+		return errors.New("--traces 不能为负数")
+	}
+
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	d, err := st.MemoryDetailByID(id)
+	if err != nil {
+		return err
+	}
+	prov := recall.ProvenanceFor(st, []store.Hit{{ID: d.ID, Project: d.Project}})[d.ID]
+	if prov == "" && d.Provenance != nil {
+		prov = d.Provenance.Preview
+	}
+	ts, err := st.TracesForMemory(d.ID, *traces)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(struct {
+			Memory     *store.MemoryDetail `json:"memory"`
+			Provenance string              `json:"provenance,omitempty"`
+			Traces     []store.MemoryTrace `json:"traces"`
+		}{Memory: d, Provenance: prov, Traces: ts})
+	}
+
+	fmt.Printf("id          %s\n", d.ID)
+	fmt.Printf("kind        %s\n", d.Kind)
+	proj := d.Project
+	if proj == "" {
+		proj = "(global)"
+	}
+	fmt.Printf("project     %s\n", proj)
+	if d.Scope != "" {
+		fmt.Printf("scope       %s\n", d.Scope)
+	}
+	fmt.Printf("salience    %.2f\n", d.Salience)
+	fmt.Printf("content_hash %s\n", d.ContentHash)
+	fmt.Printf("created     %s\n", formatUnix(d.CreatedAt))
+	fmt.Printf("updated     %s\n", formatUnix(d.UpdatedAt))
+	fmt.Printf("last_seen   %s\n", formatUnix(d.LastSeenAt))
+	if d.ExpiresAt != nil {
+		fmt.Printf("expires     %s\n", formatUnix(*d.ExpiresAt))
+	}
+	if d.SupersededBy != "" {
+		fmt.Printf("superseded  %s\n", shortID(d.SupersededBy))
+	}
+	fmt.Printf("source      %s/%s\n", d.Source, d.Channel)
+	if d.Tool != "" {
+		fmt.Printf("tool        %s\n", d.Tool)
+	}
+	fmt.Printf("access      %d\n", d.AccessCount)
+	lastAdopted := "—"
+	if d.LastAdopted != nil {
+		lastAdopted = formatUnix(*d.LastAdopted)
+	}
+	fmt.Printf("adopted     %d（最近 %s）\n", d.AdoptedCount, lastAdopted)
+	if prov != "" {
+		fmt.Printf("provenance  %s\n", prov)
+	}
+	if d.Provenance != nil {
+		fmt.Printf("origin      %s", d.Provenance.File)
+		if d.Provenance.Line > 0 {
+			fmt.Printf(":%d", d.Provenance.Line)
+		}
+		if d.Provenance.Preview != "" {
+			fmt.Printf("  %s", oneLine(d.Provenance.Preview))
+		}
+		fmt.Println()
+	}
+	fmt.Printf("content\n  %s\n", oneLine(d.Content))
+	if len(ts) == 0 {
+		fmt.Println("读侧轨迹     （暂无）")
+		return nil
+	}
+	fmt.Println("读侧轨迹")
+	for _, t := range ts {
+		fb := t.Feedback
+		if fb == "" {
+			fb = "—"
+		}
+		fmt.Printf("  %s  %-14s rank=%d  feedback=%s", shortID(t.TraceID), t.Outcome, t.InjectionRank, fb)
+		if t.QueryGate == "skip" {
+			fmt.Printf("  gate=skip(%s)", t.GateReason)
+		}
+		if t.FeedbackReason != "" {
+			fmt.Printf("  reason=%s", oneLine(t.FeedbackReason))
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+// cmdFeedback 给一条读侧供给里的某条记忆落反馈。
+// 只有 adopted 会更新 memories.adopted_count / last_adopted_at；negative 只改轨迹。
+func cmdFeedback(args []string) error {
+	var c common
+	fs := flag.NewFlagSet("feedback", flag.ContinueOnError)
+	c.register(fs)
+	adopted := fs.Bool("adopted", false, "采纳这条供给")
+	negative := fs.Bool("negative", false, "否定这条供给")
+	reason := fs.String("reason", "", "反馈原因")
+	// Go 的 flag 在首个位置参数处停止解析，而 feedback 的自然写法是
+	// `mem feedback <trace> <memory> --adopted --reason ...`。先把选项挑出来，
+	// 使选项写在位置参数前后都能用。
+	flags, rest := reorderFlags(args, map[string]bool{"--db": true, "--reason": true})
+	if err := fs.Parse(flags); err != nil {
+		return err
+	}
+	if len(rest) < 2 {
+		return errors.New("用法: mem feedback <trace> <memory> --adopted|--negative [--reason \"...\"]")
+	}
+	if *adopted == *negative {
+		return errors.New("必须且只能指定 --adopted 或 --negative 之一")
+	}
+	feedback := "adopted"
+	if *negative {
+		feedback = "negative"
+	}
+	traceID := strings.TrimSpace(rest[0])
+	memoryID := strings.TrimSpace(rest[1])
+	if traceID == "" || memoryID == "" {
+		return errors.New("trace 与 memory 都不能为空")
+	}
+
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	res, err := st.ApplyReadFeedback(traceID, memoryID, feedback, strings.TrimSpace(*reason))
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(res)
+	}
+	fmt.Printf("已记录反馈 %s → %s（%s）", shortID(res.TraceID), shortID(res.MemoryID), res.Feedback)
+	if res.Reason != "" {
+		fmt.Printf("  原因：%s", oneLine(res.Reason))
+	}
+	fmt.Printf("  累计采纳=%d\n", res.AdoptedCount)
+	return nil
+}
+
+// reorderFlags 把选项与位置参数分开，允许 `cmd <arg> --flag` 的写法。
+// valueFlags 是「后面必须跟一个值」的选项名。
+func reorderFlags(args []string, valueFlags map[string]bool) (flags, pos []string) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") && a != "-" {
+			flags = append(flags, a)
+			name, _, hasValue := strings.Cut(a, "=")
+			if valueFlags[name] && !hasValue && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		pos = append(pos, a)
+	}
+	return flags, pos
+}
+
+func formatUnix(ts int64) string {
+	if ts <= 0 {
+		return "—"
+	}
+	return time.Unix(ts, 0).Format("2006-01-02 15:04")
 }
 
 // cmdForget 显式删除一条记忆。

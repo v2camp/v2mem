@@ -408,3 +408,56 @@ func TestMCPArgNumberCoercion(t *testing.T) {
 		t.Errorf("非法类型应回默认值 0.5，got %f", got)
 	}
 }
+
+// T4：recall_context 的注入行必须带 mem:<id8> 与紧凑 provenance。
+func TestMCPRecallIncludesMemIDAndProvenance(t *testing.T) {
+	s, db := newMCPServer(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "demo", "--kind", "decision",
+		"检索预算默认走类码表"}); err != nil {
+		t.Fatal(err)
+	}
+	hits, _ := s.st.List(store.ListQuery{Scope: "all", Limit: 10})
+	if len(hits) != 1 {
+		t.Fatalf("前置条件不成立: %d", len(hits))
+	}
+	text := mcpText(mcpCall(t, s, "recall_context", map[string]any{
+		"query": "类码", "project": "demo", "scope": "all", "budget_chars": 800,
+	}))
+	if !strings.Contains(text, "mem:"+hits[0].ID[:8]) {
+		t.Fatalf("注入文本应带 mem:<id8>，got %s", text)
+	}
+	if !strings.Contains(text, " · ") {
+		t.Fatalf("注入文本应带紧凑 provenance，got %s", text)
+	}
+}
+
+// T4：search / ls 是只读检索，不得自动 touch 或采纳。
+func TestMCPReadToolsDoNotAutoAdopt(t *testing.T) {
+	s, db := newMCPServer(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "demo", "MCP 只读检索的记忆"}); err != nil {
+		t.Fatal(err)
+	}
+	hits, _ := s.st.List(store.ListQuery{Scope: "all", Limit: 10})
+	if len(hits) != 1 {
+		t.Fatalf("前置条件不成立: %d", len(hits))
+	}
+	id := hits[0].ID
+
+	mcpCall(t, s, "search", map[string]any{"query": "只读检索", "project": "demo"})
+	mcpCall(t, s, "ls", map[string]any{"project": "demo"})
+
+	d, err := s.st.MemoryDetailByID(id)
+	if err != nil {
+		t.Fatalf("MemoryDetailByID: %v", err)
+	}
+	if d.AccessCount != 0 || d.AdoptedCount != 0 || d.LastAdopted != nil {
+		t.Fatalf("search/ls 不得自动 touch: %+v", d)
+	}
+
+	// 显式 touch 才累加采纳计数。
+	mcpCall(t, s, "touch", map[string]any{"id": id[:8]})
+	d, _ = s.st.MemoryDetailByID(id)
+	if d.AdoptedCount != 1 || d.LastAdopted == nil {
+		t.Fatalf("touch 应作为 adopted 别名: %+v", d)
+	}
+}

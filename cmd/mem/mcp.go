@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/recall"
 	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
@@ -375,11 +376,14 @@ func (s *mcpServer) toolTouch(id any, args map[string]any) map[string]any {
 	if tid == "" {
 		return mcpError(id, -32602, "touch 需要 id（记忆 id 或前缀）")
 	}
-	full, err := s.st.Touch(tid)
+	// touch 是 adopted 的兼容别名：只有采纳才更新 adopted_count / last_adopted_at。
+	full, adopted, err := s.st.Adopt(tid)
 	if err != nil {
 		return mcpError(id, -32603, "touch 失败: "+err.Error())
 	}
-	return toolResult(id, map[string]string{"id": full, "touched": "true"}, false)
+	return toolResult(id, map[string]any{
+		"id": full, "touched": "true", "adopted_count": adopted,
+	}, false)
 }
 
 // toolRecall 是 search 的编排糖：返回一段可注入文本，不写库。
@@ -406,30 +410,70 @@ func (s *mcpServer) toolRecall(id any, args map[string]any) map[string]any {
 		return mcpError(id, -32602, "budget_chars 应为正数")
 	}
 	layer := argString(args, "layer")
-	if _, err := store.CanonicalLayer(layer); err != nil {
+	canon, err := store.CanonicalLayer(layer)
+	if err != nil {
 		return mcpError(id, -32602, err.Error())
 	}
 	started := time.Now()
+
+	// 已定记忆走与 hook 同一套供给管线（gate 由 Explicit 关闭：MCP 是用户显式检索）；
+	// 痕迹层没有信号/质量判据，保持原有的直接检索。
+	if canon == "memory" {
+		codes := renderKindCodes()
+		left := budget - runeLen(codes)
+		if left <= 0 {
+			left = -1
+		}
+		res, qerr := recall.Query(s.st, recall.QueryOptions{
+			Query: q, Project: project, Scope: scope,
+			Limit: defaultHookLimit, Budget: left, ContentRunes: maxHitRunes, Explicit: true,
+		})
+		if qerr != nil {
+			return mcpError(id, -32603, "recall_context 失败: "+qerr.Error())
+		}
+		var b strings.Builder
+		b.WriteString(codes)
+		hits := make([]store.Hit, 0, len(res.Injected))
+		for _, in := range res.Injected {
+			b.WriteString(recall.RenderLine(in.Hit, in.Provenance, maxHitRunes))
+			hits = append(hits, in.Hit)
+		}
+		if len(hits) == 0 {
+			line := "（无命中）\n"
+			if runeLen(b.String())+runeLen(line) <= budget {
+				b.WriteString(line)
+			}
+		}
+		s.auditSearch(started, project, q, hits)
+		return toolResult(id, map[string]string{"text": b.String()}, false)
+	}
+
 	hits, err := s.st.Search(store.SearchQuery{Query: q, Project: project, Scope: scope, Limit: defaultHookLimit, Layer: layer})
 	if err != nil {
 		return mcpError(id, -32603, "recall_context 失败: "+err.Error())
 	}
-	if s.auditFile != "-" {
-		rec := audit.Record{
-			TS: started.Unix(), Event: "manual-search", Project: project,
-			Query: scrub.Text(q), Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
-		}
-		for _, h := range hits {
-			rec.Hashes = append(rec.Hashes, h.ID)
-			rec.Kinds = append(rec.Kinds, h.Kind)
-		}
-		s.auditAppend(rec)
-	}
-	text := recallText(hits, budget)
+	s.auditSearch(started, project, q, hits)
+	text := recallText(s.st, hits, budget)
 	return toolResult(id, map[string]string{"text": text}, false)
 }
 
-func recallText(hits []store.Hit, budget int) string {
+// auditSearch 收口 MCP 读侧审计，避免两条分支各写一遍埋点。
+func (s *mcpServer) auditSearch(started time.Time, project, q string, hits []store.Hit) {
+	if s.auditFile == "-" {
+		return
+	}
+	rec := audit.Record{
+		TS: started.Unix(), Event: "manual-search", Project: project,
+		Query: scrub.Text(q), Empty: len(hits) == 0, MS: time.Since(started).Milliseconds(),
+	}
+	for _, h := range hits {
+		rec.Hashes = append(rec.Hashes, h.ID)
+		rec.Kinds = append(rec.Kinds, h.Kind)
+	}
+	s.auditAppend(rec)
+}
+
+func recallText(st *store.Store, hits []store.Hit, budget int) string {
 	var b strings.Builder
 	b.WriteString(renderKindCodes())
 	if len(hits) == 0 {
@@ -439,7 +483,8 @@ func recallText(hits []store.Hit, budget int) string {
 		}
 		return b.String()
 	}
-	block, _ := formatHits("相关记忆", hits, budget-runeLen(b.String()))
+	prov := recall.ProvenanceFor(st, hits)
+	block, _ := formatHits("相关记忆", hits, prov, budget-runeLen(b.String()))
 	b.WriteString(block)
 	return b.String()
 }
