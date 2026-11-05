@@ -535,9 +535,14 @@ func cmdAccept(args []string) error {
 	c.register(fs)
 	all := fs.Bool("all-pending", false, "采纳当前筛选下的全部 pending")
 	session := fs.String("session", "", "配合 --all-pending，只采纳这个会话")
+	auto := fs.Bool("auto", false, "按提交矩阵自动裁决：只有 auto_commit 才落库，人工类型保持 pending")
+	revision := fs.Int("revision", -1, "期望的候选 revision（默认按当前 revision；并发下用过期的值会冲突）")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *all && *revision >= 0 {
+		return errors.New("--all-pending 不能与 --revision 同用：批量采纳的每条候选 revision 不同")
 	}
 	st, err := store.Open(c.db)
 	if err != nil {
@@ -571,13 +576,43 @@ func cmdAccept(args []string) error {
 	// 旧实现在第一条失败时直接 return，把前面已经采纳成功的记忆从输出里丢掉——
 	// 但它们**已经落库**了（审计也逐条写了），于是审计数 > 用户看到数。
 	// 现在把成功的留下来照常打印/输出，失败的单列，最后再返回聚合错误。
-	var accepted []store.AcceptResult
+	//
+	// revision 在调用前显式读出并传入：两个并发 accept 会拿到同一个 revision，
+	// 随后由 store 的 CAS 判定唯一赢家；不传就会退化成「事务内自读自写」，
+	// 并发双方都能成功，CAS 失去意义。
+	var accepted []store.CommitResult
 	var failedItems []acceptFailure
+	var deferred []acceptDeferred
 	for _, id := range ids {
-		res, err := st.AcceptCandidate(id)
+		view, err := st.CommitCandidate(id)
 		if err != nil {
 			failedItems = append(failedItems, acceptFailure{Candidate: id, Error: err.Error()})
 			fmt.Fprintf(os.Stderr, "v2mem accept: %s 采纳失败: %v\n", shortID(id), err)
+			continue
+		}
+		rev := *revision
+		if rev < 0 {
+			rev = view.Revision
+		}
+		var res *store.CommitResult
+		if *auto {
+			res, err = st.AutoCommitCandidate(id, rev)
+		} else {
+			res, err = st.CommitAccept(id, rev, "human")
+		}
+		if err != nil {
+			failedItems = append(failedItems, acceptFailure{Candidate: id, Error: err.Error()})
+			fmt.Fprintf(os.Stderr, "v2mem accept: %s 采纳失败: %v\n", shortID(id), err)
+			continue
+		}
+		if !res.Committed {
+			d := acceptDeferred{
+				Candidate: res.Candidate.ID, Action: string(res.Action),
+				ReasonCodes: res.ReasonCodes,
+			}
+			deferred = append(deferred, d)
+			fmt.Fprintf(os.Stderr, "v2mem accept: %s 需人工裁决 action=%s reasons=%s\n",
+				shortID(d.Candidate), d.Action, strings.Join(d.ReasonCodes, ","))
 			continue
 		}
 		accepted = append(accepted, *res)
@@ -595,9 +630,11 @@ func cmdAccept(args []string) error {
 	}
 	if c.json {
 		// 成功与失败分开列：数组里混着两种语义就必然有人把失败当成功数。
+		// deferred 是第三类：矩阵判为「必须人工」，既不是成功也不是故障。
 		if err := printJSON(map[string]any{
-			"accepted": accepted, "failed": failedItems,
+			"accepted": accepted, "failed": failedItems, "deferred": deferred,
 			"inserted": len(accepted), "failed_count": len(failedItems),
+			"deferred_count": len(deferred),
 		}); err != nil {
 			return err
 		}
@@ -622,10 +659,19 @@ type acceptFailure struct {
 	Error     string `json:"error"`
 }
 
+// acceptDeferred 是矩阵判为「必须人工」的候选。它没有落库，也不是错误：
+// 把它混进 failed 会让自动化把「设计如此」当成故障重试。
+type acceptDeferred struct {
+	Candidate   string   `json:"candidate"`
+	Action      string   `json:"action"`
+	ReasonCodes []string `json:"reason_codes,omitempty"`
+}
+
 func cmdReject(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("reject", flag.ContinueOnError)
 	c.register(fs)
+	revision := fs.Int("revision", -1, "期望的候选 revision（默认按当前 revision）")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -639,10 +685,19 @@ func cmdReject(args []string) error {
 		return err
 	}
 	defer st.Close()
-	cand, err := st.RejectCandidate(id)
+	view, err := st.CommitCandidate(id)
 	if err != nil {
 		return err
 	}
+	rev := *revision
+	if rev < 0 {
+		rev = view.Revision
+	}
+	res, err := st.CommitReject(id, rev, "human", "")
+	if err != nil {
+		return err
+	}
+	cand := res.Candidate
 	if *auditFile != "-" {
 		_ = audit.Append(auditPath(*auditFile), audit.Record{
 			TS: time.Now().Unix(), Event: "reject", SessionID: cand.SessionID,
@@ -658,7 +713,7 @@ func cmdReject(args []string) error {
 
 func cmdCandidates(args []string) error {
 	if len(args) == 0 || args[0] != "ls" {
-		return errors.New("用法: mem candidates ls [--status pending] [--session S]")
+		return errors.New("用法: mem candidates ls [--status pending] [--session S] [--policy]")
 	}
 	var c common
 	fs := flag.NewFlagSet("candidates ls", flag.ContinueOnError)
@@ -666,6 +721,7 @@ func cmdCandidates(args []string) error {
 	status := fs.String("status", "pending", "pending|accepted|rejected|expired|空为全部")
 	session := fs.String("session", "", "限定会话")
 	limit := fs.Int("limit", 50, "条数上限")
+	policy := fs.Bool("policy", false, "显示提交矩阵裁决（只读，不写库）")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -681,6 +737,35 @@ func cmdCandidates(args []string) error {
 	if list == nil {
 		list = []store.Candidate{}
 	}
+	if *policy {
+		views := make([]candidatePolicyView, 0, len(list))
+		for _, cand := range list {
+			vc, d, derr := st.DecideCandidate(cand.ID)
+			if derr != nil {
+				return derr
+			}
+			views = append(views, candidatePolicyView{
+				Candidate: cand, Revision: vc.Revision,
+				Action: string(d.Action), ReasonCodes: d.ReasonCodes,
+			})
+		}
+		if c.json {
+			return printJSON(views)
+		}
+		if len(views) == 0 {
+			fmt.Println("（没有候选）")
+			return nil
+		}
+		for _, v := range views {
+			fmt.Printf("%s  [%s] %s  rev=%d  action=%s  %s\n",
+				shortID(v.Candidate.ID), v.Candidate.Kind, v.Candidate.Status,
+				v.Revision, v.Action, oneLine(v.Candidate.Content))
+			if len(v.ReasonCodes) > 0 {
+				fmt.Printf("    理由: %s\n", strings.Join(v.ReasonCodes, ", "))
+			}
+		}
+		return nil
+	}
 	if c.json {
 		return printJSON(list)
 	}
@@ -692,4 +777,12 @@ func cmdCandidates(args []string) error {
 		fmt.Printf("%s  [%s] %s  %s\n", shortID(cand.ID), cand.Kind, cand.Status, oneLine(cand.Content))
 	}
 	return nil
+}
+
+// candidatePolicyView 是 candidates ls --policy 的只读视图。
+type candidatePolicyView struct {
+	Candidate   store.Candidate `json:"candidate"`
+	Revision    int             `json:"revision"`
+	Action      string          `json:"action"`
+	ReasonCodes []string        `json:"reason_codes,omitempty"`
 }

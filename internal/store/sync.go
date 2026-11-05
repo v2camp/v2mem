@@ -8,10 +8,13 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"strings"
+	"time"
 
+	"github.com/v2camp/v2mem/internal/commit"
 	"github.com/v2camp/v2mem/internal/similarity"
 )
 
@@ -22,6 +25,21 @@ import (
 type Ref struct {
 	Hash    string `json:"hash"`
 	Project string `json:"project"`
+}
+
+// EvidenceLink 是随记忆一起传播的证据引用。
+//
+// 跨设备不能传播本机 evidence_id（另一端没有这行观测），因此身份以 event_uid
+// 为主、archive_hash 为辅助定位；evidence_id 只是本机快路径，导入端会重新解析。
+// 没有 event_uid 的 legacy 行不参与传播 —— 接收端无法验证它，写进去就是伪造证据。
+type EvidenceLink struct {
+	EvidenceID   string `json:"evidence_id,omitempty"`
+	EventUID     string `json:"event_uid,omitempty"`
+	ArchiveHash  string `json:"archive_hash,omitempty"`
+	RawLocator   string `json:"raw_locator,omitempty"`
+	Grade        string `json:"grade,omitempty"`
+	Seq          int    `json:"seq,omitempty"`
+	OccurredAtNS int64  `json:"occurred_at_ns,omitempty"`
 }
 
 // ExportRecord 是归集的传输单元：JSONL 一行一条。
@@ -44,16 +62,19 @@ type ExportRecord struct {
 	Source       string              `json:"source,omitempty"`
 	Channel      string              `json:"channel,omitempty"`    // user|agent|tool|import；空表示旧导出
 	Provenance   *string             `json:"provenance,omitempty"` // 原始 JSON；NULL 序列化为缺省（无溯源）
+	Evidence     []EvidenceLink      `json:"evidence,omitempty"`   // 证据链；仅带 canonical event_uid 的条目
 	AccessCount  int                 `json:"access_count"`
 	Tags         map[string][]string `json:"tags"`
 }
 
 // ImportStats 汇总一次归并的结果。
 type ImportStats struct {
-	Inserted   int `json:"inserted"`   // 本地没有，新插入
-	Merged     int `json:"merged"`     // 本地已有，按字段规则归并
-	Skipped    int `json:"skipped"`    // 内容为空等无法归并
-	Unresolved int `json:"unresolved"` // 取代引用的目标不在本地也不在文件里
+	Inserted        int `json:"inserted"`   // 本地没有，新插入
+	Merged          int `json:"merged"`     // 本地已有，按字段规则归并
+	Skipped         int `json:"skipped"`    // 内容为空等无法归并
+	Unresolved      int `json:"unresolved"` // 取代引用的目标不在本地也不在文件里
+	EvidenceLinked  int `json:"evidence_linked"`
+	EvidenceSkipped int `json:"evidence_skipped"` // 无 event_uid 或无法定位的 legacy 证据
 }
 
 // Export 导出全部记忆，按 (content_hash, project) 排序以保证可复现——
@@ -117,7 +138,39 @@ func (s *Store) Export() ([]ExportRecord, error) {
 		}
 		recs[i].Tags[k] = append(recs[i].Tags[k], v)
 	}
-	return recs, tagRows.Err()
+	if err := tagRows.Err(); err != nil {
+		return nil, err
+	}
+	tagRows.Close()
+
+	// 证据链随记录传播。只导出带 canonical event_uid 的条目：
+	// legacy 行没有跨设备可解析的身份，导出去只会让接收端写入一条无法验证的引用。
+	evRows, err := s.db.Query(
+		`SELECT memory_id, evidence_id, event_uid, archive_hash, raw_locator, grade, seq, occurred_at_ns
+		   FROM memory_evidence
+		  ORDER BY memory_id, occurred_at_ns, seq, evidence_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer evRows.Close()
+	for evRows.Next() {
+		var mid, grade string
+		var l EvidenceLink
+		if err := evRows.Scan(&mid, &l.EvidenceID, &l.EventUID, &l.ArchiveHash,
+			&l.RawLocator, &grade, &l.Seq, &l.OccurredAtNS); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(l.EventUID) == "" {
+			continue
+		}
+		i, ok := idx[mid]
+		if !ok {
+			continue
+		}
+		l.Grade = grade
+		recs[i].Evidence = append(recs[i].Evidence, l)
+	}
+	return recs, evRows.Err()
 }
 
 // Import 按 (content_hash, project) 归并一批记录。
@@ -229,6 +282,12 @@ func (s *Store) Import(recs []ExportRecord) (*ImportStats, error) {
 				}
 			}
 		}
+		linked, skipped, err := mergeEvidenceLinks(context.Background(), tx, localID, r.Evidence)
+		if err != nil {
+			return nil, err
+		}
+		stats.EvidenceLinked += linked
+		stats.EvidenceSkipped += skipped
 
 		// 记下本批记录的身份键 → 本地 id，供第二遍解析取代引用。
 		// 键必须用归一化后的 h（文件缺 content_hash 时会由 HashOf 兜底），
@@ -324,12 +383,14 @@ type SyncConflict struct {
 
 // SyncStats 汇总一次三方合并。
 type SyncStats struct {
-	Inserted   int            `json:"inserted"`
-	Merged     int            `json:"merged"`      // 远端更新（最近者胜）已并入
-	NewerLocal int            `json:"newer_local"` // 本地已更新，远端较老，未改动
-	Conflicts  []SyncConflict `json:"conflicts,omitempty"`
-	Skipped    int            `json:"skipped"`
-	Unresolved int            `json:"unresolved"` // 取代引用目标既不在文件也不在本地
+	Inserted        int            `json:"inserted"`
+	Merged          int            `json:"merged"`      // 远端更新（最近者胜）已并入
+	NewerLocal      int            `json:"newer_local"` // 本地已更新，远端较老，未改动
+	Conflicts       []SyncConflict `json:"conflicts,omitempty"`
+	Skipped         int            `json:"skipped"`
+	Unresolved      int            `json:"unresolved"` // 取代引用目标既不在文件也不在本地
+	EvidenceLinked  int            `json:"evidence_linked"`
+	EvidenceSkipped int            `json:"evidence_skipped"` // 无 event_uid / 无法定位的 legacy 证据
 }
 
 // SyncMerge 把远端导出的记录按三路规则并进本地库。见上方文档注释。
@@ -398,11 +459,11 @@ func (s *Store) SyncMerge(remote []ExportRecord) (*SyncStats, error) {
 				`INSERT INTO memories
 				   (id, content, content_idx, kind, content_hash, project, salience,
 				    created_at, updated_at, last_seen_at, expires_at,
-				    origin_device, origin_tool, source, channel, access_count)
-				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				    origin_device, origin_tool, source, channel, provenance, access_count)
+				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				id, content, idx, kind, h, r.Project, r.Salience,
 				r.CreatedAt, r.UpdatedAt, r.LastSeenAt, r.ExpiresAt,
-				r.OriginDevice, r.OriginTool, r.Source, channel, r.AccessCount,
+				r.OriginDevice, r.OriginTool, r.Source, channel, r.Provenance, r.AccessCount,
 			); err != nil {
 				return nil, err
 			}
@@ -415,6 +476,12 @@ func (s *Store) SyncMerge(remote []ExportRecord) (*SyncStats, error) {
 			identity[key] = id
 			stats.Inserted++
 			syncMergeTags(tx, id, r.Tags)
+			linked, skipped, err := mergeEvidenceLinks(context.Background(), tx, id, r.Evidence)
+			if err != nil {
+				return nil, err
+			}
+			stats.EvidenceLinked += linked
+			stats.EvidenceSkipped += skipped
 			continue
 		}
 
@@ -432,11 +499,12 @@ func (s *Store) SyncMerge(remote []ExportRecord) (*SyncStats, error) {
 				   last_seen_at = MAX(last_seen_at, ?),
 				   expires_at = CASE WHEN expires_at IS NULL OR ? IS NULL
 				                    THEN NULL ELSE MAX(expires_at, ?) END,
+				   provenance = COALESCE(provenance, ?),
 				   channel = CASE WHEN channel = '' THEN ? ELSE channel END
 				 WHERE id = ?`,
 				content, idx, kind, r.Salience, r.AccessCount,
 				r.CreatedAt, r.UpdatedAt, r.LastSeenAt,
-				r.ExpiresAt, r.ExpiresAt, channel, local.id,
+				r.ExpiresAt, r.ExpiresAt, r.Provenance, channel, local.id,
 			); err != nil {
 				return nil, err
 			}
@@ -471,6 +539,20 @@ func (s *Store) SyncMerge(remote []ExportRecord) (*SyncStats, error) {
 		// 无论是并入还是保持，都取远端 tags 并集（幂等 INSERT OR IGNORE，
 		// 不引入重复），保证远端追加的机器/工具标记不因归并丢失。
 		syncMergeTags(tx, local.id, r.Tags)
+		// provenance 与证据链同样只在本地为空时采纳对端：它们是「写入即定格」
+		// 的来源信息，不参与内容冲突判定，但也不能被旧远端值覆盖。
+		if _, err := tx.Exec(
+			`UPDATE memories SET provenance = COALESCE(provenance, ?) WHERE id = ?`,
+			r.Provenance, local.id,
+		); err != nil {
+			return nil, err
+		}
+		linked, skipped, err := mergeEvidenceLinks(context.Background(), tx, local.id, r.Evidence)
+		if err != nil {
+			return nil, err
+		}
+		stats.EvidenceLinked += linked
+		stats.EvidenceSkipped += skipped
 		identity[key] = local.id
 	}
 
@@ -528,4 +610,78 @@ func syncMergeTags(tx *sql.Tx, memoryID string, tags map[string][]string) {
 			)
 		}
 	}
+}
+
+// mergeEvidenceLinks 把远端证据引用挂到本地记忆上。
+//
+// 三条规则：
+//  1. 没有 event_uid 的条目直接跳过 —— 那是 legacy/无法验证的引用，写进去就是
+//     给接收端伪造证据；
+//  2. 本机有同 event_uid 的观测时，用本机 evidence_id/seq/locator 覆盖远端值，
+//     保证 memory_evidence 指向真实可打开的行；
+//  3. 其余情况保留远端 identity（event_uid + archive_hash），不编造 locator。
+//
+// 返回 (新插入条数, 跳过条数)。重复导入命中 INSERT OR IGNORE 不计新增，
+// 但也不计跳过 —— 它已经正确在库里了。
+func mergeEvidenceLinks(ctx context.Context, q sqlQuerier, memoryID string, links []EvidenceLink) (int, int, error) {
+	linked, skipped := 0, 0
+	for _, l := range links {
+		uid := strings.TrimSpace(l.EventUID)
+		if uid == "" {
+			skipped++
+			continue
+		}
+		eid := strings.TrimSpace(l.EvidenceID)
+		archive := strings.TrimSpace(l.ArchiveHash)
+		rawLocator := strings.TrimSpace(l.RawLocator)
+		seq := l.Seq
+		occurred := l.OccurredAtNS
+
+		var localID, localArchive, localRaw string
+		var localSeq int
+		var localOccurred int64
+		err := q.QueryRowContext(ctx, `SELECT id, archive_hash, raw_ref, source_seq, occurred_at_ns
+			FROM observations WHERE event_uid = ?`, uid).
+			Scan(&localID, &localArchive, &localRaw, &localSeq, &localOccurred)
+		switch {
+		case err == nil:
+			eid = localID
+			if localArchive != "" {
+				archive = localArchive
+			}
+			if localRaw != "" {
+				rawLocator = localRaw
+			}
+			if localSeq > 0 {
+				seq = localSeq
+			}
+			if localOccurred != 0 {
+				occurred = localOccurred
+			}
+		case errors.Is(err, sql.ErrNoRows):
+			// 本机没有这条观测：保留远端身份，仍可被 T4 作为 provenance 展示。
+		default:
+			return linked, skipped, err
+		}
+		if eid == "" && archive == "" {
+			skipped++
+			continue
+		}
+		grade := strings.ToUpper(strings.TrimSpace(l.Grade))
+		if grade != string(commit.GradeA) && grade != string(commit.GradeB) && grade != string(commit.GradeC) {
+			grade = string(gradeOfEvidence(uid, archive))
+		}
+		res, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO memory_evidence(
+			memory_id, evidence_id, event_uid, archive_hash, raw_locator, grade,
+			seq, occurred_at_ns, created_at
+		) VALUES (?,?,?,?,?,?,?,?,?)`,
+			memoryID, eid, uid, archive, rawLocator, grade, seq, occurred, time.Now().Unix())
+		if err != nil {
+			return linked, skipped, err
+		}
+		if n, err := res.RowsAffected(); err == nil && n > 0 {
+			linked++
+		}
+	}
+	return linked, skipped, nil
 }
