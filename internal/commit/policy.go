@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/v2camp/v2mem/internal/proposal"
 )
 
 // 本文件实现 T3 的确定性提交矩阵。
@@ -112,7 +110,7 @@ type Matrix struct{}
 // Decide 实现冻结的 Policy 接口。没有角色信息的调用方按 direct 处理：
 // 这样 fact 的「A 级直接证据」判据仍然成立，而 pitfall 会因缺少 error/resolution
 // 角色退回人工，不会误自动提交。
-func (m Matrix) Decide(candidate proposal.Candidate, evidence []Link) (Decision, error) {
+func (m Matrix) Decide(candidate Candidate, evidence []Link) (Decision, error) {
 	items := make([]Item, len(evidence))
 	for i, l := range evidence {
 		items[i] = Item{EvidenceID: l.EventUID, Link: l, Role: RoleDirect}
@@ -121,7 +119,7 @@ func (m Matrix) Decide(candidate proposal.Candidate, evidence []Link) (Decision,
 }
 
 // DecideItems 是带角色输入的完整裁决。
-func (m Matrix) DecideItems(candidate proposal.Candidate, evidence []Item) (Decision, error) {
+func (m Matrix) DecideItems(candidate Candidate, evidence []Item) (Decision, error) {
 	if strings.TrimSpace(candidate.ID) == "" {
 		return Decision{}, errors.New("候选 id 为空，无法裁决")
 	}
@@ -139,7 +137,7 @@ func (m Matrix) DecideItems(candidate proposal.Candidate, evidence []Item) (Deci
 	}, nil
 }
 
-func (m Matrix) judge(candidate proposal.Candidate, evidence []Item) (Action, []string) {
+func (m Matrix) judge(candidate Candidate, evidence []Item) (Action, []string) {
 	// 冲突优先于一切：同一 subject 已有互斥结论时，自动写任何一条都会让库自相矛盾。
 	if isConflict(candidate) {
 		return ActionConflict, []string{ReasonConflict}
@@ -197,7 +195,7 @@ func (m Matrix) judge(candidate proposal.Candidate, evidence []Item) (Action, []
 	return ActionHumanAccept, []string{ReasonManualKind, ReasonUnknownKind}
 }
 
-func isConflict(c proposal.Candidate) bool {
+func isConflict(c Candidate) bool {
 	kind := strings.ToLower(strings.TrimSpace(c.Kind))
 	scope := strings.ToLower(strings.TrimSpace(c.Scope))
 	review := strings.ToLower(strings.TrimSpace(c.ReviewClass))

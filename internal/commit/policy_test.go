@@ -3,8 +3,6 @@ package commit
 import (
 	"strings"
 	"testing"
-
-	"github.com/v2camp/v2mem/internal/proposal"
 )
 
 func link(uid string, grade Grade) Link {
@@ -15,8 +13,8 @@ func item(role Role, uid string, grade Grade) Item {
 	return Item{EvidenceID: "ev_" + uid, Link: link(uid, grade), Role: role}
 }
 
-func cand(kind, scope, project, taskState, review string) proposal.Candidate {
-	return proposal.Candidate{
+func cand(kind, scope, project, taskState, review string) Candidate {
+	return Candidate{
 		ID: "cand-1", Kind: kind, Scope: scope, Project: project,
 		TaskState: taskState, ReviewClass: review, Revision: 3,
 	}
@@ -26,7 +24,7 @@ func TestMatrixFactNeedsGradeADirectEvidence(t *testing.T) {
 	m := Matrix{}
 	cases := []struct {
 		name string
-		c    proposal.Candidate
+		c    Candidate
 		ev   []Item
 		want Action
 		code string
@@ -130,7 +128,7 @@ func TestMatrixManualKindsScopesAndConflict(t *testing.T) {
 			t.Fatalf("scope=%s 应人工，got %s", scope, d.Action)
 		}
 	}
-	for _, c := range []proposal.Candidate{
+	for _, c := range []Candidate{
 		cand("conflict", "project", "p", "", ""),
 		cand("fact", "conflict", "p", "", ""),
 		cand("fact", "project", "p", "", "conflict"),
@@ -171,7 +169,7 @@ func TestDecideWithoutRolesFallsBackToManualForPitfall(t *testing.T) {
 }
 
 func TestDecideRejectsEmptyCandidateID(t *testing.T) {
-	if _, err := (Matrix{}).DecideItems(proposal.Candidate{}, nil); err == nil {
+	if _, err := (Matrix{}).DecideItems(Candidate{}, nil); err == nil {
 		t.Fatal("空候选 id 应报错")
 	}
 }

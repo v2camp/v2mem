@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/commit"
-	"github.com/v2camp/v2mem/internal/proposal"
 	"github.com/v2camp/v2mem/internal/similarity"
 )
 
@@ -73,9 +72,9 @@ type CommitCandidate struct {
 	MemoryID    string  `json:"memory_id,omitempty"`
 }
 
-// Proposal 把提交视图映射回冻结的 proposal.Candidate，供矩阵裁决。
-func (c CommitCandidate) Proposal() proposal.Candidate {
-	return proposal.Candidate{
+// Proposal 把提交视图映射成 commit 包的只读候选，供矩阵裁决。
+func (c CommitCandidate) Proposal() commit.Candidate {
+	return commit.Candidate{
 		ID: c.ID, SessionID: c.SessionID, Project: c.Project, Kind: c.Kind,
 		Scope: c.Scope, Status: c.Status, ReviewClass: c.ReviewClass,
 		Revision: c.Revision, Content: c.Content, ContentHash: c.ContentHash,
