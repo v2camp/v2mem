@@ -22,5 +22,6 @@ github.com/v2camp/v2mem/internal/similarity	97	97
 github.com/v2camp/v2mem/internal/harness	93	96
 github.com/v2camp/v2mem/internal/audit	89	90
 github.com/v2camp/v2mem/internal/store	82	88
+github.com/v2camp/v2mem/internal/evidence	81	85
 github.com/v2camp/v2mem/cmd/mem	81	85
 TOTAL	83	88
