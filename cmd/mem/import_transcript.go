@@ -10,13 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/v2camp/v2mem/internal/scrub"
-	"github.com/v2camp/v2mem/internal/store"
 	"github.com/v2camp/v2mem/internal/transcript"
 )
 
-// import-transcript 只写 observations，以及（--into both|candidates 时）pending 候选。
-// 默认不写 memories。
+// import-transcript 只写证据（observations/evidence_archives），
+// 以及（--into both|candidates 时）pending 候选。默认不写 memories。
 
 func cmdImportTranscript(args []string) error {
 	var c common
@@ -61,17 +59,17 @@ func cmdImportTranscript(args []string) error {
 	if *since > 0 {
 		sinceUnix = time.Now().Add(-*since).Unix()
 	}
-	st, err := store.Open(c.db)
+	es, err := openEvidenceSession(c.db)
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer es.Close()
 
 	var stats importStats
 	stats.Sessions = map[string]bool{}
 	var fileErrs []error
 	for _, path := range files {
-		got, err := importClaudeFile(st, path, importOpts{
+		got, err := importClaudeFile(es, path, importOpts{
 			Project: *project, Since: sinceUnix, Dry: *dry, Limit: *limit,
 			NoScrub: *noScrub, Already: stats.Written,
 		})
@@ -92,7 +90,7 @@ func cmdImportTranscript(args []string) error {
 	candN := 0
 	if (*into == "both" || *into == "candidates") && !*dry {
 		for sid := range stats.Sessions {
-			rep, err := distillOne(st, distillJob{
+			rep, err := distillOne(es.store, distillJob{
 				Session: sid, Provider: "none", Audit: "-", DB: c.db,
 				Model: "rules", Timeout: time.Second,
 			})
@@ -133,9 +131,9 @@ func cmdImportTranscript(args []string) error {
 // 「写库失败」全塞在一起。于是「写库失败 100 条」和「100 条重复」在输出上完全一样，
 // 数据丢失被伪装成正常的幂等跳过。
 type importStats struct {
-	Written   int // 真正新建的观测行数（dry-run 时为「本应写入」）
-	Duplicate int // 内容已存在，命中幂等去重
-	Empty     int // 正文为空
+	Written   int // 真正新建的证据行数（dry-run 时为「本应写入」）
+	Duplicate int // 身份已存在，命中幂等
+	Empty     int // 该行没有可入库事件（空正文 / 快照 / 纯元数据行）
 	Filtered  int // 早于 --since
 	Failed    int // 写库失败（真实的错误，不是跳过）
 	Sessions  map[string]bool
@@ -161,60 +159,76 @@ type importOpts struct {
 	Already int
 }
 
-func importClaudeFile(st *store.Store, path string, opt importOpts) (importStats, error) {
+// importClaudeFile 按原生行序把一份 transcript 写成证据。
+//
+// 每一行/每个内容块都是一条证据，身份来自宿主 uuid 或「文件+偏移+块序号」，
+// 所以重复导入是幂等的（计 duplicate），既不依赖内容摘要去重，也不会吞掉
+// 同摘要的不同事件。
+func importClaudeFile(es *evidenceSession, path string, opt importOpts) (importStats, error) {
 	stats := importStats{Sessions: map[string]bool{}}
 	f, err := os.Open(path)
 	if err != nil {
 		return stats, err
 	}
 	defer f.Close()
-	lines, err := transcript.ParseClaudeJSONL(f)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return stats, err
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
 	}
-	for _, line := range lines {
-		if opt.Limit > 0 && opt.Already+stats.Written >= opt.Limit {
+
+	rd := transcript.NewReader(f)
+	tools := map[string]string{}
+	for {
+		recs, rerr := rd.Read()
+		if errors.Is(rerr, io.EOF) {
 			break
 		}
-		if opt.Since > 0 && line.At > 0 && line.At < opt.Since {
-			stats.Filtered++
-			continue
+		if rerr != nil {
+			return stats, rerr
 		}
-		text := strings.TrimSpace(line.Text)
-		if text == "" {
+		if len(recs) == 0 {
 			stats.Empty++
 			continue
 		}
-		text = scrub.Apply(text, opt.NoScrub)
-		text = truncateRunes(text, observeSummaryMaxRunes)
-		project := opt.Project
-		if project == "" {
-			project = line.Project
+		for _, rec := range recs {
+			if opt.Limit > 0 && opt.Already+stats.Written >= opt.Limit {
+				return stats, nil
+			}
+			if opt.Since > 0 && rec.At > 0 && rec.At < opt.Since {
+				stats.Filtered++
+				continue
+			}
+			sid := rec.SessionID
+			if strings.TrimSpace(sid) == "" {
+				sid = "import"
+			}
+			project := opt.Project
+			if project == "" {
+				project = rec.Project
+			}
+			ev := recordEvidence(transcriptSourceID("claude", sid), sid, project, "claude", abs, rec, tools, opt.NoScrub)
+			if opt.Dry {
+				stats.Written++
+				stats.Sessions[sid] = true
+				continue
+			}
+			_, created, cerr := captureEvidence(es, ev)
+			if cerr != nil {
+				fmt.Fprintf(os.Stderr, "v2mem import-transcript: 写证据失败，已跳过该行: %v\n", cerr)
+				// 写失败单独计数：这不是「跳过」，是丢数据。
+				stats.Failed++
+				continue
+			}
+			// 会话标记必须放在写库成功之后。原来放在写之前，写失败的行也会把会话
+			// 推进到规则蒸馏，蒸馏读到的是不完整的历史，候选与观测对不上。
+			stats.Sessions[sid] = true
+			if created {
+				stats.Written++
+			} else {
+				stats.Duplicate++
+			}
 		}
-		if opt.Dry {
-			stats.Written++
-			stats.Sessions[line.SessionID] = true
-			continue
-		}
-		res, err := st.AppendObservation(store.ObsInput{
-			SessionID: line.SessionID, Project: project, Harness: "claude",
-			Event: "import-transcript", ToolName: line.Role, Summary: text, RawRef: path,
-			Channel: store.ChannelImport,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "v2mem import-transcript: 写观测失败，已跳过该行: %v\n", err)
-			// 写失败单独计数：这不是「跳过」，是丢数据。
-			stats.Failed++
-			continue
-		}
-		// 会话标记必须放在写库成功之后。原来放在写之前，写失败的行也会把会话
-		// 推进到规则蒸馏，蒸馏读到的是不完整的历史，候选与观测对不上。
-		stats.Sessions[line.SessionID] = true
-		if res.Created {
-			stats.Written++
-		} else {
-			stats.Duplicate++
-		}
+		tools = rememberTools(tools, recs)
 	}
 	return stats, nil
 }
