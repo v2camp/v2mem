@@ -135,7 +135,7 @@ func TestMigrationFreshDBHasFullEvidenceSchema(t *testing.T) {
 			t.Errorf("fresh DB 缺列 %s.%s", c.table, c.column)
 		}
 	}
-	for _, table := range []string{"evidence_sources", "evidence_archives", "evidence_bundles", "evidence_bundle_items", "migration_marks"} {
+	for _, table := range []string{"evidence_sources", "evidence_archives", "evidence_bundles", "evidence_bundle_items", "migration_marks", "candidate_evidence", "commit_decisions", "memory_evidence", "read_traces", "read_trace_items"} {
 		if n := migrationCount(t, st, table); n != 0 {
 			t.Errorf("fresh DB 的 %s 应为空，got %d", table, n)
 		}

@@ -251,6 +251,91 @@ CREATE TABLE IF NOT EXISTS migration_marks (
   PRIMARY KEY (entity_type, entity_id)
 );
 
+-- 第二波共享表：T2/T3/T4 只写逻辑，不再各自 append schema。
+CREATE TABLE IF NOT EXISTS candidate_evidence (
+  candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+  evidence_id  TEXT NOT NULL,
+  event_uid    TEXT NOT NULL DEFAULT '',
+  source_id    TEXT NOT NULL DEFAULT '',
+  source_seq   INTEGER NOT NULL DEFAULT 0,
+  archive_hash TEXT NOT NULL DEFAULT '',
+  raw_record_hash TEXT NOT NULL DEFAULT '',
+  evidence_role TEXT NOT NULL DEFAULT 'direct', -- direct|error|resolution|completion|context
+  quote_hash   TEXT NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL,
+  PRIMARY KEY (candidate_id, evidence_id, evidence_role)
+);
+CREATE INDEX IF NOT EXISTS ix_cand_evidence_event ON candidate_evidence(event_uid);
+
+CREATE TABLE IF NOT EXISTS commit_decisions (
+  id             TEXT PRIMARY KEY,
+  candidate_id   TEXT NOT NULL,
+  revision       INTEGER NOT NULL DEFAULT 0,
+  evidence_hash  TEXT NOT NULL DEFAULT '',
+  action         TEXT NOT NULL, -- auto_commit|human_accept|reject|duplicate|conflict|backlog|defer
+  actor          TEXT NOT NULL DEFAULT 'auto',
+  reason_codes_json TEXT NOT NULL DEFAULT '[]',
+  memory_id      TEXT NOT NULL DEFAULT '',
+  idempotency_key TEXT NOT NULL,
+  created_at     INTEGER NOT NULL,
+  UNIQUE(idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS ix_commit_candidate ON commit_decisions(candidate_id, created_at);
+
+CREATE TABLE IF NOT EXISTS memory_evidence (
+  memory_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  evidence_id    TEXT NOT NULL,
+  event_uid      TEXT NOT NULL DEFAULT '',
+  archive_hash   TEXT NOT NULL DEFAULT '',
+  raw_locator    TEXT NOT NULL DEFAULT '',
+  grade          TEXT NOT NULL DEFAULT 'C', -- A|B|C
+  seq            INTEGER NOT NULL DEFAULT 0,
+  occurred_at_ns INTEGER NOT NULL DEFAULT 0,
+  created_at     INTEGER NOT NULL,
+  PRIMARY KEY (memory_id, evidence_id)
+);
+CREATE INDEX IF NOT EXISTS ix_mem_evidence_event ON memory_evidence(event_uid);
+
+CREATE TABLE IF NOT EXISTS read_traces (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL DEFAULT '',
+  project       TEXT NOT NULL DEFAULT '',
+  harness       TEXT NOT NULL DEFAULT '',
+  query_gate    TEXT NOT NULL DEFAULT 'run', -- run|skip
+  gate_reason   TEXT NOT NULL DEFAULT '',
+  raw_query     TEXT NOT NULL DEFAULT '',
+  focus_query   TEXT NOT NULL DEFAULT '',
+  scope         TEXT NOT NULL DEFAULT '',
+  target_limit  INTEGER NOT NULL DEFAULT 0,
+  budget_chars  INTEGER NOT NULL DEFAULT 0,
+  overfetch     INTEGER NOT NULL DEFAULT 0,
+  raw_hits      INTEGER NOT NULL DEFAULT 0,
+  qualified     INTEGER NOT NULL DEFAULT 0,
+  injected      INTEGER NOT NULL DEFAULT 0,
+  outcome       TEXT NOT NULL DEFAULT '', -- injected|abstained_no_hit|abstained_low_quality|skipped_gate|error
+  elapsed_ms    INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_read_traces_created ON read_traces(created_at);
+
+CREATE TABLE IF NOT EXISTS read_trace_items (
+  trace_id      TEXT NOT NULL REFERENCES read_traces(id) ON DELETE CASCADE,
+  ordinal       INTEGER NOT NULL,
+  memory_id     TEXT NOT NULL DEFAULT '',
+  content_hash  TEXT NOT NULL DEFAULT '',
+  signals_json  TEXT NOT NULL DEFAULT '{}',
+  match_class   TEXT NOT NULL DEFAULT '',
+  eligible      INTEGER NOT NULL DEFAULT 1,
+  drop_reason   TEXT NOT NULL DEFAULT '',
+  injection_rank INTEGER NOT NULL DEFAULT 0,
+  provenance    TEXT NOT NULL DEFAULT '',
+  feedback      TEXT NOT NULL DEFAULT '', -- adopted|negative|''
+  feedback_reason TEXT NOT NULL DEFAULT '',
+  feedback_at   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (trace_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS ix_read_trace_feedback ON read_trace_items(feedback, feedback_at);
+
 -- M5b-0 模糊检索：每条记忆的 MinHash 签名（512B 小端 uint64 序列）。
 -- 与记忆同写同删（外键级联）；旧库缺签名的行由 Open 时一次性补齐（backfillSigs），
 -- 覆盖 import 直插等绕开 Add 的写入路径。
