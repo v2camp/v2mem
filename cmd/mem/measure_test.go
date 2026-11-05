@@ -1029,7 +1029,9 @@ func TestCmdHookSuppressesDuplicateTriggerOfSameEvent(t *testing.T) {
 	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进同步目录"}); err != nil {
 		t.Fatalf("cmdAdd: %v", err)
 	}
-	stdin := hookStdin("UserPromptSubmit", proj, "同步目录能不能放")
+	// T4 质量筛选要求命中至少有一种结构支持；查询用「同步目录」使其产生
+	// precise 命中，避免用例被 gate/质量筛选吞掉，从而只测去重本身。
+	stdin := hookStdin("UserPromptSubmit", proj, "同步目录")
 	hook := func() string {
 		out, err := withStdin(t, stdin, func() error {
 			return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", ap})
@@ -1086,7 +1088,8 @@ func TestCmdHookDoesNotSuppressDifferentPrompt(t *testing.T) {
 	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进同步目录"}); err != nil {
 		t.Fatalf("cmdAdd: %v", err)
 	}
-	for _, q := range []string{"同步目录能不能放", "同步目录能不能放数据库文件"} {
+	// 两个不同 query，但都必须有结构支持（见上一条用例的说明）。
+	for _, q := range []string{"同步目录", "同步 目录"} {
 		out, err := withStdin(t, hookStdin("UserPromptSubmit", proj, q), func() error {
 			return cmdHook([]string{"--db", db, "--harness", "claude", "--audit", "-"})
 		})

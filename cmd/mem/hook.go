@@ -13,6 +13,7 @@ import (
 
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/harness"
+	"github.com/v2camp/v2mem/internal/recall"
 	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
@@ -155,18 +156,21 @@ func cmdHook(args []string) error {
 		}
 	}
 
-	text, injected := renderHookContext(c, event, project, in.Prompt, *limit, budget)
-	writeHookStdout(*harnessFlag, event, text)
+	out := renderHookContext(c, event, project, in.Prompt, *limit, budget,
+		hookMeta{SessionID: in.sessionID(), Harness: harnessName(*harnessFlag, in)})
+	writeHookStdout(*harnessFlag, event, out.Text)
 
 	// 审计：为「用户会话 → mem 查询」沉淀真实样本。写失败必须静默 ——
 	// 这条在宿主会话关键链上，审计问题绝不能让会话收到错误。
 	if *auditPath != "-" {
+		// gate 主动跳过（空/客套/极短无技术语义）不是「查了没命中」，不进空注入分母。
+		empty := strings.TrimSpace(out.Text) == "" && !out.Gate.Skipped()
 		rec := audit.Record{
 			TS: started.Unix(), Event: string(event), Harness: harnessName(*harnessFlag, in),
 			Project: project, SessionID: in.sessionID(), Query: scrub.Apply(strings.TrimSpace(in.Prompt), *noScrub),
-			Empty: strings.TrimSpace(text) == "", MS: time.Since(started).Milliseconds(),
+			Empty: empty, MS: time.Since(started).Milliseconds(),
 		}
-		for _, h := range injected {
+		for _, h := range out.Injected {
 			rec.Hashes = append(rec.Hashes, h.ID)
 			rec.Kinds = append(rec.Kinds, h.Kind)
 		}
@@ -240,36 +244,75 @@ func hookProject(harnessName string, in hookInput) (name, dir string) {
 	return detectProjectAt(wd), wd
 }
 
+// hookMeta 是轨迹需要的会话元数据。
+type hookMeta struct {
+	SessionID string
+	Harness   string
+	Event     string
+}
+
+// hookRender 是一次钩子渲染的结果。Gate 单列是为了让审计区分
+// 「gate 主动跳过」与「查了但没命中」——前者不进空注入分母。
+type hookRender struct {
+	Text     string
+	Injected []store.Hit
+	Gate     recall.Gate
+}
+
 // renderHookContext 构造要注入模型的文本，并返回本次实际注入的记忆。
 //
 // 返回 hits 是为了审计：没有真实会话的「查询 → 命中」样本，
 // 检索质量就无法评测（见 internal/audit 与 DESIGN.md §15）。
-func renderHookContext(c common, event harness.Event, project, prompt string, limit, maxChars int) (string, []store.Hit) {
+func renderHookContext(c common, event harness.Event, project, prompt string, limit, maxChars int, meta hookMeta) hookRender {
 	st, err := store.Open(c.db)
 	if err != nil {
 		// 库打不开时仍告诉模型「有这么个库」，否则用户会以为记忆系统不存在
 		fmt.Fprintln(os.Stderr, "v2mem hook: 打开记忆库失败:", err)
 		if event == harness.EventSessionStart || event == harness.EventPreCompact {
-			return fmt.Sprintf("[v2mem] 本地分层记忆库（Level 2）。当前工程：%s\n%s",
-				orGlobal(project), hintBlock()), nil
+			return hookRender{Text: fmt.Sprintf("[v2mem] 本地分层记忆库（Level 2）。当前工程：%s\n%s",
+				orGlobal(project), hintBlock())}
 		}
-		return "", nil
+		return hookRender{}
 	}
 	defer st.Close()
+	if meta.Event == "" {
+		meta.Event = string(event)
+	}
 
 	switch event {
 	case harness.EventSessionStart, harness.EventPreCompact:
-		return sessionStartContext(st, project, limit, maxChars)
+		text, injected := sessionStartContext(st, project, limit, maxChars, meta)
+		return hookRender{Text: text, Injected: injected}
 	case harness.EventPromptSubmit:
-		return promptSubmitContext(st, project, prompt, limit, maxChars)
+		text, injected, gate := promptSubmitContext(st, project, prompt, limit, maxChars, meta)
+		return hookRender{Text: text, Injected: injected, Gate: gate}
 	}
-	return "", nil
+	return hookRender{}
 }
 
 // notesEnabled 由 MEM_NO_NOTES 控制：置位时读侧回到「仅 v2mem 原始注入」，
 // 不做 notes 小字条去重。未置位（默认）则启用去重。
 func notesEnabled() bool {
 	return strings.TrimSpace(os.Getenv("MEM_NO_NOTES")) == ""
+}
+
+// notesCoveredPredicate 返回「这条命中是否已被 notes 覆盖」的判定。
+// nil 表示不去重（MEM_NO_NOTES 置位，或 notes 读不出来 —— 失败开放，宁可多注入）。
+func notesCoveredPredicate(st *store.Store) func(store.Hit) bool {
+	if !notesEnabled() {
+		return nil
+	}
+	rules, err := collectRules(st)
+	if err != nil {
+		return nil
+	}
+	covered := make(map[string]bool, len(rules))
+	for _, r := range rules {
+		covered[oneLine(r.Content)] = true
+	}
+	return func(h store.Hit) bool {
+		return h.Kind == "rule" && covered[oneLine(h.Content)]
+	}
 }
 
 // filterRulesCoveredByNotes 去掉「已在开场注入里出现过」的规则细节条。
@@ -281,24 +324,14 @@ func notesEnabled() bool {
 //
 // 注意：本函数只给检索侧用。开场注入侧若也调用它，规则将无处可去
 // （钩子不注入 notes 文本），等于静默丢规则 —— 见 sessionStartContext 的注释。
-//
-// 失败开放：notes 读不出来时判不了「是否被覆盖」，宁可多注入也不漏 ——
-// 与钩子「绝不漏注入」的同一条原则。MEM_NO_NOTES 置位时这里原样返回。
 func filterRulesCoveredByNotes(st *store.Store, hits []store.Hit) []store.Hit {
-	if !notesEnabled() {
+	pred := notesCoveredPredicate(st)
+	if pred == nil {
 		return hits
-	}
-	covered := map[string]bool{}
-	rules, err := collectRules(st)
-	if err != nil {
-		return hits
-	}
-	for _, r := range rules {
-		covered[oneLine(r.Content)] = true
 	}
 	out := hits[:0]
 	for _, h := range hits {
-		if h.Kind == "rule" && covered[oneLine(h.Content)] {
+		if pred(h) {
 			continue
 		}
 		out = append(out, h)
@@ -306,12 +339,95 @@ func filterRulesCoveredByNotes(st *store.Store, hits []store.Hit) []store.Hit {
 	return out
 }
 
-// sessionStartContext 注入「硬规则 + 本工程记忆 + 用法」。
+// sectionRender 是一段注入的渲染结果：预算不足时会继续向后扫描（补位），
+// 不是截断到第一条放不下就停。
+type sectionRender struct {
+	block    string
+	injected map[string]bool
+	drops    map[string]string
+	used     int
+}
+
+// renderLineWithin 从最长内容开始收缩，找到能放进 lineBudget 的最大截断。
+// 返回的字符串保证 runeLen <= lineBudget。
+func renderLineWithin(h store.Hit, provenance string, lineBudget int) (string, bool) {
+	if lineBudget <= 0 {
+		return "", false
+	}
+	for allow := maxHitRunes; allow >= 0; allow-- {
+		line := recall.RenderLine(h, provenance, allow)
+		if runeLen(line) <= lineBudget {
+			return line, true
+		}
+	}
+	return "", false
+}
+
+func renderSection(title string, hits []store.Hit, prov map[string]string, budget, cap int) sectionRender {
+	r := sectionRender{injected: map[string]bool{}, drops: map[string]string{}}
+	if cap <= 0 || cap > len(hits) {
+		cap = len(hits)
+	}
+	titleLine := ""
+	titleCost := 0
+	if title != "" {
+		titleLine = title + "：\n"
+		titleCost = runeLen(titleLine)
+	}
+	if budget < titleCost {
+		for _, h := range hits {
+			r.drops[h.ID] = "budget"
+		}
+		return r
+	}
+	var body strings.Builder
+	used := titleCost
+	n := 0
+	for _, h := range hits {
+		if n >= cap {
+			r.drops[h.ID] = "limit"
+			continue
+		}
+		line := recall.RenderLine(h, prov[h.ID], maxHitRunes)
+		cost := runeLen(line)
+		if used+cost > budget {
+			r.drops[h.ID] = "budget"
+			continue
+		}
+		body.WriteString(line)
+		used += cost
+		n++
+		r.injected[h.ID] = true
+	}
+	if n == 0 && len(hits) > 0 {
+		// 极限预算：完整行一条都放不下时，把排名最高的一条按剩余空间截短，
+		// 而不是整段弃答。只在「一条完整行都放不下」时触发，正常路径仍优先
+		// 从合格池补位完整条目（见 baseline 的 budget 用例）。
+		if line, ok := renderLineWithin(hits[0], prov[hits[0].ID], budget-titleCost); ok {
+			body.WriteString(line)
+			used += runeLen(line)
+			n++
+			r.injected[hits[0].ID] = true
+			delete(r.drops, hits[0].ID)
+		}
+	}
+	if n == 0 {
+		return r
+	}
+	r.block = titleLine + body.String()
+	r.used = used
+	return r
+}
+
+// sessionStartContext 注入「硬规则 + 全局记忆 + 本工程记忆 + 用法」。
 //
 // 顺序有讲究：跨工程硬规则在前（通常是红线，且对所有工程生效），
 // 本工程记忆在后，用法提示压尾并**预留预算**，保证它一定不被截断 ——
 // 它的作用正是告诉模型「还有多级记忆可查」，被截断就失去了钩子的意义。
-func sessionStartContext(st *store.Store, project string, limit, maxChars int) (string, []store.Hit) {
+//
+// T4 硬规则：本函数的「硬规则」段**只取 kind=rule**。全局高 salience 的普通
+// 记忆仍有注入通道（紧随其后的「全局记忆」段），但不会被冒充成硬规则。
+func sessionStartContext(st *store.Store, project string, limit, maxChars int, meta hookMeta) (string, []store.Hit) {
 	hint := hintBlock()
 	codes := renderKindCodes()
 	head := fmt.Sprintf("[v2mem] 本机有跨会话的本地记忆库（Level 2，正文不进上下文）。当前工程：%s\n",
@@ -322,104 +438,158 @@ func sessionStartContext(st *store.Store, project string, limit, maxChars int) (
 		budget = 0
 	}
 
+	pool := limit * 4
+	if pool < 12 {
+		pool = 12
+	}
+
+	type section struct {
+		title      string
+		matchClass string
+		cap        int
+		hits       []store.Hit
+	}
+	seen := map[string]bool{}
+	var sections []section
+	add := func(title, class string, cap int, hits []store.Hit) {
+		var kept []store.Hit
+		for _, h := range hits {
+			if h.ID == "" || seen[h.ID] {
+				continue
+			}
+			seen[h.ID] = true
+			kept = append(kept, h)
+		}
+		if len(kept) > 0 {
+			sections = append(sections, section{title: title, matchClass: class, cap: cap, hits: kept})
+		}
+	}
+	// 跨工程硬规则：只取 kind=rule。
+	if raw, err := st.List(store.ListQuery{Scope: "global", Kind: "rule", Limit: pool}); err == nil {
+		add("硬规则（跨工程，务必遵守）", "hard_rule", limit, raw)
+	}
+	// 其他全局记忆：保留既有注入通道，但不冒充硬规则；默认只给 1 位，避免挤占本工程。
+	if raw, err := st.List(store.ListQuery{Scope: "global", Limit: pool}); err == nil {
+		add("全局记忆", "global", 1, raw)
+	}
+	// 本工程的记忆（Scope=project 只取本工程，避免与上面的全局段重复）。
+	if project != "" {
+		if raw, err := st.List(store.ListQuery{Scope: "project", Project: project, Limit: pool}); err == nil {
+			add("本工程记忆", "project", limit, raw)
+		}
+	}
+
+	var all []store.Hit
+	for _, sec := range sections {
+		all = append(all, sec.hits...)
+	}
+	prov := recall.ProvenanceFor(st, all)
+	hashes, _ := st.ContentHashes(hitIDs(all))
+
 	var sb strings.Builder
 	sb.WriteString(head)
 	sb.WriteString(codes)
 	var injected []store.Hit
-
-	// 跨工程硬规则。
-	//
-	// 🔴 这里**不能**按 notes 去重（filterRulesCoveredByNotes）：notes 的规则正文
-	// 只有 `mem notes` 命令会产出，钩子从不注入它；若在此把 kind=rule 过滤掉，
-	// 那条红线就再也没有进入上下文的通道，只能靠人记得手工把 notes 粘到 L1 文件里。
-	// 正确的分工是：本节=notes 的规则段（开场注入一次），每轮检索侧再去重。
-	if raw, err := st.List(store.ListQuery{Scope: "global", Limit: limit}); err == nil && len(raw) > 0 {
-		hits := raw
-		if block, used := formatHits("硬规则（跨工程，务必遵守）", hits, budget); block != "" {
-			sb.WriteString(block)
-			budget -= used
-			injected = append(injected, hits[:countLines(block)]...)
+	var items []store.ReadTraceItem
+	rank := 0
+	for _, sec := range sections {
+		r := renderSection(sec.title, sec.hits, prov, budget, sec.cap)
+		if r.block != "" {
+			sb.WriteString(r.block)
+			budget -= r.used
 		}
-	}
-	// 本工程的记忆（Scope=project 只取本工程，避免与上面的全局段重复）
-	if budget > 0 && project != "" {
-		if hits, err := st.List(store.ListQuery{Scope: "project", Project: project, Limit: limit}); err == nil && len(hits) > 0 {
-			if block, used := formatHits("本工程记忆", hits, budget); block != "" {
-				sb.WriteString(block)
-				budget -= used
-				injected = append(injected, hits[:countLines(block)]...)
+		for _, h := range sec.hits {
+			it := store.ReadTraceItem{
+				MemoryID: h.ID, ContentHash: hashes[h.ID], SignalsJSON: "{}",
+				MatchClass: sec.matchClass, Eligible: true, Provenance: prov[h.ID],
 			}
+			if r.injected[h.ID] {
+				rank++
+				it.InjectionRank = rank
+				injected = append(injected, h)
+			} else {
+				it.DropReason = r.drops[h.ID]
+				if it.DropReason == "" {
+					it.DropReason = "budget"
+				}
+			}
+			items = append(items, it)
 		}
 	}
-
 	sb.WriteString(hint)
+
+	outcome := recall.OutcomeNoHit
+	if len(injected) > 0 {
+		outcome = recall.OutcomeInjected
+	} else if len(all) > 0 {
+		outcome = recall.OutcomeLowQuality
+	}
+	reason := "session_start"
+	if meta.Event == string(harness.EventPreCompact) {
+		reason = "pre_compact"
+	}
+	if _, err := st.WriteReadTrace(store.ReadTrace{
+		SessionID: meta.SessionID, Project: project, Harness: meta.Harness,
+		QueryGate: "skip", GateReason: reason, Scope: "current",
+		TargetLimit: limit, BudgetChars: maxChars, RawHits: len(all),
+		Qualified: len(all), Injected: len(injected), Outcome: outcome,
+	}, items); err != nil {
+		fmt.Fprintln(os.Stderr, "v2mem hook: 写读侧轨迹失败（不影响注入）:", err)
+	}
 	return sb.String(), injected
 }
 
-// countLines 数 formatHits 实际渲染了多少条 —— 预算截断时命中数少于候选数，
-// 审计必须记「真正注入的」而非「查到的」。
-func countLines(block string) int {
-	n := 0
-	for _, l := range strings.Split(block, "\n") {
-		if strings.HasPrefix(l, "- [") {
-			n++
-		}
+// promptSubmitContext 依据用户提问检索并注入相关记忆。
+//
+// 召回交给 internal/recall：gate 判定 → 完整融合池过取 → 质量筛选 →
+// notes/content 去重 → scope 配额 → 选择 → 预算检查 → 合格池补位。
+// 无合格项时返回空串：每轮注入无关内容纯属浪费 token。
+func promptSubmitContext(st *store.Store, project, prompt string, limit, maxChars int, meta hookMeta) (string, []store.Hit, recall.Gate) {
+	prompt = strings.TrimSpace(prompt)
+	head := "[v2mem] 相关历史记忆（若与当前代码冲突，以代码为准）：\n"
+	budget := maxChars - runeLen(head)
+	if budget <= 0 {
+		// 负数让预算检查必然失败；不能用 0（recall 会当成「未指定」用默认 1200）。
+		budget = -1
 	}
-	return n
+	res, err := recall.Query(st, recall.QueryOptions{
+		Query: prompt, Project: project, Scope: "current",
+		SessionID: meta.SessionID, Harness: meta.Harness,
+		Limit: limit, Budget: budget, ContentRunes: maxHitRunes,
+		NotesCovered: notesCoveredPredicate(st),
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "v2mem hook: 检索失败（不影响会话）:", err)
+		return "", nil, res.Gate
+	}
+	if len(res.Injected) == 0 {
+		return "", nil, res.Gate
+	}
+	var sb strings.Builder
+	sb.WriteString(head)
+	hits := make([]store.Hit, 0, len(res.Injected))
+	for _, in := range res.Injected {
+		sb.WriteString(recall.RenderLine(in.Hit, in.Provenance, maxHitRunes))
+		hits = append(hits, in.Hit)
+	}
+	return sb.String(), hits, res.Gate
 }
 
-// promptSubmitContext 依据用户提问检索并注入相关记忆。
-// 无命中时返回空串：每轮注入无关内容纯属浪费 token。
-func promptSubmitContext(st *store.Store, project, prompt string, limit, maxChars int) (string, []store.Hit) {
-	prompt = strings.TrimSpace(prompt)
-	if prompt == "" {
-		return "", nil
+func hitIDs(hits []store.Hit) []string {
+	out := make([]string, 0, len(hits))
+	for _, h := range hits {
+		if h.ID != "" {
+			out = append(out, h.ID)
+		}
 	}
-	hits, err := st.Search(store.SearchQuery{
-		Query:   prompt,
-		Project: project,
-		Scope:   "current",
-		Limit:   limit,
-	})
-	if err != nil || len(hits) == 0 {
-		return "", nil
-	}
-	hits = filterRulesCoveredByNotes(st, hits)
-	if len(hits) == 0 {
-		return "", nil
-	}
-	head := "[v2mem] 相关历史记忆（若与当前代码冲突，以代码为准）：\n"
-	block, _ := formatHits("", hits, maxChars-runeLen(head))
-	if block == "" {
-		return "", nil
-	}
-	return head + block, hits[:countLines(block)]
+	return out
 }
 
 // formatHits 渲染命中列表，返回文本与消耗的字符数。
-// title 为空则不写标题行。
-func formatHits(title string, hits []store.Hit, budget int) (string, int) {
-	var b strings.Builder
-	if title != "" {
-		b.WriteString(title + "：\n")
-		if runeLen(b.String()) > budget {
-			return "", 0
-		}
-	}
-	n := 0
-	for _, h := range hits {
-		line := fmt.Sprintf("- [%s] %s\n", h.Kind, truncateRunes(h.Content, maxHitRunes))
-		if runeLen(b.String())+runeLen(line) > budget {
-			break
-		}
-		b.WriteString(line)
-		n++
-	}
-	if n == 0 {
-		return "", 0
-	}
-	s := b.String()
-	return s, runeLen(s)
+// title 为空则不写标题行。prov 是 id → 紧凑 provenance，逐条带 mem:<id8>。
+func formatHits(title string, hits []store.Hit, prov map[string]string, budget int) (string, int) {
+	r := renderSection(title, hits, prov, budget, len(hits))
+	return r.block, r.used
 }
 
 // hintBlock 是「钩子」本体：告诉模型还有 Level 2 可查，并给出可直接执行的命令。

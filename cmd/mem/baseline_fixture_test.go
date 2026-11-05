@@ -187,7 +187,7 @@ func addReadPoolBaselineMemories(t *testing.T, db string, longFirst bool) {
 	}
 }
 
-func TestReadPoolBaselineNoBackfillAfterRuleDedupOrBudget(t *testing.T) {
+func TestReadPoolBaselineBackfillsAfterRuleDedupOrBudget(t *testing.T) {
 	t.Run("rule dedup", func(t *testing.T) {
 		t.Setenv("MEM_NO_NOTES", "")
 		db := testDB(t)
@@ -202,21 +202,22 @@ func TestReadPoolBaselineNoBackfillAfterRuleDedupOrBudget(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Search full: %v", err)
 		}
-		top, err := st.Search(store.SearchQuery{Query: "ALPHA", Project: "demo", Scope: "current", Limit: 3, NoFuzzy: true})
-		if err != nil {
-			t.Fatalf("Search top: %v", err)
+		if len(full) < 6 {
+			t.Fatalf("基线前置条件不成立: full=%d", len(full))
 		}
-		if len(full) < 6 || len(top) != 3 {
-			t.Fatalf("基线前置条件不成立: full=%d top=%d", len(full), len(top))
+		// 旧基线：top3 全是全局 rule，notes 去重后不回补 ⇒ 注入 0~1 条。
+		// T4 要求：从合格池补位，把同查询命中的事实补进来，且规则绝不冒充事实。
+		out := renderHookContext(common{db: db}, harness.EventPromptSubmit, "demo", "ALPHA", 3, 1200, hookMeta{})
+		if len(out.Injected) != 1 {
+			t.Fatalf("notes 去重后应从合格池补位（global 配额封顶 1），injected=%d text=%q", len(out.Injected), out.Text)
 		}
-		filtered := filterRulesCoveredByNotes(st, top)
-		if len(filtered) >= len(top) {
-			t.Fatalf("基线夹具要求 top3 至少含一条被 notes 覆盖的 rule, got %d/%d", len(filtered), len(top))
-		}
-
-		text, injected := renderHookContext(common{db: db}, harness.EventPromptSubmit, "demo", "ALPHA", 3, 1200)
-		if len(injected) >= 3 || len(injected) >= len(full) {
-			t.Fatalf("当前基线应在 top-k 后过滤且不回补, injected=%d full=%d text=%q", len(injected), len(full), text)
+		for _, h := range out.Injected {
+			if h.Kind == "rule" || strings.Contains(h.Content, "RULE") {
+				t.Fatalf("已被 notes 覆盖的规则不应被补位注入: %+v", h)
+			}
+			if !strings.Contains(h.Content, "FACT") {
+				t.Fatalf("补位应取合格池里的事实条目: %+v", h)
+			}
 		}
 	})
 
@@ -242,9 +243,19 @@ func TestReadPoolBaselineNoBackfillAfterRuleDedupOrBudget(t *testing.T) {
 			t.Fatalf("基线前置条件不成立: full=%d top=%d first=%q", len(full), len(top), top[0].Content)
 		}
 
-		text, injected := renderHookContext(common{db: db}, harness.EventPromptSubmit, "demo", "ALPHA LONG", 3, 100)
-		if len(injected) != 0 || strings.TrimSpace(text) != "" {
-			t.Fatalf("当前基线应在预算截断后不回补短候选, injected=%d text=%q", len(injected), text)
+		// 旧基线：top3 都是长条目，预算截断后直接放弃 ⇒ 注入 0 条。
+		// T4 要求：继续扫合格池，用能放进预算的短条目补位。
+		out := renderHookContext(common{db: db}, harness.EventPromptSubmit, "demo", "ALPHA LONG", 3, 100, hookMeta{})
+		if len(out.Injected) == 0 || strings.TrimSpace(out.Text) == "" {
+			t.Fatalf("预算不足时应从合格池补位短条目，injected=%d text=%q", len(out.Injected), out.Text)
+		}
+		for _, h := range out.Injected {
+			if strings.Contains(h.Content, "LONG") {
+				t.Fatalf("超预算的长条目不应被注入: %+v", h)
+			}
+			if !strings.Contains(h.Content, "SHORT") {
+				t.Fatalf("补位应取短条目: %+v", h)
+			}
 		}
 	})
 }
