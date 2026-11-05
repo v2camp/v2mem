@@ -126,7 +126,7 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 		return nil, errors.New("候选内容为空")
 	}
 	switch in.Kind {
-	case "preference", "decision", "pitfall", "task":
+	case "preference", "decision", "pitfall", "task", "fact":
 	default:
 		return nil, fmt.Errorf("候选 kind 无效: %q", in.Kind)
 	}

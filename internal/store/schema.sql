@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS memories (
   source        TEXT NOT NULL DEFAULT '',
   channel       TEXT NOT NULL DEFAULT '', -- user|agent|tool|import；与 source 并存。空=迁移前旧行
   provenance    TEXT,
-  access_count  INTEGER NOT NULL DEFAULT 0
+  access_count  INTEGER NOT NULL DEFAULT 0,
+  scope         TEXT NOT NULL DEFAULT '', -- project|global|cross_project；空=legacy 未定
+  adopted_count INTEGER NOT NULL DEFAULT 0,
+  last_adopted_at INTEGER
 );
 
 -- 既有库（在此列加入前创建）没有 source 列：Open 时用 ensureColumn 幂等补上；
@@ -106,11 +109,18 @@ CREATE TABLE IF NOT EXISTS observations (
   created_at    INTEGER NOT NULL,
   meta_json     TEXT NOT NULL DEFAULT '{}',
   channel       TEXT NOT NULL DEFAULT '', -- user|agent|tool|import
-  event_id      TEXT NOT NULL DEFAULT ''  -- 宿主事件号；空不参与幂等。唯一索引在 Open 里建
+  event_id      TEXT NOT NULL DEFAULT '', -- 宿主事件号；空不参与幂等。唯一索引在 Open 里建
+  event_uid     TEXT NOT NULL DEFAULT '', -- canonical 全局事件身份；空=legacy/无身份
+  source_id     TEXT NOT NULL DEFAULT '', -- 证据源；空=legacy/无身份
+  source_generation INTEGER NOT NULL DEFAULT 0,
+  source_seq    INTEGER NOT NULL DEFAULT 0,
+  occurred_at_ns INTEGER NOT NULL DEFAULT 0,
+  archive_hash  TEXT NOT NULL DEFAULT '',
+  raw_record_hash TEXT NOT NULL DEFAULT '',
+  parser_version TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_obs_session ON observations(session_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_obs_project ON observations(project, created_at);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_obs_dedup ON observations(session_id, content_hash);
 
 CREATE TABLE IF NOT EXISTS candidates (
   id            TEXT PRIMARY KEY,
@@ -126,7 +136,17 @@ CREATE TABLE IF NOT EXISTS candidates (
   obs_ids_json  TEXT NOT NULL DEFAULT '[]',
   created_at    INTEGER NOT NULL,
   decided_at    INTEGER,
-  memory_id     TEXT                       -- accept 后回填
+  memory_id     TEXT,                      -- accept 后回填
+  run_id        TEXT NOT NULL DEFAULT '',
+  bundle_id     TEXT NOT NULL DEFAULT '',
+  proposal_index INTEGER NOT NULL DEFAULT 0,
+  scope         TEXT NOT NULL DEFAULT '',
+  subject_key   TEXT NOT NULL DEFAULT '',
+  task_state    TEXT NOT NULL DEFAULT '',
+  rationale     TEXT NOT NULL DEFAULT '',
+  review_class  TEXT NOT NULL DEFAULT '',
+  revision      INTEGER NOT NULL DEFAULT 0,
+  schema_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_cand_status ON candidates(status, created_at);
 -- 同一会话里相同内容的 pending/accepted 不双插。rejected 不占这个键，允许改写后再来。
@@ -143,11 +163,93 @@ CREATE TABLE IF NOT EXISTS distill_runs (
   cand_count    INTEGER NOT NULL DEFAULT 0,
   started_at    INTEGER NOT NULL,
   finished_at   INTEGER NOT NULL,
-  window_key    TEXT NOT NULL DEFAULT '', -- 观测集合的去重键；失败行为空，允许重试
+  window_key    TEXT NOT NULL DEFAULT '', -- 旧蒸馏窗口键；新 Proposal 不再用它做游标
+  bundle_id     TEXT NOT NULL DEFAULT '',
+  executor      TEXT NOT NULL DEFAULT '', -- host|local|byok|none
+  model         TEXT NOT NULL DEFAULT '',
+  model_version TEXT NOT NULL DEFAULT '',
+  prompt_version TEXT NOT NULL DEFAULT '',
+  schema_version INTEGER NOT NULL DEFAULT 0,
+  generated_count INTEGER NOT NULL DEFAULT 0,
+  valid_count   INTEGER NOT NULL DEFAULT 0,
+  invalid_count INTEGER NOT NULL DEFAULT 0,
+  duplicate_count INTEGER NOT NULL DEFAULT 0,
+  attempt       INTEGER NOT NULL DEFAULT 0,
+  source_fingerprint TEXT NOT NULL DEFAULT '',
   UNIQUE(session_id, started_at)
 );
 -- ux_distill_window 不放在这里：旧库的 distill_runs 还没有 window_key，
 -- 索引要等 Open 里 ensureColumn 之后再建。
+
+-- T1.0 Evidence 账本。只登记来源、归档段、连续 Bundle 与条目；
+-- 真正的原始字节由 internal/evidence 写到本地 gzip segment。
+CREATE TABLE IF NOT EXISTS evidence_sources (
+  id           TEXT PRIMARY KEY,
+  kind         TEXT NOT NULL DEFAULT 'hook', -- hook|transcript|import|replay
+  locator      TEXT NOT NULL DEFAULT '',
+  generation   INTEGER NOT NULL DEFAULT 1,
+  status       TEXT NOT NULL DEFAULT 'active', -- active|rotated|deleted
+  last_seq     INTEGER NOT NULL DEFAULT 0,
+  cursor_seq   INTEGER NOT NULL DEFAULT 0,
+  source_tip   TEXT NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evidence_archives (
+  archive_hash    TEXT PRIMARY KEY,
+  source_id       TEXT NOT NULL REFERENCES evidence_sources(id),
+  generation      INTEGER NOT NULL,
+  from_seq        INTEGER NOT NULL,
+  to_seq          INTEGER NOT NULL,
+  raw_count       INTEGER NOT NULL,
+  byte_size       INTEGER NOT NULL,
+  path            TEXT NOT NULL,
+  raw_hash_concat TEXT NOT NULL DEFAULT '',
+  created_at      INTEGER NOT NULL,
+  UNIQUE(source_id, generation, from_seq)
+);
+CREATE INDEX IF NOT EXISTS ix_evarch_source ON evidence_archives(source_id, generation, to_seq);
+
+CREATE TABLE IF NOT EXISTS evidence_bundles (
+  id                 TEXT PRIMARY KEY,
+  source_id          TEXT NOT NULL REFERENCES evidence_sources(id),
+  generation         INTEGER NOT NULL,
+  from_seq_exclusive INTEGER NOT NULL,
+  to_seq_inclusive   INTEGER NOT NULL,
+  evidence_hash      TEXT NOT NULL,
+  source_tip         TEXT NOT NULL DEFAULT '',
+  status             TEXT NOT NULL DEFAULT 'pending', -- pending|leased|ok|noop|fail|backlog|quarantined
+  attempt            INTEGER NOT NULL DEFAULT 0,
+  not_before         INTEGER NOT NULL DEFAULT 0,
+  lease_until        INTEGER NOT NULL DEFAULT 0,
+  lease_owner        TEXT NOT NULL DEFAULT '',
+  last_run_id        TEXT NOT NULL DEFAULT '',
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL,
+  UNIQUE(source_id, generation, from_seq_exclusive)
+);
+CREATE INDEX IF NOT EXISTS ix_evbundle_status ON evidence_bundles(status, not_before);
+CREATE INDEX IF NOT EXISTS ix_evbundle_lease ON evidence_bundles(lease_until);
+
+CREATE TABLE IF NOT EXISTS evidence_bundle_items (
+  bundle_id   TEXT NOT NULL REFERENCES evidence_bundles(id) ON DELETE CASCADE,
+  ordinal     INTEGER NOT NULL,
+  evidence_id TEXT NOT NULL,
+  event_uid   TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (bundle_id, ordinal),
+  UNIQUE (bundle_id, evidence_id)
+);
+CREATE INDEX IF NOT EXISTS ix_evbi_evidence ON evidence_bundle_items(evidence_id);
+
+-- legacy 标记与证据物理隔离，避免被误读成伪造的 evidence 字段。
+CREATE TABLE IF NOT EXISTS migration_marks (
+  entity_type TEXT NOT NULL,
+  entity_id   TEXT NOT NULL,
+  mark        TEXT NOT NULL,
+  marked_at   INTEGER NOT NULL,
+  PRIMARY KEY (entity_type, entity_id)
+);
 
 -- M5b-0 模糊检索：每条记忆的 MinHash 签名（512B 小端 uint64 序列）。
 -- 与记忆同写同删（外键级联）；旧库缺签名的行由 Open 时一次性补齐（backfillSigs），
