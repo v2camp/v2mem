@@ -18,6 +18,7 @@ github.com/v2camp/v2mem/internal/eval	98	98
 github.com/v2camp/v2mem/internal/scrub	100	100
 github.com/v2camp/v2mem/internal/transcript	89	94
 github.com/v2camp/v2mem/internal/distill	86	92
+github.com/v2camp/v2mem/internal/proposal	85	90
 github.com/v2camp/v2mem/internal/similarity	97	97
 github.com/v2camp/v2mem/internal/harness	93	96
 github.com/v2camp/v2mem/internal/audit	89	90

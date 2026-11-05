@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/distill"
+	"github.com/v2camp/v2mem/internal/evidence"
+	"github.com/v2camp/v2mem/internal/proposal"
 	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
@@ -29,11 +32,15 @@ func cmdDistill(args []string) error {
 	pending := fs.Bool("pending", false, "蒸馏所有尚未处理的会话")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
 	noScrub := fs.Bool("no-scrub", false, "关闭密钥打码（仅本地调试）")
+	proposalMode := fs.Bool("proposal", false, "从证据账本取连续 Bundle 生成候选（T2）")
+	bundleID := fs.String("bundle", "", "只处理指定证据 Bundle（隐含 --proposal）")
+	executor := fs.String("executor", "auto", "Proposal executor: auto|host|local|byok|none")
+	maxBundles := fs.Int("max-bundles", 1, "--proposal 本次最多处理几个 Bundle")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if !*pending && strings.TrimSpace(*session) == "" {
-		return errors.New("需要 --session 或 --pending")
+	if !*pending && strings.TrimSpace(*session) == "" && strings.TrimSpace(*bundleID) == "" && !*proposalMode {
+		return errors.New("需要 --session、--pending、--proposal 或 --bundle")
 	}
 	model, timeout := distill.LoadConfig(distill.ConfigPath())
 	st, err := store.Open(c.db)
@@ -41,6 +48,180 @@ func cmdDistill(args []string) error {
 		return err
 	}
 	defer st.Close()
+
+	// T2：证据 Bundle 路径。默认 auto = Local → backlog，绝不默认外发 BYOK，
+	// 也不把 Host 放进自动链路（host_safe=false，见 design-write-governance §11）。
+	if *bundleID != "" || *proposalMode {
+		mode := strings.ToLower(strings.TrimSpace(*executor))
+		if mode == "" {
+			mode = "auto"
+		}
+		if *dry && strings.TrimSpace(*bundleID) == "" {
+			return errors.New("--dry-run 需要配合 --bundle：dry-run 不得推进连续游标")
+		}
+		var deps proposal.Deps
+		unavailable := func(label string, cause error) proposal.Generator {
+			return proposal.UnavailableGenerator(label, cause)
+		}
+		local := func() proposal.Generator {
+			fn, name, cerr := distill.PromptCompleter(distill.Options{
+				Provider: "ollama", Model: model, Timeout: timeout,
+			})
+			if cerr != nil {
+				return unavailable("local", cerr)
+			}
+			return proposal.PromptGenerator(name, fn)
+		}
+		switch mode {
+		case "auto", "local":
+			deps.Local = local()
+		case "host":
+			deps.Host = unavailable("host", proposal.ErrHostUnavailable)
+			deps.Local = local()
+		case "byok":
+			deps.Local = local()
+			fn, name, cerr := distill.PromptCompleter(distill.Options{
+				Provider: "openai", Model: model, Timeout: timeout,
+			})
+			if cerr != nil {
+				deps.BYOK = unavailable("byok", cerr)
+			} else {
+				deps.BYOK = proposal.PromptGenerator(name, fn)
+			}
+		case "none":
+			// 显式 none：没有 provider，终态是 backlog（不是 empty）。
+		default:
+			return fmt.Errorf("未知 executor: %s（auto|host|local|byok|none）", *executor)
+		}
+		ev := evidence.New(st)
+		chain, err := proposal.BuildChain(mode, ev, deps)
+		if err != nil {
+			return err
+		}
+		runner := &proposal.Runner{
+			St: st, Reader: ev, Chain: chain, Owner: "cli",
+			LeaseTTL: 2 * time.Minute, Limit: evidence.DefaultBundleLimit,
+			MaxBytes: evidence.DefaultBundleBytes, NoScrub: *noScrub,
+		}
+		limit := *maxBundles
+		if limit <= 0 {
+			limit = 1
+		}
+		outs := make([]*proposal.Outcome, 0, limit)
+		var failures []error
+		for i := 0; i < limit; i++ {
+			var out *proposal.Outcome
+			if id := strings.TrimSpace(*bundleID); id != "" {
+				if *dry {
+					out, err = runner.Peek(context.Background(), id)
+				} else {
+					out, err = runner.StepBundle(context.Background(), id)
+				}
+			} else {
+				out, err = runner.Step(context.Background())
+			}
+			if err != nil {
+				failures = append(failures, err)
+				break
+			}
+			if out.Status == "skipped" {
+				break
+			}
+			outs = append(outs, out)
+			if *bundleID != "" {
+				break
+			}
+			// 只有窗口真正被消费（ok/noop）才继续下一窗；fail/partial/backlog 停在这里。
+			if out.BundleStatus != "ok" && out.BundleStatus != "noop" {
+				break
+			}
+		}
+		if len(outs) == 0 {
+			if len(failures) > 0 {
+				return errors.Join(failures...)
+			}
+			if c.json {
+				return printJSON(map[string]any{"status": "skipped", "bundles": 0, "inserted": 0})
+			}
+			fmt.Println("没有待处理的证据窗口")
+			return nil
+		}
+
+		rank := map[string]int{
+			proposal.StatusFail: 6, proposal.StatusInvalid: 5, proposal.StatusPartial: 4,
+			proposal.StatusBacklog: 3, proposal.StatusOK: 2, proposal.StatusNoop: 1,
+			proposal.StatusWouldGenerate: 0, "skipped": -1,
+		}
+		status := outs[0].Status
+		var generated, valid, invalid, duplicate, inserted, merged int
+		results := make([]map[string]any, 0, len(outs))
+		for _, o := range outs {
+			if rank[o.Status] > rank[status] {
+				status = o.Status
+			}
+			generated += o.Generated
+			valid += o.Valid
+			invalid += o.Invalid
+			duplicate += o.Duplicate
+			inserted += o.Inserted
+			merged += o.Merged
+			results = append(results, map[string]any{
+				"bundle": o.BundleID, "session": o.SessionID, "executor": o.Executor,
+				"status": o.Status, "bundle_status": o.BundleStatus,
+				"generated": o.Generated, "valid": o.Valid, "invalid": o.Invalid,
+				"duplicate": o.Duplicate, "inserted": o.Inserted, "merged": o.Merged,
+				"blocked": o.Blocked, "error": o.Error, "attempt": o.Attempt,
+			})
+			if *auditFile != "-" {
+				_ = audit.Append(auditPath(*auditFile), audit.Record{
+					TS: time.Now().Unix(), Event: "distill", SessionID: o.SessionID,
+					Provider: o.Executor, Mode: o.Status, Count: o.Inserted,
+					Failed: o.Invalid, Source: "proposal",
+					Empty: o.Status == proposal.StatusNoop,
+				})
+			}
+			if o.Error != "" {
+				fmt.Fprintf(os.Stderr, "v2mem distill: %s\n", o.Error)
+			}
+			if c.json {
+				continue
+			}
+			fmt.Printf("bundle %s executor=%s status=%s 生成 %d 有效 %d 无效 %d 新增 %d 重复 %d\n",
+				shortID(o.BundleID), o.Executor, o.Status, o.Generated, o.Valid,
+				o.Invalid, o.Inserted, o.Duplicate)
+			if o.Blocked != "" {
+				fmt.Printf("  %s\n", o.Blocked)
+			}
+			if *dry {
+				for _, d := range o.Drafts {
+					fmt.Printf("  would_generate [%s] %s\n", d.Kind, d.Content)
+				}
+			}
+		}
+		if c.json {
+			if err := printJSON(map[string]any{
+				"status": status, "bundles": len(outs), "generated": generated,
+				"valid": valid, "invalid": invalid, "duplicate": duplicate,
+				"inserted": inserted, "merged": merged,
+				"would_generate": *dry, "results": results,
+			}); err != nil {
+				return err
+			}
+		}
+		if *strict {
+			for _, o := range outs {
+				switch o.Status {
+				case proposal.StatusFail, proposal.StatusInvalid, proposal.StatusPartial:
+					failures = append(failures, fmt.Errorf("bundle %s status=%s: %s",
+						o.BundleID, o.Status, o.Error))
+				}
+			}
+		}
+		if len(failures) > 0 {
+			return errors.Join(failures...)
+		}
+		return nil
+	}
 
 	sessions := []string{strings.TrimSpace(*session)}
 	if *pending {
