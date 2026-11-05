@@ -300,7 +300,7 @@ func TestObservationsForDistillFiltersAndOrders(t *testing.T) {
 
 func TestCandidateResolveAndAcceptEdges(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.InsertCandidate(CandidateInput{Kind: "fact", Content: "不该进"}); err == nil {
+	if _, err := s.InsertCandidate(CandidateInput{Kind: "unknown-kind", Content: "不该进"}); err == nil {
 		t.Fatal("非法 kind 应失败")
 	}
 	if _, err := s.InsertCandidate(CandidateInput{Kind: "decision", Content: "  "}); err == nil {

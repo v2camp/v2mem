@@ -87,6 +87,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("迁移 source 列失败: %w", err)
 	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS ix_mem_source ON memories(source)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("建 source 索引失败: %w", err)
+	}
 	// provenance 列是后加的：存量行保持 NULL（无溯源），幂等 ALTER。
 	if err := ensureColumn(db, "memories", "provenance", "TEXT"); err != nil {
 		db.Close()
@@ -120,6 +124,10 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("补齐观测检索失败: %w", err)
 	}
+	if err := ensureEvidenceSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 Evidence schema 失败: %w", err)
+	}
 	return st, nil
 }
 
@@ -135,24 +143,23 @@ func ensureColumn(db *sql.DB, table, column, ddl string) error {
 		return err
 	}
 	defer rows.Close()
+	exists := false
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return err
 		}
 		if name == column {
-			return nil
+			exists = true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, ddl))
-	if err != nil {
-		return err
+	if exists {
+		return nil
 	}
-	// 补列成功后补索引；列已存在时走索引创建也无妨（IF NOT EXISTS 幂等）。
-	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS ix_mem_source ON memories(source)`)
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, ddl))
 	return err
 }
 
