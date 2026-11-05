@@ -200,6 +200,10 @@ func scanObservation(row interface{ Scan(...any) error }) (Observation, error) {
 // GCObservations 删掉超过 maxAge 的观测，再把条数压到 maxKeep。
 //
 // 只动 observations。memories / candidates 不在这条路径上。
+// 被 memory_evidence 引用的观测永不删除：删掉它，记忆的证据链就指向空处，
+// 读侧只能显示「有证据」却打不开原始记录——比没有证据更具误导性。
+// 引用判定同时看 evidence_id 与 event_uid：前者是本机 id，后者是跨设备传播后
+// 仍可解析的 canonical 身份（sync 过来的链接可能只带 event_uid）。
 // maxAge<=0 时按 30 天；maxKeep<=0 时按 5 万条。
 func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult, error) {
 	if maxAge <= 0 {
@@ -209,7 +213,11 @@ func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult,
 		maxKeep = 50000
 	}
 	cutoff := time.Now().Add(-maxAge).Unix()
-	res, err := s.db.Exec(`DELETE FROM observations WHERE created_at < ?`, cutoff)
+	res, err := s.db.Exec(`DELETE FROM observations
+		WHERE created_at < ?
+		  AND NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.evidence_id = observations.id)
+		  AND NOT EXISTS (SELECT 1 FROM memory_evidence e
+		                  WHERE e.event_uid <> '' AND e.event_uid = observations.event_uid)`, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +232,11 @@ func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult,
 	if n > maxKeep {
 		extra := n - maxKeep
 		res, err = s.db.Exec(`DELETE FROM observations WHERE id IN (
-			SELECT id FROM observations ORDER BY created_at ASC, id ASC LIMIT ?)`, extra)
+			SELECT id FROM observations
+			 WHERE NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.evidence_id = observations.id)
+			   AND NOT EXISTS (SELECT 1 FROM memory_evidence e
+			                   WHERE e.event_uid <> '' AND e.event_uid = observations.event_uid)
+			 ORDER BY created_at ASC, id ASC LIMIT ?)`, extra)
 		if err != nil {
 			return nil, err
 		}

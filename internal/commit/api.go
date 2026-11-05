@@ -3,7 +3,30 @@
 // 本文件是第二波并行的冻结接口：只有类型、接口和常量，不含函数体。
 package commit
 
-import "github.com/v2camp/v2mem/internal/proposal"
+// Candidate 是提交矩阵需要的候选只读视图。
+//
+// 刻意不依赖 internal/proposal：proposal 需要 internal/store 执行租约与落库，
+// store 又需要 commit 做裁决；让 commit 反向 import proposal 会形成导入环。
+// 字段由 store 从 candidates 行映射而来，语义与 proposal.Candidate 对齐。
+type Candidate struct {
+	ID          string
+	SessionID   string
+	Project     string
+	BundleID    string
+	RunID       string
+	Kind        string
+	Scope       string
+	Status      string
+	ReviewClass string
+	Revision    int
+	Content     string
+	ContentHash string
+	SubjectKey  string
+	TaskState   string
+	Rationale   string
+	Salience    float64
+	EvidenceIDs []string
+}
 
 // Grade 是证据等级。C 级不得单独支持自动提交。
 type Grade string
@@ -65,5 +88,5 @@ type ProvenanceFormatter interface {
 
 // Policy 对候选做确定性裁决。
 type Policy interface {
-	Decide(candidate proposal.Candidate, evidence []Link) (Decision, error)
+	Decide(candidate Candidate, evidence []Link) (Decision, error)
 }

@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
-	"github.com/v2camp/v2mem/internal/similarity"
+	"github.com/v2camp/v2mem/internal/commit"
 	"modernc.org/sqlite"
 )
 
@@ -293,153 +292,39 @@ func (s *Store) ResolveCandidate(idOrPrefix string) (*Candidate, error) {
 }
 
 // AcceptCandidate 把 pending 候选写进 memories（source=distill-accept），并记 derived_from。
-// 已采纳的再调用是幂等的。拒绝或过期的候选不能采纳。
+// 已采纳的再调用是幂等的：只补证据链/派生边/provenance，不重复计数。
+// 拒绝、过期或 revision 已变化的候选不能采纳。
+//
+// 实际提交逻辑在 commit.go：这里保留旧签名，供未感知 revision 的调用方继续使用。
+// 仍然显式读出 revision 再传下去：同一进程里的并发调用会拿到同一个值，
+// 由 CAS 判定唯一赢家；若传 -1（事务内自读），双方都会成功，CAS 就失效了。
 func (s *Store) AcceptCandidate(idOrPrefix string) (*AcceptResult, error) {
-	c, err := s.ResolveCandidate(idOrPrefix)
+	view, err := s.CommitCandidate(idOrPrefix)
 	if err != nil {
 		return nil, err
 	}
-	if c.Status == "accepted" {
-		if c.MemoryID == "" {
-			return nil, fmt.Errorf("候选 %s 已采纳但缺少 memory_id，不能采纳", c.ID)
-		}
-		// 幂等重放：这里必须**补边**而不是直接返回。
-		// 旧实现直接 return，若上次在「更新候选」与「插边」之间失败，
-		// 再调用永远走这条路，derived_from 就永久缺失，且候选已 accepted 再也修不回来。
-		if err := s.ensureDerivedEdge(c.MemoryID, c.ID); err != nil {
-			return nil, err
-		}
-		return &AcceptResult{Candidate: *c, MemoryID: c.MemoryID, Hash: c.Hash, Already: true}, nil
-	}
-	if c.Status != "pending" {
-		return nil, fmt.Errorf("候选 %s 状态为 %s，不能采纳", c.ID, c.Status)
-	}
-	return s.acceptTx(c)
-}
-
-// acceptTx 在一个事务里完成「写 memories + 回填候选 + 补 derived_from 边」。
-//
-// 为什么要单事务：三步原来各自独立提交，中间任何一步失败都会留下半状态——
-// 记忆写了但候选还 pending（下次重跑会重复写），或候选 accepted 但边没插（溯源丢失）。
-// 半状态是**不可自动修复**的，所以只能靠事务整体回滚来避免。
-//
-// 注意：这里没有调用 s.Add —— Add 自己开事务，无法与外层合并；
-// 因此把 Add 的「相同知识覆盖 / 新增」语义在此重写一遍，包含内容索引与签名，
-// 保证 accept 出来的记忆与直接 add 出来的形态一致。
-func (s *Store) acceptTx(c *Candidate) (*AcceptResult, error) {
-	source := "distill-accept"
-	channel, err := DefaultChannel(c.Channel, source)
+	res, err := s.CommitAccept(idOrPrefix, view.Revision, commit.ActorHuman)
 	if err != nil {
 		return nil, err
 	}
-	salience := c.Salience
-	if salience <= 0 || salience > 1 {
-		salience = 0.5
-	}
-	device, _ := os.Hostname()
-	hash := HashOf(c.Content)
-	idx := indexText(c.Content)
-	now := time.Now().Unix()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	var id string
-	created := false
-	err = tx.QueryRow(
-		`SELECT id FROM memories WHERE content_hash = ? AND project = ?`, hash, c.Project,
-	).Scan(&id)
-	switch {
-	case err == nil:
-		// 相同知识覆盖：刷新时间戳、累加命中、salience 取较大值（与 Add 一致）。
-		if _, err = tx.Exec(
-			`UPDATE memories SET content = ?, content_idx = ?, updated_at = ?, last_seen_at = ?,
-			        access_count = access_count + 1, salience = MAX(salience, ?),
-			        origin_tool = ?, source = ?
-			 WHERE id = ?`,
-			c.Content, idx, now, now, salience, "distill", source, id); err != nil {
-			return nil, err
-		}
-	case errors.Is(err, sql.ErrNoRows):
-		created = true
-		id = newID()
-		if _, err = tx.Exec(
-			`INSERT INTO memories
-			   (id, content, content_idx, kind, content_hash, project, salience,
-			    created_at, updated_at, last_seen_at, expires_at,
-			    origin_device, origin_tool, source, channel, provenance, access_count)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,NULL,0)`,
-			id, c.Content, idx, c.Kind, hash, c.Project, salience,
-			now, now, now, device, "distill", source, channel); err != nil {
-			return nil, err
-		}
-	default:
-		return nil, err
-	}
-
-	// 签名与新内容同事务写入，否则 MinHash 检索会漏掉这条记忆。
-	if _, err = tx.Exec(
-		`INSERT OR REPLACE INTO mem_sigs(memory_id, sig) VALUES (?, ?)`,
-		id, encodeSig(similarity.Sign(c.Content))); err != nil {
-		return nil, err
-	}
-	// 只允许 pending → accepted：并发重复采纳时第二个事务不会覆盖第一个回填的 memory_id。
-	res, err := tx.Exec(
-		`UPDATE candidates SET status='accepted', decided_at=?, memory_id=?
-		  WHERE id=? AND status='pending'`, now, id, c.ID)
-	if err != nil {
-		return nil, err
-	}
-	if n, err := res.RowsAffected(); err != nil {
-		return nil, err
-	} else if n == 0 {
-		return nil, fmt.Errorf("候选 %s 状态已变化，未采纳", c.ID)
-	}
-	// INSERT OR IGNORE：边是幂等的，重放/补边都不该报错。
-	if _, err = tx.Exec(
-		`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
-		id, c.ID); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
-	}
-	updated, err := s.candidateByID(c.ID)
-	if err != nil {
-		return nil, err
-	}
-	return &AcceptResult{Candidate: *updated, MemoryID: id, Hash: hash, Already: !created}, nil
-}
-
-// ensureDerivedEdge 幂等补一条 derived_from 边（src=记忆，dst=候选）。
-func (s *Store) ensureDerivedEdge(memoryID, candidateID string) error {
-	_, err := s.db.Exec(
-		`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
-		memoryID, candidateID)
-	return err
+	return &AcceptResult{
+		Candidate: res.Candidate, MemoryID: res.MemoryID,
+		Hash: res.Hash, Already: res.Already,
+	}, nil
 }
 
 // RejectCandidate 把 pending 候选标成 rejected。不写 memories。
+// 已拒绝的重复调用幂等；revision 由 CommitReject 用 CAS 推进。
 func (s *Store) RejectCandidate(idOrPrefix string) (*Candidate, error) {
-	c, err := s.ResolveCandidate(idOrPrefix)
+	view, err := s.CommitCandidate(idOrPrefix)
 	if err != nil {
 		return nil, err
 	}
-	if c.Status == "rejected" {
-		return c, nil
-	}
-	if c.Status != "pending" {
-		return nil, fmt.Errorf("候选 %s 状态为 %s，不能拒绝", c.ID, c.Status)
-	}
-	now := time.Now().Unix()
-	if _, err := s.db.Exec(
-		`UPDATE candidates SET status='rejected', decided_at=? WHERE id=?`, now, c.ID); err != nil {
+	res, err := s.CommitReject(idOrPrefix, view.Revision, commit.ActorHuman, "")
+	if err != nil {
 		return nil, err
 	}
-	return s.candidateByID(c.ID)
+	return &res.Candidate, nil
 }
 
 // GCCandidates 把超过 pendingAge 的 pending 标为 expired，并删掉超过 acceptedAge 的已采纳行。
