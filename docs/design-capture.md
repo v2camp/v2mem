@@ -318,7 +318,9 @@ type CaptureEvent struct {
 **Fidelity 不写进归档 `segment`**：它只落在 `observations.meta_json`（`evidenceMeta.fidelity`）
 与读侧 `Ref.Fidelity`，归档 `segmentRecord` 保持字节级幂等，因此本轮归档重放哈希不变。
 
-- **捕获保真度是蒸馏的上限**。当前 15 次蒸馏全 `empty`，不是蒸馏策略问题，而是输入只有 `"stop"`。
+- **捕获保真度是蒸馏的上限**。诊断时（2026-11-02~11-04）15 次蒸馏全 `empty`，
+  不是蒸馏策略问题，而是输入只有 `"stop"`；本轮 Trae Stop 字段映射与 `Fidelity`
+  链路落地后该输入断点已修复（见「当前实现对照表」T4 行），此句只作历史诊断记录。
 - 蒸馏独立立项，但输入契约要先定：只有 `full/summary` 可蒸馏；`pointer` 先回源；`none` 跳过。
 - 蒸馏产出只进 `candidates`；采纳率是核心指标，不以候选数论英雄。
 - 评测至少覆盖：
