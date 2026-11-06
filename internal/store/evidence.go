@@ -200,7 +200,11 @@ func (s *Store) CaptureEvidence(in EvidenceCaptureInput) (EvidenceRecord, bool, 
 	if err != nil {
 		return EvidenceRecord{}, false, err
 	}
-	meta, err := json.Marshal(map[string]bool{"proposal_eligible": in.ProposalEligible})
+	meta, err := json.Marshal(evidenceMeta{
+		ProposalEligible: in.ProposalEligible,
+		Fidelity:         in.Fidelity,
+		Adapter:          in.Adapter,
+	})
 	if err != nil {
 		return EvidenceRecord{}, false, err
 	}
@@ -305,7 +309,7 @@ func (s *Store) CaptureEvidence(in EvidenceCaptureInput) (EvidenceRecord, bool, 
 		OccurredAtNS: occurred, SessionID: sessionID, Project: in.Project, Harness: in.Harness,
 		EventType: in.EventType, ArchiveHash: in.ArchiveHash, RawRecordHash: in.RawRecordHash,
 		RawLocator: locator, Summary: summary, ParserVersion: in.ParserVersion,
-		ProposalEligible: in.ProposalEligible,
+		ProposalEligible: in.ProposalEligible, Fidelity: in.Fidelity, Adapter: in.Adapter,
 	}, true, nil
 }
 
@@ -375,11 +379,11 @@ func scanEvidenceRecord(row interface{ Scan(...any) error }) (EvidenceRecord, er
 	if err != nil {
 		return EvidenceRecord{}, err
 	}
-	var m struct {
-		ProposalEligible bool `json:"proposal_eligible"`
-	}
+	var m evidenceMeta
 	if json.Unmarshal([]byte(meta), &m) == nil {
 		rec.ProposalEligible = m.ProposalEligible
+		rec.Fidelity = m.Fidelity
+		rec.Adapter = m.Adapter
 	}
 	return rec, nil
 }

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 )
@@ -461,5 +462,129 @@ func TestCaptureEvidenceRejectsBadChannel(t *testing.T) {
 	in.Channel = "shared"
 	if _, _, err := s.CaptureEvidence(in); err == nil {
 		t.Fatal("非法 channel 应报错")
+	}
+}
+
+// T1: 结构化 evidenceMeta 写入与读回同事务一致（写返回 / 查身份 / 幂等重放 /
+// 出窗 ListEvidenceRecords 四条读路径都要带出 Fidelity/Adapter）。
+func TestCaptureEvidenceFidelityAdapterRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	in := evidenceInput("uid-fa", 0)
+	in.Fidelity = "full"
+	in.Adapter = "trae"
+	rec := mustCaptureEvidence(t, s, in)
+
+	// 写入返回的 EvidenceRecord 直接带出。
+	if rec.Fidelity != "full" || rec.Adapter != "trae" || !rec.ProposalEligible {
+		t.Fatalf("写入返回未带保真度: %+v", rec)
+	}
+
+	// 落库字节必须是结构化 evidenceMeta（含 fidelity/adapter 键）。
+	var meta string
+	if err := s.db.QueryRow(`SELECT meta_json FROM observations WHERE id = ?`, rec.ID).Scan(&meta); err != nil {
+		t.Fatal(err)
+	}
+	var m evidenceMeta
+	if err := json.Unmarshal([]byte(meta), &m); err != nil {
+		t.Fatalf("meta_json 非法: %v (%s)", err, meta)
+	}
+	if m.Fidelity != "full" || m.Adapter != "trae" || !m.ProposalEligible {
+		t.Fatalf("meta_json 未结构化: %s", meta)
+	}
+
+	// 按 uid 读回。
+	got, ok, err := s.LookupEvidence("uid-fa", "src-a", 0, 0)
+	if err != nil || !ok || got.Fidelity != "full" || got.Adapter != "trae" || !got.ProposalEligible {
+		t.Fatalf("按 uid 读回不一致: %+v ok=%v err=%v", got, ok, err)
+	}
+	// 按位置读回。
+	got, ok, err = s.LookupEvidence("", "src-a", 1, 1)
+	if err != nil || !ok || got.Fidelity != "full" || got.Adapter != "trae" {
+		t.Fatalf("按位置读回不一致: %+v ok=%v err=%v", got, ok, err)
+	}
+
+	// 幂等重放走 evidenceByEventUID → scanEvidenceRecord，同样带出。
+	replay, created, err := s.CaptureEvidence(in)
+	if err != nil || created || replay.Fidelity != "full" || replay.Adapter != "trae" {
+		t.Fatalf("幂等重放读回不一致: %+v created=%v err=%v", replay, created, err)
+	}
+
+	// 出窗后 ListEvidenceRecords 读回。
+	b, err := s.NextEvidenceBundle(10, 1<<20)
+	if err != nil || b == nil {
+		t.Fatalf("出窗失败: %+v err=%v", b, err)
+	}
+	refs, err := s.ListEvidenceRecords(b.ID)
+	if err != nil || len(refs) != 1 || refs[0].Fidelity != "full" || refs[0].Adapter != "trae" {
+		t.Fatalf("ListEvidenceRecords 读回不一致: %+v err=%v", refs, err)
+	}
+}
+
+// T1: 旧格式 {"proposal_eligible":true} 兼容 —— 新键缺省时保持空串、不报错，
+// 且 ProposalEligible 语义不回退。
+func TestCaptureEvidenceLegacyMetaJSONCompat(t *testing.T) {
+	s := newTestStore(t)
+	// 不带 Fidelity/Adapter 的新写入：omitempty 让 meta_json 保持旧格式单键。
+	rec := mustCaptureEvidence(t, s, evidenceInput("uid-legacy", 0))
+	var meta string
+	if err := s.db.QueryRow(`SELECT meta_json FROM observations WHERE id = ?`, rec.ID).Scan(&meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta != `{"proposal_eligible":true}` {
+		t.Fatalf("不带 Fidelity 的写入应保持旧格式单键, got %s", meta)
+	}
+	if rec.Fidelity != "" || rec.Adapter != "" || !rec.ProposalEligible {
+		t.Fatalf("写入返回不应凭空产生保真度: %+v", rec)
+	}
+
+	// 显式模拟历史遗留行的字节级旧格式，读回不得报错。
+	if _, err := s.db.Exec(`UPDATE observations SET meta_json = ? WHERE id = ?`,
+		`{"proposal_eligible":true}`, rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.LookupEvidence("uid-legacy", "src-a", 0, 0)
+	if err != nil || !ok {
+		t.Fatalf("旧格式行读回应成功: ok=%v err=%v", ok, err)
+	}
+	if got.Fidelity != "" || got.Adapter != "" || !got.ProposalEligible {
+		t.Fatalf("旧行应保持空串且 ProposalEligible=true: %+v", got)
+	}
+}
+
+// T1: ProposalEligible=false 语义不变 —— 无 omitempty 保证 false 显式落库，
+// 与 Fidelity/Adapter 互不干扰，读回不回退。
+func TestCaptureEvidenceProposalEligibleFalseSemantics(t *testing.T) {
+	s := newTestStore(t)
+	in := evidenceInput("uid-false", 0)
+	in.ProposalEligible = false
+	in.Fidelity = "pointer"
+	in.Adapter = "trae"
+	rec := mustCaptureEvidence(t, s, in)
+	if rec.ProposalEligible {
+		t.Fatalf("写入返回应为 false: %+v", rec)
+	}
+	if rec.Fidelity != "pointer" || rec.Adapter != "trae" {
+		t.Fatalf("Fidelity/Adapter 不应受 false 影响: %+v", rec)
+	}
+
+	// false 必须显式出现在 meta_json 里（proposal_eligible 无 omitempty）。
+	var meta string
+	if err := s.db.QueryRow(`SELECT meta_json FROM observations WHERE id = ?`, rec.ID).Scan(&meta); err != nil {
+		t.Fatal(err)
+	}
+	var m evidenceMeta
+	if err := json.Unmarshal([]byte(meta), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.ProposalEligible {
+		t.Fatalf("meta_json 应显式写 false: %s", meta)
+	}
+	if meta != `{"proposal_eligible":false,"fidelity":"pointer","adapter":"trae"}` {
+		t.Fatalf("false 应与新键共存: %s", meta)
+	}
+
+	got, ok, err := s.LookupEvidence("uid-false", "src-a", 0, 0)
+	if err != nil || !ok || got.ProposalEligible || got.Fidelity != "pointer" || got.Adapter != "trae" {
+		t.Fatalf("false 读回语义回退: %+v ok=%v err=%v", got, ok, err)
 	}
 }
