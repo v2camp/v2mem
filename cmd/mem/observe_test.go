@@ -208,7 +208,10 @@ func TestObserveStopKeepsSameSummaryEventsApart(t *testing.T) {
 		t.Fatalf("同摘要不同 event_uid 必须共存，got %d", len(obs))
 	}
 	for _, o := range obs {
-		if o.Summary != "stop status=completed" {
+		// observationText 不再把 "stop" 事件名当正文（design-capture §0/§4.3）：
+		// 只有 status 时保真度为 summary，摘要是结构化的 status 值。
+		// 本用例的核心断言不变：两条摘要应相同，且不被内容去重吞并。
+		if o.Summary != "status=completed" {
 			t.Fatalf("两条摘要应相同（被内容去重吞并才算失败），got %q", o.Summary)
 		}
 	}

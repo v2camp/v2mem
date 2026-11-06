@@ -59,6 +59,10 @@ type hookInput struct {
 	TranscriptPath string          `json:"transcript_path"`
 	Status         string          `json:"status"`
 	Reason         string          `json:"reason"`
+
+	// Trae 的 Stop / SessionEnd 把最终回复放在这两个字段（design-capture §7.2）。
+	LastAssistantMessage string `json:"last_assistant_message"`
+	TextContent          string `json:"text_content"`
 }
 
 // sessionID 优先用 session_id，Cursor 有时只给 conversation_id。
