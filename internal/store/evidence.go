@@ -61,6 +61,10 @@ type EvidenceCaptureInput struct {
 	ParserVersion    string
 	ProposalEligible bool
 	Summary          string
+	// Fidelity / Adapter 是捕获层语义，只落 observations.meta_json，
+	// 不进归档 segment。空 Fidelity 表示旧行/未声明，由读侧兼容。
+	Fidelity string
+	Adapter  string
 
 	ArchiveHash   string
 	ArchivePath   string
@@ -88,6 +92,16 @@ type EvidenceRecord struct {
 	Summary          string
 	ParserVersion    string
 	ProposalEligible bool
+	Fidelity         string
+	Adapter          string
+}
+
+// evidenceMeta 是 observations.meta_json 的结构化形态（W0 冻结）。
+// 旧行只有 proposal_eligible 一个键，新增键一律 omitempty 保持兼容。
+type evidenceMeta struct {
+	ProposalEligible bool   `json:"proposal_eligible"`
+	Fidelity         string `json:"fidelity,omitempty"`
+	Adapter          string `json:"adapter,omitempty"`
 }
 
 // EvidenceSourceState 是证据源当前代与两段水位。
