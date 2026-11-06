@@ -108,11 +108,15 @@ func cutRunes(s string, n int) string {
 	return string(rs[:n])
 }
 
-// observationText 是一条观测的完整正文（已打码、未按摘要截断）。
+// observationText 是一条观测的完整正文（已打码、未按摘要截断）及其保真度。
 //
 // 归档层把它原样写进 Raw：摘要只是它的有界投影，证据不能被摘要替代。
-func observationText(event harness.Event, in hookInput, noScrub bool) string {
+// Fidelity 按「是否存在真实正文」标注，只控提案准入，不参与证据等级判定。
+// 拿不到内容时返回空正文 + FidelityNone，绝不回退成 "stop" / "session-end"
+// 这类事件名字面量——事件名不是内容（design-capture §0/§4.3）。
+func observationText(event harness.Event, in hookInput, noScrub bool) (string, evidence.Fidelity) {
 	var b strings.Builder
+	fidelity := evidence.FidelityNone
 	switch event {
 	case harness.EventPostToolUse:
 		name := strings.TrimSpace(in.ToolName)
@@ -120,26 +124,48 @@ func observationText(event harness.Event, in hookInput, noScrub bool) string {
 			name = "tool"
 		}
 		b.WriteString("tool:" + name)
-		if s := rawField(in.ToolInput, noScrub); s != "" {
-			b.WriteString("\n" + s)
+		toolIn := rawField(in.ToolInput, noScrub)
+		toolOut := rawField(in.ToolOutput, noScrub)
+		if toolIn != "" {
+			b.WriteString("\n" + toolIn)
 		}
-		if s := rawField(in.ToolOutput, noScrub); s != "" {
-			b.WriteString("\n→ " + s)
+		if toolOut != "" {
+			b.WriteString("\n→ " + toolOut)
 		}
-	case harness.EventStop:
-		b.WriteString("stop")
-		if s := strings.TrimSpace(in.Status); s != "" {
-			b.WriteString(" status=" + s)
+		if toolIn != "" || toolOut != "" {
+			fidelity = evidence.FidelityFull
+		} else {
+			// 只有工具名这行摘要，没有真实正文。
+			fidelity = evidence.FidelitySummary
 		}
-	case harness.EventSessionEnd:
-		b.WriteString("session-end")
-		if s := strings.TrimSpace(in.Reason); s != "" {
-			b.WriteString(" reason=" + s)
+	case harness.EventStop, harness.EventSessionEnd:
+		// Trae 把最终回复放在 last_assistant_message，退化时给 text_content；
+		// 两者都没有才回退既有的 status / reason（只作摘要，不作正文）。
+		switch {
+		case strings.TrimSpace(in.LastAssistantMessage) != "":
+			b.WriteString(strings.TrimSpace(in.LastAssistantMessage))
+			fidelity = evidence.FidelityFull
+		case strings.TrimSpace(in.TextContent) != "":
+			b.WriteString(strings.TrimSpace(in.TextContent))
+			fidelity = evidence.FidelityFull
+		default:
+			var meta []string
+			if s := strings.TrimSpace(in.Status); s != "" {
+				meta = append(meta, "status="+s)
+			}
+			if s := strings.TrimSpace(in.Reason); s != "" {
+				meta = append(meta, "reason="+s)
+			}
+			if len(meta) > 0 {
+				b.WriteString(strings.Join(meta, " "))
+				fidelity = evidence.FidelitySummary
+			}
+			// 否则 b 为空、fidelity 保持 None：不伪造事件名字面量。
 		}
 	default:
 		b.WriteString(string(event))
 	}
-	return truncateRunes(scrub.Apply(b.String(), noScrub), observeRawMaxRunes)
+	return truncateRunes(scrub.Apply(b.String(), noScrub), observeRawMaxRunes), fidelity
 }
 
 // isPipelineTool 判定一次工具调用是否属于“记忆系统自身的管道流量”。
@@ -279,6 +305,7 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 	hname := harnessName(harnessFlag, in)
 	sid := in.sessionID()
 	source := observeSourceID(hname, sid)
+	text, fidelity := observationText(event, in, noScrub)
 	ev := evidence.RawEvent{
 		SourceID:         source,
 		SessionID:        sid,
@@ -288,7 +315,8 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 		OccurredAtNS:     started.UnixNano(),
 		ProposalEligible: event != harness.EventPostToolUse || !isPipelineTool(in.ToolName),
 		EventUID:         observeHostUID(in, event, source),
-		Raw:              []byte(observationText(event, in, noScrub)),
+		Fidelity:         fidelity,
+		Raw:              []byte(text),
 	}
 
 	// Stop 仍是落盘标记；正文（用户/助手/工具事件）从 transcript 增量补在其前面，
@@ -456,6 +484,12 @@ func recordEvidence(source, sid, project, hname, path string, rec transcript.Rec
 		// 身份用**打码前**的正文：切 --no-scrub 不该让整份历史换身份。
 		uid = transcriptFallbackUID(path, rec, rec.Text)
 	}
+	// unparsed 行只保住原文、语义未解析：标 pointer 且不进 Proposal；
+	// 正常解析的 transcript 行带真实正文，标 full。
+	fidelity := evidence.FidelityFull
+	if rec.Unparsed {
+		fidelity = evidence.FidelityPointer
+	}
 	return evidence.RawEvent{
 		EventUID:     uid,
 		SourceID:     source,
@@ -466,6 +500,7 @@ func recordEvidence(source, sid, project, hname, path string, rec transcript.Rec
 		OccurredAtNS: rec.OccurredAtNS(),
 		// unparsed 行只是把原文保住，语义未解析出来，绝不能进 Proposal。
 		ProposalEligible: !isPipelineTool(name) && !rec.Unparsed,
+		Fidelity:         fidelity,
 		Raw:              []byte(text),
 	}
 }
