@@ -681,3 +681,45 @@ func TestExecutorFidelityFullSummaryProceed(t *testing.T) {
 		}
 	}
 }
+
+// Runner 层同样必须复用 proposalEligible：全部证据 ProposalEligible=true
+// 但 Fidelity=pointer/none 时，Step 经 countEligible==0 短路判 noop，
+// 不误判有可提案证据、不调用模型、不落候选，并正常消费窗口。
+// 用 refsReader 直接注入 Fidelity 维度（T2 合入后 toRef 会按 Raw 兜底填值，
+// 注入可精确控制准入矩阵，不受 store 兜底影响）。
+func TestRunnerStepNoopWhenAllFidelityIneligible(t *testing.T) {
+	e := newEnv(t)
+	e.capture(t, "u1", "s1", "指针证据", true)
+	b := e.bundle(t)
+	var now int64 = 1000
+
+	// 注入 1 条，与 b.EvidenceIDs 数量对齐，避免触发条目数不一致 fail。
+	injected := []evidence.Ref{
+		{ProposalEligible: true, Fidelity: evidence.FidelityPointer,
+			SessionID: "s1", EventType: "stop", Summary: "指针证据"},
+	}
+	g, calls := gen("fake", func(GenerateRequest, int) (string, error) {
+		t.Error("全不可提案窗口不应调用模型")
+		return "", nil
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, g)}, &now)
+	r.Reader = refsReader{refs: injected}
+	out, err := r.Step(context.Background())
+	if err != nil {
+		t.Fatalf("Step: %v", err)
+	}
+	if out.Status != StatusNoop || out.BundleStatus != "noop" || *calls != 0 {
+		t.Fatalf("全不可提案应 noop、消费窗口且不调模型: %+v calls=%d", out, *calls)
+	}
+	// bundleSession 的第二个 fallback 循环仍要记下 session 轨迹。
+	if out.SessionID != "s1" {
+		t.Fatalf("fallback 应记下 session: %+v", out)
+	}
+	if list, _ := e.st.ListCandidates("", "s1", 10); len(list) != 0 {
+		t.Fatalf("noop 不应落候选: %+v", list)
+	}
+	got, err := e.st.LoadProposalBundle(b.ID)
+	if err != nil || got.Status != "noop" {
+		t.Fatalf("Bundle 应被消费为 noop: %+v err=%v", got, err)
+	}
+}
