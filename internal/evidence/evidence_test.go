@@ -548,11 +548,22 @@ func TestSummarizeRawBounded(t *testing.T) {
 	if got := summarizeRaw([]byte("a\nb\tc\x00d"), "e"); got != "a b cd" {
 		t.Fatalf("应折叠空白并去控制字符: %q", got)
 	}
-	if got := summarizeRaw(nil, "post-tool-use"); got != "post-tool-use" {
-		t.Fatalf("空字节应回落事件类型: %q", got)
-	}
-	if got := summarizeRaw(nil, ""); got != "evidence" {
-		t.Fatalf("全空应回落 evidence: %q", got)
+	// T6：空内容返回空摘要，绝不回落事件类型或 "evidence" 伪正文。
+	// 事件名不是内容，observations.event 列已记录事件类型，FidelityNone 已表达无正文。
+	for _, tc := range []struct {
+		name      string
+		raw       []byte
+		eventType string
+	}{
+		{"nil + 事件名", nil, "stop"},
+		{"空切片 + 事件名", []byte{}, "post-tool-use"},
+		{"纯空白 + 事件名", []byte("  \n\t\r "), "session-end"},
+		{"全空", nil, ""},
+	} {
+		if got := summarizeRaw(tc.raw, tc.eventType); got != "" {
+			t.Errorf("summarizeRaw(%s) 应为空摘要，不得回落 %q/evidence，got %q",
+				tc.name, tc.eventType, got)
+		}
 	}
 }
 

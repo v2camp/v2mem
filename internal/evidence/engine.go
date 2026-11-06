@@ -253,8 +253,14 @@ func sha256Hex(b []byte) string {
 // summarizeRaw 给 canonical observation 一个有界摘要。
 //
 // 原始字节仍是唯一事实来源，摘要只用于检索与展示：折叠空白、去掉控制字符、
-// 截到 512 字节（按 rune 边界回退），空内容回落到事件类型。
-func summarizeRaw(raw []byte, eventType string) string {
+// 截到 512 字节（按 rune 边界回退）。
+//
+// 空内容返回空摘要，绝不回落到事件类型（"stop" / "session-end"）或 "evidence"
+// 这类占位字面量：事件名不是内容（design-capture §0/§4.3）；observations.event
+// 列已经记录事件类型；FidelityNone / 空 Raw 已经表达「无正文」。再把事件名塞进
+// 摘要只会把伪造内容当正文展示给使用者。eventType 参数保留只为固定调用点签名
+// （engine.Capture 仍传 ev.EventType），本函数不再消费它。
+func summarizeRaw(raw []byte, _ string) string {
 	s := strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' || r == '\t' {
 			return ' '
@@ -265,12 +271,6 @@ func summarizeRaw(raw []byte, eventType string) string {
 		return r
 	}, string(raw))
 	s = strings.Join(strings.Fields(s), " ")
-	if s == "" {
-		s = strings.TrimSpace(eventType)
-	}
-	if s == "" {
-		s = "evidence"
-	}
 	const max = 512
 	if len(s) <= max {
 		return s
