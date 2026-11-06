@@ -628,3 +628,56 @@ type FakeReader struct{}
 
 func (FakeReader) NextBundle(int, int64) (*evidence.Bundle, error) { return nil, nil }
 func (FakeReader) ListEvidence(string) ([]evidence.Ref, error)     { return nil, nil }
+
+// refsReader 让 executor 层测试能注入带 Fidelity 的证据引用。
+// 真实 Engine 的 toRef 在本分支不填 Fidelity（W0 冻结、T2 尚未合入），
+// 故用假 reader 直接覆盖准入矩阵，不依赖 store。
+type refsReader struct{ refs []evidence.Ref }
+
+func (r refsReader) NextBundle(int, int64) (*evidence.Bundle, error) { return nil, nil }
+func (r refsReader) ListEvidence(string) ([]evidence.Ref, error)     { return r.refs, nil }
+
+func TestExecutorNoEligibleIsNoopByFidelity(t *testing.T) {
+	// 总开关为 true，但 Fidelity 全为 pointer/none → 全不可提案 → noop 且不调模型。
+	refs := []evidence.Ref{
+		{ProposalEligible: true, Fidelity: evidence.FidelityPointer, Summary: "p", EventType: "stop", SessionID: "s"},
+		{ProposalEligible: true, Fidelity: evidence.FidelityNone, Summary: "n", EventType: "stop", SessionID: "s"},
+	}
+	g, calls := gen("fake", func(GenerateRequest, int) (string, error) {
+		t.Error("全不可提案窗口不应调用模型")
+		return "", nil
+	})
+	res, err := NewExecutor(refsReader{refs}, g).Run("b")
+	if err != nil || res.Status != StatusNoop || *calls != 0 {
+		t.Fatalf("Fidelity 全不可提案应 noop 且不调模型: %+v err=%v calls=%d", res, err, *calls)
+	}
+}
+
+func TestExecutorEmptyFidelityCompatible(t *testing.T) {
+	// 空 Fidelity（旧行/未声明）按 full 兼容：仍可提案、正常生成。
+	refs := []evidence.Ref{
+		{ProposalEligible: true, Summary: "旧证据", EventType: "stop", SessionID: "s"},
+	}
+	g, calls := gen("fake", func(GenerateRequest, int) (string, error) {
+		return `{"kind":"decision","content":"旧证据","evidence_idx":[1]}`, nil
+	})
+	res, err := NewExecutor(refsReader{refs}, g).Run("b")
+	if err != nil || res.Status != StatusOK || res.Valid != 1 || *calls != 1 {
+		t.Fatalf("空 Fidelity 应兼容并可提案: %+v err=%v calls=%d", res, err, *calls)
+	}
+}
+
+func TestExecutorFidelityFullSummaryProceed(t *testing.T) {
+	for _, fid := range []evidence.Fidelity{evidence.FidelityFull, evidence.FidelitySummary} {
+		refs := []evidence.Ref{
+			{ProposalEligible: true, Fidelity: fid, Summary: "s", EventType: "stop", SessionID: "s"},
+		}
+		g, calls := gen("fake", func(GenerateRequest, int) (string, error) {
+			return `{"kind":"decision","content":"x","evidence_idx":[1]}`, nil
+		})
+		res, err := NewExecutor(refsReader{refs}, g).Run("b")
+		if err != nil || res.Status != StatusOK || *calls != 1 {
+			t.Fatalf("Fidelity=%s 应可提案: %+v err=%v calls=%d", fid, res, err, *calls)
+		}
+	}
+}
