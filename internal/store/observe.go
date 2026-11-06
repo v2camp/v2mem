@@ -34,7 +34,28 @@ type Observation struct {
 	MetaJSON  string `json:"meta_json"`
 	Channel   string `json:"channel,omitempty"`
 	EventID   string `json:"event_id,omitempty"`
+
+	// Evidence 身份列。legacy 观测（AppendObservation 写的）全为空；
+	// 新证据路径（CaptureEvidence）写的行带这些值。两条路径共用 observations
+	// 表，读侧必须能把身份读出来，否则「有证据」却打不开原始记录。
+	// omitempty 保证旧 JSON 输出在 legacy 行上不多出字段。
+	EventUID         string `json:"event_uid,omitempty"`
+	SourceID         string `json:"source_id,omitempty"`
+	SourceGeneration int    `json:"source_generation,omitempty"`
+	SourceSeq        int    `json:"source_seq,omitempty"`
+	OccurredAtNS     int64  `json:"occurred_at_ns,omitempty"`
+	ArchiveHash      string `json:"archive_hash,omitempty"`
+	RawRecordHash    string `json:"raw_record_hash,omitempty"`
+	ParserVersion    string `json:"parser_version,omitempty"`
 }
+
+// observationColumns 是 observations 的完整读列，三条读路径共用。
+// 新增列时必须同步这里，避免 AppendObservation(legacy) 与
+// CaptureEvidence(evidence) 双写路径在读侧再次分叉。
+const observationColumns = `id, session_id, project, harness, event, tool_name, summary, raw_ref,
+	content_hash, created_at, meta_json, channel, event_id,
+	event_uid, source_id, source_generation, source_seq, occurred_at_ns,
+	archive_hash, raw_record_hash, parser_version`
 
 // ObsInput 是追加一条观测的参数。MetaJSON 空则落成 {}。
 type ObsInput struct {
@@ -109,10 +130,15 @@ func (s *Store) AppendObservation(in ObsInput) (*ObsResult, error) {
 	now := time.Now().Unix()
 	idx := observationIndexText(summary)
 
+	// legacy 观测没有原始证据身份：显式把这 8 列留空，而不是依赖 DEFAULT。
+	// 这样命中 ux_obs_dedup_legacy 的部分索引条件（event_uid='' AND source_id=''），
+	// 旧去重语义保持不变；有身份的行由 CaptureEvidence 单独写入。
 	res, err := s.db.Exec(`INSERT OR IGNORE INTO observations(
 		id, session_id, project, harness, event, tool_name, summary, summary_idx, raw_ref,
-		content_hash, created_at, meta_json, channel, event_id
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		content_hash, created_at, meta_json, channel, event_id,
+		event_uid, source_id, source_generation, source_seq, occurred_at_ns,
+		archive_hash, raw_record_hash, parser_version
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, '', '', 0, 0, 0, '', '', '')`,
 		id, in.SessionID, in.Project, in.Harness, event, in.ToolName, summary, idx, in.RawRef,
 		hash, now, meta, ch, eventID)
 	if err != nil {
@@ -161,9 +187,7 @@ func (s *Store) ListObservations(sessionID string, limit int) ([]Observation, er
 	if limit <= 0 {
 		limit = 50
 	}
-	q := `SELECT id, session_id, project, harness, event, tool_name, summary, raw_ref,
-	             content_hash, created_at, meta_json, channel, event_id
-	        FROM observations`
+	q := `SELECT ` + observationColumns + ` FROM observations`
 	var args []any
 	if sessionID != "" {
 		q += ` WHERE session_id = ?`
@@ -193,7 +217,9 @@ func scanObservation(row interface{ Scan(...any) error }) (Observation, error) {
 	var o Observation
 	err := row.Scan(&o.ID, &o.SessionID, &o.Project, &o.Harness, &o.Event,
 		&o.ToolName, &o.Summary, &o.RawRef, &o.Hash, &o.CreatedAt, &o.MetaJSON,
-		&o.Channel, &o.EventID)
+		&o.Channel, &o.EventID,
+		&o.EventUID, &o.SourceID, &o.SourceGeneration, &o.SourceSeq,
+		&o.OccurredAtNS, &o.ArchiveHash, &o.RawRecordHash, &o.ParserVersion)
 	return o, err
 }
 

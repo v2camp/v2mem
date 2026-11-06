@@ -656,6 +656,83 @@ func TestObserveStopCapturesTranscriptIncrementally(t *testing.T) {
 	}
 }
 
+// 回归计划 §7 停止条件第 1 条：非 Claude 格式的行曾被静默跳过、游标却前进，
+// 下次 Stop 永不回看。现在必须按原文归档、标记不可用于提案，且游标不卡死。
+func TestObserveStopKeepsUnparsedTranscriptLine(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	path := filepath.Join(t.TempDir(), "tx-mixed.jsonl")
+	sid := "tx-mixed"
+	const marker = "UNPARSED_MARKER_用户原文不丢"
+	writeClaudeTranscript(t, path,
+		`{"type":"user","uuid":"u1","sessionId":"`+sid+`","message":{"role":"user","content":"合法前一行"}}`,
+		`{"role":"user","content":"`+marker+`","sessionId":"`+sid+`"}`,
+		`{"type":"assistant","uuid":"a1","sessionId":"`+sid+`","message":{"role":"assistant","content":"合法后一行"}}`,
+	)
+	stop := hookJSON(t, map[string]any{
+		"hook_event_name": "Stop", "cwd": proj, "session_id": sid,
+		"status": "completed", "transcript_path": path,
+	})
+	runStop := func() {
+		t.Helper()
+		if _, err := withStdin(t, stop, func() error {
+			return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
+		}); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	}
+	runStop()
+
+	// 游标已消费整份文件：证明「留原文」没有把增量解析卡在未知行上。
+	cur := readTranscriptCursor(transcriptCursorPath(db, sid))
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.Offset != fi.Size() {
+		t.Fatalf("游标应走到文件末尾，got %d want %d", cur.Offset, fi.Size())
+	}
+
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	check := func(wantUnparsed int) {
+		t.Helper()
+		obs, err := st.ListObservations(sid, 30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unparsed, events := 0, map[string]bool{}
+		for _, o := range obs {
+			events[o.Event] = true
+			if o.Event != "unparsed" {
+				continue
+			}
+			unparsed++
+			if !strings.Contains(o.Summary, marker) {
+				t.Fatalf("未知行的原文必须留在证据里，got %q", o.Summary)
+			}
+			if !strings.Contains(o.MetaJSON, `"proposal_eligible":false`) {
+				t.Fatalf("未解析行不得进入 Proposal，meta=%q", o.MetaJSON)
+			}
+		}
+		if unparsed != wantUnparsed {
+			t.Fatalf("unparsed 证据应恰好 %d 条，got %d: %+v", wantUnparsed, unparsed, obs)
+		}
+		// 未知行前后的合法行都还在，游标没有「跳过一段」。
+		if !events["user-prompt"] || !events["assistant-text"] {
+			t.Fatalf("未知行前后的合法事件都应被归档，got %v", events)
+		}
+	}
+	check(1)
+
+	// 二次 Stop：游标不回看，原文不重复归档（身份由文件偏移+正文 hash 保证幂等）。
+	runStop()
+	check(1)
+}
+
 // 记忆工具自身与 MCP 管道事件照常归档，但不得作为 Proposal 的种子。
 func TestObservePipelineToolsArchivedButIneligible(t *testing.T) {
 	db := testDB(t)

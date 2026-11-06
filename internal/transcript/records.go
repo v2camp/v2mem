@@ -19,7 +19,19 @@ const (
 	EventToolUse       = "tool-use"
 	EventToolResult    = "tool-result"
 	EventSummary       = "summary"
+	// EventUnparsed 是无法按 Claude 格式解析、但可能含真实用户/助手内容的行。
+	// 它按原文归档、不可用于 Proposal；Codex/Qoder/QoderWork 等宿主的
+	// transcript 会落到这一类，绝不能静默丢弃后还把游标推过去。
+	EventUnparsed = "unparsed"
 )
+
+// metadataTypes 是宿主自己产生的控制行，明确不是用户内容，可解释地跳过。
+// 新增宿主元数据类型时加到这里；**不要**把「看不懂的行」加进来。
+var metadataTypes = map[string]bool{
+	"queue-operation":       true,
+	"file-history-snapshot": true,
+	"progress":              true,
+}
 
 // Record 是 transcript 里的一条事件。
 //
@@ -44,6 +56,9 @@ type Record struct {
 	End   int64
 	// Block 是同一行内的内容块序号（0 起）。单行单事件时为 0。
 	Block int
+	// Unparsed 表示这行无法按宿主格式解析，Text 是原始行文本。
+	// 调用方必须保留原文并禁止它进入 Proposal；不能当作普通事实引用。
+	Unparsed bool
 }
 
 // Reader 逐行解析 Claude 风格的 transcript。
@@ -122,21 +137,25 @@ func parseLine(line []byte, start int64) []Record {
 	if len(text) == 0 {
 		return nil
 	}
+	base := Record{Start: start, End: start + int64(len(line))}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(text, &raw); err != nil {
-		return nil // 坏行跳过，不让整份文件作废
+		return []Record{unparsedRecord(base, line)}
 	}
-	base := Record{
-		SessionID: jsonString(raw, "sessionId", "session_id"),
-		At:        jsonTime(raw["timestamp"]),
-		Start:     start,
-		End:       start + int64(len(line)),
-	}
+	base.SessionID = jsonString(raw, "sessionId", "session_id")
+	base.At = jsonTime(raw["timestamp"])
 	if cwd := jsonString(raw, "cwd"); cwd != "" {
 		base.Project = filepath.Base(cwd)
 	}
 	uuid := jsonString(raw, "uuid")
 	lineType := jsonString(raw, "type")
+
+	// 明确的宿主控制行才可解释地丢弃；其余「看不懂」的行必须留原文。
+	// 之前这里一律返回 nil，cmd 层又把游标推到行末，导致非 Claude 格式
+	// 的用户/助手原文永久丢失（计划 §7 停止条件第 1 条）。
+	if metadataTypes[lineType] {
+		return nil
+	}
 
 	msg := raw["message"]
 	if len(msg) == 0 {
@@ -145,11 +164,11 @@ func parseLine(line []byte, start int64) []Record {
 			r.Role, r.EventType, r.HostUID, r.Text = "summary", EventSummary, uuid, s
 			return []Record{r}
 		}
-		return nil
+		return []Record{unparsedRecord(base, line)}
 	}
 	var message map[string]json.RawMessage
 	if err := json.Unmarshal(msg, &message); err != nil {
-		return nil
+		return []Record{unparsedRecord(base, line)}
 	}
 	base.Role = jsonString(message, "role")
 	if base.Role == "" {
@@ -158,12 +177,12 @@ func parseLine(line []byte, start int64) []Record {
 
 	content := message["content"]
 	if len(content) == 0 {
-		return nil
+		return []Record{unparsedRecord(base, line)}
 	}
 	var whole string
 	if err := json.Unmarshal(content, &whole); err == nil {
 		if strings.TrimSpace(whole) == "" {
-			return nil
+			return nil // 宿主明确写了空正文，可解释
 		}
 		r := base
 		r.Text, r.HostUID = whole, uuid
@@ -172,7 +191,7 @@ func parseLine(line []byte, start int64) []Record {
 	}
 	var blocks []json.RawMessage
 	if err := json.Unmarshal(content, &blocks); err != nil {
-		return nil
+		return []Record{unparsedRecord(base, line)}
 	}
 	var out []Record
 	for i, rawBlock := range blocks {
@@ -180,7 +199,20 @@ func parseLine(line []byte, start int64) []Record {
 			out = append(out, rec)
 		}
 	}
+	// 合法 content 数组、但全是 thinking/空块：属于「模型中间态」的设计跳过，
+	// 不造 unparsed，避免把宿主正常元数据当噪声归档。
 	return out
+}
+
+// unparsedRecord 把看不懂的行整行保留下来，交给调用方按原文归档。
+// 不在这里截断/打码/摘要，否则「原始字节」就丢了；写入策略仍由 cmd 层决定。
+func unparsedRecord(base Record, line []byte) Record {
+	r := base
+	r.Role = "unknown"
+	r.EventType = EventUnparsed
+	r.Unparsed = true
+	r.Text = strings.TrimRight(string(line), "\r\n")
+	return r
 }
 
 func parseBlock(base Record, rawBlock json.RawMessage, idx int, uuid string) (Record, bool) {

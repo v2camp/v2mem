@@ -188,3 +188,72 @@ func TestCandidatesPolicyViewIsReadOnly(t *testing.T) {
 		t.Fatal("--policy 不得写记忆")
 	}
 }
+
+// 计划 §4.4：mem accept/reject --revision N --json 必须带 decision 字段。
+// 同时回归「reject 原有候选字段仍平铺」，避免为补字段破坏既有消费者。
+func TestAcceptRejectJSONDecisionField(t *testing.T) {
+	db := testDB(t)
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := st.InsertCandidate(store.CandidateInput{
+		SessionID: "s", Project: "p", Kind: "task",
+		Content: "待办：裁决字段要能被自动化读到", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pit, err := st.InsertCandidate(store.CandidateInput{
+		SessionID: "s", Project: "p", Kind: "pitfall",
+		Content: "坑：拒绝也要带 decision", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	execSQL(t, db, `UPDATE candidates SET task_state='done' WHERE id='`+task.Candidate.ID+`'`)
+
+	out, err := captureStdout(t, func() error {
+		return cmdAccept([]string{"--db", db, "--auto", "--json", "--audit-file", "-",
+			"--revision", "0", task.Candidate.ID})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decodeJSONOut(t, out)
+	d, ok := got["decision"].(map[string]any)
+	if !ok {
+		t.Fatalf("accept --json 缺 decision 对象，got:\n%s", out)
+	}
+	if d["action"] != "auto_commit" || num(d, "revision") != 0 || d["committed"] != true {
+		t.Fatalf("accept decision 字段不全，got %v", d)
+	}
+	if _, ok := got["decisions"].([]any); !ok {
+		t.Fatalf("accept --json 缺全量 decisions 数组，got:\n%s", out)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return cmdReject([]string{"--db", db, "--json", "--audit-file", "-",
+			"--revision", "0", pit.Candidate.ID})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = decodeJSONOut(t, out)
+	if got["id"] != pit.Candidate.ID {
+		t.Fatalf("reject --json 应保留候选字段平铺，got:\n%s", out)
+	}
+	d, ok = got["decision"].(map[string]any)
+	if !ok {
+		t.Fatalf("reject --json 缺 decision 对象，got:\n%s", out)
+	}
+	if d["action"] != "reject" || num(d, "revision") != 0 {
+		t.Fatalf("reject decision 字段不全，got %v", d)
+	}
+	// CommitResult.Committed 表示「状态迁移真的落库」；reject 也是一次成功迁移，
+	// 与 accept 的 committed=true 同义，不代表写进了 memories。
+	if d["committed"] != true {
+		t.Fatalf("reject 应完成状态迁移，got %v", d)
+	}
+}
