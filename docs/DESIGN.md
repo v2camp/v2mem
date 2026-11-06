@@ -181,11 +181,13 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 | §15 · §16 | 激活模型、评测机制、report 定位 | [`design-eval.md`](./design-eval.md) |
 | §17 | 收尾运维三件套（uninstall/备份/轮转） | [`design-maintenance.md`](./design-maintenance.md) |
 | 写侧治理 | 写必由 LLM 决策、短/跨会话记忆分配、bulk 打标 | [`design-write-governance.md`](./design-write-governance.md) |
+| 捕获层 | 多 harness 的 `CaptureEvent` 契约、A/B/C/D 捕获阶梯、artifact 扫描边界 | [`design-capture.md`](./design-capture.md) |
 
 > 正文里若出现「见 §12.x」这类跨章节引用，按上表定位文件即可。
 
 ## 阅读建议
 
 - 第一次读 / 想了解全局：读本节下列基础章节 + `design-*.md` 的标题即可。
-- 改检索：`design-dedup-merge.md`；改钩子：`design-harness.md`；改评测：
-  `design-eval.md`；改生命周期维护：`design-maintenance.md`。
+- 改检索：`design-dedup-merge.md`；改钩子：`design-harness.md`；
+  改捕获/接新 harness：`design-capture.md`；改评测：`design-eval.md`；
+  改生命周期维护：`design-maintenance.md`。

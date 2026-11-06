@@ -240,11 +240,12 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | 本文件 | 使用者 | 是什么、卖点、怎么装、怎么用、边界在哪 |
 | [`docs/VALUE.md`](./docs/VALUE.md) | 所有者 / 未来的 agent | **价值主张**：为什么这么做、红线在哪、下一步与判据（改设计前先读） |
 | [`docs/DESIGN.md`](./docs/DESIGN.md) | 深度使用者 | 设计索引页：基础决策 + 各设计专题的「专题地图」 |
-| [`docs/design-*.md`](./docs/DESIGN.md) | 深度使用者 | 8 份设计专题（索引与地图见 DESIGN.md） |
+| [`docs/design-*.md`](./docs/DESIGN.md) | 深度使用者 | 设计专题（索引与地图见 DESIGN.md） |
 | [`docs/DEVELOPER.md`](./docs/DEVELOPER.md) | 开发者 | 构建命令、目录结构、覆盖率纪律、测试纪律、MCP 实现说明 |
 | [`docs/design-harness-memory-replace.md`](./docs/design-harness-memory-replace.md) | 使用者/开发者 | 用 v2mem 接替 harness 记忆(workbuddy/traeWork/原生)：读瘦身/写收录/git同步/版本CI门禁 |
 | [`docs/design-synonym-library.md`](./docs/design-synonym-library.md) | 使用者/开发者 | 同义词词库：起步配置/查询期展开/有效迭代闭环/初始化 agent 提取管线/自动维护闭环（§8：LLM 提取 × 试用回测） |
 | [`docs/design-provenance.md`](./docs/design-provenance.md) | 使用者/开发者 | 记忆溯源：`provenance` 字段走向、ALTER 迁移、ingest 写入、sync 传播与后续资产/词库联动设想 |
+| [`docs/design-capture.md`](./docs/design-capture.md) | 所有者 / 开发者 | **捕获层架构**：多 harness 的 `CaptureEvent` 契约、A/B/C/D 捕获阶梯、适配器一致性测试、artifact 扫描边界与「事实源/查询源」划分 |
 | [`docs/setup.md`](./docs/setup.md) | 使用者 | **安装/接入规范**：合规接入五守则、hooks/MCP 分层、各宿主标准流程、监听面板引导、卸载回退 |
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |
 | [`docs/design-ref-landscape.md`](./docs/design-ref-landscape.md) | 所有者 / 开发者 | **架构参考**：mem0 与 agentmemory 的全面对照，可借鉴/不借鉴/待评估三档，两边踩过的坑 |
@@ -252,7 +253,8 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 
 设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
 `design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 ·
-`design-workbuddy` WorkBuddy 结合 · `design-eval` 激活与评测 · `design-maintenance` 收尾运维 ·
+`design-capture` 多 harness 捕获层与事件契约 · `design-workbuddy` WorkBuddy 结合 ·
+`design-eval` 激活与评测 · `design-maintenance` 收尾运维 ·
 `design-write-governance` 写侧治理与短/跨会话记忆分配 · `design-provenance` 记忆溯源。
 「见 §N」这类跨章节引用按 DESIGN 索引页的专题地图定位文件。
 
