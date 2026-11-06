@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 func newTestEngine(t *testing.T) (*Engine, string) {
@@ -698,5 +700,123 @@ func TestWriteArchiveReportsBrokenTarget(t *testing.T) {
 	}
 	if _, err := e.writeArchive(ev); err == nil {
 		t.Fatal("目标不可读时应报错")
+	}
+}
+
+// ---------- T2：Fidelity 捕获层透传与归档幂等回归 ----------
+
+func TestResolveFidelity(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  []byte
+		want Fidelity
+	}{
+		{"有内容", []byte("原始字节"), FidelityFull},
+		{"带前后空白", []byte("  x  "), FidelityFull},
+		{"nil", nil, FidelityNone},
+		{"空切片", []byte{}, FidelityNone},
+		{"纯空白", []byte("  \n\t\r "), FidelityNone},
+	}
+	for _, tc := range cases {
+		if got := resolveFidelity(tc.raw); got != tc.want {
+			t.Errorf("resolveFidelity(%s)=%q want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestToRefCarriesFidelity(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Fidelity
+	}{
+		{"full", FidelityFull},
+		{"summary", FidelitySummary},
+		{"pointer", FidelityPointer},
+		{"none", FidelityNone},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		rec := store.EvidenceRecord{Fidelity: tc.in}
+		if got := toRef(rec).Fidelity; got != tc.want {
+			t.Errorf("toRef(Fidelity=%q).Fidelity=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCaptureFidelityRoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		fidelity Fidelity
+		want     Fidelity // 显式传入或空值兜底后的期望
+		nilRaw   bool
+	}{
+		{"full", FidelityFull, FidelityFull, false},
+		{"summary", FidelitySummary, FidelitySummary, false},
+		{"pointer", FidelityPointer, FidelityPointer, false},
+		{"none", FidelityNone, FidelityNone, false},
+		{"empty-default-full", "", FidelityFull, false}, // 空值 + 有 Raw → full
+		{"empty-nil-raw-none", "", FidelityNone, true},  // 空值 + 无 Raw → none
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e, _ := newTestEngine(t)
+			ev := rawEvent("uid-" + tc.name)
+			ev.Fidelity = tc.fidelity
+			if tc.nilRaw {
+				ev.Raw = nil
+			}
+			ref, err := e.Capture(ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := e.NextBundle(10, 1<<20)
+			if err != nil || b == nil {
+				t.Fatalf("出窗失败: b=%+v err=%v", b, err)
+			}
+			refs, err := e.ListEvidence(b.ID)
+			if err != nil || len(refs) != 1 {
+				t.Fatalf("读回失败: refs=%+v err=%v", refs, err)
+			}
+			// 核心不变量：Capture 返回的 Ref 与 ListEvidence 读回一致。
+			if ref.Fidelity != refs[0].Fidelity {
+				t.Fatalf("Ref.Fidelity 与 ListEvidence 不一致: ref=%q listed=%q",
+					ref.Fidelity, refs[0].Fidelity)
+			}
+			// store 层回填 fidelity 后（T1 合入 M1），值应等于传入 / 兜底后的期望；
+			// 纯 W0 基线 store 不回填时两者均为空，上面的一致性仍成立。
+			if ref.Fidelity != "" && ref.Fidelity != tc.want {
+				t.Fatalf("Ref.Fidelity=%q want %q", ref.Fidelity, tc.want)
+			}
+		})
+	}
+}
+
+func TestCaptureReplayFidelityKeepsArchiveHash(t *testing.T) {
+	e, _ := newTestEngine(t)
+	firstEv := rawEvent("uid-fid-replay")
+	firstEv.Fidelity = FidelityFull
+	first, err := e.Capture(firstEv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 同一 event_uid 用不同 Fidelity 重放：Fidelity 不进归档 segment，
+	// archive_hash 必须逐字节不变，且不得报「归档无法按库内身份重建」。
+	// 若 recordOf/segmentRecord 误加了 Fidelity，这里会算出的 seg.hash 与库内
+	// ArchiveHash 失配而报错，从而把归档幂等回归钉死。
+	for _, fid := range []Fidelity{FidelityNone, FidelityPointer, FidelitySummary, ""} {
+		ev := rawEvent("uid-fid-replay")
+		ev.Fidelity = fid
+		again, err := e.Capture(ev)
+		if err != nil {
+			t.Fatalf("重放 Fidelity=%q 失败（归档哈希是否失配？）: %v", fid, err)
+		}
+		if again.ArchiveHash != first.ArchiveHash {
+			t.Fatalf("Fidelity 不应影响归档哈希: first=%s again=%s (fid=%q)",
+				first.ArchiveHash, again.ArchiveHash, fid)
+		}
+		if again.Fidelity != first.Fidelity {
+			t.Fatalf("重放应返回首条身份的 Fidelity: first=%q again=%q",
+				first.Fidelity, again.Fidelity)
+		}
 	}
 }
