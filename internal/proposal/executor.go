@@ -109,7 +109,8 @@ func (e *modelExecutor) Run(bundleID string) (Result, error) {
 	prompt := BuildPrompt(refs)
 	eligible := 0
 	for _, r := range refs {
-		if r.ProposalEligible {
+		// 与 BuildPrompt 共用同一判定：Fidelity 驱动的准入，两者必须一致。
+		if proposalEligible(r) {
 			eligible++
 		}
 	}

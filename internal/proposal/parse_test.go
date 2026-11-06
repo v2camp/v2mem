@@ -143,3 +143,124 @@ func TestBuildChainModes(t *testing.T) {
 		}
 	}
 }
+
+// ---- Fidelity 驱动的提案准入 + ProposalPayloadRunes 有界投影 ----
+
+func TestProposalEligible(t *testing.T) {
+	cases := []struct {
+		name     string
+		eligible bool
+		fidelity evidence.Fidelity
+		want     bool
+	}{
+		{"full 可提案", true, evidence.FidelityFull, true},
+		{"summary 可提案", true, evidence.FidelitySummary, true},
+		{"空 Fidelity 按 full 兼容", true, "", true},
+		{"pointer 不可提案", true, evidence.FidelityPointer, false},
+		{"none 不可提案", true, evidence.FidelityNone, false},
+		{"未知 Fidelity 不可提案", true, evidence.Fidelity("weird"), false},
+		{"总开关关闭 full 也不可", false, evidence.FidelityFull, false},
+		{"总开关关闭 空 Fidelity 也不可", false, "", false},
+	}
+	for _, tc := range cases {
+		r := evidence.Ref{ProposalEligible: tc.eligible, Fidelity: tc.fidelity}
+		if got := proposalEligible(r); got != tc.want {
+			t.Errorf("%s: proposalEligible=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestBuildPromptFidelityGate(t *testing.T) {
+	refs := []evidence.Ref{
+		{Summary: "FULL进", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelityFull},
+		{Summary: "SUMMARY进", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelitySummary},
+		{Summary: "POINTER挡", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelityPointer},
+		{Summary: "NONE挡", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelityNone},
+		{Summary: "空FID兼容进", EventType: "stop", SessionID: "s", ProposalEligible: true},
+		{Summary: "总开关关挡", EventType: "stop", SessionID: "s", ProposalEligible: false, Fidelity: evidence.FidelityFull},
+	}
+	p := BuildPrompt(refs)
+	for _, body := range []string{"FULL进", "SUMMARY进", "空FID兼容进"} {
+		if !strings.Contains(p, body) {
+			t.Errorf("可提案正文应进 prompt: %q\n%s", body, p)
+		}
+	}
+	for _, body := range []string{"POINTER挡", "NONE挡", "总开关关挡"} {
+		if strings.Contains(p, body) {
+			t.Errorf("不可提案正文不应进 prompt: %q\n%s", body, p)
+		}
+	}
+}
+
+// 关键不变量：被 continue 跳过的条目不重编号，evidence_idx ordinal 仍对齐 refs 下标。
+func TestBuildPromptOrdinalsWithFidelitySkips(t *testing.T) {
+	// 第 2、3 条因 Fidelity 被跳过，第 5 条因总开关被跳过；
+	// 第 4 条仍必须是 [4]、第 6 条仍是 [6]，绝不重排成 [2]/[3]。
+	refs := []evidence.Ref{
+		{Summary: "A-one", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelityFull},
+		{Summary: "B-skip", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelityPointer},
+		{Summary: "C-skip", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelityNone},
+		{Summary: "D-four", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelitySummary},
+		{Summary: "E-five-skip", EventType: "stop", SessionID: "s", ProposalEligible: false},
+		{Summary: "F-six-空FID", EventType: "stop", SessionID: "s", ProposalEligible: true},
+	}
+	p := BuildPrompt(refs)
+	if !strings.Contains(p, "[1] (stop/s) A-one") {
+		t.Fatalf("序号 1 错位: %s", p)
+	}
+	if !strings.Contains(p, "[4] (stop/s) D-four") {
+		t.Fatalf("跳过条目后序号 4 不能重排: %s", p)
+	}
+	if !strings.Contains(p, "[6] (stop/s) F-six-空FID") {
+		t.Fatalf("序号 6 错位（空 Fidelity 兼容）: %s", p)
+	}
+	for _, absent := range []string{"[2] ", "[3] ", "[5] "} {
+		if strings.Contains(p, absent) {
+			t.Errorf("被跳过的序号不应渲染: %q\n%s", absent, p)
+		}
+	}
+	for _, body := range []string{"B-skip", "C-skip", "E-five-skip"} {
+		if strings.Contains(p, body) {
+			t.Errorf("不可提案正文不应进 prompt: %q\n%s", body, p)
+		}
+	}
+}
+
+func TestBuildPromptPayloadBounded(t *testing.T) {
+	// 纯中文 520 rune：oneLine / scrub 不改变其内容，便于精确验证截断边界。
+	long := strings.Repeat("甲", evidence.ProposalPayloadRunes+120)
+	refs := []evidence.Ref{
+		{Summary: long, EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelityFull},
+	}
+	before := refs[0].Summary
+	p := BuildPrompt(refs)
+	if strings.Contains(p, long) {
+		t.Fatal("长正文未截断")
+	}
+	// 省略标记计入预算：399 rune 正文 + "…" = 严格 400 rune。
+	want := strings.Repeat("甲", evidence.ProposalPayloadRunes-1) + "…"
+	if !strings.Contains(p, want) {
+		t.Fatalf("截断边界不对（应截到 %d rune 加省略标记）:\n%s", evidence.ProposalPayloadRunes-1, p)
+	}
+	if strings.Contains(p, strings.Repeat("甲", evidence.ProposalPayloadRunes)) {
+		t.Fatalf("投影正文超过 %d rune", evidence.ProposalPayloadRunes)
+	}
+	// 投影是纯文本操作：不改传入 refs，等价于不改归档 Raw / 不回写 store。
+	if refs[0].Summary != before {
+		t.Fatal("BuildPrompt 不应修改传入 ref 的 Summary")
+	}
+}
+
+func TestBuildPromptPayloadShortAndScrubUnchanged(t *testing.T) {
+	// 短文本不追加省略标记；脱敏仍在投影内生效。
+	refs := []evidence.Ref{
+		{Summary: "token=supersecret\n换行", EventType: "stop", SessionID: "s", ProposalEligible: true, Fidelity: evidence.FidelitySummary},
+	}
+	p := BuildPrompt(refs)
+	if !strings.Contains(p, "[redacted]") || strings.Contains(p, "supersecret") {
+		t.Fatalf("投影必须保留脱敏: %s", p)
+	}
+	if strings.Contains(p, "…") {
+		t.Fatalf("短文本不应加省略标记: %s", p)
+	}
+}

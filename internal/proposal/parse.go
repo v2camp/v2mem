@@ -48,10 +48,45 @@ type wireDraft struct {
 
 const maxRawForRepair = 2000
 
+// proposalEligible 是提案准入的唯一判定，BuildPrompt 与 executor 共用。
+//
+// 语义（Fidelity 只管准入，不参与 A/B/C 证据等级）：
+//   - ProposalEligible 是总开关，false 一律不可提案；
+//   - FidelityFull / FidelitySummary 可提案；
+//   - FidelityPointer / FidelityNone（以及未知值）不可提案；
+//   - 空 Fidelity 表示「旧行/未声明」，按 full 兼容，避免没填就把旧证据全挡掉。
+func proposalEligible(r evidence.Ref) bool {
+	if !r.ProposalEligible {
+		return false
+	}
+	switch r.Fidelity {
+	case evidence.FidelityFull, evidence.FidelitySummary, "":
+		return true
+	default:
+		return false
+	}
+}
+
+// proposalPayload 把证据正文投影成有界的提案输入：折叠空白 → 脱敏 →
+// 按 rune 截到 evidence.ProposalPayloadRunes（省略标记计入预算，输出严格有界）。
+//
+// 截断只作用于 prompt 文本：事实源（归档 Raw）保持原文，store 结构不回写。
+func proposalPayload(s string) string {
+	text := scrub.Text(oneLine(s))
+	runes := []rune(text)
+	if len(runes) <= evidence.ProposalPayloadRunes {
+		return text
+	}
+	const ellipsis = "…"
+	runes = runes[:evidence.ProposalPayloadRunes-len([]rune(ellipsis))]
+	return string(runes) + ellipsis
+}
+
 // BuildPrompt 把 Bundle 内可提案的证据渲染成带序号的提示词。
 //
 // 序号使用 Bundle 内位置（1 起），不可提案的证据保留空位，绝不重排——
-// 一旦重排，模型返回的 evidence_idx 就会指向另一条证据。
+// 一旦重排，模型返回的 evidence_idx 就会指向另一条证据。这里按 refs 下标
+// 递增 idx，被 continue 跳过的条目不重编号，保证 ordinal 对齐。
 func BuildPrompt(refs []evidence.Ref) string {
 	var b strings.Builder
 	b.WriteString("从下面的会话证据提炼长期记忆。只允许新增（ADD-only），不要改写或删除已有记忆。\n")
@@ -60,11 +95,11 @@ func BuildPrompt(refs []evidence.Ref) string {
 	b.WriteString("evidence_idx 必须是下面证据的序号，且每条候选至少引用一条。\n\n")
 	for i, r := range refs {
 		idx := i + 1
-		if !r.ProposalEligible {
+		if !proposalEligible(r) {
 			continue
 		}
 		fmt.Fprintf(&b, "[%d] (%s/%s) %s\n", idx, r.EventType, r.SessionID,
-			scrub.Text(oneLine(r.Summary)))
+			proposalPayload(r.Summary))
 	}
 	return b.String()
 }
