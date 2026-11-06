@@ -100,6 +100,12 @@ func (e *Engine) capture(ev RawEvent, allowSpool bool) (Ref, error) {
 	if ev.OccurredAtNS == 0 {
 		ev.OccurredAtNS = time.Now().UnixNano()
 	}
+	// 空 Fidelity 按事实源 Raw 是否有可见内容兜底，写回本地 ev：传给账本的
+	// 值与 Capture 返回的 Ref、ListEvidence 读回保持一致。该字段只进 meta_json，
+	// 不进归档 segment，归档字节级幂等不受影响。
+	if ev.Fidelity == "" {
+		ev.Fidelity = resolveFidelity(ev.Raw)
+	}
 
 	// 先只读判重：命中就不必再分配序号/写新 segment，也不会留下孤儿归档。
 	// 库不可用时，只有显式给了 gen+seq 才继续（这正是「DB 失败保留归档 + spool」
@@ -158,6 +164,7 @@ func (e *Engine) capture(ev RawEvent, allowSpool bool) (Ref, error) {
 		SessionID: ev.SessionID, Project: ev.Project, Harness: ev.Harness,
 		EventType: ev.EventType, Channel: channel, ParserVersion: ev.ParserVersion,
 		ProposalEligible: ev.ProposalEligible, Summary: summary,
+		Fidelity: string(ev.Fidelity), Adapter: ev.Harness,
 		ArchiveHash: seg.hash, ArchivePath: seg.path, RawRecordHash: rawHash,
 		RawHashConcat: rawHash, ByteSize: seg.size, RawCount: 1,
 	})
@@ -225,8 +232,17 @@ func toRef(rec store.EvidenceRecord) Ref {
 		Project: rec.Project, Harness: rec.Harness, EventType: rec.EventType,
 		ArchiveHash: rec.ArchiveHash, RawRecordHash: rec.RawRecordHash,
 		RawLocator: rec.RawLocator, Summary: rec.Summary, ParserVersion: rec.ParserVersion,
-		ProposalEligible: rec.ProposalEligible,
+		ProposalEligible: rec.ProposalEligible, Fidelity: Fidelity(rec.Fidelity),
 	}
+}
+
+// resolveFidelity 为空 Fidelity 按事实源 Raw 是否有可见内容兜底。
+// 有内容 → full，无内容（含纯空白）→ none；结果只落 observations.meta_json。
+func resolveFidelity(raw []byte) Fidelity {
+	if strings.TrimSpace(string(raw)) != "" {
+		return FidelityFull
+	}
+	return FidelityNone
 }
 
 func sha256Hex(b []byte) string {
