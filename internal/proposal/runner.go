@@ -386,7 +386,9 @@ func lastErrString(err error) string {
 func countEligible(refs []evidence.Ref) int {
 	n := 0
 	for _, r := range refs {
-		if r.ProposalEligible {
+		// 与 BuildPrompt / executor 共用单一判定源，避免 Fidelity 接入后出现
+		// 「runner 算有、执行器算无」的双轨语义。
+		if proposalEligible(r) {
 			n++
 		}
 	}
@@ -395,7 +397,7 @@ func countEligible(refs []evidence.Ref) int {
 
 func bundleSession(refs []evidence.Ref) string {
 	for _, r := range refs {
-		if r.ProposalEligible && strings.TrimSpace(r.SessionID) != "" {
+		if proposalEligible(r) && strings.TrimSpace(r.SessionID) != "" {
 			return r.SessionID
 		}
 	}
