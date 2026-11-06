@@ -137,18 +137,11 @@ func TestFidelityE2E_RealBodyIsFullAndEligible(t *testing.T) {
 //
 // 【已知剩余缺口 / 需主会话裁决，见交付「风险/需裁决」】
 // observations.summary 当前仍是 "stop"：T6 已让 engine.go 的 summarizeRaw
-// 对空 Raw 返回空摘要，但 internal/store/evidence.go:264-270 的
-// CaptureEvidence 在 in.Summary 为空时又按 in.EventType 兜底回事件名：
-//
-//	summary := strings.TrimSpace(in.Summary)      // 改后为 ""
-//	if summary == "" { summary = strings.TrimSpace(in.EventType) }  // → "stop"
-//
-// 该回落位于 T6 禁改的 internal/store/**（计划 §4 由 T1 独占），engine.go
-// 单层修复无法阻止，故「展示摘要不得是 stop」的严格断言在本分支无法满足：
-// 实测落库值见下方 t.Logf。删除该回落后，把这里 t.Logf 分支改回 t.Fatalf
-// 即完成展示层止血（链路真正打通）。本分支授权范围内只锁死可证伪的不变量：
-// Fidelity=none、归档 Raw 为空、event 列已记录事件类型、evidence 里没有被
-// 写入任何伪造正文；提案准入由 internal/proposal 依据 Fidelity=none 拦截
+// 空载荷 Stop 有两处「事件名当正文」的回落：internal/evidence/engine.go 的
+// summarizeRaw 与 internal/store/evidence.go 的 CaptureEvidence。两处均已删除，
+// 因此展示摘要为空。本用例锁死整条链路的可证伪不变量：Fidelity=none、
+// 归档 Raw 为空、event 列仍记录事件类型、evidence 与 observation 的摘要都
+// 不含 "stop" 字面量；提案准入由 internal/proposal 依据 Fidelity=none 拦截
 // （该私有判定已由 proposal 单元测试覆盖，cmd/mem 不直接调用）。
 func TestFidelityE2E_NoPayloadIsNone(t *testing.T) {
 	db := testDB(t)
@@ -198,10 +191,17 @@ func TestFidelityE2E_NoPayloadIsNone(t *testing.T) {
 		t.Fatalf("无载荷事件不得出现伪造正文，obs=%q ref=%q", obs[0].Summary, refs[0].Summary)
 	}
 
-	// 严格断言待 store 回落删除后启用（t.Fatalf）。此处如实记录实测值，
-	// 让「展示层未止血」在 -v 输出里可见、可排查，而不是被静默吞掉。
+	// 展示层止血：两处回落都删掉后，空载荷不得再把事件名当正文显示。
 	if strings.Contains(obs[0].Summary, "stop") {
-		t.Logf("已知缺口：无载荷 Stop 展示摘要仍为 %q（store.CaptureEvidence 按 eventType 兜底，T6 禁改范围，需主会话裁决删除该回落）", obs[0].Summary)
+		t.Fatalf("无载荷 Stop 展示摘要不得是 stop 字面量，got %q", obs[0].Summary)
+	}
+	if strings.Contains(refs[0].Summary, "stop") {
+		t.Fatalf("无载荷证据摘要不得是 stop 字面量，got %q", refs[0].Summary)
+	}
+	// 证据行带 canonical 身份，不受 ux_obs_dedup_legacy 的
+	// (session_id, content_hash) 部分索引约束；空摘要不触发 legacy 去重。
+	if strings.TrimSpace(obs[0].EventUID) == "" {
+		t.Fatal("证据行应带 event_uid，空摘要不应落入 legacy 内容去重路径")
 	}
 }
 

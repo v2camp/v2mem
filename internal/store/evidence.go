@@ -261,13 +261,11 @@ func (s *Store) CaptureEvidence(in EvidenceCaptureInput) (EvidenceRecord, bool, 
 	}
 
 	id := "ev_" + newID()
+	// 事件名不是内容（design-capture §0/§4.3）：observations.event 列已记录
+	// 事件类型，空摘要 + FidelityNone 共同表达「无正文」。Engine 传来空 Summary
+	// 即代表确实没有正文，不得再用 eventType 或 "evidence" 伪造展示内容。
+	// 这是与 internal/evidence/engine.go:summarizeRaw 同一语义的第二处收口。
 	summary := strings.TrimSpace(in.Summary)
-	if summary == "" {
-		summary = strings.TrimSpace(in.EventType)
-	}
-	if summary == "" {
-		summary = "evidence"
-	}
 	sessionID := strings.TrimSpace(in.SessionID)
 	if sessionID == "" {
 		sessionID = "unknown"
