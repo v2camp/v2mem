@@ -390,6 +390,7 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 	rd := transcript.NewReaderAt(f, offset)
 	lastGood := offset
 	seen := 0
+	unparsed := 0
 	for seen < transcriptStopMaxRecords {
 		recs, rerr := rd.Read()
 		if errors.Is(rerr, io.EOF) {
@@ -405,6 +406,9 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 		}
 		failed := false
 		for _, rec := range recs {
+			if rec.Unparsed {
+				unparsed++
+			}
 			ev := recordEvidence(source, sid, project, hname, abs, rec, tools, noScrub)
 			if _, _, cerr := captureEvidence(es, ev); cerr != nil {
 				fmt.Fprintln(os.Stderr, "v2mem hook: transcript 证据写入失败，已停在此行:", cerr)
@@ -424,6 +428,12 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 		writeTranscriptCursor(cursorPath, transcriptCursor{
 			Path: abs, Offset: lastGood, Tools: toolPairs(tools),
 		})
+	}
+	// 非 Claude 格式的行已按原文归档，但语义没解析出来：明确告知，
+	// 让「跳过」变成可发现、可排查的事件，而不是静默丢字节。
+	if unparsed > 0 {
+		fmt.Fprintf(os.Stderr,
+			"v2mem hook: transcript 有 %d 行非本解析器格式，已按原文归档且不可用于提案\n", unparsed)
 	}
 }
 
@@ -447,14 +457,15 @@ func recordEvidence(source, sid, project, hname, path string, rec transcript.Rec
 		uid = transcriptFallbackUID(path, rec, rec.Text)
 	}
 	return evidence.RawEvent{
-		EventUID:         uid,
-		SourceID:         source,
-		SessionID:        sid,
-		Project:          project,
-		Harness:          hname,
-		EventType:        rec.EventType,
-		OccurredAtNS:     rec.OccurredAtNS(),
-		ProposalEligible: !isPipelineTool(name),
+		EventUID:     uid,
+		SourceID:     source,
+		SessionID:    sid,
+		Project:      project,
+		Harness:      hname,
+		EventType:    rec.EventType,
+		OccurredAtNS: rec.OccurredAtNS(),
+		// unparsed 行只是把原文保住，语义未解析出来，绝不能进 Proposal。
+		ProposalEligible: !isPipelineTool(name) && !rec.Unparsed,
 		Raw:              []byte(text),
 	}
 }

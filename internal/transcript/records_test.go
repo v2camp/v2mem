@@ -30,7 +30,7 @@ func TestReadAllPreservesOrderBlocksAndIdentity(t *testing.T) {
 	}
 	want := []string{
 		EventUserPrompt, EventAssistantText, EventToolUse, EventToolResult,
-		EventSummary, "system",
+		EventSummary, "system", EventUnparsed,
 	}
 	if strings.Join(kinds, ",") != strings.Join(want, ",") {
 		t.Fatalf("事件顺序/类型不对:\n got %v\nwant %v", kinds, want)
@@ -162,6 +162,40 @@ func TestReaderTrailingCompleteLineWithoutNewline(t *testing.T) {
 	}
 	if rd.Offset() != 0 {
 		t.Fatalf("坏尾行不应推进偏移，got %d", rd.Offset())
+	}
+}
+
+// 非 Claude 格式的行必须留下原文，不能静默返回空让游标越过它。
+// 这两类正是 Codex/Qoder/QoderWork 与纯文本日志会写入的形态。
+func TestUnparsedLineKeepsOriginalText(t *testing.T) {
+	raw := strings.Join([]string{
+		`{"role":"user","content":"帮我排查这个崩溃","sessionId":"s1","cwd":"/work/demo"}`,
+		`WorkBuddy session log: user asked to refactor`,
+		`{"type":"queue-operation","content":"忽略"}`,
+	}, "\n") + "\n"
+	recs, err := NewReader(strings.NewReader(raw)).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("两条未知行应各留一条原文证据，宿主控制行跳过，got %+v", recs)
+	}
+	for i, r := range recs {
+		if r.EventType != EventUnparsed || !r.Unparsed {
+			t.Fatalf("第 %d 条应为 unparsed，got %+v", i, r)
+		}
+	}
+	if !strings.Contains(recs[0].Text, "帮我排查这个崩溃") {
+		t.Fatalf("顶层 role/content 的原文必须保留: %q", recs[0].Text)
+	}
+	if recs[0].SessionID != "s1" || recs[0].Project != "demo" {
+		t.Fatalf("能解析出的元数据仍要带上: %+v", recs[0])
+	}
+	if !strings.Contains(recs[1].Text, "WorkBuddy session log") {
+		t.Fatalf("纯文本日志原文必须保留: %q", recs[1].Text)
+	}
+	if recs[0].Start >= recs[1].Start {
+		t.Fatalf("原文行序仍应递增: %+v / %+v", recs[0], recs[1])
 	}
 }
 

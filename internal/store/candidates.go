@@ -461,9 +461,7 @@ func (s *Store) ObservationsForDistill(sessionID string, sinceUnix int64, limit 
 	if limit <= 0 {
 		limit = 200
 	}
-	q := `SELECT id, session_id, project, harness, event, tool_name, summary, raw_ref,
-	             content_hash, created_at, meta_json, channel, event_id
-	        FROM observations WHERE 1=1`
+	q := `SELECT ` + observationColumns + ` FROM observations WHERE 1=1`
 	var args []any
 	if sessionID != "" {
 		q += ` AND session_id = ?`

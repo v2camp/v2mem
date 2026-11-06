@@ -583,6 +583,7 @@ func cmdAccept(args []string) error {
 	var accepted []store.CommitResult
 	var failedItems []acceptFailure
 	var deferred []acceptDeferred
+	decisions := make([]decisionView, 0, len(ids))
 	for _, id := range ids {
 		view, err := st.CommitCandidate(id)
 		if err != nil {
@@ -605,6 +606,9 @@ func cmdAccept(args []string) error {
 			fmt.Fprintf(os.Stderr, "v2mem accept: %s 采纳失败: %v\n", shortID(id), err)
 			continue
 		}
+		// 无论落库、重放还是「必须人工」，都产出一条裁决视图：
+		// 自动化要靠 decision 判断结果，而不是去猜 accepted/deferred 数组。
+		decisions = append(decisions, decisionOf(res, rev))
 		if !res.Committed {
 			d := acceptDeferred{
 				Candidate: res.Candidate.ID, Action: string(res.Action),
@@ -631,10 +635,17 @@ func cmdAccept(args []string) error {
 	if c.json {
 		// 成功与失败分开列：数组里混着两种语义就必然有人把失败当成功数。
 		// deferred 是第三类：矩阵判为「必须人工」，既不是成功也不是故障。
+		// decision 是计划 §4.4 的必交付字段：单条 --revision N 场景直接读它；
+		// --all-pending 批量时它取最后一笔，全量在 decisions。
+		var last any
+		if len(decisions) > 0 {
+			last = decisions[len(decisions)-1]
+		}
 		if err := printJSON(map[string]any{
 			"accepted": accepted, "failed": failedItems, "deferred": deferred,
 			"inserted": len(accepted), "failed_count": len(failedItems),
 			"deferred_count": len(deferred),
+			"decision":       last, "decisions": decisions,
 		}); err != nil {
 			return err
 		}
@@ -651,6 +662,36 @@ func cmdAccept(args []string) error {
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+// decisionView 是 accept/reject --json 的裁决视图（计划 §4.4 必交付）。
+// 它把「矩阵怎么判的、有没有真的写库、用的是哪版 revision」合成一处，
+// 自动化不必再从 accepted/deferred/reason_codes 里反推。
+type decisionView struct {
+	Candidate      string   `json:"candidate"`
+	Action         string   `json:"action"`
+	Actor          string   `json:"actor"`
+	Revision       int      `json:"revision"`
+	ReasonCodes    []string `json:"reason_codes,omitempty"`
+	Committed      bool     `json:"committed"`
+	Already        bool     `json:"already"`
+	EvidenceHash   string   `json:"evidence_hash,omitempty"`
+	IdempotencyKey string   `json:"idempotency_key,omitempty"`
+}
+
+func decisionOf(res *store.CommitResult, revision int) decisionView {
+	return decisionView{
+		Candidate: res.Candidate.ID, Action: string(res.Action), Actor: res.Actor,
+		Revision: revision, ReasonCodes: res.ReasonCodes,
+		Committed: res.Committed, Already: res.Already,
+		EvidenceHash: res.EvidenceHash, IdempotencyKey: res.IdempotencyKey,
+	}
+}
+
+// rejectResultView 匿名嵌入 Candidate，保持原有字段平铺，只新增 decision。
+type rejectResultView struct {
+	store.Candidate
+	Decision decisionView `json:"decision"`
 }
 
 // acceptFailure 是一条采纳失败的记录。保留候选 id，方便重试时定位。
@@ -705,7 +746,7 @@ func cmdReject(args []string) error {
 		})
 	}
 	if c.json {
-		return printJSON(cand)
+		return printJSON(rejectResultView{Candidate: cand, Decision: decisionOf(res, rev)})
 	}
 	fmt.Printf("已拒绝 %s\n", shortID(cand.ID))
 	return nil

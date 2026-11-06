@@ -158,3 +158,54 @@ scripts/
   MCP 通道的使用也会进入 `mem eval activity` 的评测样本，不会被悄悄漏掉
 - **测试分层**：协议纯函数（`dispatch`）直接喂 map 断言响应；传输层（`serve`）
   用字符串管道测逐行 round-trip 与解析错误；`cmdMCP` 经真实 stdin/stdout 端到端
+
+## 合并门禁与留痕
+
+多波并行合入统一用 `git merge --no-ff`。提交正文必须**用真换行**（不要写字面量
+`\n`）记录三项，否则事后无法复核：
+
+```text
+merge: T4 读侧供给与反馈闭环
+
+Base: c1ec893
+Gate: go test ./internal/recall -v PASS
+      make test PASS 13 包
+      make cover-gate PASS TOTAL 84.1% 下限 83
+      make eval-gate PASS Recall@5=1.00
+Closes: T4
+```
+
+`Gate:` 只列命令名不算留痕：必须写**通过/失败结论与关键数值**（覆盖率、Recall@5、
+p95、e2e 通过数），并附本分支专属测试的输出尾部。子 Agent 的交付五项见开发计划 §8。
+
+### 阶段 0 → T4 的门禁补记
+
+`a5d3c57..05fbe4e` 共 9 个 merge，正文都只有命令名、`\n` 是字面量、无输出尾部，
+不能作为证据。**不 rewrite 历史**，改在此补记 Base 与实测结果。
+
+| 合并 | Base | 内容 | 正文声称的 Gate |
+|:---|:---|:---|:---|
+| `38ebfa8` | `a5d3c57` | T1.0 Evidence schema 与迁移 | migration / test / cover-gate / e2e / eval-gate |
+| `8d31941` | `38ebfa8` | 契约冻结 | build / test / cover-gate |
+| `b0d45aa` | `8d31941` | 计划外：第二波共享表 | test / cover-gate |
+| `05828d5` | `b0d45aa` | T1.1 归档与连续游标 | evidence / test / cover-gate / e2e |
+| `33467f9` | `05828d5` | T1.2 Hook/transcript/spool | cmd 测试 / test / cover-gate / e2e |
+| `d6ab14f` | `33467f9` | T2 Proposal 执行器 | proposal / test / cover-gate |
+| `c1ec893` | `d6ab14f` | T3 CommitPolicy | commit / test / cover-gate |
+| `a025a3e` | `c1ec893` | T4 读侧供给 | recall / test / cover-gate / eval / e2e（local insteadOf） |
+| `05fbe4e` | `a025a3e` | 计划外：Proposal Hook 开关 | cmd 测试 / test / cover-gate |
+
+补记实测（`main@05fbe4e` 审计重跑 + 审计修正分支复跑）：
+
+| 门禁 | 实测结果 |
+|:---|:---|
+| `make test` | 13 个包全绿 |
+| `make cover-gate` | TOTAL 84.5% / 下限 83；`internal/store` 83.4% / 下限 82（余量 +1.4pt） |
+| `make eval-gate` | Recall@5=1.00，回归 0pp |
+| `make test-e2e` | 7/7 PASS。GitHub 不可达时用临时 `GIT_CONFIG_*` 的 `url.<本地路径>.insteadOf` 指向本仓库，不改全局配置 |
+| `go test -race ./internal/store -run TestCommitAcceptConcurrentRevisionCASHasSingleWinner` | PASS。`Makefile` 没有 race 目标，计划 §4.4 这条必须手工跑 |
+| `go test ./cmd/mem -run TestHookReadSupplyP95Under50ms -v` | p95=3.38ms（n=80，阈值 <50ms） |
+| `go test ./internal/recall -run TestT4AcceptanceMetrics -v` | 供给率 100%、注入 precision 86.1%（31/36）、弃答 100% |
+
+覆盖率、p95、T4 指标为审计修正分支上的数值；e2e 的 `insteadOf` 只作用于测试进程，
+不会写进 `~/.gitconfig`。
