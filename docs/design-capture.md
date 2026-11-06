@@ -1,9 +1,22 @@
 # design-capture：多 Harness 捕获层与事件契约
 
 - 日期：2026-11-06
-- 状态：草案待复核
+- 状态：**部分已落地**（本轮已合入契约冻结与保真度链路 W0/T1–T4；P2/P3 仍为提案，见下方「当前实现对照表」）
 - 关联：[`design-harness.md`](./design-harness.md)、[`design-write-governance.md`](./design-write-governance.md)、[`design-eval.md`](./design-eval.md)、[`design-provenance.md`](./design-provenance.md)、[`VALUE.md`](./VALUE.md)
 - 边界：`design-harness` 回答「每个工具怎么接」；本文回答「接上以后产出什么事件、如何归一、如何补偿」。不重复钩子安装步骤，也不定义蒸馏算法。
+
+## 当前实现对照表
+
+> 本文原为架构草案；本轮（基线 `b1adbd8` → `9911f60`）已落地契约冻结与保真度链路。
+> 左栏是**已合入代码**，右栏是**仍停留在提案**；全文其余章节凡涉及右栏项，均应按设计意图而非现状阅读。
+
+| 已落地（本轮 W0 / T1–T4） | 仍为提案（后续） |
+|:---|:---|
+| **W0 契约冻结**：`internal/evidence/api.go` 新增 `type Fidelity string` + `FidelityFull/Summary/Pointer/None` 四常量 + `const ProposalPayloadRunes = 400`，`RawEvent` / `Ref` 各 append `Fidelity`（types-only、append-only）。 | **P2 artifact 扫描**：`mem scan` 机会扫描、指纹幂等、只读有界（本文 §8），本轮未实现。 |
+| **T1 store**：`observations.meta_json` 由单键升级为结构化 `evidenceMeta{proposal_eligible, fidelity, adapter}`；旧行（无新键）按空 `Fidelity` 兼容，`ProposalEligible` 语义不变。 | **Task 级 closeout**：`closeout` 事件与显式任务收尾写入（本文 §4.2 / §5），本轮未实现；P0 仅完成 Trae Stop 字段映射。 |
+| **T2 evidence**：`Engine.Capture` 透传 `Fidelity / Adapter` 到 `EvidenceCaptureInput`（`Adapter` 由 `Harness` 承载，写入 `meta_json.adapter`），`toRef` 填 `Ref.Fidelity`；归档 `segmentRecord` 与 `ParserVersion` 一字未改。 | **独立适配器层抽象**：本文 §4 的 `CaptureEvent` 结构、§7 适配器层与一致性夹具；本轮复用 `evidence.RawEvent / Ref`，不新建该层（见 §4 落地说明）。 |
+| **T3 proposal**：`internal/proposal/parse.go` 的 `proposalEligible` 是唯一准入判定源（full / summary / 空值可提案，pointer / none / 未知值 fail-closed）；`BuildPrompt` 按 `ProposalPayloadRunes = 400` 有界投影；`executor` 与 `runner` 的 `countEligible` / `bundleSession` 统一复用该函数。 | |
+| **T4 adapter**：`cmd/mem/hook.go` 的 `hookInput` 补 `last_assistant_message` / `text_content`；`observationText` 不再把 `"stop"` 事件名当正文，按内容标注 `Fidelity`（有正文 full / summary，无正文 none）。 | |
 
 ## 0. 关键决策（待复核）
 
@@ -79,6 +92,18 @@ v2mem 不拥有过程产物的正文，也不回写源文件。否则 harness �
 
 ## 4. 核心契约：CaptureEvent
 
+> **本轮落地说明（与草案契约的差异）**：本轮**不新建 `CaptureEvent`**，复用 `internal/evidence`
+> 的 `RawEvent` / `Ref`（W0 冻结，append `Fidelity`）；适配器身份不由独立字段承载，而是用
+> `RawEvent.Harness` / `Ref.Harness` 承载、写入 `observations.meta_json.adapter`
+> （`evidenceMeta.adapter`，T2 由 `Engine.Capture` 把 `Harness` 赋给 `Adapter`）。下面的
+> `CaptureEvent` 结构与 4.2 事件枚举仍是「独立适配器层」的设计意图（见头部对照表右栏），
+> 不代表已落库字段。
+>
+> `Fidelity` 是 `evidence.Fidelity`，**只允许 `full / summary / pointer / none` 四个常量**；
+> 未知字面量在准入层一律按 `FidelityNone` 处理（由 `internal/proposal.proposalEligible` 的
+> fail-closed 分支兜底，判定为不可提案），但**落库忠实保留原值**以便排查，不改写
+> `meta_json.fidelity`。
+
 ```go
 type CaptureEvent struct {
 	Harness    string            `json:"harness"`     // traecode | workbuddy | ...
@@ -105,9 +130,20 @@ type CaptureEvent struct {
 | `Project` | 必填 | 取工程根，不取 cwd |
 | `OccurredAt` | 必填 | 事件发生时间，不是落库时间 |
 | `Fidelity` | 必填 | 拿不到内容就写 `none`，**禁止静默写成事件名** |
-| `Payload` | 有界 | 默认 ≤ 400 字；超长截断并标 `meta.truncated=1` |
+| `Payload` | 按层分离 | 事实源（归档 `Raw`）脱敏后按 32000 rune 保真原文、不丢字节；查询源（提案 / 蒸馏输入）按 `evidence.ProposalPayloadRunes = 400` 有界投影（见下方说明） |
 | `SourceRef` | 必填 | 指向原始证据；文件用 `path#Lx-Ly`，hook 用事件 id |
 | `Meta` | 可选 | 放 `truncated`、`scrubbed`、`schema_version` 等 |
+
+**Payload 预算按层分离（本轮落地）**：
+
+- **事实源**（归档 `Raw`）：只做脱敏（`internal/scrub`），按 **32000 rune** 保留原文；
+  不因提案预算而截断、不丢字节；投影不回写归档，`segmentRecord` 保持字节级幂等。
+- **查询源**（提案 / 蒸馏输入）：`internal/proposal.proposalPayload` 折叠空白 → 脱敏 → 按
+  `evidence.ProposalPayloadRunes = 400` **rune** 有界投影（省略标记计入预算，输出严格有界）；
+  截断只作用于 prompt 文本，`BuildPrompt` 的 `evidence_idx` ordinal 对齐不受影响。
+
+草案里「`Payload` 默认 ≤ 400 字」是单一上限表述，本轮已按上述两层拆开：400 不再是事实源的
+上限，只是查询源投影的上限。
 
 ### 4.2 事件类型
 
@@ -274,6 +310,14 @@ type CaptureEvent struct {
 
 ## 10. 与蒸馏、评测的关系
 
+**Fidelity 与 Grade 分层（本轮落地，不可互喂）**：`Fidelity`（`full / summary / pointer / none`）
+**只管提案准入**，唯一判定源是 `internal/proposal.proposalEligible`，决定一条证据能否进入
+`BuildPrompt` 与候选计数；`A/B/C Grade` **只管提交裁决**，由
+`internal/store/commit.go:gradeOfEvidence` 决定候选能否升格为记忆，属于 CommitPolicy。
+**两者不得互相喂值**：Fidelity 不流入 `gradeOfEvidence` / CommitPolicy，也不由 Grade 反推。
+**Fidelity 不写进归档 `segment`**：它只落在 `observations.meta_json`（`evidenceMeta.fidelity`）
+与读侧 `Ref.Fidelity`，归档 `segmentRecord` 保持字节级幂等，因此本轮归档重放哈希不变。
+
 - **捕获保真度是蒸馏的上限**。当前 15 次蒸馏全 `empty`，不是蒸馏策略问题，而是输入只有 `"stop"`。
 - 蒸馏独立立项，但输入契约要先定：只有 `full/summary` 可蒸馏；`pointer` 先回源；`none` 跳过。
 - 蒸馏产出只进 `candidates`；采纳率是核心指标，不以候选数论英雄。
@@ -286,13 +330,16 @@ type CaptureEvent struct {
 
 ## 11. 落地顺序
 
-| 阶段 | 内容 | 验收 |
-|:---|:---|:---|
-| P0 捕获止血 | Trae Stop 字段映射；任务收尾写入规则；巡检 R4/R5 内容判据 | 同会话两次 Stop 不再折叠；实质会话写侧 > 0；巡检不再误判 OK |
-| P1 契约化 | 抽 `CaptureEvent` + 适配器 + 一致性测试 | 核心写侧不解析原始载荷；Trae/WorkBuddy 夹具通过 |
-| P2 扫描 spike | 手动 `mem scan`，只读、有界、幂等 | 能补历史缺口；重复扫描 0 新增；不写 memories |
-| P3 扩展 | 其他 harness 适配器；快照与保留期 | 新 harness 只加适配器与夹具，不改核心 |
+| 阶段 | 内容 | 状态与提交范围 | 验收 |
+|:---|:---|:---|:---|
+| P0 捕获止血 | Trae Stop 字段映射（本轮范围）；任务收尾写入规则、巡检 R4/R5 内容判据仍属后续 | **已完成**（Trae 字段映射）：`786cf22` → `9911f60`（T4） | 同会话两次 Stop 不再折叠；实质会话写侧 > 0 |
+| P1 契约化 / 保真度 | W0 冻结 `Fidelity` 契约 + T1 `meta_json` 结构化 + T2 Engine 透传 + T3 提案准入与 400 字投影 | **已完成**：`51075ed` → `cdeca96`（W0/T1/T2/T3，含 `4e48849` / `2c88424` / `e549b14` 各合并点） | 契约 append-only、归档哈希不变、`proposalEligible` 单一判定、旧行兼容 |
+| P2 扫描 spike | 手动 `mem scan`，只读、有界、幂等 | **待办（提案）** | 能补历史缺口；重复扫描 0 新增；不写 memories |
+| P3 扩展 | 其他 harness 适配器；快照与保留期 | **待办（提案）** | 新 harness 只加适配器与夹具，不改核心 |
 
+P0 的「任务收尾写入规则 / 巡检判据」与 P1 原列的「抽 `CaptureEvent` + 独立适配器层 + 一致性夹具」
+本轮未纳入，分别归入头部对照表右栏（Task 级 closeout / 独立适配器层抽象）与 P3；
+本轮 P1 以「W0 冻结契约 + 保真度链路」这一等价实现路径完成。
 P0 的详细修复项见本次诊断结论；本文只锁定架构边界。
 
 ## 12. 验收判据
