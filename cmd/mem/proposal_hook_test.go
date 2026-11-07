@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // unsetGrayEnv 真正取消某个环境变量（区别于 t.Setenv 设为空串），
@@ -46,20 +48,169 @@ func TestProposalHookFlagSpawnsWithoutTranscript(t *testing.T) {
 	}
 }
 
-func TestProposalHookPendingSpawnsOnSessionStart(t *testing.T) {
-	t.Setenv("MEM_PROPOSAL_HOOK", "1")
-	var called bool
+// installCountProc 安装计数替身：每次被拉起就自增，返回计数器指针。
+// 断言「不拉起」时配合「旧规则确实跑过」的旁证使用，避免「进程没起来所以计数为 0」的假绿。
+func installCountProc(t *testing.T) *int {
+	t.Helper()
+	n := 0
 	prev := startDistillProc
 	startDistillProc = func(db, session, harness string) error {
-		called = true
+		n++
 		return nil
 	}
 	t.Cleanup(func() { startDistillProc = prev })
+	return &n
+}
 
-	distillPendingFailOpen("test.db", "-", "claude")
-	if !called {
-		t.Fatal("MEM_PROPOSAL_HOOK=1 时 SessionStart 应拉起 Proposal pending")
+// TestProposalHookPendingSpawnsOnSessionStart：SessionStart 的 Proposal 分支受
+// MEM_DISTILL_SPAWN 总闸约束，拆成「有许可」与「无许可」两条用例。
+func TestProposalHookPendingSpawnsOnSessionStart(t *testing.T) {
+	t.Run("SPAWN=1 且灰度命中拉起 Proposal", func(t *testing.T) {
+		t.Setenv("MEM_DISTILL_SPAWN", "1")
+		t.Setenv("MEM_PROPOSAL_HOOK", "1")
+		calls := installCountProc(t)
+
+		distillPendingFailOpen(grayDB(t), "-", "claude")
+		if *calls == 0 {
+			t.Fatal("MEM_DISTILL_SPAWN=1 且灰度命中时 SessionStart 应拉起 Proposal pending")
+		}
+		if *calls != 1 {
+			t.Fatalf("SessionStart 应恰好拉起 1 次，got %d", *calls)
+		}
+	})
+	t.Run("SPAWN 未设回落到内联旧规则", func(t *testing.T) {
+		unsetGrayEnv(t, "MEM_DISTILL_SPAWN")
+		t.Setenv("MEM_PROPOSAL_HOOK", "1")
+		db := grayDB(t)
+		calls := installCountProc(t)
+
+		distillPendingFailOpen(db, "-", "claude")
+		if *calls != 0 {
+			t.Fatalf("MEM_DISTILL_SPAWN 未设时不得拉起任何子进程，got %d 次", *calls)
+		}
+		// 反证：内联旧规则会打开库，库文件存在说明真的走到了旧规则分支，
+		// 而不是被某个早退分支顺手跳过。
+		if _, err := os.Stat(db); err != nil {
+			t.Fatalf("无 spawn 许可时应继续走内联旧规则（会打开库），但库未创建: %v", err)
+		}
+	})
+}
+
+// TestSessionStartSpawnGateMatrix 覆盖 MEM_DISTILL_SPAWN × MEM_PROPOSAL_HOOK ×
+// MEM_NO_DISTILL 的组合：只有「SPAWN=1 且灰度命中」才拉子进程，其余一律内联旧规则；
+// MEM_NO_DISTILL=1 仍然最先短路，完全不动作。
+func TestSessionStartSpawnGateMatrix(t *testing.T) {
+	cases := []struct {
+		name       string
+		proposal   string
+		propUnset  bool
+		spawn      string
+		spawnUnset bool
+		noDistill  string
+		harness    string
+		wantSpawn  int
+		wantLegacy bool
+	}{
+		{"SPAWN 未设+灰度命中:内联旧规则", "1", false, "", true, "", "claude", 0, true},
+		{"SPAWN=1+灰度命中:拉 Proposal", "1", false, "1", false, "", "claude", 1, false},
+		{"SPAWN=1+灰度未设:内联旧规则", "", true, "1", false, "", "claude", 0, true},
+		{"SPAWN=1+灰度未命中:内联旧规则", "trae", false, "1", false, "", "claude", 0, true},
+		{"NO_DISTILL=1 全不动作", "1", false, "1", false, "1", "claude", 0, false},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.spawnUnset {
+				unsetGrayEnv(t, "MEM_DISTILL_SPAWN")
+			} else {
+				t.Setenv("MEM_DISTILL_SPAWN", tc.spawn)
+			}
+			if tc.propUnset {
+				unsetGrayEnv(t, "MEM_PROPOSAL_HOOK")
+			} else {
+				t.Setenv("MEM_PROPOSAL_HOOK", tc.proposal)
+			}
+			t.Setenv("MEM_NO_DISTILL", tc.noDistill)
+			db := grayDB(t)
+			calls := installCountProc(t)
+
+			distillPendingFailOpen(db, "-", tc.harness)
+
+			if *calls != tc.wantSpawn {
+				t.Fatalf("拉起次数=%d, want %d", *calls, tc.wantSpawn)
+			}
+			_, err := os.Stat(db)
+			if tc.wantLegacy && err != nil {
+				t.Fatalf("应走内联旧规则（会打开库），但库未创建: %v", err)
+			}
+			if !tc.wantLegacy && err == nil {
+				t.Fatal("不该走到内联旧规则，却打开了库")
+			}
+		})
+	}
+}
+
+// seedDueSession 造一个「有待蒸馏观测」的会话，供旧规则分支的 due 判定使用。
+func seedDueSession(t *testing.T, db, sid string) {
+	t.Helper()
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.AppendObservation(store.ObsInput{
+		SessionID: sid, Project: "demo", Event: "post-tool-use",
+		Summary: "决策：gate 用例需要一条待蒸馏观测",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStopSpawnGateMatrix：Stop / SessionEnd 路径的 gate 语义回归。
+// SPAWN 未设时连库都不打开；SPAWN=1 且灰度命中走 Proposal；灰度未命中走旧规则，
+// 且旧规则仍然受 due 判定约束（非 due 会话不会拉起）。
+func TestStopSpawnGateMatrix(t *testing.T) {
+	const sid = "s-due"
+	t.Run("SPAWN 未设不拉", func(t *testing.T) {
+		unsetGrayEnv(t, "MEM_DISTILL_SPAWN")
+		t.Setenv("MEM_PROPOSAL_HOOK", "1")
+		db := grayDB(t)
+		// 先造出 due 会话：若 gate 失效，旧规则会真的拉起，计数不会是 0。
+		seedDueSession(t, db, sid)
+		calls := installCountProc(t)
+
+		maybeSpawnDistill(db, hookInput{SessionID: sid, TranscriptPath: "/tmp/t.jsonl"}, "claude")
+		if *calls != 0 {
+			t.Fatalf("MEM_DISTILL_SPAWN 未设时不应拉起任何进程，got %d", *calls)
+		}
+	})
+	t.Run("SPAWN=1 且灰度命中拉 Proposal", func(t *testing.T) {
+		t.Setenv("MEM_DISTILL_SPAWN", "1")
+		t.Setenv("MEM_PROPOSAL_HOOK", "1")
+		calls := installCountProc(t)
+
+		// Proposal 分支不依赖 transcript_path 与 due 判定。
+		maybeSpawnDistill(grayDB(t), hookInput{SessionID: sid}, "claude")
+		if *calls != 1 {
+			t.Fatalf("灰度命中应拉起 Proposal 1 次，got %d", *calls)
+		}
+	})
+	t.Run("SPAWN=1 且灰度未命中走旧规则", func(t *testing.T) {
+		t.Setenv("MEM_DISTILL_SPAWN", "1")
+		t.Setenv("MEM_PROPOSAL_HOOK", "trae")
+		calls := installCountProc(t)
+
+		db := grayDB(t)
+		seedDueSession(t, db, sid)
+		maybeSpawnDistill(db, hookInput{SessionID: sid, TranscriptPath: "/tmp/t.jsonl"}, "claude")
+		if *calls != 1 {
+			t.Fatalf("灰度未命中时 due 会话应走旧规则拉起 1 次，got %d", *calls)
+		}
+		// 旧规则才有的 due 判定：非 due 会话不拉起，说明走的确实是旧规则分支。
+		maybeSpawnDistill(db, hookInput{SessionID: "s-not-due", TranscriptPath: "/tmp/t.jsonl"}, "claude")
+		if *calls != 1 {
+			t.Fatalf("非 due 会话不应拉起旧规则，got %d", *calls)
+		}
+	})
 }
 
 // TestGrayProposalHookEnabled 覆盖选择器矩阵：未设置 / 0 / 空串 / 1 / all / on /
@@ -180,10 +331,12 @@ func TestGrayStopSpawnByHarness(t *testing.T) {
 
 // TestGraySessionStartSpawnByHarness：SessionStart 路径。Proposal 分支会拉起
 // startDistillProc；旧蒸馏分支只做同步 distillOne，不拉起子进程。
+// 必须在 SPAWN=1 的前提下跑，否则全部用例都会被总闸挡住而失去区分力。
 func TestGraySessionStartSpawnByHarness(t *testing.T) {
 	for _, tc := range graySpawnCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("MEM_NO_DISTILL", "") // 避免被早退分支短路
+			t.Setenv("MEM_DISTILL_SPAWN", "1")
 			t.Setenv("MEM_PROPOSAL_HOOK", tc.env)
 			p := installGrayProc(t)
 			distillPendingFailOpen(grayDB(t), "-", tc.harness)
@@ -258,11 +411,16 @@ func TestGrayUnresolvedHarnessKeepsLegacy(t *testing.T) {
 	})
 	t.Run("SessionStart 路径不拉起 Proposal", func(t *testing.T) {
 		t.Setenv("MEM_NO_DISTILL", "")
+		t.Setenv("MEM_DISTILL_SPAWN", "1") // 证明拦住它的是宿主名而非总闸
 		t.Setenv("MEM_PROPOSAL_HOOK", "claude")
+		db := grayDB(t)
 		p := installGrayProc(t)
-		distillPendingFailOpen(grayDB(t), "-", host)
+		distillPendingFailOpen(db, "-", host)
 		if p.called {
 			t.Fatal("宿主名无法解析时 SessionStart 不得拉起 Proposal（应走旧蒸馏）")
+		}
+		if _, err := os.Stat(db); err != nil {
+			t.Fatalf("应走内联旧规则（会打开库），但库未创建: %v", err)
 		}
 	})
 	t.Run("全量值不受宿主名影响", func(t *testing.T) {

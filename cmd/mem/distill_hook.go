@@ -90,10 +90,17 @@ func proposalHookEnabled(host string) bool {
 	return false
 }
 
+// distillSpawnEnabled 是所有蒸馏子进程的总闸：Stop / SessionEnd 的规则蒸馏或
+// Proposal 蒸馏、SessionStart 的 Proposal pending 蒸馏，都只在其为真时拉起。
+// 未设置 / 非 "1" → false，即默认不拉起任何子进程。
+func distillSpawnEnabled() bool {
+	return strings.TrimSpace(os.Getenv("MEM_DISTILL_SPAWN")) == "1"
+}
+
 // maybeSpawnDistill 在 Stop / SessionEnd 末尾可选地拉起规则蒸馏。
 // 默认不拉起。无 transcript_path 时跳过。失败只打 stderr。
 func maybeSpawnDistill(db string, in hookInput, harness string) {
-	if strings.TrimSpace(os.Getenv("MEM_DISTILL_SPAWN")) != "1" {
+	if !distillSpawnEnabled() {
 		return
 	}
 	sid := in.sessionID()
@@ -143,11 +150,16 @@ func maybeSpawnDistill(db string, in hookInput, harness string) {
 
 // distillPendingFailOpen 在 SessionStart 用规则抽取处理尚未蒸馏的会话。
 // 只用 provider none，有时间上限，失败不阻断注入，不写 memories。
+//
+// SessionStart 不是例外：没有 spawn 许可就不拉子进程。Proposal 分支必须同时满足
+// distillSpawnEnabled() 与 proposalHookEnabled(harness)；任一不满足都继续往下走
+// 内联旧规则，而不是提前 return。因此这里不做 fail-open 式的静默跳过——内联旧规则
+// 仍然会把 pending 会话蒸馏掉，不会因为没拉起子进程而丢蒸馏。
 func distillPendingFailOpen(db, auditPath, harness string) {
 	if strings.TrimSpace(os.Getenv("MEM_NO_DISTILL")) == "1" {
 		return
 	}
-	if proposalHookEnabled(harness) {
+	if distillSpawnEnabled() && proposalHookEnabled(harness) {
 		if err := startDistillProc(db, "", harness); err != nil {
 			fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 proposal pending 失败，已放过:", err)
 		}
