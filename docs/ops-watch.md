@@ -237,7 +237,7 @@ grep '"source":"distill"'  ~/.v2mem/audit.jsonl | tail -5   # 有输出 = 旧规
 | 目标 | 动作 |
 |:---|:---|
 | 回到旧规则蒸馏 | `MEM_PROPOSAL_HOOK=0`，或直接取消该变量 |
-| 完全停掉蒸馏 | 再取消 `MEM_DISTILL_SPAWN` |
+| 完全停掉蒸馏 | 取消 `MEM_DISTILL_SPAWN` **且**设 `MEM_NO_DISTILL=1`（缺后者时 SessionStart 仍会内联跑旧规则 `--pending`，见 8.1） |
 
 注意：只把 `MEM_PROPOSAL_HOOK` 设为 `0` 时，`MEM_DISTILL_SPAWN=1` 下**旧规则蒸馏仍会跑**——
 关掉的是 Proposal 路径，不是蒸馏本身。回退不需要重启宿主，下一次钩子即按新值生效。
