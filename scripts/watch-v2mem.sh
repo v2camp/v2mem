@@ -11,6 +11,8 @@
 #   scripts/watch-v2mem.sh --quiet         # 只输出非 PASS 项
 #
 # 只读：不写库、不改配置。唯一的写入是 ~/.v2mem/watch-state.json 的基线快照。
+# R3 只统计读侧 hook（prompt-submit / session-start）的 ms；写侧 stop / obs-append
+# 共用同一个 Stop 计时器，计入会污染「检索延迟」，详见 docs/ops-watch.md §3。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
 set -uo pipefail
@@ -128,6 +130,7 @@ fi
 # ---------- 运行态：解析 audit.jsonl ----------
 AUDIT="$V2MEM_DIR/audit.jsonl"
 A_EVENTS=0; A_PROMPT=0; A_PROMPT_EMPTY=0; A_SS=0; A_OBS=0; A_ADD=0; A_MS=0
+A_READ_N=0; A_WRITE_MS=0
 
 if [ -f "$AUDIT" ]; then
   # 必须用 -s：默认流式模式下 [select(...)] 会对每一行各自收集，导致只有最后一行生效
@@ -139,11 +142,14 @@ if [ -f "$AUDIT" ]; then
       "A_SS=\([$e[] | select(.event=="session-start")] | length)",
       "A_OBS=\([$e[] | select(.event=="obs-append")] | length)",
       "A_ADD=\([$e[] | select(.event=="manual-add" or .event=="write")] | length)",
-      "A_MS=\(([$e[] | select(.ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))"
+      "A_READ_N=\([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms != null and .ms > 0)] | length)",
+      "A_MS=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))",
+      "A_WRITE_MS=\(([$e[] | select(.event=="stop" and .ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))"
   ' "$AUDIT" 2>/dev/null)"
 fi
 A_EVENTS=${A_EVENTS:-0}; A_PROMPT=${A_PROMPT:-0}; A_PROMPT_EMPTY=${A_PROMPT_EMPTY:-0}
 A_SS=${A_SS:-0}; A_OBS=${A_OBS:-0}; A_ADD=${A_ADD:-0}; A_MS=${A_MS:-0}
+A_READ_N=${A_READ_N:-0}; A_WRITE_MS=${A_WRITE_MS:-0}
 
 # R1 钩子是否被真实触发
 if [ "$A_EVENTS" -ge 1 ]; then
@@ -168,14 +174,15 @@ else
   add R2 INFO "窗口内无提问" "窗口内没有 prompt-submit 事件，无法评估命中率"
 fi
 
-# R3 检索延迟
+# R3 检索延迟：只取读侧 hook，写侧 Stop 单独展示但不判级
 if [ "$A_MS" -gt 0 ]; then
+  R3_NOTE="读侧样本 ${A_READ_N} 次，写侧 Stop ${A_WRITE_MS}ms 不计入本判据"
   if [ "$A_MS" -lt 50 ]; then
-    add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 目标线"
+    add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 目标线；${R3_NOTE}"
   elif [ "$A_MS" -lt 200 ]; then
-    add R3 WARN "检索延迟 ${A_MS}ms" "高于典型值 ~9ms，观察是否库膨胀或锁竞争"
+    add R3 WARN "检索延迟 ${A_MS}ms" "高于典型值 ~9ms，观察是否库膨胀或锁竞争；${R3_NOTE}"
   else
-    add R3 FAIL "检索延迟 ${A_MS}ms" "超过 200ms，检查 WAL 大小与并发写入"
+    add R3 FAIL "检索延迟 ${A_MS}ms" "超过 200ms，检查 WAL 大小与并发写入；${R3_NOTE}"
   fi
 else
   add R3 INFO "无延迟样本" "窗口内没有带 ms 的读侧记录"
@@ -241,6 +248,17 @@ elif [ "$CAND" -le 15 ]; then
   add R8 WARN "候选积压 ${CAND}" "考虑 mem accept / mem reject 清理"
 else
   add R8 FAIL "候选积压 ${CAND}" "蒸馏产物长期未处理，检索质量会受影响"
+fi
+
+# R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤
+NOISE=$(printf '%s\n' "$CAND_OUT" | grep -cE '\{"(id|parentId|callId|type)"' || true)
+NOISE=${NOISE:-0}
+if [ "$NOISE" -eq 0 ]; then
+  add R9 PASS "候选内容无载荷残留" "pending ${CAND} 条，未发现 transcript 原始 JSON"
+elif [ "$NOISE" -le 3 ]; then
+  add R9 WARN "候选含载荷残留 ${NOISE} 条" "单窗口内产生，用 mem reject 清理并核查 distill 输入过滤"
+else
+  add R9 FAIL "候选含载荷残留 ${NOISE} 条" "蒸馏输入未过滤 pointer 观测；先修准入，再逐条 mem reject"
 fi
 
 # ---------- 输出 ----------

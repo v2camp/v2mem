@@ -77,21 +77,32 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **I5** | Trae 钩子执行环境 | `agent-hooks.log` 中 traecode 块的 `ExecEnv` | `Host` | `Sandbox`（读得到、写不进） | 未匹配到 traecode 块时 `INFO` |
 | **R1** | 钩子被真实触发 | 窗口内审计事件数 | ≥1 | — | 0 |
 | **R2** | 检索命中率 | `1 - prompt-submit.empty 占比` | ≥30% | 10–30% | <10% |
-| **R3** | 检索延迟 | 窗口内 `ms` 均值 | <50ms | 50–200ms | >200ms |
+| **R3** | 检索延迟 | 窗口内 `prompt-submit` / `session-start` 的 `ms` 均值（写侧不计入，见下） | <50ms | 50–200ms | >200ms |
 | **R4** | 写侧活动 | 窗口内 `manual-add` 数 | ≥1 | 0（库≥20 条时） | — |
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
 | **R6** | 库规模 | `mem stats` 总条数 vs 上次快照 | 未下降 | 下降 | — |
 | **R7** | spool 积压 | `spool/*.jsonl` 数 | 0 | 1–3 | >3 |
-| **R8** | 候选积压 | `mem candidates ls` | ≤5 | 6–15 | >15 |
+| **R8** | 候选积压 | `mem candidates ls` 条数 | ≤5 | 6–15 | >15 |
+| **R9** | 候选内容质量 | pending 候选中 transcript 原始 JSON 载荷残留条数 | 0 | 1–3 | >3 |
 
 阈值依据（不凭空定）：
 
 - **R3 的 50ms**：README 声明 200 条库检索平均 ~9ms，实测量级 9–15ms。50ms 是 5 倍冗余，
   越过说明库膨胀或 WAL 写锁竞争。
+  **采集口径**：只取 `prompt-submit` / `session-start`（读侧注入）。`stop` 与 `obs-append`
+  共用同一个 Stop hook 计时器，其 `ms` 是整个捕获/归档流程耗时，不是检索耗时；
+  早期脚本对所有带 `ms` 的事件取均值，把 500ms 级写侧耗时混进来，产生稳定误报。
+  脚本另在 R3 detail 展示写侧 Stop 均值供观察，**不对写侧判级**。
 - **R2 的 30%**：`docs/design-eval.md` 的口径是「能取到的细节无限深」，命中率随库内容增长而上升；
   初期低是必然。30% 是"库有料但仍常空手"的告警线。
 - **库 20 条 / 评测 20 样本**：`mem audit` 自己提示「可评测样本 ≥20 再下结论」，同一口径沿用。
 - **R8 的 15**：候选是隔离区，长期不处理会让下次蒸馏覆盖判断；经验值，可随实测调整。
+- **R9 的 0 / 3**：候选须显式 `mem accept` 才升格（[`design-write-governance.md`](./design-write-governance.md)
+  三态），所以结构化载荷残留**不是事实而是污染**，出现即说明蒸馏输入未按
+  `proposalEligible` 的准入过滤。判 0 为 PASS；单次 `distill` 实测最多产出 6 条候选
+  （`distill_runs` 观测），故 1–3 视为单巡检窗口内可人工清理的余量，>3 判为过滤失效。
+  检测为启发式：候选内容含 `{"id"` / `{"parentId"` / `{"callId"` / `{"type"` 等
+  transcript 字段即计数。**R9 不随冷启动降级**——污染与库规模无关。
 
 ---
 
@@ -101,6 +112,9 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 不是故障。用成熟期的阈值去判初期状态，会得到稳定但无意义的 FAIL，最终导致告警疲劳。
 
 判据必须阶段化，否则「符合预期」这四个字没有定义。跨过 20 条后自动启用完整阈值。
+
+**例外只覆盖 R2 / R4。** R9 不降级：候选里出现 transcript 原始 JSON 是输入过滤失效，
+与库里有多少条记忆无关，冷启动期同样应报。
 
 ---
 
@@ -115,6 +129,8 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | I2 掉到 1–3 | 宿主升级覆盖配置 | 重跑 `mem init --harness workbuddy`（幂等、带备份） |
 | I5 = WARN（`ExecEnv: Sandbox`） | Trae 钩子跑在沙箱，`~/.v2mem` 禁写 | Hooks 面板运行方式改「本地自动运行」；或在沙箱配置放行 `~/.v2mem` |
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |
+| R8 候选积压 | 隔离区长期未裁决 | `mem candidates ls --policy` 逐条看：可读候选 `mem accept`，载荷残留 `mem reject`（顶层命令，非 `mem candidates reject`） |
+| R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
@@ -141,7 +157,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…R8） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…R9） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |
