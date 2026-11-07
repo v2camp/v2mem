@@ -97,6 +97,12 @@ func TestGrayProposalHookEnabled(t *testing.T) {
 		{"未知名单关闭", "cursor", false, "claude", false},
 		{"空 harness 名单不命中", "claude", false, "", false},
 		{"空 harness 全量仍生效", "1", false, "", true},
+		{"别名 trae 命中规范名 traecode", "trae", false, "traecode", true},
+		{"规范名 traecode 命中别名 trae 名单", "traecode", false, "trae", true},
+		{"别名 claude-code 命中 claude", "claude-code", false, "claude", true},
+		{"别名 cc 命中 claude", "cc", false, "claude", true},
+		{"大小写别名 TRAE 命中 traecode", "TRAE", false, "traecode", true},
+		{"未知名单解析失败不命中", "cursorx", false, "claude", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -215,6 +221,54 @@ func TestProposalHookDefaultNoSpawn(t *testing.T) {
 		maybeSpawnDistill(grayDB(t), hookInput{SessionID: "s-default"}, "claude")
 		if p.called {
 			t.Fatal("默认值未改变：默认应是旧蒸馏（缺 transcript_path 不拉起），却拉起了 Proposal")
+		}
+	})
+}
+
+// TestGrayUnresolvedHarnessKeepsLegacy：未传 --harness 且环境变量无法推导宿主时，
+// harnessName 返回空串。此时即便设了灰度名单，也必须保守走旧蒸馏、不得误开 Proposal；
+// 全量值 1 不受宿主名影响（既有语义）。
+func TestGrayUnresolvedHarnessKeepsLegacy(t *testing.T) {
+	// 清掉注册表里全部项目目录环境变量，模拟「环境变量无法推导宿主名」。
+	for _, k := range []string{
+		"CLAUDE_PROJECT_DIR", "TRAE_PROJECT_DIR", "CODEBUDDY_PROJECT_DIR",
+		"QODER_PROJECT_DIR", "QODERCN_PROJECT_DIR", "CURSOR_PROJECT_DIR",
+	} {
+		unsetGrayEnv(t, k)
+	}
+	host := harnessName("", hookInput{})
+	if host != "" {
+		t.Fatalf("环境变量无法推导时 harnessName 应为空，got %q", host)
+	}
+
+	t.Run("选择器保守失败", func(t *testing.T) {
+		t.Setenv("MEM_PROPOSAL_HOOK", "claude")
+		if proposalHookEnabled(host) {
+			t.Fatal("宿主名无法解析时灰度名单应保守失败、保持旧蒸馏")
+		}
+	})
+	t.Run("Stop 路径不拉起 Proposal", func(t *testing.T) {
+		t.Setenv("MEM_DISTILL_SPAWN", "1")
+		t.Setenv("MEM_PROPOSAL_HOOK", "claude")
+		p := installGrayProc(t)
+		maybeSpawnDistill(grayDB(t), hookInput{SessionID: "s-unresolved"}, host)
+		if p.called {
+			t.Fatal("宿主名无法解析时 Stop 不得拉起 Proposal（应走旧蒸馏）")
+		}
+	})
+	t.Run("SessionStart 路径不拉起 Proposal", func(t *testing.T) {
+		t.Setenv("MEM_NO_DISTILL", "")
+		t.Setenv("MEM_PROPOSAL_HOOK", "claude")
+		p := installGrayProc(t)
+		distillPendingFailOpen(grayDB(t), "-", host)
+		if p.called {
+			t.Fatal("宿主名无法解析时 SessionStart 不得拉起 Proposal（应走旧蒸馏）")
+		}
+	})
+	t.Run("全量值不受宿主名影响", func(t *testing.T) {
+		t.Setenv("MEM_PROPOSAL_HOOK", "1")
+		if !proposalHookEnabled(host) {
+			t.Fatal("全量值 1 应保持既有语义，不受宿主名无法解析影响")
 		}
 	})
 }
