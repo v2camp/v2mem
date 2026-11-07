@@ -179,15 +179,23 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 ### 8.1 灰度开关
 
-Proposal 路径由两个环境变量共同决定，缺一不生效：
+两条路径受**不同**变量约束，不是「缺一不生效」的统一开关：
 
-| 变量 | 取值 | 语义 | 默认 |
+| 路径 | 入口 | 受 `MEM_DISTILL_SPAWN` 约束 | 走 Proposal 的条件 |
 |:---|:---|:---|:---|
-| `MEM_DISTILL_SPAWN` | `1` | 允许 Stop / SessionEnd 末尾 `Start` 一次短命蒸馏子进程 | **未设 = 不拉起任何蒸馏子进程**（`cmd/mem/distill_hook.go:96`） |
-| `MEM_PROPOSAL_HOOK` | 见 8.2 | 决定拉起的是 **Proposal 路径**还是**旧规则蒸馏** | **未设 = 旧规则蒸馏** |
+| Stop / SessionEnd | `maybeSpawnDistill`（`cmd/mem/distill_hook.go:95`） | **是**：第 96 行先判 `!= "1"`，未设直接返回、什么都不做 | `MEM_DISTILL_SPAWN=1` **且** `proposalHookEnabled(host)` 为真 |
+| SessionStart | `distillPendingFailOpen`（`distill_hook.go:146`） | **否**：只判 `MEM_NO_DISTILL`（`:147`） | `proposalHookEnabled(host)` 为真即**拉 Proposal 子进程**（`:150`）；否则内联跑旧规则 `--pending`（200ms 上限） |
 
-> 口径澄清：`MEM_DISTILL_SPAWN` 只管**子进程**。SessionStart 的 pending 抽取是同步内联、有 200ms
-> 时间上限（`distill_hook.go:167`），不受该变量控制；两条路径的选择都由 `MEM_PROPOSAL_HOOK` 决定。
+- `MEM_DISTILL_SPAWN` 的语义：**只 gate Stop / SessionEnd 的蒸馏子进程**（未设 = 这两条路径不做事）。
+- `MEM_PROPOSAL_HOOK` 的语义：决定走 Proposal 还是旧规则蒸馏，未设 / 空 / `0` = 旧规则（默认未变），取值见 8.2。
+
+**运维结论：灰度期必须两个都设**（`MEM_DISTILL_SPAWN=1` + `MEM_PROPOSAL_HOOK=<宿主>`）。
+只设 `MEM_PROPOSAL_HOOK` 会出现**半开状态**：SessionStart 已走 Proposal，Stop / SessionEnd 什么都不做，
+观察窗口里只拿到开场侧的数据，R1 的 proposal 事件时有时无，§8.7 的转正判据无法判定。
+
+> **已知不一致（待裁决）**：变量名字面是「允许拉起蒸馏子进程」，但 SessionStart 的 Proposal 分支
+> 不受它约束（`distill_hook.go:150`）。是否把该分支也纳入 gate 属于一条**行为变更**，尚未裁决；
+> 本节只记录现状，不预告改动。
 
 ### 8.2 `MEM_PROPOSAL_HOOK` 取值语义（已裁决）
 
