@@ -67,6 +67,10 @@ func proposalEligible(r evidence.Ref) bool {
 	}
 }
 
+// Eligible 是 proposalEligible 的导出入口，供旧规则蒸馏路径复用同一份准入判定。
+// 新增调用方一律走这里，不得另写 Fidelity / ProposalEligible 的组合判断。
+func Eligible(r evidence.Ref) bool { return proposalEligible(r) }
+
 // proposalPayload 把证据正文投影成有界的提案输入：折叠空白 → 脱敏 →
 // 按 rune 截到 evidence.ProposalPayloadRunes（省略标记计入预算，输出严格有界）。
 //

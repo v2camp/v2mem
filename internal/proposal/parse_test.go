@@ -264,3 +264,32 @@ func TestBuildPromptPayloadShortAndScrubUnchanged(t *testing.T) {
 		t.Fatalf("短文本不应加省略标记: %s", p)
 	}
 }
+
+// Eligible 是旧规则蒸馏路径复用的导出入口，必须与内部判定逐项同值，
+// 否则会出现「两条路径对同一条证据给出不同准入结论」。
+func TestEligibleExportedContract(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  evidence.Ref
+		want bool
+	}{
+		{"full", evidence.Ref{ProposalEligible: true, Fidelity: evidence.FidelityFull}, true},
+		{"summary", evidence.Ref{ProposalEligible: true, Fidelity: evidence.FidelitySummary}, true},
+		{"legacy-empty-fidelity", evidence.Ref{ProposalEligible: true}, true},
+		{"pointer", evidence.Ref{ProposalEligible: true, Fidelity: evidence.FidelityPointer}, false},
+		{"none", evidence.Ref{ProposalEligible: true, Fidelity: evidence.FidelityNone}, false},
+		{"unknown-fail-closed", evidence.Ref{ProposalEligible: true, Fidelity: evidence.Fidelity("bogus")}, false},
+		{"switch-off", evidence.Ref{ProposalEligible: false, Fidelity: evidence.FidelityFull}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Eligible(c.ref)
+			if got != c.want {
+				t.Fatalf("Eligible(%+v)=%v want %v", c.ref, got, c.want)
+			}
+			if inner := proposalEligible(c.ref); inner != got {
+				t.Fatalf("导出入口 %v 与内部判定 %v 不一致", got, inner)
+			}
+		})
+	}
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -358,6 +359,34 @@ type distillJob struct {
 	NoScrub  bool
 }
 
+// distillObservationEligible 判断一条 observations 行能否进入规则蒸馏输入。
+//
+// 字段契约来自 internal/store/evidence.go 的 evidenceMeta（W0 冻结）：
+// proposal_eligible=false 或 fidelity=pointer/none 的行只保住原始载荷，不是可抽取的
+// 事实（design-capture §4.3、observe.go 的 pointer 标注）。把这类 summary 交给
+// distill.Run 会产出 240 字符的 JSON 截断片段当候选，见 ops-watch §3 R9。
+//
+// 旧行没有 proposal_eligible 键时按兼容语义视为可提案：历史窗口依赖 legacy 观测
+// 收敛，全部挡掉会让这些窗口永远停在 pending。判定本身复用 proposal.Eligible，
+// 这里只做 meta_json 到 evidence.Ref 的映射。
+func distillObservationEligible(metaJSON string) bool {
+	var m struct {
+		ProposalEligible *bool  `json:"proposal_eligible"`
+		Fidelity         string `json:"fidelity,omitempty"`
+	}
+	if strings.TrimSpace(metaJSON) != "" {
+		_ = json.Unmarshal([]byte(metaJSON), &m)
+	}
+	eligible := true
+	if m.ProposalEligible != nil {
+		eligible = *m.ProposalEligible
+	}
+	return proposal.Eligible(evidence.Ref{
+		ProposalEligible: eligible,
+		Fidelity:         evidence.Fidelity(m.Fidelity),
+	})
+}
+
 func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 	started := time.Now()
 	report := &distillReport{Session: job.Session, Status: distill.StatusSkipped}
@@ -378,18 +407,27 @@ func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 		writeDistillAudit(job, report, time.Since(started))
 		return report, nil
 	}
+	// ids 保留全量用于窗口身份（不改历史 DistillWindowDone 语义）；
+	// 只有准入通过的观测才进入蒸馏输入，pointer/none 载荷不参与抽取。
 	ids := make([]string, len(obs))
 	project := ""
-	in := make([]distill.Observation, len(obs))
+	in := make([]distill.Observation, 0, len(obs))
 	for i, o := range obs {
 		ids[i] = o.ID
+		if !distillObservationEligible(o.MetaJSON) {
+			continue
+		}
 		if project == "" {
 			project = o.Project
 		}
-		in[i] = distill.Observation{
+		in = append(in, distill.Observation{
 			ID: o.ID, SessionID: o.SessionID, Project: o.Project,
 			Summary: scrub.Apply(o.Summary, job.NoScrub),
-		}
+		})
+	}
+	if len(in) == 0 {
+		writeDistillAudit(job, report, time.Since(started))
+		return report, nil
 	}
 	window := distill.WindowKey(ids)
 	done, err := st.DistillWindowDone(job.Session, window)
