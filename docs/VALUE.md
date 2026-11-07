@@ -180,6 +180,32 @@ L1 文件里的「记忆钩子」升级为一张**类码表**：
 
 后两条是本次价值主张探讨的**新增产出**——它们无法从代码里读出来，只能由本文件承载。
 
+### 4.1 归档与投影的字节口径
+
+「归档」容易被读成「宿主 stdin 的字节级原件」。**不是**：归档是**打码（scrub）后的有界长文**。
+四层口径各自独立，混读会把「设计上的有界」误判成「丢数据」：
+
+| 层 | 内容 | 上限 | 出处 |
+|:---|:---|:---|:---|
+| 宿主 stdin | 一次钩子事件的原始 JSON | 不设限，不落库 | 宿主 |
+| 归档 Raw | 抽字段 → 打码 → 按 rune 硬截断 | **32000 rune**（`observeRawMaxRunes`） | `cmd/mem/observe.go:34` |
+| 证据摘要 | 折叠空白后的单行摘要 | 512 字节 | `internal/evidence/engine.go:274` |
+| 提案输入投影 | 摘要 → 脱敏 → 截断（省略号计入预算） | **400 rune**（`ProposalPayloadRunes`） | `internal/evidence/api.go:23`、`internal/proposal/parse.go:78` |
+
+三条边界：
+
+1. **归档 ≠ 原件，是可复现的有界长文。** 超过 32000 rune 的部分直接丢弃（`cutRunes` 不加省略号），
+   「归档里有」只保证**前 32000 个 rune** 里有。`segmentRecord`（`internal/evidence/archive.go:21`）
+   与 `archive_hash`（压缩后字节的 sha256，`archive.go:64`）的计算口径**不变**：归档层仍是字节级幂等，
+   `Fidelity` 不进 segment（`api.go:11`）。
+2. **事实源与查询源按层分离。** 事实溯源读归档 Raw（32000 rune）；提案输入只取 400 rune 投影
+   （`internal/proposal/parse.go:78`）。「原文里有、提案里没有」是**分层设计**，不是丢数据——
+   要细节去读归档，不要放大投影预算来补偿。
+3. **`--no-scrub` 是排障开关，不是配置项。** 关闭打码会让密钥明文进入归档 Raw，并顺着证据摘要
+   与 400 字投影进入提案输入、落进候选；归档字节随打码状态改变，`archive_hash` 随之改变（身份
+   `EventUID` 对 transcript 行仍按打码前正文算，`cmd/mem/observe.go:494`）。只允许 `--db` 指向临时库
+   （`t.TempDir()` / `mktemp`）做**一次性**排障；**生产库禁用**，且排障结束必须摘掉，不得长期留着该开关。
+
 ---
 
 ## 5. 路线图与判据

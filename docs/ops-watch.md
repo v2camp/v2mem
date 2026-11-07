@@ -169,3 +169,114 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 > mem0 的 `ADDITIVE_EXTRACTION_PROMPT`（写侧抽取）与 agentmemory 的 4-tier 衰减
 > 对**检索质量**有意义，但对**运行观测**没有——观测只看链路是否通、量是否合理，不看内容好不好。
 > 内容质量归 `docs/design-eval.md`（recall / write 评测），两者不要混在一个指标里。
+
+---
+
+## 8. Proposal Hook 观察期 SOP
+
+> 本节只定义**灰度流程与转正判据**，不新增也不修改 §3 的判据 ID 与阈值。
+> 引用时一律用 §3 的 R1 / R2 / R4 / R5 / R8 / R9，不自造 ID。
+
+### 8.1 灰度开关
+
+两条路径受**不同**变量约束，不是「缺一不生效」的统一开关：
+
+| 路径 | 入口 | 受 `MEM_DISTILL_SPAWN` 约束 | 走 Proposal 的条件 |
+|:---|:---|:---|:---|
+| Stop / SessionEnd | `maybeSpawnDistill`（`cmd/mem/distill_hook.go:95`） | **是**：第 96 行先判 `!= "1"`，未设直接返回、什么都不做 | `MEM_DISTILL_SPAWN=1` **且** `proposalHookEnabled(host)` 为真 |
+| SessionStart | `distillPendingFailOpen`（`distill_hook.go:146`） | **否**：只判 `MEM_NO_DISTILL`（`:147`） | `proposalHookEnabled(host)` 为真即**拉 Proposal 子进程**（`:150`）；否则内联跑旧规则 `--pending`（200ms 上限） |
+
+- `MEM_DISTILL_SPAWN` 的语义：**只 gate Stop / SessionEnd 的蒸馏子进程**（未设 = 这两条路径不做事）。
+- `MEM_PROPOSAL_HOOK` 的语义：决定走 Proposal 还是旧规则蒸馏，未设 / 空 / `0` = 旧规则（默认未变），取值见 8.2。
+
+**运维结论：灰度期必须两个都设**（`MEM_DISTILL_SPAWN=1` + `MEM_PROPOSAL_HOOK=<宿主>`）。
+只设 `MEM_PROPOSAL_HOOK` 会出现**半开状态**：SessionStart 已走 Proposal，Stop / SessionEnd 什么都不做，
+观察窗口里只拿到开场侧的数据，R1 的 proposal 事件时有时无，§8.7 的转正判据无法判定。
+
+> **已知不一致（待裁决）**：变量名字面是「允许拉起蒸馏子进程」，但 SessionStart 的 Proposal 分支
+> 不受它约束（`distill_hook.go:150`）。是否把该分支也纳入 gate 属于一条**行为变更**，尚未裁决；
+> 本节只记录现状，不预告改动。
+
+### 8.2 `MEM_PROPOSAL_HOOK` 取值语义（已裁决）
+
+| 取值 | 结果 |
+|:---|:---|
+| 未设置 / 空串 / `0` | **旧规则蒸馏**（`--session <sid> --provider none`），默认未改变 |
+| `1` / `all` / `on`（大小写不敏感） | 全宿主启用 Proposal |
+| 其它 | 按**逗号分隔的 harness 名单**灰度 |
+
+名单匹配规则（`proposalHookEnabled`，`cmd/mem/distill_hook.go:69`）：
+
+- 名单项与当前宿主名**都经注册表归一化到规范名后比较**：大小写不敏感、去空格、解析别名。
+  因此 `trae` 能命中 `traecode` / `traework`；`claude-code`、`cc` 能命中 `claude`。
+- 未显式传 `--harness` 时，宿主名由宿主的 `*_PROJECT_DIR` 推导（`harnessName`，`cmd/mem/hook.go:187`）。
+  推导成功 → 灰度照常生效；推导失败（宿主名为空）→ **名单灰度保守失效、回归旧规则蒸馏**。
+  全量值（`1` / `all` / `on`）不受影响。
+
+### 8.3 配错自证（已知风险，必须先做）
+
+**名单写错会静默回落。** 写成 `claud`、`trae-code` 这类未注册别名时，归一化后匹配不上，
+`proposalHookEnabled` 返回 false，链路**不报错**、照常跑旧规则蒸馏——从「钩子正常」看不出区别。
+
+| 步骤 | 动作 | 通过标准 |
+|:---|:---|:---|
+| ① 链路自证 | 临时库上设 `MEM_PROPOSAL_HOOK=1`（跳过名单）跑一轮 Stop | 审计出现 `event=distill` + `source=proposal` |
+| ② 再改名单 | 换成目标名单，保持 `MEM_DISTILL_SPAWN=1` | 审计同样出现 `source=proposal` |
+| ③ 首日确认 | 观察期第 1 天查 R1 钩子事件 | 有 proposal 记录，而不是**只有** `--provider none` 的旧蒸馏 |
+
+```bash
+grep '"source":"proposal"' ~/.v2mem/audit.jsonl | tail -5   # 有输出 = Proposal 真的跑了
+grep '"source":"distill"'  ~/.v2mem/audit.jsonl | tail -5   # 有输出 = 旧规则蒸馏（对照用）
+```
+
+> 旧规则蒸馏的审计同理是 `event=distill`，区别在 `source`：Proposal 写 `proposal`，旧规则写 `distill`
+> 且 `provider=none`（`cmd/mem/distill.go:177` / `:562`）。**只看 `event=distill` 分不出两者。**
+
+### 8.4 秒级回退
+
+| 目标 | 动作 |
+|:---|:---|
+| 回到旧规则蒸馏 | `MEM_PROPOSAL_HOOK=0`，或直接取消该变量 |
+| 完全停掉蒸馏 | 取消 `MEM_DISTILL_SPAWN` **且**设 `MEM_NO_DISTILL=1`（缺后者时 SessionStart 仍会内联跑旧规则 `--pending`，见 8.1） |
+
+注意：只把 `MEM_PROPOSAL_HOOK` 设为 `0` 时，`MEM_DISTILL_SPAWN=1` 下**旧规则蒸馏仍会跑**——
+关掉的是 Proposal 路径，不是蒸馏本身。回退不需要重启宿主，下一次钩子即按新值生效。
+
+### 8.5 观察期与逐条判据
+
+观察期**至少 7 天 / 14 个 12h 窗口**（对齐 §6 的巡检节奏）。信号全部来自 §3，不新增指标：
+
+| ID | 看到什么算正常 |
+|:---|:---|
+| **R1** 钩子被真实触发 | 每窗口 ≥1 事件，且窗口内存在 `source=proposal` 的 distill 记录；连续两窗只有 `provider=none` → 按 8.3 查名单 |
+| **R2** 检索命中率 | ≥30%（库 ≥20 条）；<20 条时为 `INFO`，不看数值 |
+| **R4** 写侧活动 | 库 ≥20 条时每窗口 `manual-add` ≥1；为 0 记 `WARN`，不是 FAIL |
+| **R5** 观测落库 | 每窗口 `obs-append` ≥1（归档链路未断） |
+| **R8** 候选积压 | `pending` 候选 ≤5；6–15 为 `WARN`，>15 为 `FAIL` |
+| **R9** 候选载荷残留 | 恒为 **0**；出现即说明 Proposal 输入未按 `proposalEligible` / `Fidelity` 过滤 |
+
+`R3` / `R6` / `R7` 照常巡检，但**不参与本节的转正判定**——它们衡量的是检索延迟与库、spool 健康，
+与 Proposal 路径无关。
+
+### 8.6 冷启动期例外
+
+库内记忆 **<20 条**时，R2 / R4 按 §4 降级为 `INFO`：**只有 FAIL 需要介入，INFO 不是回退**。
+冷启动期 R2 低、R4 为 0 是设计预期；把它当 Proposal 失效去回滚开关，属于误判。
+R9 **不降级**：载荷残留与库规模无关，冷启动期同样判 0。
+
+### 8.7 转正判据（可量化）
+
+全部满足才建议切默认；任一条不满足 → **继续观察**，不自动改默认值：
+
+| # | 条件 | 阈值 | 来源 |
+|:---|:---|:---|:---|
+| 1 | 观察期无 FAIL | 连续 7 天（14 个窗口）全部窗口无 `FAIL` | §3 判级 |
+| 2 | R8 不积压 | 14 个窗口中 `>5` 的窗口 ≤2 个，且末窗口值 ≤ 首窗口值（不呈单调增长） | **建议值** |
+| 3 | R9 干净 | 14 个窗口恒为 `0` | §3 R9 PASS 线 |
+| 4 | 检索无回退 | `make eval-gate` 的 Recall@5 ≥ **0.60**，且较切换前一次实测基线绝对下降 ≤ **0.03** | 0.60 出自 `eval-policy.txt` 的 `recall5_min`；0.03 为**建议值** |
+
+> `make eval-gate` 跑的是沙箱夹具（不读个人库），它守的是**代码级检索回归**，不反映 Proposal 质量——
+> Proposal 质量由条件 2 / 3 与人工抽查候选可读性共同判定。两类证据不要互相替代。
+
+**切默认值必须单独提一次变更并留档**（改默认 = 改所有宿主的行为），不得在观察期结束时顺手合并。
+
