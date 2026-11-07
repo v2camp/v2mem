@@ -320,10 +320,10 @@ func TestTraeRecordEvidenceFidelity(t *testing.T) {
 	}
 }
 
-// TestTraePipelineToolStillIneligible：Trae 把 last_assistant_message 塞进
-// PostToolUse 载荷时，管道工具仍 ProposalEligible=false（isPipelineTool 逻辑不动），
-// 且未知字段被忽略而非丢事件。
-func TestTraePipelineToolStillIneligible(t *testing.T) {
+// TestTraePostToolUseNeverEligible：Trae 把 last_assistant_message 塞进
+// PostToolUse 载荷时，工具载荷一律不可提案（按事件类型判定，不看工具名），
+// 且未知字段被忽略而非丢事件；归档与 Fidelity 不受影响。
+func TestTraePostToolUseNeverEligible(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
 	sid := "trae-pipe-sess"
@@ -350,6 +350,9 @@ func TestTraePipelineToolStillIneligible(t *testing.T) {
 		t.Fatalf("管道事件仍须归档: ok=%v err=%v", ok, err)
 	}
 	if rec.ProposalEligible {
-		t.Fatalf("管道工具仍不可提案")
+		t.Fatalf("工具载荷一律不可提案")
+	}
+	if rec.Fidelity != string(evidence.FidelityFull) {
+		t.Fatalf("带 tool_input 的 PostToolUse 仍应为 full，got %q", rec.Fidelity)
 	}
 }

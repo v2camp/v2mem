@@ -192,11 +192,13 @@ func TestImportTranscriptKeepsSameSummaryApart(t *testing.T) {
 	}
 }
 
-// 记忆工具自身与 MCP 管道事件：照常归档，但 ProposalEligible=false。
+// 工具输入/输出是 artifact：tool_use / tool_result 行照常归档，但一律不可提案；
+// 只有对话正文（user / assistant text）才是提案种子。
 func TestImportTranscriptPipelineToolIneligible(t *testing.T) {
 	db := testDB(t)
 	path := filepath.Join(t.TempDir(), "pipe.jsonl")
 	body := strings.Join([]string{
+		`{"type":"user","uuid":"p0","sessionId":"pipe","message":{"role":"user","content":"决策：普通工具载荷不进提案"}}`,
 		`{"type":"assistant","uuid":"p1","sessionId":"pipe","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_mem","name":"mcp__v2mem__search","input":{"query":"x"}}]}}`,
 		`{"type":"user","uuid":"p2","sessionId":"pipe","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_mem","content":"[]"}]}}`,
 		`{"type":"assistant","uuid":"p3","sessionId":"pipe","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls"}}]}}`,
@@ -214,9 +216,10 @@ func TestImportTranscriptPipelineToolIneligible(t *testing.T) {
 	defer st.Close()
 	src := transcriptSourceID("claude", "pipe")
 	cases := map[string]bool{
+		"tx:p0":                    true, // 对话正文仍可提案，防止收窄过头
 		"tx:tool_use:toolu_mem":    false,
 		"tx:tool_result:toolu_mem": false,
-		"tx:tool_use:toolu_bash":   true,
+		"tx:tool_use:toolu_bash":   false,
 	}
 	for uid, want := range cases {
 		rec, ok, err := st.LookupEvidence(uid, src, 0, 0)
@@ -227,7 +230,7 @@ func TestImportTranscriptPipelineToolIneligible(t *testing.T) {
 			t.Errorf("%s ProposalEligible=%v want %v", uid, rec.ProposalEligible, want)
 		}
 	}
-	if obs, err := st.ListObservations("pipe", 10); err != nil || len(obs) != 3 {
+	if obs, err := st.ListObservations("pipe", 10); err != nil || len(obs) != 4 {
 		t.Fatalf("管道事件也必须归档，got %d err=%v", len(obs), err)
 	}
 }
