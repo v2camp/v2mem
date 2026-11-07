@@ -1,22 +1,25 @@
 # design-capture：多 Harness 捕获层与事件契约
 
 - 日期：2026-11-06
-- 状态：**部分已落地**（本轮已合入契约冻结与保真度链路 W0/T1–T4；P2/P3 仍为提案，见下方「当前实现对照表」）
+- 状态：**部分已落地**（契约冻结与保真度链路 W0/T1–T4、适配器映射表、灰度名单已合入；closeout 规则已裁决但无实现，mem scan 价值已验证为「当前不值得写」，见下方「当前实现对照表」）
 - 关联：[`design-harness.md`](./design-harness.md)、[`design-write-governance.md`](./design-write-governance.md)、[`design-eval.md`](./design-eval.md)、[`design-provenance.md`](./design-provenance.md)、[`VALUE.md`](./VALUE.md)
 - 边界：`design-harness` 回答「每个工具怎么接」；本文回答「接上以后产出什么事件、如何归一、如何补偿」。不重复钩子安装步骤，也不定义蒸馏算法。
 
 ## 当前实现对照表
 
-> 本文原为架构草案；本轮（基线 `b1adbd8` → `9911f60`）已落地契约冻结与保真度链路。
+> 本文原为架构草案；`b1adbd8` → `9911f60` 落地契约冻结与保真度链路，`9ceadb7` 之后补上适配器映射表与灰度名单。
 > 左栏是**已合入代码**，右栏是**仍停留在提案**；全文其余章节凡涉及右栏项，均应按设计意图而非现状阅读。
+> 「已裁决」只表示规则定了，不表示代码存在；凡无实现处均显式写明。
 
-| 已落地（本轮 W0 / T1–T4） | 仍为提案（后续） |
+| 已落地（W0 / T1–T4 / 适配器映射表 / 灰度名单） | 仍为提案（后续） |
 |:---|:---|
-| **W0 契约冻结**：`internal/evidence/api.go` 新增 `type Fidelity string` + `FidelityFull/Summary/Pointer/None` 四常量 + `const ProposalPayloadRunes = 400`，`RawEvent` / `Ref` 各 append `Fidelity`（types-only、append-only）。 | **P2 artifact 扫描**：`mem scan` 机会扫描、指纹幂等、只读有界（本文 §8），本轮未实现。 |
-| **T1 store**：`observations.meta_json` 由单键升级为结构化 `evidenceMeta{proposal_eligible, fidelity, adapter}`；旧行（无新键）按空 `Fidelity` 兼容，`ProposalEligible` 语义不变。 | **Task 级 closeout**：`closeout` 事件与显式任务收尾写入（本文 §4.2 / §5），本轮未实现；P0 仅完成 Trae Stop 字段映射。 |
-| **T2 evidence**：`Engine.Capture` 透传 `Fidelity / Adapter` 到 `EvidenceCaptureInput`（`Adapter` 由 `Harness` 承载，写入 `meta_json.adapter`），`toRef` 填 `Ref.Fidelity`；归档 `segmentRecord` 与 `ParserVersion` 一字未改。 | **独立适配器层抽象**：本文 §4 的 `CaptureEvent` 结构、§7 适配器层与一致性夹具；本轮复用 `evidence.RawEvent / Ref`，不新建该层（见 §4 落地说明）。 |
+| **W0 契约冻结**：`internal/evidence/api.go` 新增 `type Fidelity string` + `FidelityFull/Summary/Pointer/None` 四常量 + `const ProposalPayloadRunes = 400`，`RawEvent` / `Ref` 各 append `Fidelity`（types-only、append-only）。 | **P2 artifact 扫描 `mem scan`**：提案，且**本轮价值验证结论为「当前不值得写」**（2026-11 实测，见 §8.5）；机会扫描、指纹幂等、只读有界（本文 §8）均未实现。 |
+| **T1 store**：`observations.meta_json` 由单键升级为结构化 `evidenceMeta{proposal_eligible, fidelity, adapter}`；旧行（无新键）按空 `Fidelity` 兼容，`ProposalEligible` 语义不变。 | **Task 级 closeout**：提案，**规则已裁决**（§13.1：默认显式收工、启发式只提醒、Stop 只是 Turn 级），代码**无实现**；P0 仅完成 Trae Stop 字段映射。 |
+| **T2 evidence**：`Engine.Capture` 透传 `Fidelity / Adapter` 到 `EvidenceCaptureInput`（`Adapter` 由 `Harness` 承载，写入 `meta_json.adapter`），`toRef` 填 `Ref.Fidelity`；归档 `segmentRecord` 与 `ParserVersion` 一字未改。 | |
 | **T3 proposal**：`internal/proposal/parse.go` 的 `proposalEligible` 是唯一准入判定源（full / summary / 空值可提案，pointer / none / 未知值 fail-closed）；`BuildPrompt` 按 `ProposalPayloadRunes = 400` 有界投影；`executor` 与 `runner` 的 `countEligible` / `bundleSession` 统一复用该函数。 | |
 | **T4 adapter**：`cmd/mem/hook.go` 的 `hookInput` 补 `last_assistant_message` / `text_content`；`observationText` 不再把 `"stop"` 事件名当正文，按内容标注 `Fidelity`（有正文 full / summary，无正文 none）。 | |
+| **适配器映射表（本波 T1）**：`cmd/mem/adapters.go` 的 `adapterTable` 按宿主规范名分派字段映射（`claude` / `traecode` / `traework`，别名经 `harness.Get` 归一；未知宿主走 `defaultAdapter`）。每项只描述「去哪取字段」（`stopReply` 优先级列表、`toolInput` / `toolOutput`、`allowMetaSummary`），Fidelity 判定仍统一在 `observationText`；`cmd/mem/adapters_test.go` 提供每家分派 / 字段映射 / 新增宿主只加表项的 fixture 测试。**不新建 `CaptureEvent` 第四层契约。** | |
+| **灰度开关（本波 T2）**：`cmd/mem/distill_hook.go:69` 的 `proposalHookEnabled(host)` 让 `MEM_PROPOSAL_HOOK` 接受逗号分隔宿主名单（如 `MEM_PROPOSAL_HOOK=traecode`），宿主名两侧都经 `normalizeHarness` 归一到规范名；`1` / `all` / `on` 仍为全量。**默认值未改**：未设置 / 空 / `0` → 旧规则蒸馏。 | |
 
 ## 0. 关键决策（待复核）
 
@@ -96,8 +99,8 @@ v2mem 不拥有过程产物的正文，也不回写源文件。否则 harness �
 > 的 `RawEvent` / `Ref`（W0 冻结，append `Fidelity`）；适配器身份不由独立字段承载，而是用
 > `RawEvent.Harness` / `Ref.Harness` 承载、写入 `observations.meta_json.adapter`
 > （`evidenceMeta.adapter`，T2 由 `Engine.Capture` 把 `Harness` 赋给 `Adapter`）。下面的
-> `CaptureEvent` 结构与 4.2 事件枚举仍是「独立适配器层」的设计意图（见头部对照表右栏），
-> 不代表已落库字段。
+> `CaptureEvent` 结构与 4.2 事件枚举只作设计意图阅读：适配器已按 §7 的**字段映射表**落地，
+> 并不存在这个结构体；`closeout` 一行是已裁决但**未实现**的事件类型（§13.1）。
 >
 > `Fidelity` 是 `evidence.Fidelity`，**只允许 `full / summary / pointer / none` 四个常量**；
 > 未知字面量在准入层一律按 `FidelityNone` 处理（由 `internal/proposal.proposalEligible` 的
@@ -212,19 +215,33 @@ type CaptureEvent struct {
 
 ## 7. 适配器层
 
+> **状态（本波 T1 已落地）**：「独立适配器层」不再是提案，但落地形态与 §4 的 `CaptureEvent` 草案不同：
+> 实现是 `cmd/mem/adapters.go` 的**字段映射表 + 每家 fixture 测试**，不是新建第四层契约。
+> `adapterTable` 以宿主规范名为 key（`claude` / `traecode` / `traework`），每项只回答「去哪个字段取正文」；
+> Fidelity 判定、去重、落库仍走 `hookInput → observationText → evidence.RawEvent` 原链路。
+> 因此这里说的「适配器」= 一次表查找，`CaptureEvent` 结构仍只作设计意图阅读。
+
 ### 7.1 职责
 
 适配器只做三件事：
 
 1. 识别本 harness 的事件；
-2. 把原生载荷翻译成 `CaptureEvent`；
-3. 声明本 harness 可扫描的 artifact 路径。
+2. 把原生载荷翻译成统一事件（实现上是 `hookInput` 的字段映射，见 §7.2）；
+3. 声明本 harness 可扫描的 artifact 路径（路径清单仍属提案，未实现）。
 
-核心写侧不读 `stdin` 原始 JSON，也不判断「这是 Trae 还是 WorkBuddy」。
+核心写侧不读 `stdin` 原始 JSON，也不判断「这是 Trae 还是 WorkBuddy」。新增宿主 = `adapterTable` 加一行 + 一份 fixture，核心分支不动；`TestAdapterNewHarnessOnlyNeedsTableEntry` 就是这条约束的回归护栏。
 
-### 7.2 Trae 映射示例
+### 7.2 映射表（已落地）
 
-| 原生事件 | CaptureEvent.Kind | Fidelity | 取值 |
+| 宿主（规范名） | `stopReply` 取值优先级 | `tool_input` / `tool_output` | `allowMetaSummary` |
+|:---|:---|:---|:---|
+| `traecode` / `traework` | `last_assistant_message` → `text_content` | 默认字段 | 是 |
+| `claude` | 空（最终回复走 transcript，stdin 不带） | 默认字段 | 是（无正文时落到 `status` / `reason` 摘要） |
+| 未知 / 空 harness | 同 `defaultAdapter`（保守默认，保持本波之前行为） | 默认字段 | 是 |
+
+Trae 系的字段语义：
+
+| 原生事件 | 事件类型 | Fidelity | 取值 |
 |:---|:---|:---|:---|
 | `SessionStart` | `session.start` | `none` / `summary` | 无正文时 `none` |
 | `UserPromptSubmit` | `user.prompt` | `full` | `prompt` |
@@ -236,16 +253,16 @@ type CaptureEvent struct {
 
 ### 7.3 一致性测试
 
-每个适配器必须通过同一套 fixture 测试：
+每个适配器必须通过同一套 fixture 测试（当前落在 `cmd/mem/adapters_test.go`，表驱动）：
 
 - 必填字段齐全；
 - `Fidelity` 与 `Payload` 自洽：`full/summary` 必须有正文，`pointer` 必须有 `SourceRef`，`none` 必须为空；
-- Turn 级事件必须有 `TurnID`；
+- Turn 级事件必须有 `TurnID`（`hookInput` 的 `session_id` + 轮次身份；transcript 侧用 `HostUID`）；
 - 同一会话两次不同 Stop 产生两个不同事件身份；
 - 未知字段被忽略而不是导致整条事件丢失；
 - 缺字段时显式降级为 `none`，日志里能看到缺口。
 
-测试夹具放 `testdata/capture/<harness>/`，表驱动；新增 harness 先加夹具再接代码。
+fixture 用构造的 `hookInput` 直接跑 `observationText`，不依赖真实 stdin；新增 harness 先加 fixture 再接代码。
 
 ## 8. artifact 无侵入扫描（C 层）
 
@@ -290,6 +307,40 @@ type CaptureEvent struct {
 **价值假设**：artifact 扫描能补上 hook 覆盖不到的历史与无 hook 工具，让「源头」不止于实时事件。
 
 **判据**：连续两周扫描，若产生的候选采纳率长期趋近 0，或噪声/重复占比过高，则收窄路径清单或停掉该层；不要无限期维护一个只产生垃圾的扫描器。
+
+#### 8.5.1 本轮价值验证结论（2026-11 实测，临时库，未触碰 `~/.v2mem`）
+
+`mem scan` **无实现**，因此无法直接测扫描器本身。本轮用**现成命令** `import-transcript`（C/D 补偿层，
+与 scan 同属「把既有 artifact 变成证据」的链路）做一次最小真实验证，测的是同一个价值假设：
+**把 artifact 直接喂进证据/候选链路，产出的东西值不值得留下。**
+
+- fixture：`mktemp -d` 下单个 JSONL 共 3 行（1 条 user prompt、1 条 assistant 正文、1 条带原始 JSON
+  载荷的 `tool_result`，载荷为 `{"level":"error","msg":"permission denied",...}`）；**未提交**，用完删除。
+- 命令：`go run ./cmd/mem import-transcript -file <tmp>/x.jsonl -db <tmp>/probe.db --into both -json`
+
+| 指标 | 实测 | 说明 |
+|:---|:---|:---|
+| observation 条数 | 3 | 3 行全部入库，`meta_json.fidelity` 均为 `full` |
+| 候选条数 | 2 | 规则蒸馏产出（`source=distill`, `status=pending`） |
+| 载荷残留 | **1 / 2 = 50%** | 候选正文是 `tool_result {"level":"error",...}` 的原始 JSON，未提炼成事实 |
+| 重复率 | **0 / 2 = 0%** | 同文件二次导入 `duplicate=3`、新增候选 0，身份幂等成立 |
+| 可采纳候选 | **0 / 2** | 另一条是把用户提问「排查 go test 失败根因」判成 `pitfall`，属噪声。**该列为人工判读，非脚本判定**，不参与门禁 |
+
+对照（`--dry-run` 同参数）：`{"observations":3,"written":3,"duplicate":0,"candidates":0,"dry_run":true}`。
+观测计数与非 dry-run 一致（3 = 3）；`candidates` 为 0 是**设计如此**——`import_transcript.go` 里蒸馏
+分支带 `&& !*dry`，dry-run 不跑蒸馏，故该字段不可用于对照。
+
+**结论：当前不值得写 `mem scan`。** 理由不是「扫描没价值」，而是这次测出的瓶颈不在覆盖面，而在准入：
+原始工具载荷（`tool_result` 的 JSON）以 `fidelity=full` 直通候选，重复率已经不构成问题（0%），
+噪声来自「什么内容算事实」这一步，扫描器只会把同样的噪声按更高吞吐复制一遍。
+
+- **判死条件**：在准入收窄（工具载荷不得直出候选）之前，`mem scan` 不启动；若强行实现，以「候选
+  残留率 > 20%」或「可采纳候选 < 20%」为停止线。
+- **重新评估条件**：① 准入层能区分「工具载荷 / 事实陈述」并通过回归测试；② 有一个 hook 覆盖不到的
+  真实历史语料（非合成 fixture）可测，且人工标注的可采纳率 ≥ 30%。两条同时满足再重开 P2。
+
+现在要做的替代动作不是扫描器，而是给 `recordEvidence` / `proposalEligible` 补一条「工具载荷不是
+事实」的判定（见 §13.2 仍开放项），属后续提案。
 
 ## 9. 事实源与查询源
 
@@ -336,12 +387,13 @@ type CaptureEvent struct {
 |:---|:---|:---|:---|
 | P0 捕获止血 | Trae Stop 字段映射（本轮范围）；任务收尾写入规则、巡检 R4/R5 内容判据仍属后续 | **已完成**（Trae 字段映射）：`786cf22` → `9911f60`（T4） | 同会话两次 Stop 不再折叠；实质会话写侧 > 0 |
 | P1 契约化 / 保真度 | W0 冻结 `Fidelity` 契约 + T1 `meta_json` 结构化 + T2 Engine 透传 + T3 提案准入与 400 字投影 | **已完成**：`51075ed` → `cdeca96`（W0/T1/T2/T3，含 `4e48849` / `2c88424` / `e549b14` 各合并点） | 契约 append-only、归档哈希不变、`proposalEligible` 单一判定、旧行兼容 |
-| P2 扫描 spike | 手动 `mem scan`，只读、有界、幂等 | **待办（提案）** | 能补历史缺口；重复扫描 0 新增；不写 memories |
-| P3 扩展 | 其他 harness 适配器；快照与保留期 | **待办（提案）** | 新 harness 只加适配器与夹具，不改核心 |
+| P1.5 适配器与灰度 | 适配器字段映射表（`cmd/mem/adapters.go`）+ 每家 fixture；`MEM_PROPOSAL_HOOK` 宿主名单灰度 | **已完成**：`ddb18fd`（T1 映射表）、`9ceadb7`（T2 灰度名单，默认值未改） | 新增宿主只加表项；默认仍走旧规则蒸馏 |
+| P2 扫描 spike | 手动 `mem scan`，只读、有界、幂等 | **不启动（价值已验证为「当前不值得写」）**：2026-11 实测见 §8.5.1，重建条件与判死线同节 | 重启前须先收窄准入；重复扫描 0 新增；不写 memories |
+| P2.5 任务收尾 | `closeout` 显式收工 | **规则已裁决、无实现**：§13.1 | 触发方式为 MCP / CLI / skill 显式调用；启发式只提醒 |
+| P3 扩展 | 其他 harness 适配器；快照与保留期 | **部分落地**：映射表已支持 `claude` / `traecode` / `traework`；artifact 路径清单与快照仍为提案 | 新 harness 只加适配器与夹具，不改核心 |
 
-P0 的「任务收尾写入规则 / 巡检判据」与 P1 原列的「抽 `CaptureEvent` + 独立适配器层 + 一致性夹具」
-本轮未纳入，分别归入头部对照表右栏（Task 级 closeout / 独立适配器层抽象）与 P3；
-本轮 P1 以「W0 冻结契约 + 保真度链路」这一等价实现路径完成。
+P0 的「任务收尾写入规则 / 巡检判据」与 P1 原列的「抽 `CaptureEvent` + 独立适配器层 + 一致性夹具」：
+适配器部分已由 P1.5 的映射表 + fixture 等价落地（不新建第四层契约）；任务收尾写入规则归入 P2.5。
 P0 的详细修复项见本次诊断结论；本文只锁定架构边界。
 
 ## 12. 验收判据
@@ -352,11 +404,56 @@ P0 的详细修复项见本次诊断结论；本文只锁定架构边界。
 4. artifact 扫描重复执行 0 新增；只写 `observations` / `candidates`。
 5. 实质会话结束后，写侧活动 > 0；`mem eval activity` 不再长期显示「只查未记」。
 6. 巡检能对「Stop 有载荷但摘要为裸事件名」报 WARN/FAIL。
-7. artifact 扫描若两周采纳率趋近 0，按判死规则收窄或停用。
+7. artifact 扫描若两周采纳率趋近 0，或实测载荷残留 > 20%，按判死规则收窄或停用（当前结论见 §8.5.1）。
 
 ## 13. 开放问题
 
-- **任务边界**：closeout 由模型显式调用，还是用启发式（如 Stop 后出现决策/根因关键词）自动触发？默认显式，启发式只做提醒。
+### 13.1 已裁决：任务边界与「谁有权喊收工」
+
+> 本节只裁决**规则**。`closeout` **当前无任何实现**（无 `mem closeout` 子命令、无对应 MCP 工具、
+> 无 skill 调用）；下面出现的命令 / 工具形态都是**建议形态、尚未实现**，不得按已可用阅读。
+
+**裁决一：默认显式收工。** 任务结束必须由一次显式动作声明，而不是由系统猜：
+
+- 建议形态（均未实现）：CLI `mem closeout --session <sid> [--summary <text>]`；MCP 工具 `closeout`；
+  skill 在任务收尾时调用上述之一。三者应是同一条写入路径的不同入口，产出 `closeout` 事件（§4.2）。
+- 显式动作的语义边界：`closeout` 只产出 **Task 级** 产物（candidate，`source=closeout`）；
+  它**不直接写 `memories`**，升格仍要显式 `accept`（§5、§8.3 的同一原则）。
+
+**裁决二：启发式只做提醒，绝不自动触发。** 长时间静默、连续多轮无写入、Stop 后出现「根因 / 决策」
+关键词等信号，只能产出**提醒或候选提示**（例如在 hook 输出里加一行提示、或标记 `meta.closeout_hint=1`），
+**不得**自动判定收工、不得自动触发 Proposal、不得凭启发式写候选。理由：这些信号在采集侧不可证伪，
+误判成本直接落在记忆库上。
+
+**裁决三：`Stop` / `SessionEnd` 仍只是 Turn 级。** `Stop` = 「这一轮回复结束」，`SessionEnd` = 「会话结束」，
+两者**都不等于任务边界**。事件类型上 `assistant.final`（Turn）与 `closeout`（Task）互不替代、互不推导。
+Trae 一次任务跨多个 Stop 是常态，不能把第 N 个 Stop 当收工。
+
+**裁决四：与 Hook 默认值的上下游关系（默认值一律不动）。**
+
+- Hook 默认仍是**旧规则蒸馏**：`maybeSpawnDistill` 先要求 `MEM_DISTILL_SPAWN == "1"`，否则直接返回；
+  该变量**默认关闭**。开关打开后，`proposalHookEnabled(host)` 决定走 `--proposal` 还是
+  `--session <sid> --provider none`，其默认（未设置 / 空 / `0`）为 **false**，且名单灰度只影响
+  「哪些宿主进 Proposal」，不改变默认值。
+- `closeout` 是**独立于 Hook 开关的显式动作**：它由 MCP / CLI / skill 主动调用，不依赖
+  `MEM_DISTILL_SPAWN`，也不依赖 `MEM_PROPOSAL_HOOK`。
+- `closeout` 落地后，**也不**把 Hook 默认值改成「自动启用 Proposal」。二者的关系是单向补充，
+  不是替换：Hook 负责 Turn 级 observation，closeout 负责 Task 级候选。
+- 完整链路：**谁触发 closeout**（人或 Agent 在任务收尾显式调用 MCP 工具 / CLI 子命令 / skill）
+  → **closeout 触发什么**（写一条 `closeout` 证据 + 一个 Task 级 candidate，不做别的）
+  → **什么情况下才会拉起 Proposal**（仅当 `MEM_DISTILL_SPAWN=1` 且 `proposalHookEnabled(host)` 为真、
+  且存在 `session_id` 时由 Stop / SessionEnd 触发；与 closeout 无因果关系）。
+
+### 13.2 仍开放
+
+- **工具载荷准入**：`recordEvidence`（`cmd/mem/observe.go:479`）对已解析的 `tool_result` 默认标
+  `fidelity=full` 且 `ProposalEligible=true`，例外只有两类：`unparsed` 行降 `pointer` 且不可提案；
+  `isPipelineTool(name)`（`observe.go:185`）命中则**只关掉 `ProposalEligible`**（fidelity 仍 `full`）。
+  该判定只认流水线工具名（含 `v2mem`、`toolsearch` / `tool_search` / `search_tools` / `list_mcp_*` /
+  `read_mcp_*`，以及 `*mem` / `*memory` 服务下的记忆类工具，外加 `recall_context`），
+  因此**只挡流水线工具，不挡普通工具载荷**：bash / read 这类 `tool_result` 的原始 JSON 依旧 full + 可提案，
+  §8.5.1 的 50% 残留成因而保持不变。需决定：按事件类型 / 普通工具名继续收窄，
+  还是引入「事实陈述 vs 原始载荷」的判定层。
 - **artifact 稳定性**：哪些路径是稳定契约，哪些是内部实现（如 Trae `hub_event_cache`、加密 `database.db`）？只把稳定路径写进清单。
 - **快照保留**：是否需要不可变快照？保留多久？如何删除？
 - **跨来源去重**：A 层与 C 层同时看到同一内容时，按 `source_ref` 合并的边界在哪？
