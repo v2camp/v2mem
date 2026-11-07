@@ -42,12 +42,6 @@ const (
 	transcriptToolMemory = 128
 )
 
-// memoryToolNames 是 mem 自己暴露的 MCP 工具名。这些工具产生的流量是管道事件：
-// 照常归档，但不能拿来生成新 Proposal（否则会自蒸馏）。
-var memoryToolNames = map[string]bool{
-	"search": true, "add": true, "ls": true, "touch": true, "recall_context": true,
-}
-
 // spoolMaxSegments 是单个会话的 spool 段数上限。旧实现按单文件体量设限；
 // 段式 spool 的风险变成「文件数无限增长」，所以按段数守。
 // 变量而非常量只为让测试能把上限压到可测规模。
@@ -178,33 +172,6 @@ func observationText(event harness.Event, in hookInput, noScrub bool, hname ...s
 	return truncateRunes(scrub.Apply(b.String(), noScrub), observeRawMaxRunes), fidelity
 }
 
-// isPipelineTool 判定一次工具调用是否属于“记忆系统自身的管道流量”。
-//
-// 这类事件必须归档（否则丢失真实操作史），但不得作为 Proposal 的种子：
-// 记忆工具的输出会包含记忆正文，自蒸馏会把库里的东西再写回库里。
-func isPipelineTool(name string) bool {
-	n := strings.ToLower(strings.TrimSpace(name))
-	if n == "" {
-		return false
-	}
-	if strings.Contains(n, "v2mem") {
-		return true
-	}
-	switch n {
-	case "toolsearch", "tool_search", "listmcpresources", "list_mcp_resources",
-		"listmcpresourcestool", "readmcpresource", "read_mcp_resource",
-		"readmcpresourcetool", "list_mcp_tools", "search_tools":
-		return true
-	}
-	if i := strings.LastIndex(n, "__"); i > 0 {
-		server, tool := n[:i], n[i+2:]
-		if strings.HasSuffix(server, "mem") || strings.HasSuffix(server, "memory") {
-			return memoryToolNames[tool]
-		}
-	}
-	return n == "recall_context"
-}
-
 func observeSourceID(hname, sessionID string) string {
 	return "hook:" + orUnknown(hname, "unknown") + ":" + orUnknown(sessionID, "unknown")
 }
@@ -317,13 +284,16 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 	source := observeSourceID(hname, sid)
 	text, fidelity := observationText(event, in, noScrub, hname)
 	ev := evidence.RawEvent{
-		SourceID:         source,
-		SessionID:        sid,
-		Project:          project,
-		Harness:          hname,
-		EventType:        string(event),
-		OccurredAtNS:     started.UnixNano(),
-		ProposalEligible: event != harness.EventPostToolUse || !isPipelineTool(in.ToolName),
+		SourceID:     source,
+		SessionID:    sid,
+		Project:      project,
+		Harness:      hname,
+		EventType:    string(event),
+		OccurredAtNS: started.UnixNano(),
+		// 工具输出是 artifact，不是事实陈述；事实来自用户提问与助手回复。
+		// 所以 PostToolUse 一律不进提案（不再按工具名区分）——R9 巡检里 20 条
+		// pending 候选都是 transcript 原始 JSON，根因就是这里放行了普通工具载荷。
+		ProposalEligible: event != harness.EventPostToolUse,
 		EventUID:         observeHostUID(in, event, source),
 		Fidelity:         fidelity,
 		Raw:              []byte(text),
@@ -500,16 +470,20 @@ func recordEvidence(source, sid, project, hname, path string, rec transcript.Rec
 	if rec.Unparsed {
 		fidelity = evidence.FidelityPointer
 	}
+	// 工具输入/输出是 artifact，不是事实陈述；事实只来自用户提问与助手回复。
+	// tool-use / tool-result 行一律不进提案（R9 残留的 transcript 原始 JSON
+	// 就是这两类行，根因在准入而不在蒸馏）；unparsed 行语义未解析，同样不进。
+	eligible := rec.EventType != transcript.EventToolUse &&
+		rec.EventType != transcript.EventToolResult && !rec.Unparsed
 	return evidence.RawEvent{
-		EventUID:     uid,
-		SourceID:     source,
-		SessionID:    sid,
-		Project:      project,
-		Harness:      hname,
-		EventType:    rec.EventType,
-		OccurredAtNS: rec.OccurredAtNS(),
-		// unparsed 行只是把原文保住，语义未解析出来，绝不能进 Proposal。
-		ProposalEligible: !isPipelineTool(name) && !rec.Unparsed,
+		EventUID:         uid,
+		SourceID:         source,
+		SessionID:        sid,
+		Project:          project,
+		Harness:          hname,
+		EventType:        rec.EventType,
+		OccurredAtNS:     rec.OccurredAtNS(),
+		ProposalEligible: eligible,
 		Fidelity:         fidelity,
 		Raw:              []byte(text),
 	}

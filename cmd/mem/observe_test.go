@@ -13,6 +13,7 @@ import (
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/evidence"
 	"github.com/v2camp/v2mem/internal/store"
+	"github.com/v2camp/v2mem/internal/transcript"
 )
 
 func hookJSON(t *testing.T, fields map[string]any) string {
@@ -736,29 +737,34 @@ func TestObserveStopKeepsUnparsedTranscriptLine(t *testing.T) {
 	check(1)
 }
 
-// 记忆工具自身与 MCP 管道事件照常归档，但不得作为 Proposal 的种子。
-func TestObservePipelineToolsArchivedButIneligible(t *testing.T) {
+// 工具输出是 artifact，不是事实陈述：PostToolUse 一律不进提案（不按工具名区分）。
+// 归档与保真度不变：有载荷 full、只有工具名 summary。R9 根因回归。
+func TestObservePostToolUseNeverProposalEligible(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
 	cases := []struct {
+		name     string
 		tool     string
-		eligible bool
+		input    map[string]any
+		fidelity string
 	}{
-		{"mcp__v2mem__search", false},
-		{"ToolSearch", false},
-		{"ListMcpResources", false},
-		{"Bash", true},
+		{"普通工具带 JSON 载荷", "Bash", map[string]any{"command": "echo R9_PAYLOAD"}, string(evidence.FidelityFull)},
+		{"管道工具带载荷", "mcp__v2mem__search", map[string]any{"query": "x"}, string(evidence.FidelityFull)},
+		{"只有工具名", "ToolSearch", nil, string(evidence.FidelitySummary)},
 	}
-	for _, tc := range cases {
-		in := hookJSON(t, map[string]any{
+	for i, tc := range cases {
+		fields := map[string]any{
 			"hook_event_name": "postToolUse", "cwd": proj, "session_id": "pipe-sess",
-			"tool_name": tc.tool, "event_id": "evt-" + tc.tool,
-			"tool_input": map[string]any{"command": "echo pipe"},
-		})
+			"tool_name": tc.tool, "event_id": "evt-" + strconv.Itoa(i),
+		}
+		if tc.input != nil {
+			fields["tool_input"] = tc.input
+		}
+		in := hookJSON(t, fields)
 		if _, err := withStdin(t, in, func() error {
 			return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
 		}); err != nil {
-			t.Fatalf("%s: %v", tc.tool, err)
+			t.Fatalf("%s: %v", tc.name, err)
 		}
 	}
 	st, err := store.Open(db)
@@ -767,18 +773,81 @@ func TestObservePipelineToolsArchivedButIneligible(t *testing.T) {
 	}
 	defer st.Close()
 	src := observeSourceID("claude", "pipe-sess")
-	for _, tc := range cases {
-		rec, ok, err := st.LookupEvidence(src+":event:evt-"+tc.tool, src, 0, 0)
+	for i, tc := range cases {
+		uid := src + ":event:evt-" + strconv.Itoa(i)
+		rec, ok, err := st.LookupEvidence(uid, src, 0, 0)
 		if err != nil || !ok {
-			t.Fatalf("%s 应被归档: ok=%v err=%v", tc.tool, ok, err)
+			t.Fatalf("%s 应被归档: ok=%v err=%v", tc.name, ok, err)
 		}
-		if rec.ProposalEligible != tc.eligible {
-			t.Errorf("%s ProposalEligible=%v want %v", tc.tool, rec.ProposalEligible, tc.eligible)
+		if rec.ProposalEligible {
+			t.Errorf("%s: 工具载荷不得进提案", tc.name)
+		}
+		if rec.Fidelity != tc.fidelity {
+			t.Errorf("%s: Fidelity=%q want %q", tc.name, rec.Fidelity, tc.fidelity)
 		}
 	}
 	obs, err := st.ListObservations("pipe-sess", 10)
 	if err != nil || len(obs) != len(cases) {
-		t.Fatalf("管道事件不得被丢弃，got %d err=%v", len(obs), err)
+		t.Fatalf("工具事件不得被丢弃，got %d err=%v", len(obs), err)
+	}
+}
+
+// transcript 侧同口径：tool-result 行一律不进提案；用户提问与助手回复仍可提案
+// （防止收窄过头把对话正文也挡掉）；unparsed 仍 pointer + 不可提案。
+func TestObserveTranscriptProposalEligibility(t *testing.T) {
+	const (
+		src  = "transcript:claude:tx-admission"
+		path = "/tmp/tx-admission.jsonl"
+	)
+	tools := map[string]string{"toolu_bash": "Bash"}
+	cases := []struct {
+		name     string
+		rec      transcript.Record
+		fidelity evidence.Fidelity
+		eligible bool
+	}{
+		{
+			name:     "tool-result/普通工具",
+			rec:      transcript.Record{EventType: transcript.EventToolResult, ToolID: "toolu_bash", Text: "tool_result"},
+			fidelity: evidence.FidelityFull,
+			eligible: false,
+		},
+		{
+			name:     "tool-use/普通工具（工具输入也是 artifact）",
+			rec:      transcript.Record{EventType: transcript.EventToolUse, ToolID: "toolu_bash", ToolName: "Bash", Text: `tool:Bash\n{"command":"ls"}`},
+			fidelity: evidence.FidelityFull,
+			eligible: false,
+		},
+		{
+			name:     "user prompt",
+			rec:      transcript.Record{EventType: transcript.EventUserPrompt, Text: "需求：把证据写全"},
+			fidelity: evidence.FidelityFull,
+			eligible: true,
+		},
+		{
+			name:     "assistant text",
+			rec:      transcript.Record{EventType: transcript.EventAssistantText, Text: "结论：按事件类型收窄准入"},
+			fidelity: evidence.FidelityFull,
+			eligible: true,
+		},
+		{
+			name:     "unparsed",
+			rec:      transcript.Record{EventType: transcript.EventUnparsed, Text: "RAW_MARKER", Unparsed: true},
+			fidelity: evidence.FidelityPointer,
+			eligible: false,
+		},
+	}
+	for _, tc := range cases {
+		ev := recordEvidence(src, "tx-admission", "demo", "claude", path, tc.rec, tools, false)
+		if ev.ProposalEligible != tc.eligible {
+			t.Errorf("%s: ProposalEligible=%v want %v", tc.name, ev.ProposalEligible, tc.eligible)
+		}
+		if ev.Fidelity != tc.fidelity {
+			t.Errorf("%s: Fidelity=%q want %q", tc.name, ev.Fidelity, tc.fidelity)
+		}
+		if len(ev.Raw) == 0 {
+			t.Errorf("%s: 原文仍须归档", tc.name)
+		}
 	}
 }
 
