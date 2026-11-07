@@ -179,23 +179,26 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 ### 8.1 灰度开关
 
-两条路径受**不同**变量约束，不是「缺一不生效」的统一开关：
+`MEM_DISTILL_SPAWN=1` 是**所有**蒸馏子进程的总闸（`distillSpawnEnabled`，`cmd/mem/distill_hook.go:96`）；
+`MEM_PROPOSAL_HOOK` 只决定「拉起的是 Proposal 还是旧规则蒸馏」。两者**缺一不生效**：
 
 | 路径 | 入口 | 受 `MEM_DISTILL_SPAWN` 约束 | 走 Proposal 的条件 |
 |:---|:---|:---|:---|
-| Stop / SessionEnd | `maybeSpawnDistill`（`cmd/mem/distill_hook.go:95`） | **是**：第 96 行先判 `!= "1"`，未设直接返回、什么都不做 | `MEM_DISTILL_SPAWN=1` **且** `proposalHookEnabled(host)` 为真 |
-| SessionStart | `distillPendingFailOpen`（`distill_hook.go:146`） | **否**：只判 `MEM_NO_DISTILL`（`:147`） | `proposalHookEnabled(host)` 为真即**拉 Proposal 子进程**（`:150`）；否则内联跑旧规则 `--pending`（200ms 上限） |
+| Stop / SessionEnd | `maybeSpawnDistill`（`distill_hook.go:102`） | **是**：`:103` 先判 gate，未设直接返回、什么都不做 | `MEM_DISTILL_SPAWN=1` **且** `proposalHookEnabled(host)` 为真 |
+| SessionStart | `distillPendingFailOpen`（`distill_hook.go:158`） | **是**：`:162` 要求 gate 与名单同时成立 | 同上；否则**继续往下**内联跑旧规则 `--pending`（200ms 上限，受 `MEM_NO_DISTILL` 约束） |
 
-- `MEM_DISTILL_SPAWN` 的语义：**只 gate Stop / SessionEnd 的蒸馏子进程**（未设 = 这两条路径不做事）。
-- `MEM_PROPOSAL_HOOK` 的语义：决定走 Proposal 还是旧规则蒸馏，未设 / 空 / `0` = 旧规则（默认未变），取值见 8.2。
+- `MEM_DISTILL_SPAWN` 未设 / 非 `1` → Stop / SessionEnd 与 SessionStart 都不拉子进程，SessionStart 退回内联旧规则——这是**默认**。
+- `MEM_PROPOSAL_HOOK` 未设 / 空 / `0` → 全部走旧规则蒸馏，取值见 8.2。
+- SessionStart 在 gate 不成立时**不是静默跳过**：内联旧规则仍会蒸馏 pending 会话，所以不会丢蒸馏。
 
-**运维结论：灰度期必须两个都设**（`MEM_DISTILL_SPAWN=1` + `MEM_PROPOSAL_HOOK=<宿主>`）。
-只设 `MEM_PROPOSAL_HOOK` 会出现**半开状态**：SessionStart 已走 Proposal，Stop / SessionEnd 什么都不做，
-观察窗口里只拿到开场侧的数据，R1 的 proposal 事件时有时无，§8.7 的转正判据无法判定。
+**运维结论：灰度期两个都设**（`MEM_DISTILL_SPAWN=1` + `MEM_PROPOSAL_HOOK=<宿主>`）。
+只设 `MEM_PROPOSAL_HOOK` 时三条路径全部不动（等于什么都没开），不会出现「半开」——
+但也不会产生任何 Proposal 数据，观察期白跑。
 
-> **已知不一致（待裁决）**：变量名字面是「允许拉起蒸馏子进程」，但 SessionStart 的 Proposal 分支
-> 不受它约束（`distill_hook.go:150`）。是否把该分支也纳入 gate 属于一条**行为变更**，尚未裁决；
-> 本节只记录现状，不预告改动。
+> 口径变更记录：本节在 `6ed7e8b` 之前写的是「SessionStart 不受 gate 约束」。该不一致已在
+> `6ed7e8b` 修复（`distillPendingFailOpen` 纳入同一 gate），现在两个变量是真正的「缺一不生效」。
+> **升级影响**：只配了 `MEM_PROPOSAL_HOOK` 而未配 `MEM_DISTILL_SPAWN` 的宿主，SessionStart 会从
+> 「拉 Proposal 子进程」退回「内联旧规则」——Proposal 观察数据归零而不是补齐，需按上表两变量同设。
 
 ### 8.2 `MEM_PROPOSAL_HOOK` 取值语义（已裁决）
 

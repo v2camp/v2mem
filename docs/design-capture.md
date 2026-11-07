@@ -20,6 +20,8 @@
 | **T4 adapter**：`cmd/mem/hook.go` 的 `hookInput` 补 `last_assistant_message` / `text_content`；`observationText` 不再把 `"stop"` 事件名当正文，按内容标注 `Fidelity`（有正文 full / summary，无正文 none）。 | |
 | **适配器映射表（本波 T1）**：`cmd/mem/adapters.go` 的 `adapterTable` 按宿主规范名分派字段映射（`claude` / `traecode` / `traework`，别名经 `harness.Get` 归一；未知宿主走 `defaultAdapter`）。每项只描述「去哪取字段」（`stopReply` 优先级列表、`toolInput` / `toolOutput`、`allowMetaSummary`），Fidelity 判定仍统一在 `observationText`；`cmd/mem/adapters_test.go` 提供每家分派 / 字段映射 / 新增宿主只加表项的 fixture 测试。**不新建 `CaptureEvent` 第四层契约。** | |
 | **灰度开关（本波 T2）**：`cmd/mem/distill_hook.go:69` 的 `proposalHookEnabled(host)` 让 `MEM_PROPOSAL_HOOK` 接受逗号分隔宿主名单（如 `MEM_PROPOSAL_HOOK=traecode`），宿主名两侧都经 `normalizeHarness` 归一到规范名；`1` / `all` / `on` 仍为全量。**默认值未改**：未设置 / 空 / `0` → 旧规则蒸馏。 | |
+| **spawn gate 一致化**：`distillSpawnEnabled()`（`distill_hook.go:96`）成为所有蒸馏子进程的总闸，`distillPendingFailOpen`（SessionStart）与 `maybeSpawnDistill`（Stop / SessionEnd）共用同一判定；`MEM_DISTILL_SPAWN` 未设时三条路径都不拉子进程，SessionStart 退回内联旧规则。 | |
+| **工具载荷准入收窄**：`PostToolUse` 与 transcript 的 `tool-use` / `tool-result` 一律 `ProposalEligible=false`（`observe.go:296` / `:476`），`Fidelity` 不变；旧按工具名判定的 `isPipelineTool` / `memoryToolNames` 已删除。裁决见 §13.2。 | |
 
 ## 0. 关键决策（待复核）
 
@@ -339,8 +341,9 @@ fixture 用构造的 `hookInput` 直接跑 `observationText`，不依赖真实 s
 - **重新评估条件**：① 准入层能区分「工具载荷 / 事实陈述」并通过回归测试；② 有一个 hook 覆盖不到的
   真实历史语料（非合成 fixture）可测，且人工标注的可采纳率 ≥ 30%。两条同时满足再重开 P2。
 
-现在要做的替代动作不是扫描器，而是给 `recordEvidence` / `proposalEligible` 补一条「工具载荷不是
-事实」的判定（见 §13.2 仍开放项），属后续提案。
+> **后续进展（`6ed7e8b` 之后的 `df6afc4`）**：上表 50% 残留是**修复前**的基线。准入已按 §13.2 裁决改为
+> 「工具输入/输出一律不进提案」，因此条件 ① 已满足一半（判定层落地），但条件 ② 仍缺真实语料——
+> **`mem scan` 仍不启动**，结论不变。已有 pending 污染候选需 `mem reject` 清理，否则 R9 仍会读到存量。
 
 ## 9. 事实源与查询源
 
@@ -388,6 +391,7 @@ fixture 用构造的 `hookInput` 直接跑 `observationText`，不依赖真实 s
 | P0 捕获止血 | Trae Stop 字段映射（本轮范围）；任务收尾写入规则、巡检 R4/R5 内容判据仍属后续 | **已完成**（Trae 字段映射）：`786cf22` → `9911f60`（T4） | 同会话两次 Stop 不再折叠；实质会话写侧 > 0 |
 | P1 契约化 / 保真度 | W0 冻结 `Fidelity` 契约 + T1 `meta_json` 结构化 + T2 Engine 透传 + T3 提案准入与 400 字投影 | **已完成**：`51075ed` → `cdeca96`（W0/T1/T2/T3，含 `4e48849` / `2c88424` / `e549b14` 各合并点） | 契约 append-only、归档哈希不变、`proposalEligible` 单一判定、旧行兼容 |
 | P1.5 适配器与灰度 | 适配器字段映射表（`cmd/mem/adapters.go`）+ 每家 fixture；`MEM_PROPOSAL_HOOK` 宿主名单灰度 | **已完成**：`ddb18fd`（T1 映射表）、`9ceadb7`（T2 灰度名单，默认值未改） | 新增宿主只加表项；默认仍走旧规则蒸馏 |
+| P1.6 准入与 gate | 工具载荷一律不进提案（§13.2）；`MEM_DISTILL_SPAWN` 成为所有蒸馏子进程的总闸 | **已完成**：`df6afc4`（合并 `6b552aa`）、`3806cb8`（合并 `6ed7e8b`） | `PostToolUse` / `tool-use` / `tool-result` 不可提案；SessionStart 与 Stop 共用同一 gate |
 | P2 扫描 spike | 手动 `mem scan`，只读、有界、幂等 | **不启动（价值已验证为「当前不值得写」）**：2026-11 实测见 §8.5.1，重建条件与判死线同节 | 重启前须先收窄准入；重复扫描 0 新增；不写 memories |
 | P2.5 任务收尾 | `closeout` 显式收工 | **规则已裁决、无实现**：§13.1 | 触发方式为 MCP / CLI / skill 显式调用；启发式只提醒 |
 | P3 扩展 | 其他 harness 适配器；快照与保留期 | **部分落地**：映射表已支持 `claude` / `traecode` / `traework`；artifact 路径清单与快照仍为提案 | 新 harness 只加适配器与夹具，不改核心 |
@@ -405,8 +409,10 @@ P0 的详细修复项见本次诊断结论；本文只锁定架构边界。
 5. 实质会话结束后，写侧活动 > 0；`mem eval activity` 不再长期显示「只查未记」。
 6. 巡检能对「Stop 有载荷但摘要为裸事件名」报 WARN/FAIL。
 7. artifact 扫描若两周采纳率趋近 0，或实测载荷残留 > 20%，按判死规则收窄或停用（当前结论见 §8.5.1）。
+8. `PostToolUse` 与 transcript 的 `tool-use` / `tool-result` 的 `ProposalEligible` 恒为 `false`；
+   `user-prompt` / `assistant-text` 仍可提案（防止过度收窄的回归线）。
 
-## 13. 开放问题
+## 13. 问题与裁决
 
 ### 13.1 已裁决：任务边界与「谁有权喊收工」
 
@@ -441,19 +447,26 @@ Trae 一次任务跨多个 Stop 是常态，不能把第 N 个 Stop 当收工。
   不是替换：Hook 负责 Turn 级 observation，closeout 负责 Task 级候选。
 - 完整链路：**谁触发 closeout**（人或 Agent 在任务收尾显式调用 MCP 工具 / CLI 子命令 / skill）
   → **closeout 触发什么**（写一条 `closeout` 证据 + 一个 Task 级 candidate，不做别的）
-  → **什么情况下才会拉起 Proposal**（仅当 `MEM_DISTILL_SPAWN=1` 且 `proposalHookEnabled(host)` 为真、
-  且存在 `session_id` 时由 Stop / SessionEnd 触发；与 closeout 无因果关系）。
+  → **什么情况下才会拉起 Proposal**（仅当 `MEM_DISTILL_SPAWN=1` 且 `proposalHookEnabled(host)` 为真：
+  Stop / SessionEnd 由 `maybeSpawnDistill` 按 gate 拉起，SessionStart 由 `distillPendingFailOpen`
+  按同一 gate 拉起 Proposal pending；gate 不成立时 SessionStart 退回内联旧规则，与 closeout 无因果关系）。
 
-### 13.2 仍开放
+### 13.2 已裁决：工具载荷准入（`R9` 根因）
 
-- **工具载荷准入**：`recordEvidence`（`cmd/mem/observe.go:479`）对已解析的 `tool_result` 默认标
-  `fidelity=full` 且 `ProposalEligible=true`，例外只有两类：`unparsed` 行降 `pointer` 且不可提案；
-  `isPipelineTool(name)`（`observe.go:185`）命中则**只关掉 `ProposalEligible`**（fidelity 仍 `full`）。
-  该判定只认流水线工具名（含 `v2mem`、`toolsearch` / `tool_search` / `search_tools` / `list_mcp_*` /
-  `read_mcp_*`，以及 `*mem` / `*memory` 服务下的记忆类工具，外加 `recall_context`），
-  因此**只挡流水线工具，不挡普通工具载荷**：bash / read 这类 `tool_result` 的原始 JSON 依旧 full + 可提案，
-  §8.5.1 的 50% 残留成因而保持不变。需决定：按事件类型 / 普通工具名继续收窄，
-  还是引入「事实陈述 vs 原始载荷」的判定层。
+**裁决：提案只从对话文本抽事实；工具输入/输出是 artifact，只归档与检索，不进提案。**
+
+- 钩子路径 `PostToolUse` **一律** `ProposalEligible=false`（不再按工具名区分，`observe.go:296`）。
+- transcript 路径 `tool-use` / `tool-result` 行**一律** `ProposalEligible=false`；`unparsed` 行仍为 `pointer` 且不可提案（`observe.go:476`）。
+- **`Fidelity` 不变**：钩子侧仍按有无正文给 `full` / `summary`，transcript 侧 `full`（`unparsed` → `pointer`）。
+  归档、`mem search --layer observation` 的可读性不受影响，只是不再作为提案种子。
+- 旧实现按工具名判定（`isPipelineTool` + `memoryToolNames`）只挡流水线工具，挡不住 bash / read 这类普通载荷，
+  §8.5.1 实测 50% 残留即由此而来；该判定已被事件类型规则取代并删除。
+
+代价与非目标：只靠 `PostToolUse` 而无对话正文的畸形宿主会产出 0 候选——按定义它此前产出的也只是工具 JSON。
+存量 pending 污染候选不会自动消失，需 `mem reject` 或等窗口过期。
+
+### 13.3 仍开放
+
 - **artifact 稳定性**：哪些路径是稳定契约，哪些是内部实现（如 Trae `hub_event_cache`、加密 `database.db`）？只把稳定路径写进清单。
 - **快照保留**：是否需要不可变快照？保留多久？如何删除？
 - **跨来源去重**：A 层与 C 层同时看到同一内容时，按 `source_ref` 合并的边界在哪？
