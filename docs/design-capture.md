@@ -324,7 +324,7 @@ fixture 用构造的 `hookInput` 直接跑 `observationText`，不依赖真实 s
 | 候选条数 | 2 | 规则蒸馏产出（`source=distill`, `status=pending`） |
 | 载荷残留 | **1 / 2 = 50%** | 候选正文是 `tool_result {"level":"error",...}` 的原始 JSON，未提炼成事实 |
 | 重复率 | **0 / 2 = 0%** | 同文件二次导入 `duplicate=3`、新增候选 0，身份幂等成立 |
-| 可采纳候选 | **0 / 2** | 另一条是把用户提问「排查 go test 失败根因」判成 `pitfall`，属噪声 |
+| 可采纳候选 | **0 / 2** | 另一条是把用户提问「排查 go test 失败根因」判成 `pitfall`，属噪声。**该列为人工判读，非脚本判定**，不参与门禁 |
 
 对照（`--dry-run` 同参数）：`{"observations":3,"written":3,"duplicate":0,"candidates":0,"dry_run":true}`。
 观测计数与非 dry-run 一致（3 = 3）；`candidates` 为 0 是**设计如此**——`import_transcript.go` 里蒸馏
@@ -446,9 +446,14 @@ Trae 一次任务跨多个 Stop 是常态，不能把第 N 个 Stop 当收工。
 
 ### 13.2 仍开放
 
-- **工具载荷准入**：`recordEvidence` 对已解析的 `tool_result` 一律标 `fidelity=full` 且
-  `ProposalEligible=true`（只有 `unparsed` 降为 `pointer`），§8.5.1 实测因此出现 50% 载荷残留。
-  需决定：按事件类型 / 工具名收窄，还是引入「事实陈述 vs 原始载荷」的判定层。
+- **工具载荷准入**：`recordEvidence`（`cmd/mem/observe.go:479`）对已解析的 `tool_result` 默认标
+  `fidelity=full` 且 `ProposalEligible=true`，例外只有两类：`unparsed` 行降 `pointer` 且不可提案；
+  `isPipelineTool(name)`（`observe.go:185`）命中则**只关掉 `ProposalEligible`**（fidelity 仍 `full`）。
+  该判定只认流水线工具名（含 `v2mem`、`toolsearch` / `tool_search` / `search_tools` / `list_mcp_*` /
+  `read_mcp_*`，以及 `*mem` / `*memory` 服务下的记忆类工具，外加 `recall_context`），
+  因此**只挡流水线工具，不挡普通工具载荷**：bash / read 这类 `tool_result` 的原始 JSON 依旧 full + 可提案，
+  §8.5.1 的 50% 残留成因而保持不变。需决定：按事件类型 / 普通工具名继续收窄，
+  还是引入「事实陈述 vs 原始载荷」的判定层。
 - **artifact 稳定性**：哪些路径是稳定契约，哪些是内部实现（如 Trae `hub_event_cache`、加密 `database.db`）？只把稳定路径写进清单。
 - **快照保留**：是否需要不可变快照？保留多久？如何删除？
 - **跨来源去重**：A 层与 C 层同时看到同一内容时，按 `source_ref` 合并的边界在哪？
