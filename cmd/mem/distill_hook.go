@@ -13,9 +13,11 @@ import (
 
 // startDistillProc 拉起一次性 distill 子进程。测试可替换。
 // 钩子不等待它，也不把候选写进 memories。
+// harness 由调用方逐层传入，供按宿主灰度选择器判定本次是否走 Proposal；
+// 选择器本身不读全局配置、不写文件、不引入包级可变状态。
 var startDistillProc = defaultStartDistill
 
-func defaultStartDistill(db, session string) error {
+func defaultStartDistill(db, session, harness string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -24,7 +26,7 @@ func defaultStartDistill(db, session string) error {
 		return fmt.Errorf("测试二进制不拉起 distill")
 	}
 	args := []string{"distill"}
-	if proposalHookEnabled() {
+	if proposalHookEnabled(harness) {
 		args = append(args, "--proposal", "--executor", "auto", "--max-bundles", "1")
 	} else {
 		args = append(args, "--session", session, "--provider", "none")
@@ -37,26 +39,49 @@ func defaultStartDistill(db, session string) error {
 	return cmd.Start()
 }
 
-// proposalHookEnabled 是旧规则蒸馏与 T2 Proposal 的显式切换点。
-// 默认保持旧行为；设置 MEM_PROPOSAL_HOOK=1 后，Stop/SessionStart 改拉起
-// 基于连续 Evidence Bundle 的 Proposal 路径。默认不在 Hook 内起模型进程。
-func proposalHookEnabled() bool {
-	return strings.TrimSpace(os.Getenv("MEM_PROPOSAL_HOOK")) == "1"
+// proposalHookEnabled 是旧规则蒸馏与 T2 Proposal 的显式切换点，按当前 harness 灰度。
+//
+//   - 未设置 / 空串 / "0" → false：保持旧规则蒸馏（--session <sid> --provider none）。
+//     这是默认值，绝不改变。
+//   - "1" / "all" / "on"（大小写不敏感）→ true：保持既有全量语义。
+//   - 其它值按逗号分隔的 harness 名单匹配（大小写不敏感、去空格），
+//     只有当前 harness 在名单里才 true，例如 MEM_PROPOSAL_HOOK=claude 只对 claude 生效。
+//
+// harness 名由调用方从 --harness 逐层传入；未指定 harness 时名单灰度保守返回 false
+// （回归默认旧行为），全量值不受影响。失败一律 fail-open，不阻断宿主。
+func proposalHookEnabled(harness string) bool {
+	raw := strings.TrimSpace(os.Getenv("MEM_PROPOSAL_HOOK"))
+	if raw == "" || raw == "0" {
+		return false
+	}
+	if strings.EqualFold(raw, "1") || strings.EqualFold(raw, "all") || strings.EqualFold(raw, "on") {
+		return true
+	}
+	harness = strings.TrimSpace(harness)
+	if harness == "" {
+		return false
+	}
+	for _, item := range strings.Split(raw, ",") {
+		if strings.EqualFold(strings.TrimSpace(item), harness) {
+			return true
+		}
+	}
+	return false
 }
 
 // maybeSpawnDistill 在 Stop / SessionEnd 末尾可选地拉起规则蒸馏。
 // 默认不拉起。无 transcript_path 时跳过。失败只打 stderr。
-func maybeSpawnDistill(db string, in hookInput) {
+func maybeSpawnDistill(db string, in hookInput, harness string) {
 	if strings.TrimSpace(os.Getenv("MEM_DISTILL_SPAWN")) != "1" {
 		return
 	}
 	sid := in.sessionID()
-	if proposalHookEnabled() {
+	if proposalHookEnabled(harness) {
 		if sid == "" {
 			fmt.Fprintln(os.Stderr, "v2mem hook: 无 session_id，跳过 proposal")
 			return
 		}
-		if err := startDistillProc(db, sid); err != nil {
+		if err := startDistillProc(db, sid, harness); err != nil {
 			fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 proposal 失败，已放过:", err)
 		}
 		return
@@ -90,19 +115,19 @@ func maybeSpawnDistill(db string, in hookInput) {
 	if !due {
 		return
 	}
-	if err := startDistillProc(db, sid); err != nil {
+	if err := startDistillProc(db, sid, harness); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 distill 失败，已放过:", err)
 	}
 }
 
 // distillPendingFailOpen 在 SessionStart 用规则抽取处理尚未蒸馏的会话。
 // 只用 provider none，有时间上限，失败不阻断注入，不写 memories。
-func distillPendingFailOpen(db, auditPath string) {
+func distillPendingFailOpen(db, auditPath, harness string) {
 	if strings.TrimSpace(os.Getenv("MEM_NO_DISTILL")) == "1" {
 		return
 	}
-	if proposalHookEnabled() {
-		if err := startDistillProc(db, ""); err != nil {
+	if proposalHookEnabled(harness) {
+		if err := startDistillProc(db, "", harness); err != nil {
 			fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 proposal pending 失败，已放过:", err)
 		}
 		return

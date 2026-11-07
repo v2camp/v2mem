@@ -174,7 +174,7 @@ func TestHookStopDoesNotInsertMemories(t *testing.T) {
 	t.Setenv("MEM_DISTILL_SPAWN", "1")
 	var spawned []string
 	prev := startDistillProc
-	startDistillProc = func(db, session string) error {
+	startDistillProc = func(db, session, harness string) error {
 		spawned = append(spawned, session)
 		return nil
 	}
@@ -208,7 +208,7 @@ func TestHookSkipsDistillWithoutTranscript(t *testing.T) {
 	t.Setenv("MEM_DISTILL_SPAWN", "1")
 	called := false
 	prev := startDistillProc
-	startDistillProc = func(string, string) error { called = true; return nil }
+	startDistillProc = func(string, string, string) error { called = true; return nil }
 	t.Cleanup(func() { startDistillProc = prev })
 	if _, err := withStdin(t, raw, func() error {
 		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
@@ -369,7 +369,7 @@ func TestDistillDryRunPrintsAndSkipsEmpty(t *testing.T) {
 }
 
 func TestDefaultStartDistillRefusesTestBinary(t *testing.T) {
-	if err := defaultStartDistill(testDB(t), "s"); err == nil {
+	if err := defaultStartDistill(testDB(t), "s", "claude"); err == nil {
 		t.Fatal("测试二进制不应真的拉起 distill")
 	}
 }
