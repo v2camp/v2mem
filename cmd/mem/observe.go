@@ -114,7 +114,17 @@ func cutRunes(s string, n int) string {
 // Fidelity 按「是否存在真实正文」标注，只控提案准入，不参与证据等级判定。
 // 拿不到内容时返回空正文 + FidelityNone，绝不回退成 "stop" / "session-end"
 // 这类事件名字面量——事件名不是内容（design-capture §0/§4.3）。
-func observationText(event harness.Event, in hookInput, noScrub bool) (string, evidence.Fidelity) {
+//
+// hname 是可选的宿主名：生产路径由 appendObservationFailOpen 传入，字段来源
+// 按 adapterFor(hname) 查表；不传时（既有直接调用）走保守默认，保持重构前行为。
+// 主体 Fidelity 判定分支对所有宿主一致、不随表变化 —— 新增宿主只加表项。
+func observationText(event harness.Event, in hookInput, noScrub bool, hname ...string) (string, evidence.Fidelity) {
+	host := ""
+	if len(hname) > 0 {
+		host = hname[0]
+	}
+	cfg := adapterFor(host)
+
 	var b strings.Builder
 	fidelity := evidence.FidelityNone
 	switch event {
@@ -124,8 +134,8 @@ func observationText(event harness.Event, in hookInput, noScrub bool) (string, e
 			name = "tool"
 		}
 		b.WriteString("tool:" + name)
-		toolIn := rawField(in.ToolInput, noScrub)
-		toolOut := rawField(in.ToolOutput, noScrub)
+		toolIn := rawField(adapterRawField(cfg.toolInput, in.ToolInput, in), noScrub)
+		toolOut := rawField(adapterRawField(cfg.toolOutput, in.ToolOutput, in), noScrub)
 		if toolIn != "" {
 			b.WriteString("\n" + toolIn)
 		}
@@ -139,16 +149,16 @@ func observationText(event harness.Event, in hookInput, noScrub bool) (string, e
 			fidelity = evidence.FidelitySummary
 		}
 	case harness.EventStop, harness.EventSessionEnd:
-		// Trae 把最终回复放在 last_assistant_message，退化时给 text_content；
-		// 两者都没有才回退既有的 status / reason（只作摘要，不作正文）。
-		switch {
-		case strings.TrimSpace(in.LastAssistantMessage) != "":
-			b.WriteString(strings.TrimSpace(in.LastAssistantMessage))
-			fidelity = evidence.FidelityFull
-		case strings.TrimSpace(in.TextContent) != "":
-			b.WriteString(strings.TrimSpace(in.TextContent))
-			fidelity = evidence.FidelityFull
-		default:
+		// 按表里的优先级列表取最终回复：命中第一个非空字段即作为真实正文。
+		for _, sel := range cfg.stopReply {
+			if v := strings.TrimSpace(sel(in)); v != "" {
+				b.WriteString(v)
+				fidelity = evidence.FidelityFull
+				break
+			}
+		}
+		// 没拿到正文时才考虑 status / reason 作结构化摘要，是否允许由表决定。
+		if fidelity == evidence.FidelityNone && cfg.allowMetaSummary {
 			var meta []string
 			if s := strings.TrimSpace(in.Status); s != "" {
 				meta = append(meta, "status="+s)
@@ -160,8 +170,8 @@ func observationText(event harness.Event, in hookInput, noScrub bool) (string, e
 				b.WriteString(strings.Join(meta, " "))
 				fidelity = evidence.FidelitySummary
 			}
-			// 否则 b 为空、fidelity 保持 None：不伪造事件名字面量。
 		}
+		// 否则 b 为空、fidelity 保持 None：不伪造事件名字面量。
 	default:
 		b.WriteString(string(event))
 	}
@@ -305,7 +315,7 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 	hname := harnessName(harnessFlag, in)
 	sid := in.sessionID()
 	source := observeSourceID(hname, sid)
-	text, fidelity := observationText(event, in, noScrub)
+	text, fidelity := observationText(event, in, noScrub, hname)
 	ev := evidence.RawEvent{
 		SourceID:         source,
 		SessionID:        sid,
