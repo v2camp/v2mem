@@ -271,7 +271,7 @@ if [ "$A_WRITE_N" -gt 0 ]; then
   if [ "$A_WRITE_MS" -lt 1000 ]; then
     add R10 PASS "写侧延迟 ${A_WRITE_MS}ms" "低于 1000ms；${R10_NOTE}"
   elif [ "$A_WRITE_MS" -le 3000 ]; then
-    add R10 WARN "写侧延迟 ${A_WRITE_MS}ms" "1000–3000ms，查单次 Stop 的 transcript 补写量与 WAL 堆积；${R10_NOTE}"
+    add R10 WARN "写侧延迟 ${A_WRITE_MS}ms" "1000–3000ms，查单次 Stop 的 transcript 补写量（瓶颈是逐条归档 fsync）；WAL 由 R11 单独判；${R10_NOTE}"
   else
     add R10 FAIL "写侧延迟 ${A_WRITE_MS}ms" ">3000ms，接近同步 hook 超时预算；${R10_NOTE}"
   fi
