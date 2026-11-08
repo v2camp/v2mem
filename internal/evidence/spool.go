@@ -32,25 +32,37 @@ type SpoolDrainResult struct {
 
 // writeSpool 把一个事件落成独立 spool segment，返回文件路径。
 func (e *Engine) writeSpool(ev RawEvent) (string, error) {
-	dir := filepath.Join(e.spoolRoot, spoolSession(ev.SessionID))
+	return e.writeSpoolBatch([]RawEvent{ev})
+}
+
+// writeSpoolBatch 把一批事件写进同一个多行 spool segment（只做一次 fsync）。
+// drainOneSpool 逐行读取并逐条幂等回放，整批失败后不会丢数据。
+func (e *Engine) writeSpoolBatch(evs []RawEvent) (string, error) {
+	if len(evs) == 0 {
+		return "", errors.New("spool 批次不能为空")
+	}
+	dir := filepath.Join(e.spoolRoot, spoolSession(evs[0].SessionID))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	body, err := json.Marshal(recordOf(ev))
-	if err != nil {
-		return "", err
-	}
-	body = append(body, '\n')
-
 	tmp, err := os.CreateTemp(dir, "seg-*.tmp")
 	if err != nil {
 		return "", err
 	}
 	tmpName := tmp.Name()
-	if _, err := tmp.Write(body); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return "", err
+	for _, ev := range evs {
+		body, err := json.Marshal(recordOf(ev))
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return "", err
+		}
+		body = append(body, '\n')
+		if _, err := tmp.Write(body); err != nil {
+			tmp.Close()
+			os.Remove(tmpName)
+			return "", err
+		}
 	}
 	// spool 的全部意义是宿主崩溃后还能补写，必须 fsync 而不是只写页缓存。
 	if err := tmp.Sync(); err != nil {

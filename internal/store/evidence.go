@@ -72,6 +72,12 @@ type EvidenceCaptureInput struct {
 	RawHashConcat string
 	ByteSize      int64
 	RawCount      int
+
+	// 批量归档专用：archive_hash 是 evidence_archives 的主键，一批只插一行账。
+	// 批内第一条设 ToSeq / RawCount / RawHashConcat 并写账，其余条设
+	// SkipArchiveLedger=true 只写 observations。零值时行为与单条完全一致。
+	ToSeq             int
+	SkipArchiveLedger bool
 }
 
 // EvidenceRecord 是一条证据行的最小引用（与 evidence.Ref 字段一一对应）。
@@ -187,18 +193,84 @@ func (s *Store) LookupEvidence(eventUID, sourceID string, gen, seq int) (Evidenc
 // 注意 seq：调用方传 0 表示追加，由本函数取 last_seq+1；传非 0 必须等于 last_seq+1，
 // 否则返回 ErrEvidenceSeqGap —— 连续游标不能靠跳号或补历史来「修」。
 func (s *Store) CaptureEvidence(in EvidenceCaptureInput) (EvidenceRecord, bool, error) {
+	channel, meta, err := prepareEvidenceInput(in)
+	if err != nil {
+		return EvidenceRecord{}, false, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return EvidenceRecord{}, false, err
+	}
+	defer tx.Rollback()
+	rec, created, err := captureEvidenceTx(tx, in, channel, meta, time.Now().Unix())
+	if err != nil {
+		return EvidenceRecord{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return EvidenceRecord{}, false, err
+	}
+	return rec, created, nil
+}
+
+// CaptureEvidenceBatch 在一个事务里写入一批证据。
+//
+// archive_hash 是 evidence_archives 的主键，故批内只有第一条写 archive 账
+// （from_seq..to_seq 覆盖整批），其余条设 SkipArchiveLedger 只写 observations。
+// 每条仍走与单条完全相同的判重、seq gap 校验与水位推进；同一事务内后一条
+// 能看到前一条推进的 last_seq，因此连续序号不会被拒绝。
+func (s *Store) CaptureEvidenceBatch(ins []EvidenceCaptureInput) ([]EvidenceRecord, []bool, error) {
+	if len(ins) == 0 {
+		return nil, nil, nil
+	}
+	type prepared struct {
+		in      EvidenceCaptureInput
+		channel string
+		meta    []byte
+	}
+	items := make([]prepared, 0, len(ins))
+	for _, in := range ins {
+		channel, meta, err := prepareEvidenceInput(in)
+		if err != nil {
+			return nil, nil, err
+		}
+		items = append(items, prepared{in: in, channel: channel, meta: meta})
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	recs := make([]EvidenceRecord, 0, len(items))
+	created := make([]bool, 0, len(items))
+	for _, it := range items {
+		rec, ok, err := captureEvidenceTx(tx, it.in, it.channel, it.meta, now)
+		if err != nil {
+			return nil, nil, err
+		}
+		recs = append(recs, rec)
+		created = append(created, ok)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return recs, created, nil
+}
+
+// prepareEvidenceInput 校验身份并预计算 channel / meta_json，单条与批量共用。
+func prepareEvidenceInput(in EvidenceCaptureInput) (string, []byte, error) {
 	if strings.TrimSpace(in.EventUID) == "" {
-		return EvidenceRecord{}, false, errors.New("event_uid 不能为空")
+		return "", nil, errors.New("event_uid 不能为空")
 	}
 	if strings.TrimSpace(in.SourceID) == "" {
-		return EvidenceRecord{}, false, errors.New("source_id 不能为空")
+		return "", nil, errors.New("source_id 不能为空")
 	}
 	if strings.TrimSpace(in.ArchiveHash) == "" {
-		return EvidenceRecord{}, false, errors.New("archive_hash 不能为空")
+		return "", nil, errors.New("archive_hash 不能为空")
 	}
 	channel, err := DefaultObsChannel(in.EventType, in.Channel)
 	if err != nil {
-		return EvidenceRecord{}, false, err
+		return "", nil, err
 	}
 	meta, err := json.Marshal(evidenceMeta{
 		ProposalEligible: in.ProposalEligible,
@@ -206,16 +278,14 @@ func (s *Store) CaptureEvidence(in EvidenceCaptureInput) (EvidenceRecord, bool, 
 		Adapter:          in.Adapter,
 	})
 	if err != nil {
-		return EvidenceRecord{}, false, err
+		return "", nil, err
 	}
+	return channel, meta, nil
+}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return EvidenceRecord{}, false, err
-	}
-	defer tx.Rollback()
-
-	now := time.Now().Unix()
+// captureEvidenceTx 是单条与批量共用的事务体，不负责 Commit。
+// 判重命中时返回已有行且不推进水位，与重构前行为逐字一致。
+func captureEvidenceTx(tx *sql.Tx, in EvidenceCaptureInput, channel string, meta []byte, now int64) (EvidenceRecord, bool, error) {
 	gen, lastSeq, tip, err := ensureEvidenceSourceTx(tx, in, now)
 	if err != nil {
 		return EvidenceRecord{}, false, err
@@ -247,17 +317,23 @@ func (s *Store) CaptureEvidence(in EvidenceCaptureInput) (EvidenceRecord, bool, 
 		return EvidenceRecord{}, false, fmt.Errorf("%w: got seq %d, 当前 last_seq %d", ErrEvidenceSeqGap, seq, lastSeq)
 	}
 
-	rawCount := in.RawCount
-	if rawCount <= 0 {
-		rawCount = 1
-	}
-	if _, err := tx.Exec(`INSERT INTO evidence_archives(
-		archive_hash, source_id, generation, from_seq, to_seq, raw_count, byte_size,
-		path, raw_hash_concat, created_at
-	) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		in.ArchiveHash, in.SourceID, gen, seq, seq, rawCount, in.ByteSize,
-		in.ArchivePath, in.RawHashConcat, now); err != nil {
-		return EvidenceRecord{}, false, fmt.Errorf("写 archive 账失败: %w", err)
+	if !in.SkipArchiveLedger {
+		toSeq := in.ToSeq
+		if toSeq <= 0 {
+			toSeq = seq
+		}
+		rawCount := in.RawCount
+		if rawCount <= 0 {
+			rawCount = 1
+		}
+		if _, err := tx.Exec(`INSERT INTO evidence_archives(
+			archive_hash, source_id, generation, from_seq, to_seq, raw_count, byte_size,
+			path, raw_hash_concat, created_at
+		) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			in.ArchiveHash, in.SourceID, gen, seq, toSeq, rawCount, in.ByteSize,
+			in.ArchivePath, in.RawHashConcat, now); err != nil {
+			return EvidenceRecord{}, false, fmt.Errorf("写 archive 账失败: %w", err)
+		}
 	}
 
 	id := "ev_" + newID()
@@ -298,9 +374,6 @@ func (s *Store) CaptureEvidence(in EvidenceCaptureInput) (EvidenceRecord, bool, 
 		SET last_seq = ?, source_tip = ?, updated_at = ? WHERE id = ?`,
 		seq, newTip, now, in.SourceID); err != nil {
 		return EvidenceRecord{}, false, fmt.Errorf("推进证据源水位失败: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return EvidenceRecord{}, false, err
 	}
 	return EvidenceRecord{
 		ID: id, EventUID: in.EventUID, SourceID: in.SourceID, Generation: gen, Seq: seq,

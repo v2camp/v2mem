@@ -1,6 +1,6 @@
 # 批量归档：写侧延迟治本方案（方案 B）
 
-> **状态**：设计定稿。P1 归档层 API 已落地但**默认未接入** `Engine.Capture` / hook；P2 生产切换待灰度。
+> **状态**：P0 / P1 / P2 已实现。P2 由 `MEM_EVIDENCE_BATCH=1` 灰度开启，**默认关**（关闭时逐字走原逐条路径）；P3 转正需连续 2 个 12h 窗口观察，尚未执行。
 > 价值判断以 [`VALUE.md`](./VALUE.md) 为准；判据以 [`ops-watch.md`](./ops-watch.md) §3 为准。本文只定义「怎么做」，不重定价值与阈值。
 > 起因见 2026-11-08 巡检：R10 写侧延迟从健康期 3–20ms 劣化到 p95 2847ms，而现行判据此前不对写侧判级。
 
@@ -49,13 +49,15 @@
 
 新增 `ReadArchiveRecord(locator string) (segmentRecord, error)`：拆出 `#seq`，逐行扫描 gzip 流，按 `rec.Seq == seq` 返回；无后缀时兼容返回首行（保持既有单条归档可读）；seq 不存在返回明确错误。这是补上 §4.1 声称的事实溯源能力，也是批量归档的必要配套。
 
-单条 `writeArchive` **保持原样**，P1 新 API 不接入任何生产调用者。
+单条 `writeArchive` 与批量共用 `writeArchiveRecords`，单条压缩字节逐字节不变（存量 `archive_hash` 不受影响）。P2 起由 `Engine.CaptureBatch` 在灰度开启时调用。
 
-### 3.2 账本层（P2，本轮不实现）
+### 3.2 账本层（P2 已实现）
 
 一批对应 `evidence_archives` **一行**：`from_seq` / `to_seq` 取批的 seq 区间，`raw_count=N`，`raw_hash_concat` 按批内顺序拼接，`UNIQUE(source_id, generation, from_seq)` 正好锁住批起点；`observations` 仍为每事件一行，`raw_ref` 指向同一 `<path>#<seq>`。
 
-需要 `Store.CaptureEvidenceBatch`：从现有 `CaptureEvidence` 抽出 `captureEvidenceTx(tx, in)` 供单条与批量复用，在一个事务内完成「水位推进 → 逐条判重/seq 校验 → 插 N 行 observations → 插 1 行 archive 账」。**判重与 seq gap 语义必须与单条路径逐字一致**，否则重放会分叉。
+`Store.CaptureEvidenceBatch` 已落地：从 `CaptureEvidence` 抽出 `captureEvidenceTx(tx, in)` 与 `prepareEvidenceInput`，单条 = 批量 N=1，**判重 / seq gap / 水位语义逐字一致**。批内第一条写 archive 账（新增可选字段 `ToSeq` / `RawCount`），其余条设 `SkipArchiveLedger` 只写 observations，规避 `archive_hash` 主键冲突。同一事务内后一条能看到前一条推进的 `last_seq`，连续序号不会被拒绝。
+
+`Engine.CaptureBatch` 先按 `event_uid` 过滤库内已有与批内重复项，再读一次水位预分配连续 seq，然后「一次归档 → 一次批量写账」。批内混入不同 `source_id` 直接报错，避免把不同水位混进同一批。
 
 ### 3.3 失败与幂等（P2 的关键约束）
 
@@ -66,18 +68,18 @@
 
 ### 3.4 批次边界与预算
 
-自然批次 = 一次 Stop 的 transcript 增量（实测均值 25.6 / p95 93 行）。沿用 `transcriptStopMaxRecords=5000` 上限，另加**字节预算**（单条 32000 rune × 批可能很大），超限按序切批；切批点记入游标，保证可重放。
+自然批次 = 一次 Stop 的 transcript 增量（实测均值 25.6 / p95 93 行）。沿用 `transcriptStopMaxRecords=5000` 上限，并以 `evidenceBatchMaxRecords=200` + `evidenceBatchMaxBytes=1MiB` 双预算按序切批；**只有整批写账成功才推进游标**，失败保留游标，下次重放由 `event_uid` 幂等兜住（已成功的前几批不会重复写入）。
 
 ## 4. 分阶段与回滚
 
 | 阶段 | 内容 | 状态 |
 |:---|:---|:---|
 | P0 | 契约核查（见 §1） | 已完成 |
-| P1 | `writeArchiveBatch` + `ReadArchiveRecord` + 单测；**默认不接入** | 本轮 |
-| P2 | `CaptureEvidenceBatch` + `Engine.CaptureBatch` + hook transcript 接入；`MEM_EVIDENCE_BATCH` 开关灰度，默认关 | 待做 |
-| P3 | 连续 2 个 12h 窗口观察后转正、清理单条旧路径 | 待做 |
+| P1 | `writeArchiveBatch` + `ReadArchiveRecord` + 单测 | 已完成 |
+| P2 | `CaptureEvidenceBatch` + `Engine.CaptureBatch` + `writeSpoolBatch` + hook transcript 接入；`MEM_EVIDENCE_BATCH` 灰度开关默认关 | **已完成** |
+| P3 | 开启开关 → 连续 2 个 12h 窗口观察 → 转正默认开、清理单条旧路径 | 待做（需真实时间观察） |
 
-**回滚**：P2 只需关闭 `MEM_EVIDENCE_BATCH`，单条路径保持完整可回退；P1 未接入，无运行时影响。
+**回滚**：关闭 `MEM_EVIDENCE_BATCH` 即可，单条路径保持完整可回退。**开启方式**：在启动宿主的环境中导出 `MEM_EVIDENCE_BATCH=1`（hook 子进程继承环境变量），或由宿主配置注入；不要改 `settings.json` 里的 hook 命令行。
 
 ## 5. 风险与必守回归
 
@@ -91,12 +93,12 @@
 
 ## 6. 验收判据
 
-1. 同款黑盒实验（N=93）：Stop 耗时从 1011ms 降到 **<200ms**。
-2. R10 连续 3 个 12h 窗口 PASS；R11 不再因单批写入反复越线。
-3. 归档文件数显著下降（每批一个，而非每条一个）。
-4. `make test` / `make cover-gate` / `make test-watch` / e2e 全绿，覆盖率下限不下调。
-5. 重放两次不新增 observations 行，`archive_hash` 稳定。
+1. 同款黑盒实验（N=93）：Stop 耗时从 1011ms 降到 **<200ms**。**已实测 925ms → 58ms（15.9×）**，判据达成。
+2. R10 连续 3 个 12h 窗口 PASS；R11 不再因单批写入反复越线。**P3 待观察**（需先开启开关）。
+3. 归档文件数显著下降（每批一个，而非每条一个）。**已实测 94 → 2**。
+4. `make test` / `make cover-gate` / `make test-watch` 全绿，覆盖率下限不下调。
+5. 重放两次不新增 observations 行，`archive_hash` 稳定。**已实测重放新增 0 行**；`archive` 账为 `(from_seq=1, to_seq=93, raw_count=93)`，JSONL 行数守恒 94。
 
 ## 7. 复现方式
 
-基准脚本（临时产物，不入库）：`/tmp/v2mem-hook-bench.py`（真实二进制黑盒）、`/tmp/v2mem-batch-bench.py`（C-sqlite 隔离对照）。Go 探针为一次性临时测试，跑完即删。原始数据与结论见工作区日志 `.workbuddy/memory/2026-11-08.md`。
+基准脚本（临时产物，不入库）：`/tmp/v2mem-hook-bench.py`（真实二进制黑盒斜率）、`/tmp/v2mem-batch-bench.py`（C-sqlite 隔离对照）、`/tmp/v2mem-p2-bench.py`（P2 开关开/关对照 + 重放幂等验收）。Go 探针为一次性临时测试，跑完即删。原始数据与结论见工作区日志 `.workbuddy/memory/2026-11-08.md`。

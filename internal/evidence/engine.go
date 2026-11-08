@@ -78,18 +78,16 @@ func (e *Engine) SpoolRoot() string { return e.spoolRoot }
 // 顺序固定：解析身份 → 写 gzip segment（临时文件→fsync→rename）→ 单事务写账。
 // DB 失败时保留 segment 并把事件写进独立 spool segment；archive 失败时直接返回错误，
 // 既不写账也不推进水位。
-func (e *Engine) Capture(ev RawEvent) (Ref, error) {
-	return e.capture(ev, true)
-}
-
-func (e *Engine) capture(ev RawEvent, allowSpool bool) (Ref, error) {
+// normalizeEvent 规整一条待归档事件，单条与批量路径共用。
+// Fidelity 兜底只进 meta_json，不进归档 segment，字节级幂等不受影响。
+func normalizeEvent(ev RawEvent) (RawEvent, error) {
 	ev.EventUID = strings.TrimSpace(ev.EventUID)
 	ev.SourceID = strings.TrimSpace(ev.SourceID)
 	if ev.EventUID == "" {
-		return Ref{}, errors.New("event_uid 不能为空")
+		return RawEvent{}, errors.New("event_uid 不能为空")
 	}
 	if ev.SourceID == "" {
-		return Ref{}, errors.New("source_id 不能为空")
+		return RawEvent{}, errors.New("source_id 不能为空")
 	}
 	if ev.EventType == "" {
 		ev.EventType = "raw"
@@ -100,11 +98,122 @@ func (e *Engine) capture(ev RawEvent, allowSpool bool) (Ref, error) {
 	if ev.OccurredAtNS == 0 {
 		ev.OccurredAtNS = time.Now().UnixNano()
 	}
-	// 空 Fidelity 按事实源 Raw 是否有可见内容兜底，写回本地 ev：传给账本的
-	// 值与 Capture 返回的 Ref、ListEvidence 读回保持一致。该字段只进 meta_json，
-	// 不进归档 segment，归档字节级幂等不受影响。
 	if ev.Fidelity == "" {
 		ev.Fidelity = resolveFidelity(ev.Raw)
+	}
+	return ev, nil
+}
+
+func (e *Engine) Capture(ev RawEvent) (Ref, error) {
+	return e.capture(ev, true)
+}
+
+// CaptureBatch 把一批同源事件写成一个归档 segment 与一个 DB 事务。
+//
+// 顺序：先规整并按 event_uid 过滤已存在事件 → 读一次证据源水位预分配连续 seq
+// → 一次 writeArchiveBatch（一次 fsync）→ 一次 CaptureEvidenceBatch（单事务）。
+// DB 失败时保留整份归档并把整批写进一个多行 spool segment，由 DrainSpool 逐行
+// 幂等回放。批内若混入不同 source_id 直接报错，避免把不同水位混进同一批。
+//
+// P2 阶段由 MEM_EVIDENCE_BATCH 灰度开关控制，默认仍走单条 Capture。
+func (e *Engine) CaptureBatch(evs []RawEvent) ([]Ref, error) {
+	if len(evs) == 0 {
+		return nil, nil
+	}
+	refs := make([]Ref, 0, len(evs))
+	pending := make([]RawEvent, 0, len(evs))
+	// 批内重复 event_uid 只保留首条：否则同事务内第二条会命中判重但不推进水位，
+	// 让 archive 账的 to_seq / raw_count 与实际写入行数不符。
+	seenUID := make(map[string]struct{}, len(evs))
+	for _, ev := range evs {
+		ev, err := normalizeEvent(ev)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := seenUID[ev.EventUID]; dup {
+			continue
+		}
+		seenUID[ev.EventUID] = struct{}{}
+		rec, ok, err := e.st.LookupEvidence(ev.EventUID, ev.SourceID, ev.Generation, ev.Seq)
+		if err != nil {
+			return nil, fmt.Errorf("查证据身份失败: %w", err)
+		}
+		if ok {
+			refs = append(refs, toRef(rec))
+			continue
+		}
+		pending = append(pending, ev)
+	}
+	if len(pending) == 0 {
+		return refs, nil
+	}
+	sourceID := pending[0].SourceID
+	for _, ev := range pending[1:] {
+		if ev.SourceID != sourceID {
+			return nil, errors.New("批量归档要求批内证据源一致")
+		}
+	}
+	head, _, err := e.st.EvidenceSourceHead(sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("读证据源水位失败: %w", err)
+	}
+	for i := range pending {
+		pending[i].Generation = head.Generation
+		pending[i].Seq = head.LastSeq + 1 + i
+	}
+
+	seg, err := e.writeArchiveBatch(pending)
+	if err != nil {
+		return nil, fmt.Errorf("归档原始证据失败: %w", err)
+	}
+
+	ins := make([]store.EvidenceCaptureInput, 0, len(pending))
+	var concat strings.Builder
+	for i, ev := range pending {
+		rawHash := sha256Hex(ev.Raw)
+		concat.WriteString(rawHash)
+		channel, err := store.DefaultObsChannel(ev.EventType, "")
+		if err != nil {
+			return nil, err
+		}
+		in := store.EvidenceCaptureInput{
+			EventUID: ev.EventUID, SourceID: ev.SourceID, SourceKind: "hook",
+			Generation: ev.Generation, Seq: ev.Seq, OccurredAtNS: ev.OccurredAtNS,
+			SessionID: ev.SessionID, Project: ev.Project, Harness: ev.Harness,
+			EventType: ev.EventType, Channel: channel, ParserVersion: ev.ParserVersion,
+			ProposalEligible: ev.ProposalEligible, Summary: summarizeRaw(ev.Raw, ev.EventType),
+			Fidelity: string(ev.Fidelity), Adapter: ev.Harness,
+			ArchiveHash: seg.hash, ArchivePath: seg.path,
+			RawRecordHash: rawHash, ByteSize: seg.size,
+		}
+		if i == 0 {
+			in.RawCount = len(pending)
+			in.ToSeq = pending[len(pending)-1].Seq
+		} else {
+			in.SkipArchiveLedger = true
+		}
+		ins = append(ins, in)
+	}
+	ins[0].RawHashConcat = concat.String()
+
+	recs, _, err := e.st.CaptureEvidenceBatch(ins)
+	if err != nil {
+		spoolPath, serr := e.writeSpoolBatch(pending)
+		if serr != nil {
+			return nil, errors.Join(fmt.Errorf("批量写账失败: %w", err), fmt.Errorf("批量落 spool 失败: %w", serr))
+		}
+		return nil, fmt.Errorf("批量写账失败: %w（归档已保留：%s；已落 spool：%s）", err, seg.path, spoolPath)
+	}
+	for _, rec := range recs {
+		refs = append(refs, toRef(rec))
+	}
+	return refs, nil
+}
+
+func (e *Engine) capture(ev RawEvent, allowSpool bool) (Ref, error) {
+	ev, err := normalizeEvent(ev)
+	if err != nil {
+		return Ref{}, err
 	}
 
 	// 先只读判重：命中就不必再分配序号/写新 segment，也不会留下孤儿归档。

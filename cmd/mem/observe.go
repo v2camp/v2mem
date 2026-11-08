@@ -40,6 +40,10 @@ const (
 	// transcriptToolMemory 是游标里保留的 tool_use id → 工具名条数，
 	// 供跨次识别 tool_result 属于哪个工具（决定 ProposalEligible）。
 	transcriptToolMemory = 128
+	// 批量归档（方案 B P2）的切批预算：条数与字节任一触线即提交一批。
+	// 实测单次 Stop 增量均值 25.6 行 / p95 93 行，200 条留了 2 倍余量。
+	evidenceBatchMaxRecords = 200
+	evidenceBatchMaxBytes   = 1 << 20
 )
 
 // spoolMaxSegments 是单个会话的 spool 段数上限。旧实现按单文件体量设限；
@@ -399,6 +403,31 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 	lastGood := offset
 	seen := 0
 	unparsed := 0
+
+	// MEM_EVIDENCE_BATCH 是方案 B 的灰度开关，默认关：关闭时逐字走原逐条路径。
+	// 开启时把 transcript 增量攒成批，一次归档 fsync + 一个 DB 事务。
+	batchEnabled := os.Getenv("MEM_EVIDENCE_BATCH") == "1"
+	pending := make([]evidence.RawEvent, 0, evidenceBatchMaxRecords)
+	var pendingBytes int64
+	pendingOffset := offset
+	batchFailed := false
+
+	// flushBatch 只在整批写账成功后推进游标；失败时保留游标，下次重放由
+	// event_uid 幂等兜住，已成功的前几批不会重复写入。
+	flushBatch := func() bool {
+		if len(pending) == 0 {
+			return true
+		}
+		if _, err := es.engine.CaptureBatch(pending); err != nil {
+			fmt.Fprintln(os.Stderr, "v2mem hook: transcript 批量证据写入失败，已停在此行:", err)
+			return false
+		}
+		lastGood = pendingOffset
+		pending = pending[:0]
+		pendingBytes = 0
+		return true
+	}
+
 	for seen < transcriptStopMaxRecords {
 		recs, rerr := rd.Read()
 		if errors.Is(rerr, io.EOF) {
@@ -409,7 +438,9 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 			break
 		}
 		if len(recs) == 0 {
-			lastGood = rd.Offset()
+			if !batchEnabled {
+				lastGood = rd.Offset()
+			}
 			continue
 		}
 		failed := false
@@ -418,7 +449,10 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 				unparsed++
 			}
 			ev := recordEvidence(source, sid, project, hname, abs, rec, tools, noScrub)
-			if _, _, cerr := captureEvidence(es, ev); cerr != nil {
+			if batchEnabled {
+				pending = append(pending, ev)
+				pendingBytes += int64(len(ev.Raw))
+			} else if _, _, cerr := captureEvidence(es, ev); cerr != nil {
 				fmt.Fprintln(os.Stderr, "v2mem hook: transcript 证据写入失败，已停在此行:", cerr)
 				failed = true
 				break
@@ -429,7 +463,19 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 			break
 		}
 		tools = rememberTools(tools, recs)
-		lastGood = rd.Offset()
+		pendingOffset = rd.Offset()
+		if !batchEnabled {
+			lastGood = rd.Offset()
+		} else if len(pending) >= evidenceBatchMaxRecords || pendingBytes >= evidenceBatchMaxBytes {
+			if !flushBatch() {
+				batchFailed = true
+				break
+			}
+		}
+	}
+	// 循环结束提交尾批；失败时 lastGood 保持上次成功位置，游标不前进。
+	if batchEnabled && !batchFailed {
+		_ = flushBatch()
 	}
 
 	if reset || lastGood != cur.Offset {
