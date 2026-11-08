@@ -13,6 +13,8 @@
 # 只读：不写库、不改配置。唯一的写入是 ~/.v2mem/watch-state.json 的基线快照。
 # R3 只统计读侧 hook（prompt-submit / session-start）的 ms；写侧 stop / obs-append
 # 共用同一个 Stop 计时器，计入会污染「检索延迟」，详见 docs/ops-watch.md §3。
+# R10 给这部分写侧耗时独立判级（只取 stop，避免与 obs-append 双计）；R11 只读
+# mem.db-wal 的文件大小，绝不修改或删除 -wal。判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
 set -uo pipefail
@@ -130,7 +132,7 @@ fi
 # ---------- 运行态：解析 audit.jsonl ----------
 AUDIT="$V2MEM_DIR/audit.jsonl"
 A_EVENTS=0; A_PROMPT=0; A_PROMPT_EMPTY=0; A_SS=0; A_OBS=0; A_ADD=0; A_MS=0
-A_READ_N=0; A_WRITE_MS=0
+A_READ_N=0; A_WRITE_MS=0; A_WRITE_N=0
 
 if [ -f "$AUDIT" ]; then
   # 必须用 -s：默认流式模式下 [select(...)] 会对每一行各自收集，导致只有最后一行生效
@@ -144,12 +146,13 @@ if [ -f "$AUDIT" ]; then
       "A_ADD=\([$e[] | select(.event=="manual-add" or .event=="write")] | length)",
       "A_READ_N=\([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms != null and .ms > 0)] | length)",
       "A_MS=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))",
+      "A_WRITE_N=\([$e[] | select(.event=="stop" and .ms != null and .ms > 0)] | length)",
       "A_WRITE_MS=\(([$e[] | select(.event=="stop" and .ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))"
   ' "$AUDIT" 2>/dev/null)"
 fi
 A_EVENTS=${A_EVENTS:-0}; A_PROMPT=${A_PROMPT:-0}; A_PROMPT_EMPTY=${A_PROMPT_EMPTY:-0}
 A_SS=${A_SS:-0}; A_OBS=${A_OBS:-0}; A_ADD=${A_ADD:-0}; A_MS=${A_MS:-0}
-A_READ_N=${A_READ_N:-0}; A_WRITE_MS=${A_WRITE_MS:-0}
+A_READ_N=${A_READ_N:-0}; A_WRITE_MS=${A_WRITE_MS:-0}; A_WRITE_N=${A_WRITE_N:-0}
 
 # R1 钩子是否被真实触发
 if [ "$A_EVENTS" -ge 1 ]; then
@@ -176,7 +179,7 @@ fi
 
 # R3 检索延迟：只取读侧 hook，写侧 Stop 单独展示但不判级
 if [ "$A_MS" -gt 0 ]; then
-  R3_NOTE="读侧样本 ${A_READ_N} 次，写侧 Stop ${A_WRITE_MS}ms 不计入本判据"
+  R3_NOTE="读侧样本 ${A_READ_N} 次；写侧 Stop ${A_WRITE_MS}ms 由 R10 单独判级，不计入本判据"
   if [ "$A_MS" -lt 50 ]; then
     add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 目标线；${R3_NOTE}"
   elif [ "$A_MS" -lt 200 ]; then
@@ -259,6 +262,37 @@ elif [ "$NOISE" -le 3 ]; then
   add R9 WARN "候选含载荷残留 ${NOISE} 条" "单窗口内产生，用 mem reject 清理并核查 distill 输入过滤"
 else
   add R9 FAIL "候选含载荷残留 ${NOISE} 条" "蒸馏输入未过滤 pointer 观测；先修准入，再逐条 mem reject"
+fi
+
+# R10 写侧延迟：stop 与 obs-append 共用同一个 Stop 计时器，只取 stop 避免双计。
+# 阈值来自 Stop hook 同步超时 20s 的 5% / 15%，见 docs/ops-watch.md §3。
+if [ "$A_WRITE_N" -gt 0 ]; then
+  R10_NOTE="stop ${A_WRITE_N} 次均值；宿主 Stop hook timeout=20s，阈值取 5% / 15%"
+  if [ "$A_WRITE_MS" -lt 1000 ]; then
+    add R10 PASS "写侧延迟 ${A_WRITE_MS}ms" "低于 1000ms；${R10_NOTE}"
+  elif [ "$A_WRITE_MS" -le 3000 ]; then
+    add R10 WARN "写侧延迟 ${A_WRITE_MS}ms" "1000–3000ms，查单次 Stop 的 transcript 补写量与 WAL 堆积；${R10_NOTE}"
+  else
+    add R10 FAIL "写侧延迟 ${A_WRITE_MS}ms" ">3000ms，接近同步 hook 超时预算；${R10_NOTE}"
+  fi
+else
+  add R10 INFO "无写侧样本" "窗口内没有带 ms 的 stop 事件，无法评估写侧延迟"
+fi
+
+# R11 WAL 堆积：只读文件大小，绝不修改或删除 -wal。
+WAL_FILE="$V2MEM_DIR/mem.db-wal"
+WAL_BYTES=0
+if [ -f "$WAL_FILE" ]; then
+  WAL_BYTES=$(wc -c < "$WAL_FILE" 2>/dev/null | tr -d ' ')
+fi
+WAL_BYTES=${WAL_BYTES:-0}
+WAL_FRAMES=$(( WAL_BYTES / 4096 ))
+if [ "$WAL_FRAMES" -le 1000 ]; then
+  add R11 PASS "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，未超 wal_autocheckpoint=1000"
+elif [ "$WAL_FRAMES" -le 2000 ]; then
+  add R11 WARN "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，被动 checkpoint 未跟上；按 §5 执行 wal_checkpoint(TRUNCATE) 并记录返回三元组"
+else
+  add R11 FAIL "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，超过阈值 2 倍；按 §5 执行 wal_checkpoint(TRUNCATE)，不要手工删 -wal"
 fi
 
 # ---------- 输出 ----------

@@ -7,6 +7,7 @@
 ```bash
 make test        # go test ./...（CGO_ENABLED=0）
 make test-install # 安装脚本 dry-run / mock（不联网）
+make test-watch  # 巡检判据分级回归（临时库 + mem stub，不触碰 ~/.v2mem）
 make build       # → bin/mem
 make smoke       # 造一个临时库跑 add/search/stats
 make build-linux # 交叉编译（Go 内建，无需交叉工具链）
