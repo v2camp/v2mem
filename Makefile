@@ -16,6 +16,10 @@ test:
 test-install:
 	bash scripts/test-install.sh
 
+# 巡检判据回归：临时 V2MEM_DIR + mem stub，不触碰 ~/.v2mem。
+test-watch:
+	bash scripts/test-watch-v2mem.sh
+
 # 端到端测试（黑盒）：跑真实二进制，覆盖 安装→初始化→使用→维护→优化→评测→卸载 全生命周期动线。
 # 独立于 go test ./...（e2e 目录带 build tag，默认构建不参与覆盖统计）。
 test-e2e:
@@ -90,4 +94,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test test-install cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate release-dry release
+.PHONY: build install test test-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate release-dry release
