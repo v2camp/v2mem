@@ -121,8 +121,10 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   口径（未扣 WAL 头与每帧 24 字节头，误差约 0.6%，不影响分级），detail 同时给出
   原始字节数供复核。实测 11-08 04:19 为 1118 帧 / 4.5MB，
   手动 `PRAGMA wal_checkpoint(TRUNCATE)` 返回 `0|0|0` 并归零，证明可回收。
-  **局限**：这是单点采样，刚 checkpoint 完会读到 0，须与 R10 合看，不单独下结论；
-  它与 R10 是「果」与「症」的关系，不互为因果判据。
+  **局限**：这是单点采样，刚 checkpoint 完会读到 0；它只反映 checkpoint 状态，
+  **不用于推断写侧延迟**——11-08 黑盒实测中 hook 进程退出后 WAL 帧恒为 0，
+  而 Stop 耗时仍随 transcript 行数线性上升，两者无因果关系（见
+  [`design-write-batch.md`](./design-write-batch.md) §0）。R10 与 R11 各自独立判级。
 
 ---
 
@@ -152,7 +154,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |
 | R8 候选积压 | 隔离区长期未裁决 | `mem candidates ls --policy` 逐条看：可读候选 `mem accept`，载荷残留 `mem reject`（顶层命令，非 `mem candidates reject`） |
 | R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
-| R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多 | 先看窗口内 `stop` 条数与 transcript 增量；`captureTranscriptFailOpen` 每条记录走一次独立 `Engine.Capture`（gzip segment fsync + 独立事务），长会话会线性放大耗时。临时缓解用 `PRAGMA wal_checkpoint(TRUNCATE)`，治本需收敛单次批量写账；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
+| R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档）；`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
 | R11 WAL 帧数越线 | 被动 checkpoint 未跟上 | `sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(TRUNCATE);"` 并记下返回三元组 `(busy,log,checkpointed)`；`busy=1` 说明有长读事务，查各 harness 的 `mem mcp` 连接。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
