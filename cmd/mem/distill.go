@@ -792,13 +792,14 @@ func cmdReject(args []string) error {
 
 func cmdCandidates(args []string) error {
 	if len(args) == 0 || args[0] != "ls" {
-		return errors.New("用法: mem candidates ls [--status pending] [--session S] [--policy]")
+		return errors.New("用法: mem candidates ls [--status pending] [--session S] [--project P] [--policy]")
 	}
 	var c common
 	fs := flag.NewFlagSet("candidates ls", flag.ContinueOnError)
 	c.register(fs)
 	status := fs.String("status", "pending", "pending|accepted|rejected|expired|空为全部")
 	session := fs.String("session", "", "限定会话")
+	project := fs.String("project", "", "限定工程（就近裁决用）")
 	limit := fs.Int("limit", 50, "条数上限")
 	policy := fs.Bool("policy", false, "显示提交矩阵裁决（只读，不写库）")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -809,7 +810,7 @@ func cmdCandidates(args []string) error {
 		return err
 	}
 	defer st.Close()
-	list, err := st.ListCandidates(*status, *session, *limit)
+	list, err := st.ListCandidatesByProject(*status, *session, *project, *limit)
 	if err != nil {
 		return err
 	}

@@ -13,7 +13,7 @@
 
 | 项 | 现状 |
 |:---|:---|
-| 写库路径 | 仅 3 条：CLI `mem add`（`cmd/mem/main.go:300`）、MCP `add` 工具（`cmd/mem/mcp.go:278`）、`mem ingest`（`cmd/mem/level1.go:94`） |
+| 写库路径 | 现状 5 条：CLI `mem add`（`cmd/mem/main.go:300`）、MCP `add` 工具、`mem ingest`（`cmd/mem/level1.go:94`）、`mem accept` 与 MCP `accept`（后两者走隔离区升格，均为**显式**裁决，非自动） |
 | 钩子写永久库吗 | **否**。钩子仍不 `store.Add`。观测缓冲写入同库另表 `observations`（`source=hook-observe`）。默认 `mem search` 不看它；`layer=observation` 或 `both` 才查痕迹 |
 | 去重键 | `(content_hash, project)`，跨工程同句各自独立 —— 设计文档明示的既定语义，**不是 bug**（见 `design-dedup-merge` e2e） |
 | 那 208 条是谁 | 脚本紧凑循环调 `mem add` 灌入（对应 ~200 条检索基准）。**既非 hooks 自动灌，也非 LLM 逐条决策**——是第三类：无来源标记的批量写入 |
@@ -152,3 +152,77 @@ MCP `add` 的 schema 声明 `required:["content"]`；写侧一律带 `source`（
 5. Hook 检测到 Proposal 环境时禁止再次 spawn distill。
 
 阶段 2 的契约测试通过并把结论改为 `host_safe=true` 后，再按「Host 优先、Local 兜底」启用；否则按「Local 优先、Host 显式」运行。
+
+---
+
+## 12. 候选裁决的自动化闭环（2026-11-09 已裁决）
+
+> 本节承载三态链路**最后一跳**的触发与执行口径。因 `design-capture.md` 已达 500 行硬上限，
+> 完整裁决由该处迁至本文；[`design-capture.md`](./design-capture.md) §13.4 只留指针。
+> 判据阈值在 [`ops-watch.md`](./ops-watch.md) §3。
+
+### 12.1 问题
+
+默认安装下，「候选积压」没有任何主动触发点。库内已有 `有观测无采纳` 信号
+（`cmd/mem/measure.go:787`），但 SessionStart 注入块不提候选、MCP 工具面无裁决入口、
+`GCCandidates`（`internal/store/candidates.go`）只由手工 `mem gc --candidates` 调用、
+12h 巡检是宿主侧额外配置的定时任务。结果是「观测 → candidates → accept」的最后一跳
+依赖用户记得去跑 CLI；`VALUE.md §3.3` 的采纳率判据会把「没人看见」误读成
+「价值指向不成立」，进而按判据停掉一个其实从未被看见的功能。
+
+### 12.2 裁决：四点同时落地
+
+不引入常驻进程、不把 LLM 放进关键路径、**不自动裁决**。
+
+| # | 改动 | 落点 | 边界 |
+|:--|:---|:---|:---|
+| 1 | **发现**：SessionStart 注入按当前 `project` 的 pending 计数与就近裁决提示 | `cmd/mem/hook.go` `sessionStartContext` + 新增 `store.CountPendingByProject` | 只读 COUNT、失败开放当 0、计入固定预算预留（预算不足时给 hint 让路）、不写审计与 read trace；仅 N>0 时出现 |
+| 2 | **执行**：MCP 增 `candidates_ls` / `accept` / `reject` | `cmd/mem/mcp.go`，直接调 `CommitCandidate → CommitAccept/CommitReject` | **显式调用，不是自动 accept**；沿用 revision CAS 与隔离区升格；CLI 三命令不改；`distill` 仍不进 MCP |
+| 3 | **判据**：R8 按 `project` 分组、窗口取最坏项目 | `scripts/watch-v2mem.sh` + `ops-watch.md §3/§5/§8.5/§8.7` 两处同改；`candidates ls --project` | 阈值 5/15 不变、不新增判据 ID；R9 采集改走 JSON 但判定语义等价；新增判据表↔脚本同步检查 |
+| 5 | **前提**：把「有人裁决」写成采纳率判据的采样前提 | `VALUE.md §3.3` 新增 (c) | 不改判据行、路线图判据列与任何数值 |
+
+**设计决策变更**：`design-anti-agentmemory.md §2.2` 原写「MCP 没有 accept，没有 distill」，
+本次改为「有 accept / reject，仍无 distill」。理由：裁决是**显式**的，与 §3
+「永久记忆只经 LLM 明确决策写入」一致；放进 MCP 只是把执行主体从「人跑 CLI」扩到
+「会话内 Agent 显式调用」，没有把决策自动化。`distill` 是产出候选的批处理，不是裁决。
+
+**为什么四点要同时做**：1 的提示必须指向 2 的工具，否则 Agent 看见了也做不了；
+3 的分组口径必须与「就近裁决」同源，否则全局计数会把别的项目候选误诊为脏数据
+（11-09 巡检把 7 条 training-products + 2 条 Ydisks 建议 reject 即此误诊：候选表本就有
+`project` 列，那些是各自项目的合法产物，reject 等于丢证据）；
+5 则把此前隐含的人工前提显式化，防止判据误杀功能。
+
+### 12.3 参考工程的对照（为什么不照搬）
+
+| | 做法 | 把「用户记得去做」删掉的方式 | 代价，以及本仓为何不取 |
+|:--|:---|:---|:---|
+| mem0 v2.2.1 | `add(infer=True)` 一次 LLM 直接产出 ADD 入库；v3 只 ADD | 决策压进**同步写路径**，没有待裁决队列，也就没有积压 | LLM 进关键路径、需 API key、库只增不减 |
+| agentmemory v0.9.31 | 进程内 8 个 `setInterval` 默认开（auto-forget / consolidation / decay / sweep…），健康监测也内置 30s | **调度器内置进常驻进程**，安全阀是 dryRun + 单次上限 + 审计，不是人工批准 | 常驻 iii + 3 worker + 多端口，约 14000 行运维代码 |
+
+两者都成立，但分别被「默认零 LLM」「不做常驻进程」两条红线挡住。本方案取第三条路：
+**把触发点放进已有的 hook 注入，把执行权放进已有的 MCP 通道** —— 都是既有组件，零新增进程、
+零新增模型调用，也没有把裁决自动化。
+
+### 12.4 验收口径
+
+`make test` 13 包全绿、`make cover-gate` TOTAL ≥83%、`make test-watch`（含新增的
+判据表↔脚本同步检查）、黑盒四证：① 本工程会话看到自己的计数 ② 换工程看到对方的计数
+③ R8 按工程分组取最大值（跨工程不相加）④ `candidates ls --project` 就近过滤。
+`hooks 只读护栏`（§5）不得因只读 COUNT 而失效。
+
+### 12.5 点 4 评估结论：不落地（1/2/3/5 落地后复核）
+
+点 4 = 在 `SessionStart` 里挂 `GCCandidates`，让超 14 天的 pending 自动转 `expired`。
+1/2/3/5 全部落地并验收后复核，结论是**不做**：
+
+| 维度 | 结论 |
+|:---|:---|
+| 红线 | `GCCandidates` 是 `UPDATE` + `DELETE`（pending → `expired`、删 90 天以上已采纳行）。挂在 `SessionStart` 直接撞 §5「hooks 只读护栏」；还会给每个会话加一次写事务，污染 R3 读侧延迟口径（R3 只统计 `prompt-submit` / `session-start` 的 ms），并使 §12.4 的只读断言失效 |
+| 边际价值 | 点 1 让本工程 pending 计数在会话开始可见，点 2 让会话内可显式裁决，点 3 让跨工程候选不再污染本工程 R8 判级——「发现 → 裁决」闭环已闭合。自动过期不新增任何触发能力，只新增一种无人裁决的处置 |
+| 实证 | 2026-11-09 真实库 13 条 pending，最老 `2026-11-07 22:55`（1.41 天），距 14 天阈值还有 12.59 天；按工程为 training-products 7 / v2mem 4 / Ydisks-Xianyu-Helper 2。挂上去至少 12 天内**零次生效** |
+| 原则 | 自动转 `expired` 等于替用户丢弃**从未读过**的证据，长期不开会话的工程首当其冲。§12.2 记录的「跨项目混入 → reject」误诊正是这个错误的样本，不能把它自动化放大 |
+
+**替代项**（同等收益、零护栏冲突，均不在本次范围）：
+
+- 若需要紧迫度，可在点 1 的只读行里补一次 `MIN(created_at)` 显示「最老待裁决 N 天」，仍是 `SELECT`；代价是多一次查询、注入预算更紧（点 1 已有小预算让路逻辑）。
+- 真要回收证据走人工路径：在对应工程会话里用 `mem candidates ls --project P --policy` 逐条裁决，或用户确认后跑 `mem gc --candidates`；判据侧按 [`ops-watch.md`](./ops-watch.md) §5 R8 的「就近裁决」动作，不跨工程批量处理。

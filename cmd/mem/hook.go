@@ -436,8 +436,17 @@ func sessionStartContext(st *store.Store, project string, limit, maxChars int, m
 	codes := renderKindCodes()
 	head := fmt.Sprintf("[v2mem] 本机有跨会话的本地记忆库（Level 2，正文不进上下文）。当前工程：%s\n",
 		orGlobal(project))
+	// 待裁决提示与 head/codes/hint 同属固定开销：先预留，绝不进 sections 被预算裁掉。
+	// 只在当前工程确有 pending 候选时出现，长度与库规模无关（一个计数 + 固定文案）。
+	pending := pendingCandidatesLine(st, project)
+	fixed := runeLen(head) + runeLen(hint) + runeLen(codes)
+	// 固定开销放不下提示时，宁可不提示也不挤掉类码表与 hint（钩子本体）。
+	// 默认预算 1200 永远够；只有外部把 --max-chars 压得很小时才走这里。
+	if fixed+runeLen(pending) > maxChars {
+		pending = ""
+	}
 
-	budget := maxChars - runeLen(head) - runeLen(hint) - runeLen(codes)
+	budget := maxChars - fixed - runeLen(pending)
 	if budget < 0 {
 		budget = 0
 	}
@@ -493,6 +502,7 @@ func sessionStartContext(st *store.Store, project string, limit, maxChars int, m
 	var sb strings.Builder
 	sb.WriteString(head)
 	sb.WriteString(codes)
+	sb.WriteString(pending)
 	var injected []store.Hit
 	var items []store.ReadTraceItem
 	rank := 0
@@ -594,6 +604,29 @@ func hitIDs(hits []store.Hit) []string {
 func formatHits(title string, hits []store.Hit, prov map[string]string, budget int) (string, int) {
 	r := renderSection(title, hits, prov, budget, len(hits))
 	return r.block, r.used
+}
+
+// pendingCandidatesLine 把「本工程还有几条候选没裁决」推进会话，补上
+// 观测 → candidates → accept 三态链路的最后一跳的触发点。
+//
+// 只读、失败开放：查询失败一律当 0 并只写 stderr，绝不阻断宿主。
+// 只算当前 project —— 别的项目候选留给它们自己的会话就近裁决，
+// 全局累加会让本工程会话把别项目的合法产物误判成脏数据。
+// 未识别工程（project == ""）时不提示：没有工程上下文就谈不上「就近」。
+func pendingCandidatesLine(st *store.Store, project string) string {
+	if project == "" {
+		return ""
+	}
+	n, err := st.CountPendingByProject(project)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "v2mem hook: 待裁决计数失败，按 0 处理:", err)
+		return ""
+	}
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("[待裁决] 本工程 %d 条 pending 候选（隔离区，不进检索）："+
+		"用 MCP candidates_ls 查看，逐条 accept / reject 裁决；或跑 mem candidates ls。\n", n)
 }
 
 // hintBlock 是「钩子」本体：告诉模型还有 Level 2 可查，并给出可直接执行的命令。

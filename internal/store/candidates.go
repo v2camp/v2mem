@@ -225,7 +225,17 @@ func scanCandidate(row rowScanner) (*Candidate, error) {
 }
 
 // ListCandidates 按状态列出候选。status 为空则不限。session 为空则不限会话。
+//
+// 保留旧签名：全仓 20 处调用点（含 internal/proposal 的测试）都依赖它，
+// 按工程过滤请改用 ListCandidatesByProject。
 func (s *Store) ListCandidates(status, session string, limit int) ([]Candidate, error) {
+	return s.ListCandidatesByProject(status, session, "", limit)
+}
+
+// ListCandidatesByProject 在 ListCandidates 之上加工程过滤。
+// project 为空表示**不过滤**（与 status / session 的空值语义一致）；
+// 想只取全局候选请显式传 project="" 并配合 status，不要依赖空值。
+func (s *Store) ListCandidatesByProject(status, session, project string, limit int) ([]Candidate, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -240,6 +250,10 @@ func (s *Store) ListCandidates(status, session string, limit int) ([]Candidate, 
 	if session != "" {
 		q += ` AND session_id = ?`
 		args = append(args, session)
+	}
+	if project != "" {
+		q += ` AND project = ?`
+		args = append(args, project)
 	}
 	q += ` ORDER BY created_at ASC, id ASC LIMIT ?`
 	args = append(args, limit)
@@ -257,6 +271,22 @@ func (s *Store) ListCandidates(status, session string, limit int) ([]Candidate, 
 		out = append(out, *c)
 	}
 	return out, rows.Err()
+}
+
+// CountPendingByProject 统计指定工程仍在 pending 的候选数，供 SessionStart
+// 注入「本工程还有几条没裁决」的提示用。
+//
+// 与 ListCandidatesByProject 的空值语义**不同**：这里的 project 是 WHERE 的等值条件，
+// 空串精确匹配全局候选（project 列默认值），不是「不过滤」。调用方必须在拿到
+// 已解析的工程名后再调用；未识别工程时不要调用本方法。
+//
+// 只读、单次 COUNT，命中 ix_cand_status 的 status 前导列。
+func (s *Store) CountPendingByProject(project string) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM candidates WHERE status = 'pending' AND project = ?`,
+		project).Scan(&n)
+	return n, err
 }
 
 // ResolveCandidate 按 id 或前缀定位一条候选。

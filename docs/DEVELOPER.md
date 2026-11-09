@@ -7,7 +7,7 @@
 ```bash
 make test        # go test ./...（CGO_ENABLED=0）
 make test-install # 安装脚本 dry-run / mock（不联网）
-make test-watch  # 巡检判据分级回归（临时库 + mem stub，不触碰 ~/.v2mem）
+make test-watch  # 巡检判据分级回归 + 判据表↔脚本同步检查（临时库 + mem stub，不触碰 ~/.v2mem）
 make build       # → bin/mem
 make smoke       # 造一个临时库跑 add/search/stats
 make build-linux # 交叉编译（Go 内建，无需交叉工具链）
@@ -86,7 +86,7 @@ cmd/mem/            CLI 入口（命令名 mem）
   init.go           配置生成：扫描选择、合并写入、指令块
   level1.go         ingest（机械化搬运）与 budget（体量守卫）
   measure.go        audit / eval recall / eval write / eval activity
-  mcp.go            MCP stdio server（initialize/tools list/call，search/add/ls/touch）
+  mcp.go            MCP stdio server（initialize/tools list/call，读写 5 工具 + 候选裁决 3 工具）
 internal/
   store/            SQLite + FTS5、schema、生命周期、跨设备归并、相似归并
   similarity/       字符 n-gram + MinHash + 四条护栏（纯算法，无 IO）
@@ -153,8 +153,9 @@ scripts/
   MCP stdio 只是 newline-delimited JSON-RPC 2.0 的一个小子集（`initialize` /
   `tools/list` / `tools/call` / `ping`），自实现约 250 行且可纯函数单测；
   引 mcp-go 会破坏单文件轻量卖点，换来的流式/采样能力当前用不上
-- **工具面刻意最小**：`search` / `add` / `ls` / `touch`，外加只读 `recall_context`。
-  没有 `accept` / `distill`。评测/运维（audit、eval、gc、consolidate）不进工具面
+- **工具面刻意最小**：`search` / `add` / `ls` / `touch` + 只读 `recall_context`，
+  再加隔离区裁决 `candidates_ls` / `accept` / `reject`（显式调用，见 design-write-governance.md §12）。
+  `distill` 与评测/运维（audit、eval、gc、consolidate）仍不进工具面
 - **审计复用**：MCP 的检索/写入与 CLI 共享 `manual-search`/`manual-add` 埋点，
   MCP 通道的使用也会进入 `mem eval activity` 的评测样本，不会被悄悄漏掉
 - **测试分层**：协议纯函数（`dispatch`）直接喂 map 断言响应；传输层（`serve`）

@@ -1,11 +1,12 @@
 ---
 name: mem-distill
-description: 用 CLI 把观测抽成候选，再人工采纳。accept 和 distill 不在 MCP 里。
+description: 用 CLI 把观测抽成候选，再显式采纳；候选可在会话内用 MCP 工具就近裁决，distill 不在 MCP 里。
 ---
 
 # mem-distill
 
-蒸馏不进主库。MCP 里没有 distill，也没有 accept。
+蒸馏不进主库。MCP 里没有 distill；`accept` / `reject` 是会话内 Agent 的**显式**裁决（不是自动采纳），
+与下面 CLI 走同一套 revision CAS 和隔离区升格。`SessionStart` 会提示本工程还有几条 pending，可就近裁决。
 
 ```bash
 mem distill --provider none --session <id>

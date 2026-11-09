@@ -37,6 +37,8 @@ type mcpTool struct {
 
 // mcpTools 是 mem 暴露给 MCP 的工具清单 —— 只放「记忆本身的操作」，
 // 评测/运维（audit、eval、gc、consolidate）不进工具面，保持工具语义最小。
+// candidates_ls / accept / reject 是隔离区的**显式裁决**（design-write-governance.md §12）：
+// 由会话内 Agent 明确调用，不是自动裁决；distill 仍不进 MCP。
 var mcpTools = []mcpTool{
 	{
 		Name:        "search",
@@ -106,6 +108,45 @@ var mcpTools = []mcpTool{
 				"budget_chars": map[string]any{"type": "number", "description": "注入文本的字符预算，默认 1200"},
 			},
 			"required": []string{"query"},
+		},
+	},
+	{
+		Name:        "candidates_ls",
+		Description: "只读。列出隔离区 candidates（默认 pending，不进检索面）。用 project 限定工程即可就近裁决本会话产生的候选。",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"status":  map[string]any{"type": "string", "description": "pending|accepted|rejected|expired|all，默认 pending；all 不限状态"},
+				"session": map[string]any{"type": "string", "description": "限定会话"},
+				"project": map[string]any{"type": "string", "description": "限定工程（默认不限）"},
+				"limit":   map[string]any{"type": "number", "description": "最多列出多少条，默认 50"},
+			},
+		},
+	},
+	{
+		Name:        "accept",
+		Description: "显式采纳一条 pending 候选，升格为 memories（source=distill-accept）。这是会话内 Agent 的明确决策，不是自动裁决。id 必填。",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":       map[string]any{"type": "string", "description": "候选 id 或前缀（必填）"},
+				"revision": map[string]any{"type": "number", "description": "期望的候选 revision；省略或 <0 时按当前值，带值可做 CAS"},
+				"auto":     map[string]any{"type": "boolean", "description": "走提交矩阵自动裁决（默认 false，即人工/会话内显式采纳）"},
+			},
+			"required": []string{"id"},
+		},
+	},
+	{
+		Name:        "reject",
+		Description: "显式拒绝一条 pending 候选（不写 memories）。id 必填；reject 是顶层动作，不是 candidates 的子命令。",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":       map[string]any{"type": "string", "description": "候选 id 或前缀（必填）"},
+				"revision": map[string]any{"type": "number", "description": "期望的候选 revision；省略或 <0 时按当前值"},
+				"reason":   map[string]any{"type": "string", "description": "拒绝理由（可空）"},
+			},
+			"required": []string{"id"},
 		},
 	},
 }
@@ -246,6 +287,12 @@ func (s *mcpServer) callTool(id any, name string, args map[string]any) map[strin
 		return s.toolTouch(id, args)
 	case "recall_context":
 		return s.toolRecall(id, args)
+	case "candidates_ls":
+		return s.toolCandidatesLS(id, args)
+	case "accept":
+		return s.toolAccept(id, args)
+	case "reject":
+		return s.toolReject(id, args)
 	default:
 		return mcpError(id, -32602, "unknown tool: "+name)
 	}
@@ -487,6 +534,111 @@ func recallText(st *store.Store, hits []store.Hit, budget int) string {
 	block, _ := formatHits("相关记忆", hits, prov, budget-runeLen(b.String()))
 	b.WriteString(block)
 	return b.String()
+}
+
+// ---------- 候选裁决工具（隔离区显式裁决，见 design-write-governance.md §12） ----------
+//
+// 三个 handler 都直接走 store 层，不复用 cmdAccept / cmdReject / cmdCandidates：
+// 那些 CLI 命令把结果打印到 os.Stdout，而 MCP 的 stdout 是 JSON-RPC 通道，
+// 任何打印都会破坏协议；mcpServer 也已持有自己的 st 连接。
+
+// toolCandidatesLS 只读列出隔离区候选（默认 pending，不进检索面）。
+func (s *mcpServer) toolCandidatesLS(id any, args map[string]any) map[string]any {
+	limit := argInt(args, "limit", 50)
+	if limit <= 0 {
+		return mcpError(id, -32602, "limit 应为正数")
+	}
+	status := argString(args, "status")
+	if status == "" {
+		status = "pending"
+	}
+	switch status {
+	case "pending", "accepted", "rejected", "expired":
+	case "all":
+		status = ""
+	default:
+		return mcpError(id, -32602, fmt.Sprintf("status 可选 pending|accepted|rejected|expired|all，got %q", status))
+	}
+	list, err := s.st.ListCandidatesByProject(status,
+		argString(args, "session"), argString(args, "project"), limit)
+	if err != nil {
+		return mcpError(id, -32603, "candidates_ls 失败: "+err.Error())
+	}
+	if list == nil {
+		list = []store.Candidate{}
+	}
+	return toolResult(id, list, false)
+}
+
+// toolAccept 显式采纳一条候选。revision 缺省时按当前值；带值则走 CAS，
+// 与 CLI `mem accept --revision N` 同一语义。auto=true 才走提交矩阵。
+func (s *mcpServer) toolAccept(id any, args map[string]any) map[string]any {
+	cid := argString(args, "id")
+	if cid == "" {
+		return mcpError(id, -32602, "accept 需要 id（候选 id 或前缀）")
+	}
+	view, err := s.st.CommitCandidate(cid)
+	if err != nil {
+		return mcpError(id, -32603, "accept 失败: "+err.Error())
+	}
+	rev := argInt(args, "revision", view.Revision)
+	if rev < 0 {
+		rev = view.Revision
+	}
+	var res *store.CommitResult
+	if argBool(args, "auto", false) {
+		res, err = s.st.AutoCommitCandidate(cid, rev)
+	} else {
+		res, err = s.st.CommitAccept(cid, rev, "human")
+	}
+	if err != nil {
+		return mcpError(id, -32603, "accept 失败: "+err.Error())
+	}
+	if res.Committed && s.auditFile != "-" {
+		mode := "create"
+		if res.Already {
+			mode = "overwrite"
+		}
+		s.auditAppend(audit.Record{
+			TS: time.Now().Unix(), Event: "accept", SessionID: res.Candidate.SessionID,
+			Project: res.Candidate.Project, Source: "distill-accept", Mode: mode,
+			Count: 1, Hashes: []string{res.MemoryID}, Kinds: []string{res.Candidate.Kind},
+		})
+	}
+	return toolResult(id, map[string]any{
+		"candidate": res.Candidate.ID, "memory_id": res.MemoryID,
+		"created": res.CreatedMemory, "already": res.Already,
+		"decision": decisionOf(res, rev),
+	}, false)
+}
+
+// toolReject 显式拒绝一条候选，不写 memories。
+func (s *mcpServer) toolReject(id any, args map[string]any) map[string]any {
+	cid := argString(args, "id")
+	if cid == "" {
+		return mcpError(id, -32602, "reject 需要 id（候选 id 或前缀）")
+	}
+	view, err := s.st.CommitCandidate(cid)
+	if err != nil {
+		return mcpError(id, -32603, "reject 失败: "+err.Error())
+	}
+	rev := argInt(args, "revision", view.Revision)
+	if rev < 0 {
+		rev = view.Revision
+	}
+	res, err := s.st.CommitReject(cid, rev, "human", argString(args, "reason"))
+	if err != nil {
+		return mcpError(id, -32603, "reject 失败: "+err.Error())
+	}
+	if s.auditFile != "-" {
+		s.auditAppend(audit.Record{
+			TS: time.Now().Unix(), Event: "reject", SessionID: res.Candidate.SessionID,
+			Project: res.Candidate.Project, Source: "distill", Count: 1, Mode: "rejected",
+		})
+	}
+	return toolResult(id, rejectResultView{
+		Candidate: res.Candidate, Decision: decisionOf(res, rev),
+	}, false)
 }
 
 // ---------- 协议辅助 ----------

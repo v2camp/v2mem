@@ -237,26 +237,46 @@ else
   add R7 FAIL "spool 积压 ${SPOOL_FILES} 个文件" "写库持续失败，检查库文件权限与磁盘"
 fi
 
-# R8 候选积压
-CAND_OUT=$( "$MEM_BIN" candidates ls 2>/dev/null )
-if printf '%s' "$CAND_OUT" | grep -q '没有候选'; then
-  CAND=0
+# R8 候选积压 / R9 载荷残留：统一从 candidates ls --json 采集，避免文本行数口径。
+# 按 project 分组，窗口值取各工程计数的**最大值**（阈值 5/15 不变）：
+# 跨工程候选不相加——别的项目候选留给它们自己的会话就近裁决，
+# 全局累加会把合法产物误诊成脏数据。见 docs/ops-watch.md §3 R8 / design-write-governance.md §12。
+CAND_JSON=$( "$MEM_BIN" candidates ls --json --limit 100000 2>/dev/null )
+if printf '%s' "$CAND_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  CAND_READ_FAIL=0
 else
-  CAND=$(printf '%s' "$CAND_OUT" | grep -c . )
+  CAND_JSON='[]'
+  CAND_READ_FAIL=1
 fi
+CAND_PENDING=$(printf '%s' "$CAND_JSON" | jq -c '[.[] | select(.status == "pending")]' 2>/dev/null || echo '[]')
+CAND=$(printf '%s' "$CAND_PENDING" | jq -r 'length' 2>/dev/null || echo 0)
 CAND=${CAND:-0}
-if [ "$CAND" -le 5 ]; then
-  add R8 PASS "候选待处理 ${CAND}" "隔离区未积压"
-elif [ "$CAND" -le 15 ]; then
-  add R8 WARN "候选积压 ${CAND}" "考虑 mem accept / mem reject 清理"
+CAND_MAX=$(printf '%s' "$CAND_PENDING" | jq -r '[group_by(.project)[] | length] | max // 0' 2>/dev/null || echo 0)
+CAND_MAX=${CAND_MAX:-0}
+# detail 以 | 分隔 RESULTS，且会被拼进 JSON：项目名里的 | 与 " 一律替换掉。
+CAND_GROUPS=$(printf '%s' "$CAND_PENDING" | jq -r '
+  group_by(.project) | map({p:(.[0].project // ""), n:length}) | sort_by(-.n)
+  | map((if .p == "" then "(全局)" else .p end) + "=" + (.n|tostring))
+  | join(", ") | gsub("[\"|]"; "/")' 2>/dev/null || echo '')
+
+if [ "$CAND_READ_FAIL" -eq 1 ]; then
+  add R8 WARN "候选读取失败" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
+elif [ "$CAND_MAX" -le 5 ]; then
+  add R8 PASS "候选待处理 ${CAND_MAX}" "隔离区未积压；按工程：${CAND_GROUPS:-无}"
+elif [ "$CAND_MAX" -le 15 ]; then
+  add R8 WARN "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决"
 else
-  add R8 FAIL "候选积压 ${CAND}" "蒸馏产物长期未处理，检索质量会受影响"
+  add R8 FAIL "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响"
 fi
 
-# R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤
-NOISE=$(printf '%s\n' "$CAND_OUT" | grep -cE '\{"(id|parentId|callId|type)"' || true)
+# R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤。
+# 检测式与旧版 grep '\{"(id|parentId|callId|type)"' 等价，只是改读 JSON 的 content 字段。
+NOISE=$(printf '%s' "$CAND_PENDING" | jq -r '
+  [.[] | select((.content // "") | test("\\{\"(id|parentId|callId|type)\""))] | length' 2>/dev/null || echo 0)
 NOISE=${NOISE:-0}
-if [ "$NOISE" -eq 0 ]; then
+if [ "$CAND_READ_FAIL" -eq 1 ]; then
+  add R9 WARN "候选内容未校验" "pending 内容未读取；按 WARN 观察"
+elif [ "$NOISE" -eq 0 ]; then
   add R9 PASS "候选内容无载荷残留" "pending ${CAND} 条，未发现 transcript 原始 JSON"
 elif [ "$NOISE" -le 3 ]; then
   add R9 WARN "候选含载荷残留 ${NOISE} 条" "单窗口内产生，用 mem reject 清理并核查 distill 输入过滤"
