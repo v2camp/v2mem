@@ -82,8 +82,8 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
 | **R6** | 库规模 | `mem stats` 总条数 vs 上次快照 | 未下降 | 下降 | — |
 | **R7** | spool 积压 | `spool/*.jsonl` 数 | 0 | 1–3 | >3 |
-| **R8** | 候选积压 | `mem candidates ls` 条数 | ≤5 | 6–15 | >15 |
-| **R9** | 候选内容质量 | pending 候选中 transcript 原始 JSON 载荷残留条数 | 0 | 1–3 | >3 |
+| **R8** | 候选积压 | `mem candidates ls --json` 按 `project` 分组后的**单工程** pending 数；窗口取各工程最大值 | ≤5 | 6–15 | >15 |
+| **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中 transcript 原始 JSON 载荷残留条数 | 0 | 1–3 | >3 |
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
 | **R11** | WAL 堆积 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0） | ≤1000 帧 | 1001–2000 | >2000 |
 
@@ -99,6 +99,13 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   初期低是必然。30% 是"库有料但仍常空手"的告警线。
 - **库 20 条 / 评测 20 样本**：`mem audit` 自己提示「可评测样本 ≥20 再下结论」，同一口径沿用。
 - **R8 的 15**：候选是隔离区，长期不处理会让下次蒸馏覆盖判断；经验值，可随实测调整。
+  **分组口径（2026-11-09）**：阈值按**单个 `project`** 计，跨工程候选不相加，窗口值取各工程计数的
+  **最大值**（任一工程越线即按该级判）。理由：库本就全局、`project` 是列，别的项目候选是各自会话的
+  合法蒸馏产物；旧口径把它们全局累加，会诱导「在 A 工程会话里把 B 工程候选 reject 掉」的误诊
+  （[`design-write-governance.md`](./design-write-governance.md) §12）。`mem candidates ls --project P` 与 MCP
+  `candidates_ls` 提供就近查看。R9 的采集同步改读 `--json` 的 `content`，检测式与旧版
+  `grep '\{"(id|parentId|callId|type)"'` 等价，**判定语义与阈值均未变**。
+  `candidates ls --json` 不可解析时 R8/R9 按 `WARN` 观察，不静默判 `PASS`。
 - **R9 的 0 / 3**：候选须显式 `mem accept` 才升格（[`design-write-governance.md`](./design-write-governance.md)
   三态），所以结构化载荷残留**不是事实而是污染**，出现即说明蒸馏输入未按
   `proposalEligible` 的准入过滤。判 0 为 PASS；单次 `distill` 实测最多产出 6 条候选
@@ -152,7 +159,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | I2 掉到 1–3 | 宿主升级覆盖配置 | 重跑 `mem init --harness workbuddy`（幂等、带备份） |
 | I5 = WARN（`ExecEnv: Sandbox`） | Trae 钩子跑在沙箱，`~/.v2mem` 禁写 | Hooks 面板运行方式改「本地自动运行」；或在沙箱配置放行 `~/.v2mem` |
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |
-| R8 候选积压 | 隔离区长期未裁决 | `mem candidates ls --policy` 逐条看：可读候选 `mem accept`，载荷残留 `mem reject`（顶层命令，非 `mem candidates reject`） |
+| R8 候选积压 | 隔离区长期未裁决 | 先看 detail 里的**按工程分组**计数，在**对应工程的会话里**就近裁决：`mem candidates ls --project P --policy` 或 MCP `candidates_ls` 逐条看；可读候选 `mem accept` / MCP `accept`，载荷残留 `mem reject` / MCP `reject`（顶层命令，非 `mem candidates reject`）。不要跨工程批量 reject |
 | R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
 | R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
 | R11 WAL 帧数越线 | 被动 checkpoint 未跟上 | `sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(TRUNCATE);"` 并记下返回三元组 `(busy,log,checkpointed)`；`busy=1` 说明有长读事务，查各 harness 的 `mem mcp` 连接。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务 |
@@ -182,7 +189,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…R9） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R11） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |
@@ -280,7 +287,7 @@ grep '"source":"distill"'  ~/.v2mem/audit.jsonl | tail -5   # 有输出 = 旧规
 | **R2** 检索命中率 | ≥30%（库 ≥20 条）；<20 条时为 `INFO`，不看数值 |
 | **R4** 写侧活动 | 库 ≥20 条时每窗口 `manual-add` ≥1；为 0 记 `WARN`，不是 FAIL |
 | **R5** 观测落库 | 每窗口 `obs-append` ≥1（归档链路未断） |
-| **R8** 候选积压 | `pending` 候选 ≤5；6–15 为 `WARN`，>15 为 `FAIL` |
+| **R8** 候选积压 | 各 `project` 的 `pending` 计数，窗口值取最大值（§3 口径）；≤5 正常，6–15 为 `WARN`，>15 为 `FAIL` |
 | **R9** 候选载荷残留 | 恒为 **0**；出现即说明 Proposal 输入未按 `proposalEligible` / `Fidelity` 过滤 |
 
 `R3` / `R6` / `R7` 照常巡检，但**不参与本节的转正判定**——它们衡量的是检索延迟与库、spool 健康，
@@ -298,13 +305,15 @@ R9 **不降级**：载荷残留与库规模无关，冷启动期同样判 0。
 
 | # | 条件 | 阈值 | 来源 |
 |:---|:---|:---|:---|
-| 1 | 观察期无 FAIL | 连续 7 天（14 个窗口）全部窗口无 `FAIL` | §3 判级 |
-| 2 | R8 不积压 | 14 个窗口中 `>5` 的窗口 ≤2 个，且末窗口值 ≤ 首窗口值（不呈单调增长） | **建议值** |
+| 1 | 观察期无 FAIL | 连续 7 天（14 个窗口）全部窗口无 `FAIL`；R8 按工程分组后**任一 `project` 越线即该窗口 FAIL** | §3 判级 |
+| 2 | R8 不积压 | **窗口值 = 该窗口各 `project` 计数的最大值**；14 个窗口中 `>5` 的窗口 ≤2 个，且末窗口最大值 ≤ 首窗口最大值（不呈单调增长） | **建议值** |
 | 3 | R9 干净 | 14 个窗口恒为 `0` | §3 R9 PASS 线 |
 | 4 | 检索无回退 | `make eval-gate` 的 Recall@5 ≥ **0.60**，且较切换前一次实测基线绝对下降 ≤ **0.03** | 0.60 出自 `eval-policy.txt` 的 `recall5_min`；0.03 为**建议值** |
 
 > `make eval-gate` 跑的是沙箱夹具（不读个人库），它守的是**代码级检索回归**，不反映 Proposal 质量——
 > Proposal 质量由条件 2 / 3 与人工抽查候选可读性共同判定。两类证据不要互相替代。
+> **口径切换**：R8 于 2026-11-09 改为按 `project` 分组取最大值，此前留存的窗口序列是**全局旧口径**，
+> 不得与新口径混算；观察期若跨该日期，条件 2 需从切换后的首个窗口重新起算 14 窗。
 
 **切默认值必须单独提一次变更并留档**（改默认 = 改所有宿主的行为），不得在观察期结束时顺手合并。
 

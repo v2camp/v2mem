@@ -89,7 +89,7 @@ v2mem 不拥有过程产物的正文，也不回写源文件。否则 harness �
 
 - 不做常驻文件 watcher / 守护进程；
 - 不让 hook 直接写 `memories`；
-- 不自动 `accept` 候选；
+- 不自动 `accept` 候选（MCP 的 `accept` 是会话内 Agent 显式调用，见 design-write-governance.md §12，不属自动）；
 - 不把向量或 LLM 放进检索关键路径；
 - 不做全盘 `~` 通用 glob 扫描；
 - 不把 artifact 正文复制成 v2mem 的「唯一真相源」；
@@ -473,12 +473,18 @@ Trae 一次任务跨多个 Stop 是常态，不能把第 N 个 Stop 当收工。
 - **无文件 harness**：只有加密 DB 或远端 API 的 harness，是否只能依赖 hook + closeout？
 - **事件枚举治理**：`Kind` 新增是否需要版本号与兼容策略？
 
+### 13.4 已裁决：候选裁决的自动化闭环（2026-11-09）
+
+完整裁决（问题、四点方案、设计决策变更、参考工程对照）见
+[`design-write-governance.md`](./design-write-governance.md) §12 —— 该文档承载三态与 `accept` 的治理口径。
+本文件只保留 §14 的「不自动 accept」红线边界。
+
 ## 14. 不做清单
 
 - 不做常驻 watcher / 文件守护进程；
 - 不做「全盘 `~` 扫描」；
 - 不让 hook 直接写 `memories`；
-- 不自动 `accept` 候选；
+- 不自动 `accept` 候选（MCP 的 `accept` 是会话内 Agent 显式调用，见 design-write-governance.md §12，不属自动）；
 - 不把 artifact 正文复制成唯一事实源；
 - 不做双向同步或回写 harness 文件；
 - 不把向量/LLM 放进检索关键路径；

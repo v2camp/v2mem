@@ -132,9 +132,10 @@ Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 M
 
 ### MCP server
 
-`mem mcp` 暴露 5 个工具：`search`（检索；`layer` 为 `memory` / `observation` / `both`，默认只查已定记忆）、`add`（写入，相同内容自动覆盖）、
-`ls`（列出）、`touch`（记录命中）、`recall_context`（只读，把类码和命中拼成一段文本；`query` 必填，`layer` 与 search 相同）。
-没有 `accept` / `distill`。在支持 MCP 的工具里加一行进程配置即可：
+`mem mcp` 暴露 8 个工具：`search`（检索；`layer` 为 `memory` / `observation` / `both`，默认只查已定记忆）、`add`（写入，相同内容自动覆盖）、
+`ls`（列出）、`touch`（记录命中）、`recall_context`（只读，把类码和命中拼成一段文本；`query` 必填，`layer` 与 search 相同），
+以及隔离区裁决三件：`candidates_ls`（列出候选，可用 `project` 限定工程）、`accept` / `reject`（**显式**采纳/拒绝，走 revision CAS）。
+`distill` 仍不进 MCP。裁决工具只是把执行主体从「人跑 CLI」扩到「会话内 Agent 显式调用」，没有把决策自动化。在支持 MCP 的工具里加一行进程配置即可：
 
 ```json
 { "mcpServers": { "v2mem": { "command": "mem", "args": ["mcp"] } } }
@@ -171,7 +172,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 **Level 1 文件运维**：`mem ingest <文件.md...>`（把既有 md 机械化搬进库，幂等；写侧治理含 `--source harness-summary` 锚定"任务收尾汇总"双路径写）
 · `mem budget --file <文件> [--max-chars N]`（检查注入文件是否超预算，超限非零退出）
 · `mem notes`（先输出类码表 P/D/X/T，再输出硬规则小字条：`kind=rule`/全局高优先，一行一条、幂等；正文由 SessionStart 注入承载，每轮检索侧再去重，`MEM_NO_NOTES=1` 让检索侧也回退到原始注入）
-· `mem distill --provider none`（从观测抽候选，**不**写永久记忆）· `mem candidates ls` · `mem accept` / `mem reject`
+· `mem distill --provider none`（从观测抽候选，**不**写永久记忆）· `mem candidates ls [--project P]`（按工程就近查看）· `mem accept` / `mem reject`（顶层命令，MCP 里是 `accept` / `reject` 工具）
 · `mem import-transcript --file <claude.jsonl>`（默认只写观测；`--into both` 再跑规则蒸馏，仍须 accept）
 · `mem gc --candidates`（pending 14 天过期，已采纳行 90 天后删除，不动记忆）
 
@@ -246,6 +247,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-synonym-library.md`](./docs/design-synonym-library.md) | 使用者/开发者 | 同义词词库：起步配置/查询期展开/有效迭代闭环/初始化 agent 提取管线/自动维护闭环（§8：LLM 提取 × 试用回测） |
 | [`docs/design-provenance.md`](./docs/design-provenance.md) | 使用者/开发者 | 记忆溯源：`provenance` 字段走向、ALTER 迁移、ingest 写入、sync 传播与后续资产/词库联动设想 |
 | [`docs/design-capture.md`](./docs/design-capture.md) | 所有者 / 开发者 | **捕获层架构**：多 harness 的 `CaptureEvent` 契约、A/B/C/D 捕获阶梯、适配器一致性测试、artifact 扫描边界与「事实源/查询源」划分 |
+| [`docs/design-write-governance.md`](./docs/design-write-governance.md) | 所有者 / 开发者 | **写侧治理**：三态（观测/候选/采纳）、写必由 LLM 决策、channel 与来源标记；§12 候选裁决自动化闭环（触发点、MCP 显式裁决、R8 分组、采纳率前提） |
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |
 | [`docs/setup.md`](./docs/setup.md) | 使用者 | **安装/接入规范**：合规接入五守则、hooks/MCP 分层、各宿主标准流程、监听面板引导、卸载回退 |
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |

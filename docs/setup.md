@@ -27,7 +27,7 @@ v2mem 对宿主提供**两种合规接入**，定位互补，不可互相替代�
 | 接入 | 载体 | 解决什么 | 官方要求 |
 |---|---|---:|---|
 | **读侧注入（hooks）** | `mem hook` | 会话开始/提问时**自动塞相关记忆进上下文**（"记得住"） | hooks 事件 + 面板启用/审核 |
-| **检索能力（MCP）** | `mem mcp` (stdio) | 把 search/add/ls/touch **作为工具暴露**给支持 MCP 的宿主 | `.mcp.json` + 信任确认 |
+| **检索能力（MCP）** | `mem mcp` (stdio) | 把 search/add/ls/touch/recall_context 与候选裁决 candidates_ls/accept/reject **作为工具暴露**给支持 MCP 的宿主 | `.mcp.json` + 信任确认 |
 
 - hooks 负责**自动喂上下文**（读侧确定性入口）；MCP 负责**能力暴露**（供 agent 显式调用）。互斥？不——v2mem 两条都提供，方向一致。
 - 安装动作的目标：**让两条路都"合规产出 + 引导面板确认"**，而非侵入写入。
@@ -108,7 +108,8 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 4. MCP（可选，与 hooks 相互独立）：在 `~/.workbuddy/mcp.json` 加 `v2mem` 只是**声明，不会激活**。
    必须到「专家·技能·连接器 → 连接器页 → 右上角自定义连接器」，或「侧边栏 插件 → MCP 服务器」
    把 v2mem 开关打开。开启后 `~/.workbuddy/mcp-approvals.json` 出现 `<sha256>::v2mem`，
-   会话内即可看到 `mcp__v2mem__search / add / ls / touch / recall_context`。
+   会话内即可看到 `mcp__v2mem__search / add / ls / touch / recall_context`，
+   以及候选裁决 `candidates_ls / accept / reject`（显式调用，不自动裁决）。
 5. 验收（只读）：
    ```bash
    mem audit --tail 5                     # 应有 session-start | workbuddy、prompt-submit | workbuddy
@@ -132,7 +133,7 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 
 - 产出一份 `.mcp.json`（或宿主等价配置），把 `mem mcp` 注册为 stdio 工具服务器；
 - 首次须在宿主里**信任/允许**该 MCP server；
-- 之后 agent 可在对话中显式调用 mem 的 search/add/ls/touch。
+- 之后 agent 可在对话中显式调用 mem 的 search/add/ls/touch/recall_context，并用 candidates_ls/accept/reject 就近裁决本工程候选。
 
 ## 4. `mem setup`（理想接口形态）
 

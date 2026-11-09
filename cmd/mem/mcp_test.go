@@ -89,15 +89,20 @@ func TestMCPToolsList(t *testing.T) {
 			t.Errorf("工具 %v 缺 inputSchema", tl["name"])
 		}
 	}
-	for _, want := range []string{"search", "add", "ls", "touch", "recall_context"} {
+	for _, want := range []string{
+		"search", "add", "ls", "touch", "recall_context",
+		"candidates_ls", "accept", "reject",
+	} {
 		if !names[want] {
 			t.Errorf("工具清单缺 %s，got %v", want, names)
 		}
 	}
-	if len(names) != 5 {
-		t.Fatalf("工具面应为 5，got %v", names)
+	if len(names) != 8 {
+		t.Fatalf("工具面应为 8，got %v", names)
 	}
-	for _, banned := range []string{"accept", "distill", "reject"} {
+	// design-write-governance.md §12：accept/reject 是会话内 Agent 的**显式**裁决，
+	// 已获准进 MCP；distill 是产出候选的批处理，仍不进工具面。
+	for _, banned := range []string{"distill"} {
 		if names[banned] {
 			t.Errorf("MCP 不得暴露 %s", banned)
 		}

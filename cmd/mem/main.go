@@ -54,7 +54,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem budget --file <文件>          检查 Level 1 文件是否超出注入预算
   mem audit  [--stats]             审计日志：钩子激活次数、空注入率、可评测样本数
   mem eval   recall|write|activity      评测：检索准不准（recall）／记录准不准（write）／用量视图（activity）
-  mem mcp                           MCP server（stdio）：把 search/add/ls/touch/recall_context 暴露给支持 MCP 的工具
+  mem mcp                           MCP server（stdio）：search/add/ls/touch/recall_context + 候选裁决 candidates_ls/accept/reject
   mem stats  [选项]                 库概览
   mem help
 
