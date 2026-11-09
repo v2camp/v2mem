@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# 回归：R8 候选积压 / R9 载荷残留 / R10 写侧延迟 / R11 WAL 堆积 的分级边界，
-# 逐格对应 docs/ops-watch.md §3 判据表。
+# 回归：R8 候选积压 / R9 载荷残留 / R10 写侧延迟 / R11 WAL 堆积 /
+# R12 写侧自动决策链路 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
 # 用临时 V2MEM_DIR + mem stub，不触碰生产库；只断言 --json 输出的级别。
-# 重点守住三条口径：R8 按工程分组取最大值（跨工程不相加）、R10 只取 stop
-# （不与 obs-append 双计）、无样本记 INFO 而非 PASS。
+# 重点守住四条口径：R8 按工程分组取最大值（跨工程不相加）、R10 只取 stop
+# （不与 obs-append 双计）、无样本记 INFO 而非 PASS、R12 判级只依赖 audit
+# （eval activity 读不到时仍须独立判级）。
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WATCH="$ROOT/scripts/watch-v2mem.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 NOW="$(date +%s)"
+N=0
 
 # cand_json <project> <n> [content]：造 n 条 pending 候选。
 # content 可塞 transcript 载荷用于 R9；默认是可读的原子事实。
@@ -21,9 +23,10 @@ cand_json() {
 
 merge_json() { jq -nc --argjson a "$1" --argjson b "$2" '$a + $b'; }
 
-# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json>
+# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json> [audit_extra] [activity_json]
 run_case() {
   local name="$1" stop_ms="$2" frames="$3" with_obs="$4" cands="$5"
+  local extra_audit="${6:-}" activity="${7:-}"
   local d="$TMP/$name"
   mkdir -p "$d/v2mem" "$d/wb" "$d/home"
 
@@ -32,6 +35,7 @@ run_case() {
 case "${1:-}" in
   stats) echo "总条数 10" ;;
   candidates) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
+  eval) printf '%s\n' "${STUB_ACTIVITY_JSON:-}" ;;
 esac
 exit 0
 STUB
@@ -57,6 +61,9 @@ SETTINGS
       printf '{"ts":%s,"event":"obs-append","ms":9000}\n' "$NOW"
     fi
   } > "$d/v2mem/audit.jsonl"
+  if [ -n "$extra_audit" ]; then
+    printf '%s' "$extra_audit" >> "$d/v2mem/audit.jsonl"
+  fi
 
   if [ "$frames" -gt 0 ]; then
     dd if=/dev/zero of="$d/v2mem/mem.db-wal" bs=4096 count="$frames" 2>/dev/null
@@ -67,6 +74,7 @@ SETTINGS
   HOME="$d/home" \
   MEM_BIN="$d/mem-stub" \
   STUB_CAND_JSON="$cands" \
+  STUB_ACTIVITY_JSON="$activity" \
     bash "$WATCH" --json 2>/dev/null || true
 }
 
@@ -87,11 +95,42 @@ assert_case() {
       exit 1
     fi
   done
+  N=$((N+1))
   printf 'ok  %-26s R10=%-4s R11=%-4s R8=%-4s R9=%-4s\n' \
     "$name" "$want_r10" "$want_r11" "${want_r8:--}" "${want_r9:--}"
 }
 
 EMPTY='[]'
+
+# R12 夹具：造 distill 审计行与 mem eval activity --json 的返回。
+# 判级只依赖前者；后者只补诊断文案，所以要单独测「读不到也不影响判级」。
+dline() {
+  printf '{"ts":%s,"event":"distill","source":"%s","mode":"%s","failed":%s}\n' "$NOW" "$1" "$2" "$3"
+}
+decline() { printf '{"ts":%s,"event":"%s"}\n' "$NOW" "$1"; }
+activity_json() {
+  jq -nc --arg v "$1" '{exists:true, verdict:$v, summary:{observations:1,distill_ok:1,distill_fail:0,accepts:0,rejects:0}}'
+}
+
+# assert_r12 <名称> <obs yes/no> <audit_extra> <activity_json> <want_level> [detail 子串]
+assert_r12() {
+  local name="$1" with_obs="$2" extra="$3" activity="$4" want="$5" needle="${6:-}"
+  local out got detail
+  out="$(run_case "$name" 100 0 "$with_obs" "$EMPTY" "$extra" "$activity")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R12") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R12") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R12 want=$want got=$got" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R12 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R12=%-4s\n' "$name" "$want"
+}
 
 # R10 边界：<1000 PASS / 1000–3000 WARN / >3000 FAIL / 无样本 INFO；顺带断言 R8/R9 空库 PASS。
 assert_case r10_pass            100 0 no "$EMPTY" PASS PASS PASS PASS
@@ -122,4 +161,18 @@ assert_case r9_noise_warn      100 0 no "$(cand_json A 1 '{"id":1,"type":"x"}')"
 # 采集失败保护：不可解析的 JSON 不得静默判 PASS。
 assert_case r8_read_fail       100 0 no 'not-json' PASS PASS WARN WARN
 
-echo "watch-v2mem 判据回归 17/17 PASS"
+# R12 边界：无样本 INFO / 有蒸馏且 0 失败 PASS / 断链 WARN / 失败 1–3 WARN / >3 FAIL。
+assert_r12 r12_no_sample        no  '' '' INFO
+assert_r12 r12_pass_rules       yes "$(dline distill ok false)$(dline distill empty false)" "$(activity_json '本次任务有沉淀')" PASS '蒸馏 2'
+assert_r12 r12_broken_chain     yes '' '' WARN 'MEM_DISTILL_SPAWN'
+assert_r12 r12_fail_1           yes "$(dline distill fail true)" '' WARN
+assert_r12 r12_fail_3           yes "$(dline distill fail true)$(dline distill fail true)$(dline distill fail true)" '' WARN
+assert_r12 r12_fail_4           yes "$(dline distill fail true)$(dline distill fail true)$(dline distill fail true)$(dline distill fail true)" '' FAIL
+assert_r12 r12_proposal_split   yes "$(dline proposal ok false)$(dline distill empty false)" '' PASS 'proposal 1'
+assert_r12 r12_empty_not_fail   yes "$(dline distill empty false)$(dline distill noop false)" '' PASS '合法空 2'
+assert_r12 r12_invalid_mode     yes "$(dline proposal invalid false)" '' WARN
+assert_r12 r12_activity_badjson yes "$(dline distill ok false)" 'not-json' PASS
+assert_r12 r12_activity_verdict yes "$(dline distill ok false)" "$(activity_json '有观测无采纳')" PASS '有观测无采纳'
+assert_r12 r12_decisions_shown  yes "$(dline distill ok false)$(decline accept)$(decline reject)" '' PASS 'accept 1 reject 1'
+
+echo "watch-v2mem 判据回归 ${N}/${N} PASS"

@@ -86,6 +86,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中 transcript 原始 JSON 载荷残留条数 | 0 | 1–3 | >3 |
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
 | **R11** | WAL 堆积 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0） | ≤1000 帧 | 1001–2000 | >2000 |
+| **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `source` 分流）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
 
 阈值依据（不凭空定）：
 
@@ -132,6 +133,27 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   **不用于推断写侧延迟**——11-08 黑盒实测中 hook 进程退出后 WAL 帧恒为 0，
   而 Stop 耗时仍随 transcript 行数线性上升，两者无因果关系（见
   [`design-write-batch.md`](./design-write-batch.md) §0）。R10 与 R11 各自独立判级。
+- **R12 的 0 / 3 与断链口径（2026-11-09 新增）**：这里的「自动决策」指 hook 驱动的
+  `observations → distill_runs → candidates` 链，**不含** `accept` / `reject` —— 后者是显式裁决，
+  积压由 R8 判级、动作在 §5 R8。R12 只回答「自动段有没有推进」：
+  - `obs-append = 0` → `INFO`。这是**无样本**，与 R3 / R10 同类，不是 §4 的冷启动降级。
+  - `event=distill = 0` 而有观测 → `WARN`（断链）。成因按 §8.1 的三开关
+    （`MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL`）、
+    `startDistillProc` 失败（只打 stderr、不写审计，故库里看不出来）或名单静默回落（§8.3）逐项排查。
+    **不判 `FAIL`**：`MEM_NO_DISTILL=1` 完全停掉蒸馏是 §8.4 的合法配置，判 FAIL 会制造恒久误报。
+  - 失败状态沿用 R7 / R9 的「单窗口可人工处理余量」分档 `0 / 1–3 / >3`。失败集合取
+    `failed=true` 或 `mode ∈ {fail, partial, invalid, backlog}`：Proposal 会写 `noop` /
+    `invalid` / `backlog`，而 `audit.Summarize` 只认 `mode=ok` / `mode=fail`，
+    `mem eval activity` 的 `distill_fail` 因此有盲区，R12 直接读审计补齐。
+    `empty` / `noop` / `ok` 是合法结果，不计失败。
+  - `source=proposal` 为 0 **不判级**：默认安装跑旧规则蒸馏，Proposal 是 §8 的灰度项。
+    detail 展示分流，是把 §8.3 的「首日确认」从人工 grep 变成每窗口可见。
+  - 裁决活性（`accept` / `reject` 计数）与 `mem eval activity --json` 的 `verdict`
+    （含「有观测无采纳」）只作 detail，不判级：零裁决已由 R8 的积压判级承接，避免重复告警。
+    `eval activity` 读不到或不可解析时 R12 判级不受影响。
+  - **采集只读**：`audit.jsonl` + `mem eval activity --json`（`cmdEvalActivity` 不开库），
+    不执行 `mem distill` / `accept` / `reject` / `gc`。`distill_runs` 的 `status` / `error` /
+    `attempt` 与 `evidence_bundles` 积压留作 §5 的深挖命令，不进脚本采集，避免引入 sqlite 依赖。
 
 ---
 
@@ -142,9 +164,10 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 判据必须阶段化，否则「符合预期」这四个字没有定义。跨过 20 条后自动启用完整阈值。
 
-**例外只覆盖 R2 / R4。** R9、R10、R11 不降级：候选载荷残留是输入过滤失效、写侧延迟
-是同步 hook 的耗时、WAL 堆积是 checkpoint 未跟上，三者都与库里有多少条记忆无关，
-冷启动期同样应报。
+**例外只覆盖 R2 / R4。** R9、R10、R11、R12 不降级：候选载荷残留是输入过滤失效、写侧延迟
+是同步 hook 的耗时、WAL 堆积是 checkpoint 未跟上、写侧决策断链是自动链路没推进，都与库里
+有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
+与 R3 / R10 的「无样本」同类，**不是**本节的降级。
 
 ---
 
@@ -163,6 +186,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
 | R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
 | R11 WAL 帧数越线 | 被动 checkpoint 未跟上 | `sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(TRUNCATE);"` 并记下返回三元组 `(busy,log,checkpointed)`；`busy=1` 说明有长读事务，查各 harness 的 `mem mcp` 连接。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务 |
+| R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
@@ -173,6 +197,8 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 - 定时任务：每 12 小时跑 `scripts/watch-v2mem.sh --window 12h`。
 - 基线快照：`~/.v2mem/watch-state.json`（`{ts,total,window}`），供 R6 对比；首次跑记为 `INFO`。
 - 脚本**只读**库与配置，唯一写入是上述快照。`--quiet` 只输出非 PASS 项，`--json` 供机器消费。
+  R12 额外调用的 `mem eval activity --json` 只读 `audit.jsonl`（`cmdEvalActivity` 不打开数据库），
+  不写审计、不写库；该命令不可用时 R12 仍按审计独立判级。
 - 告警口径：只有 `FAIL` 需要人介入；`WARN` 观察，`INFO` 忽略。
 
 ---
@@ -189,14 +215,14 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R11） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R12） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |
 |:---|:---|
 | 进程资源阈值（event loop lag / CPU / RSS） | v2mem 无常驻进程，无对象可测 |
 | `stale-pidfile` 类诊断 | 没有 pid 文件，问题不存在 |
-| mem0 的 `ADD` 事件遥测 | mem0 走 LLM 抽取 + 向量库，写侧决策模型与 v2mem 的 `candidates → accept` 不同；搬来会对齐错误的写治理语义 |
+| mem0 的 `ADD` 事件遥测 | mem0 走 LLM 抽取 + 向量库，写侧决策模型与 v2mem 的 `candidates → accept` 不同；搬来会对齐错误的写治理语义。**这并不等于不观测写侧**：R12 观测的是自动链路是否推进，不是内容决策由谁做（§3 R12） |
 
 > mem0 的 `ADDITIVE_EXTRACTION_PROMPT`（写侧抽取）与 agentmemory 的 4-tier 衰减
 > 对**检索质量**有意义，但对**运行观测**没有——观测只看链路是否通、量是否合理，不看内容好不好。
@@ -207,7 +233,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 ## 8. Proposal Hook 观察期 SOP
 
 > 本节只定义**灰度流程与转正判据**，不新增也不修改 §3 的判据 ID 与阈值。
-> 引用时一律用 §3 的 R1 / R2 / R4 / R5 / R8 / R9，不自造 ID。
+> 引用时一律用 §3 的 R1 / R2 / R4 / R5 / R8 / R9 / R12，不自造 ID。
 
 ### 8.1 灰度开关
 
@@ -289,6 +315,7 @@ grep '"source":"distill"'  ~/.v2mem/audit.jsonl | tail -5   # 有输出 = 旧规
 | **R5** 观测落库 | 每窗口 `obs-append` ≥1（归档链路未断） |
 | **R8** 候选积压 | 各 `project` 的 `pending` 计数，窗口值取最大值（§3 口径）；≤5 正常，6–15 为 `WARN`，>15 为 `FAIL` |
 | **R9** 候选载荷残留 | 恒为 **0**；出现即说明 Proposal 输入未按 `proposalEligible` / `Fidelity` 过滤 |
+| **R12** 写侧自动决策链路 | 看 detail 的 `source` 分流：灰度期应出现 `proposal>0`；连续两窗只有 `rules` → 按 8.3 查名单与 `MEM_DISTILL_SPAWN`。断链与失败态按 §5 R12 只读处置，**不改本节的转正阈值** |
 
 `R3` / `R6` / `R7` 照常巡检，但**不参与本节的转正判定**——它们衡量的是检索延迟与库、spool 健康，
 与 Proposal 路径无关。
