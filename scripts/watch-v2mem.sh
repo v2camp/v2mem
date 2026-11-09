@@ -14,7 +14,9 @@
 # R3 只统计读侧 hook（prompt-submit / session-start）的 ms；写侧 stop / obs-append
 # 共用同一个 Stop 计时器，计入会污染「检索延迟」，详见 docs/ops-watch.md §3。
 # R10 给这部分写侧耗时独立判级（只取 stop，避免与 obs-append 双计）；R11 只读
-# mem.db-wal 的文件大小，绝不修改或删除 -wal。判据定义以 docs/ops-watch.md §3 为准。
+# mem.db-wal 的文件大小，绝不修改或删除 -wal。R12 诊断写侧自动决策链路，只读
+# audit.jsonl 与 mem eval activity --json，不调用 distill/accept/reject/gc。
+# 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
 set -uo pipefail
@@ -31,7 +33,7 @@ while [ $# -gt 0 ]; do
     --window) WINDOW="${2:-12h}"; shift 2 ;;
     --json)   JSON_OUT=1; shift ;;
     --quiet)  QUIET=1; shift ;;
-    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -153,6 +155,44 @@ fi
 A_EVENTS=${A_EVENTS:-0}; A_PROMPT=${A_PROMPT:-0}; A_PROMPT_EMPTY=${A_PROMPT_EMPTY:-0}
 A_SS=${A_SS:-0}; A_OBS=${A_OBS:-0}; A_ADD=${A_ADD:-0}; A_MS=${A_MS:-0}
 A_READ_N=${A_READ_N:-0}; A_WRITE_MS=${A_WRITE_MS:-0}; A_WRITE_N=${A_WRITE_N:-0}
+
+# R12 写侧事件单独采集：不复用上面的 eval 字符串插值 —— 插值内部再嵌字符串字面量
+# 会触发 jq INVALID_CHARACTER。这里输出 TSV 后由 read 拆列，表达式里没有插值。
+A_DISTILL=0; A_DISTILL_PROPOSAL=0; A_DISTILL_FAIL=0
+A_DISTILL_EMPTY=0; A_DECIDE_A=0; A_DECIDE_R=0
+if [ -f "$AUDIT" ]; then
+  W12=$(jq -sr --argjson c "$CUTOFF" '
+    map(select(.ts >= $c)) as $e
+    | [$e[] | select(.event=="distill")] as $d
+    | [ ($d|length),
+        ([$d[] | select(.source=="proposal")]|length),
+        ([$d[] | (.failed // false) as $f | (.mode // "") as $m
+                | select($f == true or ($m | test("^(fail|partial|invalid|backlog)$")))]|length),
+        ([$d[] | (.mode // "") as $m | select($m | test("^(empty|noop)$"))]|length),
+        ([$e[] | select(.event=="accept")]|length),
+        ([$e[] | select(.event=="reject")]|length) ]
+    | @tsv' "$AUDIT" 2>/dev/null)
+  if [ -n "${W12:-}" ]; then
+    IFS=$'\t' read -r A_DISTILL A_DISTILL_PROPOSAL A_DISTILL_FAIL A_DISTILL_EMPTY A_DECIDE_A A_DECIDE_R <<< "$W12"
+  fi
+fi
+A_DISTILL=${A_DISTILL:-0}; A_DISTILL_PROPOSAL=${A_DISTILL_PROPOSAL:-0}
+A_DISTILL_FAIL=${A_DISTILL_FAIL:-0}; A_DISTILL_EMPTY=${A_DISTILL_EMPTY:-0}
+A_DECIDE_A=${A_DECIDE_A:-0}; A_DECIDE_R=${A_DECIDE_R:-0}
+
+# R12 诊断文案：mem eval activity --json 只读 audit.jsonl（cmdEvalActivity 不开库）。
+# 读不到或不可解析时只省略文案，R12 仍按上面的审计计数独立判级。
+ACT_VERDICT=""
+SINCE="$WINDOW"
+case "$SINCE" in
+  ''|*[!0-9]*) : ;;
+  *) SINCE="${SINCE}s" ;;
+esac
+ACT_JSON=$( "$MEM_BIN" eval activity --since "$SINCE" --json 2>/dev/null )
+if printf '%s' "$ACT_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
+  ACT_VERDICT=$(printf '%s' "$ACT_JSON" | jq -r '(.verdict // "") | gsub("[\"|]"; "/") | .[0:48]' 2>/dev/null)
+fi
+ACT_VERDICT=${ACT_VERDICT:-}
 
 # R1 钩子是否被真实触发
 if [ "$A_EVENTS" -ge 1 ]; then
@@ -313,6 +353,24 @@ elif [ "$WAL_FRAMES" -le 2000 ]; then
   add R11 WARN "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，被动 checkpoint 未跟上；按 §5 执行 wal_checkpoint(TRUNCATE) 并记录返回三元组"
 else
   add R11 FAIL "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，超过阈值 2 倍；按 §5 执行 wal_checkpoint(TRUNCATE)，不要手工删 -wal"
+fi
+
+# R12 写侧自动决策链路：观测 → 蒸馏 → 候选 → 显式裁决。
+# 判级只看「自动段」是否推进；裁决活性与 eval activity 的 verdict 只作诊断信息，
+# 零裁决由 R8 判积压，避免同一现象重复告警。阈值与依据见 docs/ops-watch.md §3 R12。
+A_DISTILL_RULES=$(( A_DISTILL - A_DISTILL_PROPOSAL ))
+D12="观测 ${A_OBS} / 蒸馏 ${A_DISTILL}（proposal ${A_DISTILL_PROPOSAL} · rules ${A_DISTILL_RULES}） / 合法空 ${A_DISTILL_EMPTY} / 失败 ${A_DISTILL_FAIL} / 裁决 accept ${A_DECIDE_A} reject ${A_DECIDE_R}"
+if [ -n "$ACT_VERDICT" ]; then D12="${D12}；结论: ${ACT_VERDICT}"; fi
+if [ "$A_OBS" -eq 0 ]; then
+  add R12 INFO "无观测样本" "窗口内无 obs-append，无法评估写侧决策链路（无样本，非冷启动降级）"
+elif [ "$A_DISTILL_FAIL" -gt 3 ]; then
+  add R12 FAIL "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；按 §5 R12 查 distill_runs 的 error 与 attempt，不要重跑 distill 掩盖"
+elif [ "$A_DISTILL" -eq 0 ]; then
+  add R12 WARN "自动蒸馏未推进" "${D12}；有观测但窗口内 0 条 distill；按 §8.1 核对 MEM_DISTILL_SPAWN / MEM_PROPOSAL_HOOK / MEM_NO_DISTILL，确认是否按 §8.4 有意关闭"
+elif [ "$A_DISTILL_FAIL" -ge 1 ]; then
+  add R12 WARN "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；查 distill_runs 的 error 与 evidence_bundles 是否 backlog"
+else
+  add R12 PASS "写侧决策链路推进" "${D12}"
 fi
 
 # ---------- 输出 ----------

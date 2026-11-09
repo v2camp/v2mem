@@ -39,4 +39,11 @@ if [ -n "$declared" ]; then
   [ "$declared" = "$max_r" ] || fail "文档声明到 R${declared}，判据表实际到 R${max_r}"
 fi
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；枚举到 R${max_r}"
+# ④ R12 阈值：文档「失败 >3」与脚本分级字面量必须同步，断链分支不许被删。
+r12_row="$(grep -E '^\| \*\*R12\*\*' "$DOC" | head -1)"
+[ -n "$r12_row" ] || fail "§3 找不到 R12 行"
+printf '%s' "$r12_row" | grep -q '失败 >3' || fail "§3 R12 的 FAIL 线不是 失败 >3"
+grep -q 'A_DISTILL_FAIL" -gt 3' "$SCRIPT" || fail "脚本 R12 的 FAIL 线不是 >3"
+grep -q 'A_DISTILL" -eq 0' "$SCRIPT"     || fail "脚本 R12 缺断链判级分支"
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；枚举到 R${max_r}"
