@@ -158,9 +158,13 @@ func WantsDeep(q string) bool {
 // QueryProfile 是查询侧的可匹配特征。
 type QueryProfile struct {
 	Identifiers []string // 需整体出现的精确技术标识符
+	// Terms 是查询的「可覆盖词项」：中文按二字切，拉丁/数字按整 token 切。
+	// 用途是算「一条正文覆盖了提问的多少词项」——见 broadOnlySupported。
+	Terms []string
 }
 
-// AnalyzeQuery 抽取查询里的技术标识符（ASCII 词、带数字/下划线/点/斜杠的串）。
+// AnalyzeQuery 抽取查询里的技术标识符（ASCII 词、带数字/下划线/点/斜杠的串），
+// 以及用于算覆盖率的词项。
 func AnalyzeQuery(q string) QueryProfile {
 	var out []string
 	seen := map[string]bool{}
@@ -186,7 +190,90 @@ func AnalyzeQuery(q string) QueryProfile {
 		flush()
 	}
 	flush()
-	return QueryProfile{Identifiers: out}
+	return QueryProfile{Identifiers: out, Terms: queryTerms(q)}
+}
+
+// queryTerms 把查询切成「可覆盖词项」：中文取相邻二字（bigram），拉丁/数字取整 token。
+//
+// 为什么中文用 bigram：fts5 对无空格中文的实际索引与 broad 路的查询表达式本来就是
+// 二字切分，只有用同一粒度算覆盖率，「覆盖了几个词项」才能和「broad 路命中了什么」对齐。
+// 单字不成项：「的」「是」这类字几乎在任何中文正文里都出现，算进覆盖率只会稀释判据。
+// 拉丁 token 过一遍停用词表，理由同上——"the"、"how" 出现在任何英文记忆里。
+func queryTerms(q string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(t string) {
+		if seen[t] {
+			return
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	var cur []rune
+	inHan := false
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		run := cur
+		cur = cur[:0]
+		if inHan {
+			if len(run) < 2 {
+				return
+			}
+			for i := 0; i+1 < len(run); i++ {
+				add(string(run[i : i+2]))
+			}
+			return
+		}
+		tok := strings.Trim(strings.ToLower(string(run)), "._-/:")
+		if len(tok) < 2 || stopIdentifiers[tok] {
+			return
+		}
+		add(tok)
+	}
+	for _, r := range q {
+		switch {
+		case isHanRune(r):
+			if !inHan {
+				flush()
+				inHan = true
+			}
+			cur = append(cur, r)
+		case isIdentRune(r):
+			if inHan {
+				flush()
+				inHan = false
+			}
+			cur = append(cur, r)
+		default:
+			flush()
+		}
+	}
+	flush()
+	return out
+}
+
+// termCoverage 返回正文覆盖了多少个查询词项。
+// 拉丁 token 走边界匹配（containsIdent），否则 "read" 会命中 "reader"。
+func termCoverage(content string, terms []string) int {
+	if content == "" || len(terms) == 0 {
+		return 0
+	}
+	lower := strings.ToLower(content)
+	n := 0
+	for _, t := range terms {
+		if hasASCIILetter(t) {
+			if containsIdent(lower, t) {
+				n++
+			}
+			continue
+		}
+		if strings.Contains(lower, t) {
+			n++
+		}
+	}
+	return n
 }
 
 func hasASCIILetter(s string) bool {
@@ -226,27 +313,62 @@ type Support struct {
 	Classes []string `json:"classes"`
 }
 
-// Evaluate 计算一条命中的结构支持。
-//
-// 五类支持：精确技术标识符、有效 query group 的 precise、两路以上共同支持、
-// 显式深查、同 subject 正反馈。分值让「强多路」能压过「弱 precise」：
+// 支持类别与分值。分值让「强多路」能压过「弱 precise」：
 // 只被 precise 单路命中的条目是 1.0，而两路共同支持从 2.0 起。
 // 精确标识符（3.0）与显式深查（3.0）是更强的证据，仍可越过普通多路。
+// broad 单路（见 broadOnlySupported）排在 precise 单路之后、但不再是 0。
+const (
+	scoreIdentifier = 3.0
+	scoreDeep       = 3.0
+	scoreSubject    = 1.5
+	scoreMultiBase  = 2.0
+	scoreMultiStep  = 0.25
+	scorePrecise    = 1.0
+	// scoreBroadOnly 的取法：落在「0（弃答）」与「1.0（precise 单路）」之间的
+	// 低半区，取 0.5。它必须 > 0 —— 否则供给层会把检索真找到的东西整段丢掉；
+	// 又必须明显 < 1.0 —— 因为 broad 是「任一 bigram 出现即可」的 OR 召回，
+	// 证据强度确定弱于 precise 的「查询词组整体出现（AND）」，同池里它永远排在
+	// precise 命中之后，不会因为「先被看到」而挤掉强证据。
+	scoreBroadOnly = 0.5
+)
+
+// classBroadOnly 是「只有 broad 一路召回、但正文确实覆盖了提问词项」的支持类别。
+// 独立成类而不是并进 precise：它在轨迹里必须可被单独统计，才能回答
+// 「有多少注入是靠宽召回兜底进来的」。
+const classBroadOnly = "broad_only"
+
+// 放行 broad 单路的两条附加条件（见 broadOnlySupported）。两条都不是绝对值，
+// 也都不读 broad 的分数量级 —— 那个量是 1/(60+名次) 归一化后的相对量，
+// 换个库、换批候选就变，写死阈值等于把某个库的规模拟合进判据。
+const (
+	// broadOnlyMinTerms 要求正文至少共享 3 个查询词项：1~2 个是常见二字词撞上的
+	// 偶然（「记忆」「目录」），3 个起步才谈得上「这段正文在讲同一件事」。
+	broadOnlyMinTerms = 3
+	// broadOnlyMinCoverageNum/Den 要求词项覆盖率 ≥ 1/3：光有绝对条数不够，
+	// 一个 30 词的提问蹭到 3 个词仍是噪声。写成整数比避免浮点边界抖动。
+	broadOnlyMinCoverageNum = 1
+	broadOnlyMinCoverageDen = 3
+)
+
+// Evaluate 计算一条命中的结构支持。
+//
+// 六类支持：精确技术标识符、有效 query group 的 precise、两路以上共同支持、
+// broad 单路（弱相关）、显式深查、同 subject 正反馈。
 func Evaluate(h store.Hit, p QueryProfile, ctx SupportContext) Support {
 	var classes []string
 	var score float64
 
 	if len(p.Identifiers) > 0 && containsAllIdentifiers(h.Content, p.Identifiers) {
 		classes = append(classes, "identifier")
-		score += 3.0
+		score += scoreIdentifier
 	}
 	if ctx.Deep {
 		classes = append(classes, "deep")
-		score += 3.0
+		score += scoreDeep
 	}
 	if ctx.PositiveSubjects[SubjectKey(h)] {
 		classes = append(classes, "subject")
-		score += 1.5
+		score += scoreSubject
 	}
 	routes := 0
 	if h.Signals != nil {
@@ -262,13 +384,48 @@ func Evaluate(h store.Hit, p QueryProfile, ctx SupportContext) Support {
 	}
 	if routes >= 2 {
 		classes = append(classes, "multi")
-		score += 2.0 + 0.25*float64(routes-2)
+		score += scoreMultiBase + scoreMultiStep*float64(routes-2)
 	}
-	if h.Signals != nil && h.Signals.Precise > 0 {
+	switch {
+	case h.Signals != nil && h.Signals.Precise > 0:
 		classes = append(classes, "precise")
-		score += 1.0
+		score += scorePrecise
+	case broadOnlySupported(h, p):
+		classes = append(classes, classBroadOnly)
+		score += scoreBroadOnly
 	}
 	return Support{Score: score, Classes: classes}
+}
+
+// isBroadOnly 判断一条命中是否只由 broad 一路带回（precise/fuzzy 都没有贡献）。
+// RenderLine 也用同一判据打「弱相关」标记，两处口径必须一致。
+func isBroadOnly(s *store.HitSignals) bool {
+	return s != nil && s.Broad > 0 && s.Precise == 0 && s.Fuzzy == 0
+}
+
+// broadOnlySupported 是 broad 单路命中的放行判据。
+//
+// 为什么需要附加条件：broad 是「任一 bigram 出现即可」的 OR 召回，长中文提问会把它
+// 变成「几乎每条同领域记忆都进来」的宽松召回。实测（eval/sandbox 夹具，8 条记忆）：
+// 3 条真正相关的 broad-only 命中覆盖率分别是 14/23、11/23、9/15（0.48~0.61），
+// 同池里的噪声命中一律只有 1~2 个词项（覆盖率 0.04~0.25）。所以判据落在两者之间：
+// 至少 3 个词项、且覆盖提问词项的 1/3 以上。这条判据只看「提问与正文共享多少结构」，
+// 不看 broad 的分数绝对值，因此换库、换候选规模都不需要重新标定。
+//
+// 为什么不用「top1 相对池内中位数的间隔」：融合分是加权 RRF，broad 单路时
+// signals.Broad 恒等于 1/(60+名次)，相邻名次的间隔固定约 1.6%，不管相关与否都长得一样，
+// 拿它当「不是一堆并列噪声」的证据是把 RRF 的名次差当成了相关性差。实测确认过这一点。
+func broadOnlySupported(h store.Hit, p QueryProfile) bool {
+	if !isBroadOnly(h.Signals) {
+		return false
+	}
+	terms := len(p.Terms)
+	if terms == 0 {
+		return false
+	}
+	matched := termCoverage(h.Content, p.Terms)
+	return matched >= broadOnlyMinTerms &&
+		matched*broadOnlyMinCoverageDen >= terms*broadOnlyMinCoverageNum
 }
 
 // MatchClass 把支持类别压成稳定的短串（写 read_trace_items.match_class）。
@@ -641,11 +798,21 @@ func NormalizeContent(s string) string {
 
 // RenderLine 渲染一条注入行。hook 与 recall 的预算检查共用它，
 // 保证「算的」和「注入的」是同一串字符。
+//
+// broad 单路命中的行尾带「（弱相关）」：这类条目是靠宽召回（任一 bigram 出现）
+// 带进来的，证据强度弱于 precise，标记出来让读的人（和模型）知道该以代码为准先核对。
+// 判据只看 Signals，不看 Evaluate 的覆盖率条件 —— 标记描述的是「谁把它带回来的」，
+// 放行判据描述的是「要不要它」；两件事分开，轨迹里的 match_class 才是唯一权威。
+// 标记在正文之后、provenance 之前：前缀位（`- [kind] mem:…`）被 CLI 与测试按字面
+// 断言过，任何改动它的改动都更贵；后缀位只是多五个字。
 func RenderLine(h store.Hit, provenance string, contentRunes int) string {
 	if contentRunes <= 0 {
 		contentRunes = 120
 	}
 	line := fmt.Sprintf("- [%s] mem:%s %s", h.Kind, ShortID(h.ID), truncateRunes(oneLine(h.Content), contentRunes))
+	if isBroadOnly(h.Signals) {
+		line += "（弱相关）"
+	}
 	if strings.TrimSpace(provenance) != "" {
 		line += " · " + provenance
 	}
