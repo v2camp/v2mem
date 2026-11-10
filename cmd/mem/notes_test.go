@@ -194,7 +194,7 @@ func TestFilterRulesCoveredByNotesDedups(t *testing.T) {
 		{Kind: "rule", Content: "commit 前必跑 make cover-gate", Project: ""},
 		{Kind: "decision", Content: "部署用 scripts", Project: ""},
 	}
-	filtered := filterRulesCoveredByNotes(st, hits)
+	filtered := filterRulesCoveredByNotes(st, "", hits)
 	if len(filtered) != 1 {
 		t.Fatalf("应只剩 1 条非覆盖, got %d: %+v", len(filtered), filtered)
 	}
