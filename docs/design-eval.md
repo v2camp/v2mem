@@ -407,13 +407,17 @@ mem eval recall --sandbox eval/sandbox --k 5 --receipts eval/receipts
 
 ### 17.1 注入路径的 ON/OFF 评测（L2.5，2026-11-10）
 
+> 2026-11-11 修口径：ON 臂原先只跑 `prompt-submit`、从不跑 `session-start`，把「开场已经
+> 注入过、提问不再重复注入」误记成注入丢失（见下方「为什么要跑开场」）。现改为先开场、
+> 再提问、命中取并集，并分开报告两个阶段的贡献。
+
 `make eval-hook-ab`（`scripts/eval-hook-ab.sh`）回答的是另一个问题：
 **检索已经找到的东西，注入这一步有没有丢掉。**
 
 | 臂 | 怎么跑 | 用途 |
 |:---|:---|:---|
 | OFF | `mem search --db <tmp> --limit 5 --scope all --json`，逐条 query | 只检索、不注入；parity 的基线 |
-| ON | `mem hook --event prompt-submit --limit 5 --max-chars <预算>`，逐条 query | 生产真实注入路径 |
+| ON | 同一 `session_id` 先 `mem hook --event session-start`、再 `mem hook --event prompt-submit`（`--limit 5 --max-chars <预算>`），**命中取两事件 `hashes` 的并集** | 生产真实注入路径；并集 = 提问那一刻会话的累计上下文 |
 | PROD | 同上但 `--limit 3`（生产默认） | 只报告「按生产配置实际注入几条」，不判级 |
 | 参照值 | `mem eval recall --sandbox eval/sandbox --k 5` | 发布门禁口径（7 条金标准），分母不同，**不参与 parity** |
 
@@ -428,16 +432,35 @@ mem eval recall --sandbox eval/sandbox --k 5 --receipts eval/receipts
 两臂的 Recall 由**同一个 shell 函数**（`count_hits`）算，gold 都是 hash 前缀——
 这样 parity 才只反映「注入」这一段，而不是两套打分口径的差。
 
+**为什么要跑开场**：真实会话里 `session-start` 一定先跑，它按「跨工程硬规则 / 全局记忆 /
+本工程记忆」三段注入（各有 cap）。一条记忆若在开场已经进了上下文，`prompt-submit` 就有意
+不再重复注入它（`kind=rule` 的 notes 去重，`filterRulesCoveredByNotes`）——那是设计行为。
+只跑 `prompt-submit` 时，「开场已给过」会被记成「注入丢失」，是**评测构造出来的伪丢失**
+（首跑里的 #4 `私钥块` 正是这一类）。所以每条 query 用同一个 sid 依次跑两个事件、命中取并集。
+
+**为什么必须分阶段报告**：并集只回答「有没有」，回答不了「是哪一段给的」。脚本把开场贡献
+（`open_recall5`）与提问贡献（`ps_recall5`）分开打印，`--verbose` 还逐条列出「并集 N/M
+（开场 x、提问 y）」——否则丢失再次出现时仍然定位不到阶段。
+
+**确定性**：开场注入哪几条由 `store.List` 的排序决定（`salience DESC, last_seen_at DESC,
+updated_at DESC, id ASC`）。种子全部同 salience、又在同一秒灌入时会落到 `id ASC`，而 id 是
+`crypto/rand` 生成的 ⇒ 开场集合每次运行都不同，并集召回会抖动。脚本因此让种子逐条隔 1 秒
+灌入，`last_seen_at` 严格递增，开场集合唯一确定（最近灌入的 5 条）。重复跑三次得到同一个数。
+
 口径与判据：
 
 - Recall@5 仍是宏平均、hash 前缀匹配，与 §15.4 一致；`--limit 5` 必须显式给 ——
   生产默认 3，不给 5 就是拿 top3 和 OFF 的 top5 比，差值混进了「条数」这个变量。
+  两个事件用**同一个 limit 与同一个预算**：ON 臂是一个「会话」，不该开场和提问两个口径。
 - 门槛是 `eval-policy.txt` 的 `hook_recall5_min`（绝对值），**不进** `make eval-gate`：
   注入保真不该单独挡发版。与 OFF 臂的差值只作 detail 打印（`parity=±Npt`）——
   两臂同库、同 query、同 k、同一打分函数，差值只来自「注入这一段」（gate／质量门／
   去重／预算），这正是要看的数；但它是诊断量，不是质量结论，所以不判级。
-- 结构断言另有两条：客套/无检索意图的 query **不注入**（不注入也是正确行为）；
-  预算压力下**至少一条 gold 仍在注入 id 里**（按条裁剪而非整块弃答）。
+- 结构断言另有两条，且**都落在提问段**：客套/无检索意图的 query `prompt-submit` **不注入**
+  （不注入也是正确行为）；预算压力下 `prompt-submit` **至少一条 gold 仍在注入 id 里**
+  （按条裁剪而非整块弃答）。开场段不经 query gate、按工程整段转储，对「谢谢」也会注入——
+  那是会话基线，不是往上下文里灌噪声，所以它不进这两条断言（脚本另外打印「客套 case 的
+  开场段 4/4 有注入」作为基线，不判级）。
 - 预算语义要说清：`prompt-submit` 走 `recall.Query`，某条完整行放不下时**跳过并继续
   向后补位**（`drop_budget`），不是把正文越截越短；`renderLineWithin` 的逐行收缩只在
   `session-start` 的「一条完整行都放不下」分支触发。也就是说这条路径的下界不是
@@ -446,14 +469,26 @@ mem eval recall --sandbox eval/sandbox --k 5 --receipts eval/receipts
 - 夹具 `eval/sandbox/hook-prompts.jsonl` 16 条 5 类：`hit` / `multi-gold` / `cjk-heavy` /
   `budget-stress` / `miss`。它**不参与** `make eval-gate`（沙箱只认 `*.gold.jsonl`）。
 
-首跑实测（2026-11-10，n=12 条可评分）：OFF = 1.0000，ON = 0.6250，parity = -37.5pt。
-丢的 4.5 条里只有 0.5 条是预算造成的，其余是**供给阶段的判定**：
+实测（2026-11-11 修口径后，n=12 条可评分）：OFF = 1.0000，ON（开场 ∪ 提问）= 0.7917，
+parity = -20.8pt；其中**开场贡献 0.3333、提问贡献 0.6250**（并集比只算提问多 16.7pt，
+2 条用例是开场补上的）。
 
-1. 三条长中文自然语言提问 → 精确路无命中，检索靠 broad 兜底返回了正确条目，
-   但供给的质量门只认 `Signals.Precise`／标识符／多路支持，broad-only 一律判「无支持」
-   → 整段弃答（读侧轨迹 `outcome=abstained_low_quality`）。**这正是本评测存在的理由**：
-   §15.5 修的是检索侧的 broad 兜底，注入侧的同一件事没跟上。
-2. 一条 `kind=rule` 的命中被 notes 去重（开场已注入过的规则不重复），是设计行为，不是丢失。
+与旧数（2026-11-10，ON 只跑 prompt-submit：ON = 0.6250、parity = -37.5pt、丢 4.5 条）的差异：
+
+1. **+2 条是伪丢失被消除，不是质量变好**：#4 `私钥块`（rule 命中被 notes 去重，但那次评测
+   从来没有开场，「开场已注入过」这个前提不成立）与 #9 `宿主事件号重复捕获时应当怎么处理`
+   （其 gold 就在本工程记忆开场段里）。这两条是评测口径造出来的丢失，旧账作废。
+   注：notes 去重的判据是「库里存在这条 rule」（`collectRules`），不是「本次开场真的注入了它」；
+   夹具里规则恰好在开场 cap 之内，所以口径自洽；若规则排在开场 cap 之外，prompt-submit 仍会
+   过滤掉它而开场也没给 —— 那是 main 上的遗留问题，不在本评测的修正范围。
+2. **剩下的 -20.8pt 仍是真实缺陷**：2 条长中文自然语言提问（#7/#8）→ 精确路无命中，检索靠
+   broad 兜底返回了正确条目，但供给的质量门只认 `Signals.Precise`／标识符／多路支持，
+   broad-only 一律判「无支持」→ 整段弃答（读侧轨迹 `outcome=abstained_low_quality`），
+   占 -16.7pt。**这正是本评测存在的理由**：§15.5 修的是检索侧的 broad 兜底，注入侧同一件事
+   没跟上。另 -4.2pt 来自预算：#11（多 gold，`--max-chars 120`）按条裁剪后只剩排名第一的
+   那条，属设计内的按条裁剪，不是丢弃。
+   #9 能被开场覆盖是**碰巧**——开场不认识 query，只按工程整段转储；它不能替代 prompt-submit
+   的检索质量，所以分阶段值要分开看（**提问贡献 0.6250 才是「检索→注入」这一段的真实水平**）。
 
 > 诚实边界：16 条合成夹具、单机单次结果，**不是检索质量结论**，也不能替代 L2 的
 > 真实会话金标准。它的结论只限于「注入保真」这一层，且只在这批夹具上成立。
@@ -466,9 +501,10 @@ mem eval recall --sandbox eval/sandbox --k 5 --receipts eval/receipts
   二进制与 jq」，而本评测读**合成夹具**、依赖仓库与 Go 工具链。更要紧的是它**确定性**——
   同一份代码重复跑只有同一个数，12h 跑一次不产生任何新信息；放进去只会让巡检多一条
   与真实使用无关的红灯路径。
-- **暂不作为发版门禁**：首跑 `ON=0.6250` 与门槛 `0.60` 只差 2.5pt，而低分的根因是上面
-  那条**已知未修**的低质量弃答。此刻把门槛贴着实测值钉死，等于把夹具拟合成红线。
-  等缺陷修完、`parity` 回到 0 附近，再用那时的真实分布重新定阈值，并挂进 `make release`。
+- **暂不作为发版门禁**：修口径后 `ON=0.7917` 高于门槛 `0.60` 约 19pt，但剩下的落差根因是
+  上面那条**已知未修**的低质量弃答，与门槛的距离并不代表余量。此刻把门槛贴着实测值上调，
+  等于把夹具拟合成红线。等缺陷修完、提问贡献回到 1 附近，再用那时的真实分布重新定阈值，
+  并挂进 `make release`。
 - **运行态的对应观测**：R2（空注入率）是结果指标——它会报警但不说原因；归因路径写在
   [`ops-watch.md`](./ops-watch.md) §5 的 R2 行（查 `read_traces.outcome` 分流
   `abstained_no_hit` / `abstained_low_quality` / `skipped_gate`）。R13 管体量越线。

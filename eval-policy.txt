@@ -9,7 +9,8 @@ recall5_min=0.60
 # 口径：真实 `mem hook` 注入出来的 Recall@5（宏平均）。夹具 eval/sandbox/hook-prompts.jsonl，
 # gold 用 content_hash 前 12 位；注入 id 取自审计的 hashes（生产真实路径，不解析渲染文本）。
 # 这个 0.60 是**可接受下限**，不是实测值：取它是因为与 recall5_min 同量级、且 60% 意味着
-# 「多数已命中记忆能穿过注入层」——不是为了让某次结果恰好通过。首跑实测 ON=0.6250。
+# 「多数已命中记忆能穿过注入层」——不是为了让某次结果恰好通过。
+# 实测（2026-11-11 修口径后，ON 臂 = session-start ∪ prompt-submit）：ON=0.7917（提问段 0.6250）。
 # 特意不按实测值上调：把门槛贴着实测值等于把夹具拟合成门槛，下次改动一动就红灯，
 # 却说不清是回归还是抖动。与 OFF 臂的差值只作 detail 打印（parity=±Npt），不判级。
 hook_recall5_min=0.60

@@ -1,7 +1,7 @@
 {"query":"临时记忆库","gold":["be280bd4c970"],"case":"hit","note":"短关键词命中。检索与注入都应该保住这条，是 ON/OFF 对照的锚点。"}
 {"query":"合成金标准","gold":["491a508a2dd1"],"case":"hit","note":"短关键词命中 decision。同上的锚点，覆盖另一条不同 kind。"}
 {"query":"显式采纳","gold":["d0d73b8dfb19"],"case":"hit","note":"短关键词命中 fact。验证真值不是靠 kind 撞出来的。"}
-{"query":"私钥块","gold":["8f41c899d063"],"case":"hit","note":"命中 kind=rule。rule 在每轮注入前会被 notes 去重（开场已注入过的规则不再重复），所以检索命中不等于注入命中 —— 这条留证该设计是有意为之，不是丢数据。"}
+{"query":"私钥块","gold":["8f41c899d063"],"case":"hit","note":"命中 kind=rule。rule 在提问段会被 notes 去重（开场已注入过的不重复注入），所以「检索命中」不等于「提问段命中」；ON 臂先跑 session-start，这条应由开场贡献命中 —— 它留证的是「开场已给的规则不重复注入」，不是丢数据。"}
 {"query":"宿主事件号","gold":["1c5873759c47"],"case":"hit","note":"短关键词命中 fact。用于和 cjk-heavy 里的同义长问句对照：同一个知识，换个问法会不会丢。"}
 {"query":"沙箱工程甲","gold":["9c2a91875b88","f33a0ae8b74b"],"case":"multi-gold","note":"一条 query 命中两条同工程记忆。预算充裕时两条都该注入（strict-all 视角），预算不足时才按条裁剪。"}
 {"query":"沙箱评测时到底该不该读取用户主目录里的个人记忆库","gold":["be280bd4c970"],"case":"cjk-heavy","note":"长中文自然语言提问（无空格、无技术标识符）。原始检索能靠 broad 兜底找到它，问题在于注入阶段的供给质量门是否也认。"}
