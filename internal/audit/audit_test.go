@@ -3,8 +3,39 @@ package audit
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+// InjectBytes 是 R13 的唯一数据来源：序列化丢了就量不出「查到了但送不进去」。
+// 非 0 必须原样落字段；0 走 omitempty —— 读侧 0 字节等价于「无注入」，已由 empty 表达。
+func TestInjectBytesJSON(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := Append(p, Record{Event: "session-start", InjectBytes: 3599}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := Append(p, Record{Event: "prompt-submit", Empty: true}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	rs, err := Read(p, 0)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(rs) != 2 || rs[0].InjectBytes != 3599 || rs[1].InjectBytes != 0 {
+		t.Fatalf("inject_bytes 应原样读回，got %+v", rs)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if !strings.Contains(lines[0], `"inject_bytes":3599`) {
+		t.Errorf("非 0 体量应落字段，got %s", lines[0])
+	}
+	if strings.Contains(lines[1], "inject_bytes") {
+		t.Errorf("0 字节不应落字段（读侧 0 字节等价于无注入，由 empty 表达），got %s", lines[1])
+	}
+}
 
 func TestAppendReadRoundTrip(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "sub", "audit.jsonl")

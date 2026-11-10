@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # 回归：R8 候选积压 / R9 载荷残留 / R10 写侧延迟 / R11 WAL 堆积 /
-# R12 写侧自动决策链路 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
+# R12 写侧自动决策链路 / R13 注入体量 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
 # 用临时 V2MEM_DIR + mem stub，不触碰生产库；只断言 --json 输出的级别。
 # 重点守住四条口径：R8 按工程分组取最大值（跨工程不相加）、R10 只取 stop
 # （不与 obs-append 双计）、无样本记 INFO 而非 PASS、R12 判级只依赖 audit
@@ -23,10 +23,10 @@ cand_json() {
 
 merge_json() { jq -nc --argjson a "$1" --argjson b "$2" '$a + $b'; }
 
-# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json> [audit_extra] [activity_json]
+# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json> [audit_extra] [activity_json] [audit_lines]
 run_case() {
   local name="$1" stop_ms="$2" frames="$3" with_obs="$4" cands="$5"
-  local extra_audit="${6:-}" activity="${7:-}"
+  local extra_audit="${6:-}" activity="${7:-}" audit_lines="${8:-}"
   local d="$TMP/$name"
   mkdir -p "$d/v2mem" "$d/wb" "$d/home"
 
@@ -61,6 +61,11 @@ SETTINGS
       printf '{"ts":%s,"event":"obs-append","ms":9000}\n' "$NOW"
     fi
   } > "$d/v2mem/audit.jsonl"
+  if [ -n "$audit_lines" ]; then
+    # 给了完整审计体就整段替换：R13 要区分「无读侧记录」与「只有旧格式记录」，
+    # 默认夹具恒有两条读侧记录，做不到这两种场景。
+    printf '%s' "$audit_lines" > "$d/v2mem/audit.jsonl"
+  fi
   if [ -n "$extra_audit" ]; then
     printf '%s' "$extra_audit" >> "$d/v2mem/audit.jsonl"
   fi
@@ -174,5 +179,46 @@ assert_r12 r12_invalid_mode     yes "$(dline proposal invalid false)" '' WARN
 assert_r12 r12_activity_badjson yes "$(dline distill ok false)" 'not-json' PASS
 assert_r12 r12_activity_verdict yes "$(dline distill ok false)" "$(activity_json '有观测无采纳')" PASS '有观测无采纳'
 assert_r12 r12_decisions_shown  yes "$(dline distill ok false)$(decline accept)$(decline reject)" '' PASS 'accept 1 reject 1'
+
+# R13 夹具：iline 造带 inject_bytes 的读侧记录；oldline 造升级前无该字段的旧记录。
+iline()   { printf '{"ts":%s,"event":"%s","inject_bytes":%s}\n' "$NOW" "${2:-session-start}" "$1"; }
+oldline() { printf '{"ts":%s,"event":"%s","ms":9,"empty":false}\n' "$NOW" "${1:-prompt-submit}"; }
+
+# assert_r13 <名称> <audit_lines> <want_level> [detail 子串]
+assert_r13() {
+  local name="$1" lines="$2" want="$3" needle="${4:-}"
+  local out got detail
+  out="$(run_case "$name" 100 0 no "$EMPTY" '' '' "$lines")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R13") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R13") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R13 want=$want got=$got" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R13 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R13=%-4s\n' "$name" "$want"
+}
+
+# R13 边界：≤3600 PASS（含边界）/ 3601–8000 WARN（含 8000）/ >8000 FAIL。
+assert_r13 r13_pass_3599       "$(iline 3599)"                            PASS
+assert_r13 r13_pass_3600       "$(iline 3600)"                            PASS
+assert_r13 r13_warn_3601       "$(iline 3601)"                            WARN
+assert_r13 r13_warn_8000       "$(iline 8000)"                            WARN
+assert_r13 r13_fail_8001       "$(iline 8001)"                            FAIL '8001'
+# 只有旧记录（无 inject_bytes）：不得当 0 判 PASS，应 INFO 并点明是升级前的记录。
+assert_r13 r13_old_records     "$(oldline prompt-submit)"                 INFO '旧记录'
+# 读侧事件有三个：只有 pre-compact 的旧记录同样算「有读侧记录」，不得错报「无读侧记录」。
+assert_r13 r13_old_precompact  "$(oldline pre-compact)"                  INFO '旧记录'
+# pre-compact 带字段时也必须计入最大值（不只 session-start / prompt-submit）。
+assert_r13 r13_precompact_over "$(iline 9000 pre-compact)"                FAIL '9000'
+# 窗口内无读侧记录（只有写侧观测）：同为 INFO，但说明必须不同。
+assert_r13 r13_no_read_side    "$(printf '{"ts":%s,"event":"obs-append","ms":9}\n' "$NOW")" INFO '无读侧记录'
+# 混合：旧记录 + 8001 必须 FAIL，证明缺失字段不会被当 0 拉低最大值。
+assert_r13 r13_mixed_old_over  "$(oldline prompt-submit)$(iline 8001)"    FAIL '8001'
 
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"

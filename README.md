@@ -253,13 +253,14 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |
 | [`docs/design-ref-landscape.md`](./docs/design-ref-landscape.md) | 所有者 / 开发者 | **架构参考**：mem0 与 agentmemory 的全面对照，可借鉴/不借鉴/待评估三档，两边踩过的坑 |
 | [`docs/design-anti-agentmemory.md`](./docs/design-anti-agentmemory.md) | 所有者 / 开发者 | 为何不照搬常驻 iii 与 54 个 MCP 工具；默认零常驻 |
+| [`docs/design-db-stamp.md`](./docs/design-db-stamp.md) | 开发者 | **库版本台账**：`db_meta` 写入者版本戳、库比二进制新时拒绝打开、与 `user_version` 门控的边界 |
 
 设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
 `design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 ·
 `design-capture` 多 harness 捕获层与事件契约 · `design-workbuddy` WorkBuddy 结合 ·
 `design-eval` 激活与评测 · `design-maintenance` 收尾运维 ·
 `design-write-governance` 写侧治理与短/跨会话记忆分配 · `design-provenance` 记忆溯源 ·
-`design-write-batch` 写侧延迟治本（批量归档）。
+`design-write-batch` 写侧延迟治本（批量归档） · `design-db-stamp` 库版本台账与降级守卫。
 「见 §N」这类跨章节引用按 DESIGN 索引页的专题地图定位文件。
 
 ---

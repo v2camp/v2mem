@@ -16,6 +16,8 @@
 # R10 给这部分写侧耗时独立判级（只取 stop，避免与 obs-append 双计）；R11 只读
 # mem.db-wal 的文件大小，绝不修改或删除 -wal。R12 诊断写侧自动决策链路，只读
 # audit.jsonl 与 mem eval activity --json，不调用 distill/accept/reject/gc。
+# R13 取读侧审计 inject_bytes 的最大值（**字节**，不是 rune）：宿主对 hook stdout
+# 有硬上限，越线会整块换占位且仍报成功，R2 的命中率看不出来。
 # 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
@@ -179,6 +181,27 @@ fi
 A_DISTILL=${A_DISTILL:-0}; A_DISTILL_PROPOSAL=${A_DISTILL_PROPOSAL:-0}
 A_DISTILL_FAIL=${A_DISTILL_FAIL:-0}; A_DISTILL_EMPTY=${A_DISTILL_EMPTY:-0}
 A_DECIDE_A=${A_DECIDE_A:-0}; A_DECIDE_R=${A_DECIDE_R:-0}
+
+# R13 注入体量单独采集：同样用 TSV 后 read 拆列，不往上面的 eval 插值里再嵌字面量。
+# 三列 = 最大值 / 带字段的样本数 / 读侧记录总数（不论有没有字段）。
+# 字段缺失（升级前的旧记录）用 (.inject_bytes // null) != null 判定，不能当 0：
+# 当 0 会拉低最大值、掩盖越线。A_INJ_READ 用来区分「窗口内真无读侧记录」与「全是旧记录」——
+# 读侧事件有三个，只数 session-start / prompt-submit 会漏掉只有 pre-compact 的窗口。
+A_INJ_MAX=0; A_INJ_N=0; A_INJ_READ=0
+if [ -f "$AUDIT" ]; then
+  W13=$(jq -sr --argjson c "$CUTOFF" '
+    map(select(.ts >= $c)) as $e
+    | [$e[] | select(.event=="session-start" or .event=="prompt-submit" or .event=="pre-compact")] as $r
+    | [ ($r | map(select((.inject_bytes // null) != null) | .inject_bytes)
+              | if length > 0 then max else 0 end),
+        ($r | map(select((.inject_bytes // null) != null)) | length),
+        ($r | length) ]
+    | @tsv' "$AUDIT" 2>/dev/null)
+  if [ -n "${W13:-}" ]; then
+    IFS=$'\t' read -r A_INJ_MAX A_INJ_N A_INJ_READ <<< "$W13"
+  fi
+fi
+A_INJ_MAX=${A_INJ_MAX:-0}; A_INJ_N=${A_INJ_N:-0}; A_INJ_READ=${A_INJ_READ:-0}
 
 # R12 诊断文案：mem eval activity --json 只读 audit.jsonl（cmdEvalActivity 不开库）。
 # 读不到或不可解析时只省略文案，R12 仍按上面的审计计数独立判级。
@@ -371,6 +394,23 @@ elif [ "$A_DISTILL_FAIL" -ge 1 ]; then
   add R12 WARN "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；查 distill_runs 的 error 与 evidence_bundles 是否 backlog"
 else
   add R12 PASS "写侧决策链路推进" "${D12}"
+fi
+
+# R13 注入体量：宿主对 hook stdout 的硬上限会把超限内容整块换成约 2KB 占位且**仍返回成功**，
+# 用户侧表现为「记忆没出现」而不是报错——R2 只测查得到，测不到送不进去。阈值依据见 §3 R13。
+R13_RUNES=$(( A_INJ_MAX / 3 ))
+if [ "$A_INJ_N" -eq 0 ]; then
+  if [ "$A_INJ_READ" -gt 0 ]; then
+    add R13 INFO "无注入体量样本" "读侧记录均无 inject_bytes 字段（升级前的旧记录），无法评估注入体量；新记录自带该字段"
+  else
+    add R13 INFO "无注入体量样本" "窗口内无读侧记录（session-start / prompt-submit / pre-compact），无法评估注入体量"
+  fi
+elif [ "$A_INJ_MAX" -le 3600 ]; then
+  add R13 PASS "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次，未超 3600 字节"
+elif [ "$A_INJ_MAX" -le 8000 ]; then
+  add R13 WARN "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，落在 3601–8000，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次，查预算变量是否被调高"
+elif [ "$A_INJ_MAX" -gt 8000 ]; then
+  add R13 FAIL "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，超过 8000，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次。宿主可能整块替换为占位且仍报成功，记忆会静默消失"
 fi
 
 # ---------- 输出 ----------

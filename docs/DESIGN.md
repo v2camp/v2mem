@@ -183,6 +183,7 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 | 写侧治理 | 写必由 LLM 决策、短/跨会话记忆分配、bulk 打标 | [`design-write-governance.md`](./design-write-governance.md) |
 | 捕获层 | 多 harness 的 `CaptureEvent` 契约、A/B/C/D 捕获阶梯、artifact 扫描边界 | [`design-capture.md`](./design-capture.md) |
 | 写侧性能 | 写侧延迟根因实证、批量归档（方案 B）、P0 契约核查与灰度分期 | [`design-write-batch.md`](./design-write-batch.md) |
+| 库版本台账 | `db_meta` 写入者版本戳、库比二进制新时拒绝打开、与 `user_version` 门控的边界 | [`design-db-stamp.md`](./design-db-stamp.md) |
 
 > 正文里若出现「见 §12.x」这类跨章节引用，按上表定位文件即可。
 

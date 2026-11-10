@@ -29,6 +29,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
 用法:
   mem add    [选项] "<原子事实>"    写入一条记忆（相同内容自动覆盖）
   mem search [选项] "<查询>"        全文检索（FTS5 / bm25）
+  mem asset  <path> [选项]          按源文件反查关联记忆（provenance.file）
   mem ls     [选项]                列出库里的记忆（无需查询词；可按工程/类型/标记过滤）
   mem touch  <id|前缀>             记录一次采纳（adopted 兼容别名）
   mem show   <id|前缀>             深查：正文 + 溯源 + 最近读侧轨迹
@@ -126,7 +127,7 @@ hook 选项:
 // 起因：新增 `mem report` 时漏了同步测试里的清单，护栏立刻报警 ——
 // 清单有两个出处就一定会漂移，所以把它抽成一处。
 var knownSubcommands = []string{
-	"add", "search", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
+	"add", "search", "asset", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
 	"gc", "consolidate", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
 	"distill", "accept", "reject", "candidates",
@@ -144,6 +145,8 @@ func main() {
 		err = cmdAdd(os.Args[2:])
 	case "search":
 		err = cmdSearch(os.Args[2:])
+	case "asset":
+		err = cmdAsset(os.Args[2:])
 	case "ls":
 		err = cmdLs(os.Args[2:])
 	case "stats":
