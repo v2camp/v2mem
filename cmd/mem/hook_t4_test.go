@@ -250,16 +250,19 @@ func readAudit(t *testing.T, path string) []audit.Record {
 func TestHookBackfillsFullQuotaAfterNotesDedup(t *testing.T) {
 	db := testDB(t)
 	proj, name := hookProjectDir(t, "demo-repo")
-	for i := 0; i < 3; i++ {
-		if err := cmdAdd([]string{"--db", db, "--project", name, "--kind", "rule",
-			fmt.Sprintf("检索规则 %d：提交前必须跑门禁", i)}); err != nil {
-			t.Fatalf("cmdAdd rule: %v", err)
-		}
-	}
+	// 顺序有讲究：开场段按 salience DESC, last_seen_at DESC 取前 cap 条，后加的更新。
+	// 所以先加 fact、后加 rule，开场才会注入 rule —— 这个用例要测的正是「rule 被开场
+	// 覆盖后，检索侧从合格池补 fact」；反过来则开场注入 fact，去重无据可依。
 	for i := 0; i < 3; i++ {
 		if err := cmdAdd([]string{"--db", db, "--project", name, "--kind", "fact",
 			fmt.Sprintf("检索事实 %d：部署脚本放在 scripts 目录", i)}); err != nil {
 			t.Fatalf("cmdAdd fact: %v", err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := cmdAdd([]string{"--db", db, "--project", name, "--kind", "rule",
+			fmt.Sprintf("检索规则 %d：提交前必须跑门禁", i)}); err != nil {
+			t.Fatalf("cmdAdd rule: %v", err)
 		}
 	}
 	if _, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "检索"), func() error {
@@ -267,7 +270,16 @@ func TestHookBackfillsFullQuotaAfterNotesDedup(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("cmdHook: %v", err)
 	}
-	res := renderHookContext(common{db: db}, harness.EventPromptSubmit, name, "检索", 3, 1200, hookMeta{})
+	const sid = "sess-backfill"
+	// 先跑一次开场：3 条 rule 都在 cap 内、被真实注入并落轨迹，检索侧才有依据跳过它们。
+	// 不跑开场时判据无据可依（失败开放、不去重），配额根本腾不出来，这个用例就测不到补位。
+	open := renderHookContext(common{db: db}, harness.EventSessionStart, name, "", 3, 1200,
+		hookMeta{SessionID: sid})
+	if len(open.Injected) != 3 {
+		t.Fatalf("开场应注入 3 条 rule，got %d", len(open.Injected))
+	}
+	res := renderHookContext(common{db: db}, harness.EventPromptSubmit, name, "检索", 3, 1200,
+		hookMeta{SessionID: sid})
 	if len(res.Injected) != 3 {
 		t.Fatalf("notes 去重后应补满 3 条，got %d", len(res.Injected))
 	}
