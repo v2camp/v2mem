@@ -52,6 +52,12 @@ cover-update:
 eval-gate:
 	@./scripts/release-eval.sh --gate-only
 
+# 钩子注入路径的 ON/OFF 评测：检索已找到的东西会不会在注入阶段丢掉（gate/去重/预算）。
+# 预算不足时按条裁剪并向后补位，而不是整块弃答 —— 这是被测的行为，不是假设。
+# 不读个人库，夹具在 eval/sandbox。与 eval-gate 相互独立（门槛键也不同）。
+eval-hook-ab:
+	@./scripts/eval-hook-ab.sh
+
 # 预演：只打印下一个将推导出的版本号（不打 tag、不跑 eval）。
 release-dry:
 	@./scripts/derive-version.sh --repo . --last $$(git describe --tags --abbrev=0 2>/dev/null || echo v0.1.0)
@@ -96,4 +102,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test test-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate release-dry release
+.PHONY: build install test test-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release

@@ -41,13 +41,18 @@ SessionStart 是天然的必然事件（用户每次开新会话都会发生）�
 | 用户会话 → mem 查询 → 命中是否准 | 用户换个问法，还找得到吗？ | `mem eval recall --gold`（金标准）／`mem audit`（真实样本沉淀） |
 | 用户会话 → mem 记录 → 记录是否准 | 该记的记下了吗？记的全是废物吗？ | `mem eval write --session --gold` |
 
-**三层评测，成本递增、可信度递增**：
+**分层评测，成本递增、可信度递增**：
 
 | 层 | 手段 | 能证明什么 | 自动 |
 |:---|:---|:---|:---|
 | L1 索引可用性 | `mem eval recall --auto` | 索引与中文切分没坏 | ✅ |
 | L2 检索相关性 | `mem eval recall --gold`（人工标注、来自真实会话的查询） | **唯一能支撑替换决策的指标** | ❌ 需标注 |
-| L3 端到端任务成功率 | 有/无记忆两臂对比同一批需要历史知识的问题 | 记忆是否真的提升了任务表现 | ❌ 需设计 A/B |
+| L2.5 注入保真（hook 路径） | `make eval-hook-ab`（真跑 `mem hook`，注入 id 取自审计 `hashes`） | 检索已找到的东西**没有**在 gate／去重／预算／渲染阶段被丢掉 | ✅ |
+| L3 端到端任务成功率 | 有/无记忆两臂对比同一批需要历史知识的问题 | 记忆是否真的提升了任务表现。**仍未做**：其机械前提（注入不丢东西）已由 `make eval-hook-ab` 覆盖，但那只是前提，不是任务成功率 | ❌ 需设计 A/B |
+
+L2.5 是本次补的：在此之前只有 L2，量的是「search 找得到吗」，而用户实际看到的是
+**注入**出来的那段文本。检索对了、供给的 gate／去重／预算把它挤掉，L2 一点都看不出来。
+L2.5 反过来也**不能**替代 L2：夹具是合成的小样本，它只回答「注入这一步有没有丢东西」。
 
 ### 15.4 口径红线（必须先定死，改动须同步本节）
 
@@ -399,3 +404,56 @@ mem eval recall --sandbox eval/sandbox --k 5 --receipts eval/receipts
 | `evidence.ndjson` | 查询的 sha256、gold 前缀、返回的 content_hash。没有正文，没有查询原文 |
 
 这是开发评测，不是和别的记忆系统比名次。
+
+### 17.1 注入路径的 ON/OFF 评测（L2.5，2026-11-10）
+
+`make eval-hook-ab`（`scripts/eval-hook-ab.sh`）回答的是另一个问题：
+**检索已经找到的东西，注入这一步有没有丢掉。**
+
+| 臂 | 怎么跑 | 用途 |
+|:---|:---|:---|
+| OFF | `mem search --db <tmp> --limit 5 --scope all --json`，逐条 query | 只检索、不注入；parity 的基线 |
+| ON | `mem hook --event prompt-submit --limit 5 --max-chars <预算>`，逐条 query | 生产真实注入路径 |
+| PROD | 同上但 `--limit 3`（生产默认） | 只报告「按生产配置实际注入几条」，不判级 |
+| 参照值 | `mem eval recall --sandbox eval/sandbox --k 5` | 发布门禁口径（7 条金标准），分母不同，**不参与 parity** |
+
+为什么自己建临时库：`mem eval recall --sandbox` 在 `runSandboxRecall` 里自己
+`os.MkdirTemp` 建库、跑完即删，库路径不对外暴露，两臂没法共用；所以脚本把
+`seed.jsonl` 的 `layer=memory` 行用 `mem add` 灌进自己的临时库，OFF 与 ON 打同一个库。
+（`layer=observation` 的行跳过：`prompt-submit` 只查 memory 层，对两臂都无影响。）
+
+关键是**注入 id 的来源**：不解析渲染文本（那是给人看的，没有 id），而是读审计
+（`audit.jsonl` 的 `hashes` 就是本次实际注入的记忆 id，见 `cmd/mem/hook.go` 的审计写入），
+再按 `mem export` 的 `id → content_hash` 映射转成 hash 前缀，与夹具的 gold 比。
+两臂的 Recall 由**同一个 shell 函数**（`count_hits`）算，gold 都是 hash 前缀——
+这样 parity 才只反映「注入」这一段，而不是两套打分口径的差。
+
+口径与判据：
+
+- Recall@5 仍是宏平均、hash 前缀匹配，与 §15.4 一致；`--limit 5` 必须显式给 ——
+  生产默认 3，不给 5 就是拿 top3 和 OFF 的 top5 比，差值混进了「条数」这个变量。
+- 门槛是 `eval-policy.txt` 的 `hook_recall5_min`（绝对值），**不进** `make eval-gate`：
+  注入保真不该单独挡发版。与 OFF 臂的差值只作 detail 打印（`parity=±Npt`）——
+  两臂同库、同 query、同 k、同一打分函数，差值只来自「注入这一段」（gate／质量门／
+  去重／预算），这正是要看的数；但它是诊断量，不是质量结论，所以不判级。
+- 结构断言另有两条：客套/无检索意图的 query **不注入**（不注入也是正确行为）；
+  预算压力下**至少一条 gold 仍在注入 id 里**（按条裁剪而非整块弃答）。
+- 预算语义要说清：`prompt-submit` 走 `recall.Query`，某条完整行放不下时**跳过并继续
+  向后补位**（`drop_budget`），不是把正文越截越短；`renderLineWithin` 的逐行收缩只在
+  `session-start` 的「一条完整行都放不下」分支触发。也就是说这条路径的下界不是
+  「永远注入点什么」——实测 `--max-chars 60`（连固定标题都放不下）会整段弃答，
+  而 120 仍能保住排名第一的那条。夹具的 `budget-stress` 取 120，正是取这个边界之上。
+- 夹具 `eval/sandbox/hook-prompts.jsonl` 16 条 5 类：`hit` / `multi-gold` / `cjk-heavy` /
+  `budget-stress` / `miss`。它**不参与** `make eval-gate`（沙箱只认 `*.gold.jsonl`）。
+
+首跑实测（2026-11-10，n=12 条可评分）：OFF = 1.0000，ON = 0.6250，parity = -37.5pt。
+丢的 4.5 条里只有 0.5 条是预算造成的，其余是**供给阶段的判定**：
+
+1. 三条长中文自然语言提问 → 精确路无命中，检索靠 broad 兜底返回了正确条目，
+   但供给的质量门只认 `Signals.Precise`／标识符／多路支持，broad-only 一律判「无支持」
+   → 整段弃答（读侧轨迹 `outcome=abstained_low_quality`）。**这正是本评测存在的理由**：
+   §15.5 修的是检索侧的 broad 兜底，注入侧的同一件事没跟上。
+2. 一条 `kind=rule` 的命中被 notes 去重（开场已注入过的规则不重复），是设计行为，不是丢失。
+
+> 诚实边界：16 条合成夹具、单机单次结果，**不是检索质量结论**，也不能替代 L2 的
+> 真实会话金标准。它的结论只限于「注入保真」这一层，且只在这批夹具上成立。

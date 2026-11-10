@@ -3,7 +3,9 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1112,5 +1114,120 @@ func TestExportImportPropagatesProvenance(t *testing.T) {
 	}
 	if !strings.Contains(raw, "AGENTS.md") {
 		t.Errorf("Import 后 provenance 应保留，got %q", raw)
+	}
+}
+
+// ---------- 库版本台账（writer stamp）在 Open 上的接线 ----------
+
+// Open 必须给新库打戳：没有台账就无从判断「库比二进制新」，降级守卫等于不存在。
+func TestOpenStampsWriterVersion(t *testing.T) {
+	s := newTestStore(t)
+	got := map[string]string{}
+	rows, err := s.db.Query(`SELECT k, v FROM db_meta`)
+	if err != nil {
+		t.Fatalf("读 db_meta: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			t.Fatalf("扫描 db_meta: %v", err)
+		}
+		got[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 db_meta: %v", err)
+	}
+	if got["schema_version"] != strconv.Itoa(CurrentSchemaVersion) {
+		t.Errorf("schema_version = %q，want %d", got["schema_version"], CurrentSchemaVersion)
+	}
+	if strings.TrimSpace(got["written_by"]) == "" {
+		t.Error("written_by 为空：降级报错会缺一段上下文")
+	}
+	if n, err := strconv.ParseInt(got["first_seen"], 10, 64); err != nil || n <= 0 {
+		t.Errorf("first_seen = %q，应为正整数时间戳（err=%v）", got["first_seen"], err)
+	}
+}
+
+// 库比二进制新时必须**拒绝打开**。这是「旧二进制静默错读新库」的唯一出口：
+// 打开成功即意味着后续所有读都建立在错误假设上。
+func TestOpenRefusesNewerSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mem.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("首次 Open: %v", err)
+	}
+	id := mustAdd(t, s, "降级守卫必须拒绝打开更新的库")
+	newer := CurrentSchemaVersion + 5
+	if _, err := s.db.Exec(`UPDATE db_meta SET v = ? WHERE k = 'schema_version'`, strconv.Itoa(newer)); err != nil {
+		t.Fatalf("改写 schema_version: %v", err)
+	}
+	s.Close()
+
+	s2, err := Open(path)
+	if err == nil {
+		s2.Close()
+		t.Fatal("库版本更高时 Open 必须失败，否则旧二进制会静默错读")
+	}
+	if !errors.Is(err, ErrDBSchemaNewer) {
+		t.Fatalf("错误未携带 ErrDBSchemaNewer，调用方无法判别: %v", err)
+	}
+	if !strings.Contains(err.Error(), strconv.Itoa(newer)) {
+		t.Errorf("错误文本应含库的实际版本 %d，实际: %v", newer, err)
+	}
+
+	// 拒绝打开不能破坏库：把版本改回当前值后仍应能打开，且数据还在。
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("直接开库修正版本: %v", err)
+	}
+	if _, err := raw.Exec(`UPDATE db_meta SET v = ? WHERE k = 'schema_version'`,
+		strconv.Itoa(CurrentSchemaVersion)); err != nil {
+		t.Fatalf("改回 schema_version: %v", err)
+	}
+	raw.Close()
+	s3, err := Open(path)
+	if err != nil {
+		t.Fatalf("改回版本后应可打开: %v", err)
+	}
+	defer s3.Close()
+	var content string
+	if err := s3.db.QueryRow(`SELECT content FROM memories WHERE id = ?`, id).Scan(&content); err != nil {
+		t.Errorf("拒绝打开的一轮不应丢数据: %v", err)
+	}
+}
+
+// 同一版本重复打开必须幂等：first_seen 是「第一次打戳」的时间锚点，被刷新就失去意义。
+func TestOpenKeepsFirstSeenAcrossOpens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mem.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("首次 Open: %v", err)
+	}
+	var first string
+	if err := s.db.QueryRow(`SELECT v FROM db_meta WHERE k = 'first_seen'`).Scan(&first); err != nil {
+		t.Fatalf("读 first_seen: %v", err)
+	}
+	s.Close()
+
+	time.Sleep(1100 * time.Millisecond) // 时间戳是秒级，跨秒才能证明没被刷新
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("再次 Open: %v", err)
+	}
+	defer s2.Close()
+	var again string
+	if err := s2.db.QueryRow(`SELECT v FROM db_meta WHERE k = 'first_seen'`).Scan(&again); err != nil {
+		t.Fatalf("再次读 first_seen: %v", err)
+	}
+	if again != first {
+		t.Errorf("first_seen 被刷新: %q → %q", first, again)
+	}
+	var n int
+	if err := s2.db.QueryRow(`SELECT COUNT(*) FROM db_meta`).Scan(&n); err != nil {
+		t.Fatalf("计数 db_meta: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("db_meta 应只有 3 行，got %d", n)
 	}
 }

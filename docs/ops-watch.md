@@ -87,6 +87,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
 | **R11** | WAL 堆积 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0） | ≤1000 帧 | 1001–2000 | >2000 |
 | **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `source` 分流）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
+| **R13** | 注入体量 | 窗口内读侧（`session-start` / `prompt-submit` / `pre-compact`）审计记录 `inject_bytes` 的**最大值**（无样本记 `INFO`） | ≤3600 | 3601–8000 | >8000 |
 
 阈值依据（不凭空定）：
 
@@ -154,6 +155,23 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   - **采集只读**：`audit.jsonl` + `mem eval activity --json`（`cmdEvalActivity` 不开库），
     不执行 `mem distill` / `accept` / `reject` / `gc`。`distill_runs` 的 `status` / `error` /
     `attempt` 与 `evidence_bundles` 积压留作 §5 的深挖命令，不进脚本采集，避免引入 sqlite 依赖。
+- **R13 的 3600 / 8000 字节（2026-11-10 新增）**：单位是**字节**不是 rune。宿主按 stdout 的字节
+  （字符）数设硬上限，本仓库的预算按 rune 收，CJK 下两者最坏差 3 倍（UTF-8 一个汉字 3 字节），
+  所以只能拿字节对齐宿主的尺子。
+  - **3600 = 默认预算的最坏值**：`cmd/mem/hook.go` 的 `defaultHookBudget=1200` rune × 3 字节/rune。
+    它表示「没人用环境变量抬高预算」时的注入上限；`--max-chars` 或 `MEM_PRECOMPACT_BUDGET`
+    被主动调大后越线是预期行为，按 §5 R13 处置，而不是据此认定故障。
+  - **8000 = 宿主上限的 80% 安全线**：10,000 是 Claude Code 钩子 stdout 的实测上限
+    （来源：本仓库对 claude-mem 的对标研究 `~/code/oss-research/claude-mem/RESEARCH.md` §3.2）。
+    **其他 harness 的实际阈值未知，v2mem 无法探测**，所以取 80% 作保守线，而不是贴着 10000 定。
+  - **越线后果与其他判据不同**：宿主不报错，而是把整块 stdout **替换成一个约 2KB 的占位字符串，
+    仍然返回成功**——用户侧只看到「记忆没出现」。因此 R2 管「查不到」、R13 管「查到了但送不进去」，
+    两者不可互相替代：R2 PASS 只说明检索命中了，不代表宿主收下了。
+  - **口径**：记的是 `out.Text` 的字节数，即**未包 JSON 信封**的正文；Cursor 系外层还有
+    `{"additional_context":"..."}`，包壳与转义后实际 stdout 更大，故阈值留有余量。
+  - **字段缺失 = 升级前的旧记录**：脚本按「无样本」处理，不当 0 算——把旧记录当 0 会拉低最大值、
+    掩盖真实越线。`A_INJ_READ`（读侧记录总数，含 `pre-compact`）用来区分「窗口内真无读侧记录」
+    与「读侧记录全是旧格式」，`A_INJ_N` 是其中带 `inject_bytes` 字段的样本数。
 
 ---
 
@@ -164,10 +182,10 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 判据必须阶段化，否则「符合预期」这四个字没有定义。跨过 20 条后自动启用完整阈值。
 
-**例外只覆盖 R2 / R4。** R9、R10、R11、R12 不降级：候选载荷残留是输入过滤失效、写侧延迟
-是同步 hook 的耗时、WAL 堆积是 checkpoint 未跟上、写侧决策断链是自动链路没推进，都与库里
-有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
-与 R3 / R10 的「无样本」同类，**不是**本节的降级。
+**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13 不降级：候选载荷残留是输入过滤失效、写侧延迟
+是同步 hook 的耗时、WAL 堆积是 checkpoint 未跟上、写侧决策断链是自动链路没推进、注入体量是
+单次注入的字节数，都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
+与 R3 / R10 / R13 的「无样本」同类，**不是**本节的降级。
 
 ---
 
@@ -187,6 +205,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
 | R11 WAL 帧数越线 | 被动 checkpoint 未跟上 | `sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(TRUNCATE);"` 并记下返回三元组 `(busy,log,checkpointed)`；`busy=1` 说明有长读事务，查各 harness 的 `mem mcp` 连接。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务 |
 | R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
+| R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
@@ -215,7 +234,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R12） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R13） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |

@@ -79,3 +79,51 @@ store.AddInput{..., Provenance: &store.Provenance{
 ## 8. 与 channel 的分工
 
 `provenance` 回答「来自哪个文件第几行」。`channel`（`user|agent|tool|import`）回答「谁写的」，和 `source` 并存。约定与捕获幂等见 [`design-write-governance.md`](./design-write-governance.md) §10。channel 随 export/import 传播：本地为空才采纳对端，不参与内容冲突判定。
+
+## 9. 资产联动：`mem asset`
+
+§6 的第一条联动（源文件变更 → 反查记忆）落地为只读命令：
+
+```
+mem asset <path> [--db ...] [--json] [--project P] [--limit N]
+```
+
+### 为什么按文件反查
+
+语义检索（`mem search`）对「这个文件」这种**结构化条件**无能为力：一条讲 `hook.go` 预算的记忆里未必出现 "hook.go"。而 Agent 改文件前最自然的问法恰恰是「关于这个文件，记住过什么」——按 `provenance.file` 精确匹配，精确率是语义检索给不了的。
+
+### 为什么库里仍存相对路径
+
+绝对路径跨设备失效（§2 表格）。反查的成本因此被推到读侧：用户给什么形态，就在 CLI 层投影成一组候选字面量。
+
+### 路径归一化 = 投影成多候选
+
+`normalizeAssetPaths`（`cmd/mem/asset.go`）把输入投影成：
+
+1. 相对工程根的路径（斜杠分隔）——今天写入的主流形态；
+2. 输入本身（`Clean` 后）——覆盖「cwd 正好是工程根」的写法；
+3. 绝对路径——覆盖历史数据与外部工具直接写绝对路径的情形。
+
+工程根用 `git rev-parse --show-toplevel` 求，起点是**源文件所在目录**而非进程 cwd（查别的工程的文件时，cwd 的工程名会把结果滤空）；`~` 只展开开头，不做 shell 展开。
+
+### 为什么不解析符号链接
+
+投影**只做字符串运算**：`~` 展开 → `Clean` → 非绝对时 `Join(cwd)` → `ToSlash`，不调 `EvalSymlinks`。
+
+- 解析会把路径**移出**工程根：工程经 symlink 暴露时（例如 `~/work/proj` 链到 `/Volumes/x/proj`），唯一真正有用的「相对工程根」候选直接失效。
+- 解析结果依赖本机布局（不存在的路径解析失败；macOS 的 `/home` 是 autofs 指到 `/System/Volumes/Data/home`），投影会多出与用户输入无关的候选，也让「纯函数」变成不可测的机器相关函数。
+- 代价是「库里存的是 symlink 一侧、用户给另一侧」时相对候选对不上，绝对路径候选仍可用。溯源记录的就是写入当时的字面量，投影只负责对齐常见写法，不为符号链接做路径规范化。
+
+### 为什么不做目录前缀匹配
+
+`mem asset ./cmd/mem/` 不做「该目录下所有文件」的匹配。前缀匹配是隐藏的全表 `LIKE`，召回一堆弱相关内容；且「这个目录下有哪些记忆」已由 `mem ls --project` 承担。范围收窄成单文件的代价是可解释。
+
+### 全表扫描的代价
+
+`provenance` 无索引，`json_extract` 是整表扫描。本地库千级量级下为毫秒级，且 `asset` 是按需命令、不在 hook 热路径上，因此**不**为此加生成列或表达式索引（那是 schema 变更，属于迁移任务）。查询只读取检索可见的记忆（复用 `visibilityWhere`），与 `mem search` 口径一致：被归并取代、已过期的条目不会出现在这里。
+
+### 边界
+
+- `provenance` 为 NULL / 空串 / 非法 JSON 一律视为不命中，单条脏数据不会让整次查询失败。读取 `file`/`line`/`preview` 的每个表达式都先过 `json_valid`：SQLite 的 `json_extract` 遇到非法 JSON 是**抛错**而不是返回 NULL，守卫不能只加在 `WHERE` 用到的那个上。
+- 未记录锚点行时（`$.line` 不存在）`json_extract` 返回 NULL，输出渲染为 `L-`；排序里 NULL 在 0 之前，即「只有文件级结论」的条目排在最前。
+- 无命中时打印提示并**以 0 退出**，与 `mem search` 的「无结果」语义一致：空结果是答案的一部分，不是错误。

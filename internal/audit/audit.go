@@ -34,6 +34,14 @@ type Record struct {
 	Hashes    []string `json:"hashes,omitempty"` // 读侧＝实际注入的记忆 id；写侧＝写入的 content_hash
 	Kinds     []string `json:"kinds,omitempty"`
 	Empty     bool     `json:"empty"` // 注入内容为空
+	// InjectBytes 是本次读侧实际写给宿主的注入体量，单位是**字节**而非 rune。
+	// 宿主对 hook stdout 设的是字节/字符硬上限，而本仓库的预算按 rune 收，
+	// CJK 下两者最坏差 3 倍（一个汉字 3 字节）——只能用字节对齐宿主，用 rune 会低估。
+	// 记录的是未包 JSON 信封的正文：Cursor 系外层还有 {"additional_context":...}，
+	// 包壳（含转义）后的真实字节更大，故 R13 的阈值留了余量（docs/ops-watch.md §3）。
+	// 用 omitempty：读侧 0 字节必然等价于「无注入」（Empty=true 或 gate 主动跳过），
+	// 已由 Empty 表达，不需要像 Count 那样用字段缺失区分「0 条」与「没写计数」。
+	InjectBytes int `json:"inject_bytes,omitempty"`
 	// Mode 仅写侧使用：create=新增，overwrite=命中「相同知识覆盖」。
 	// 用它可算「模型重复记录率」——去重是否在起作用。
 	Mode string `json:"mode,omitempty"`

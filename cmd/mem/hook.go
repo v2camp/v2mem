@@ -173,6 +173,9 @@ func cmdHook(args []string) error {
 			TS: started.Unix(), Event: string(event), Harness: harnessName(*harnessFlag, in),
 			Project: project, SessionID: in.sessionID(), Query: scrub.Apply(strings.TrimSpace(in.Prompt), *noScrub),
 			Empty: empty, MS: time.Since(started).Milliseconds(),
+			// 与 writeHookStdout 打出去的是同一个串，量的是宿主眼里的大小（字节）。
+			// 未含 Cursor 系的 {"additional_context":...} 信封，包壳后实际更大 ⇒ R13 阈值留了余量。
+			InjectBytes: len(out.Text),
 		}
 		for _, h := range out.Injected {
 			rec.Hashes = append(rec.Hashes, h.ID)

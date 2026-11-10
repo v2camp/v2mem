@@ -46,4 +46,14 @@ printf '%s' "$r12_row" | grep -q '失败 >3' || fail "§3 R12 的 FAIL 线不是
 grep -q 'A_DISTILL_FAIL" -gt 3' "$SCRIPT" || fail "脚本 R12 的 FAIL 线不是 >3"
 grep -q 'A_DISTILL" -eq 0' "$SCRIPT"     || fail "脚本 R12 缺断链判级分支"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；枚举到 R${max_r}"
+# ⑤ R13 注入体量：文档两档字面量与脚本分级必须同步，无样本分支不许被删。
+# 这条判据守的是「查到了但送不进去」——R2 命中率看不出宿主把 stdout 换成占位。
+r13_row="$(grep -E '^\| \*\*R13\*\*' "$DOC" | head -1)"
+[ -n "$r13_row" ] || fail "§3 找不到 R13 行"
+printf '%s' "$r13_row" | grep -q '≤3600' || fail "§3 R13 的 PASS 线不是 ≤3600"
+printf '%s' "$r13_row" | grep -q '>8000' || fail "§3 R13 的 FAIL 线不是 >8000"
+grep -q 'A_INJ_MAX" -le 3600' "$SCRIPT" || fail "脚本 R13 的 PASS 线不是 ≤3600"
+grep -q 'A_INJ_MAX" -gt 8000' "$SCRIPT" || fail "脚本 R13 的 FAIL 线不是 >8000"
+grep -q 'A_INJ_N" -eq 0'      "$SCRIPT" || fail "脚本 R13 缺无样本分支"
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；枚举到 R${max_r}"
