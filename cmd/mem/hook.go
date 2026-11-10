@@ -303,12 +303,40 @@ func notesEnabled() bool {
 	return strings.TrimSpace(os.Getenv("MEM_NO_NOTES")) == ""
 }
 
-// notesCoveredPredicate 返回「这条命中是否已被 notes 覆盖」的判定。
-// nil 表示不去重（MEM_NO_NOTES 置位，或 notes 读不出来 —— 失败开放，宁可多注入）。
-func notesCoveredPredicate(st *store.Store) func(store.Hit) bool {
+// notesCoveredPredicate 返回「这条命中是否已被本会话开场注入覆盖」的判定。
+// nil 表示不去重 —— 失败开放，宁可多注入：
+//   - MEM_NO_NOTES 置位（读侧回退到「仅 v2mem 原始注入」）；
+//   - 判据查询失败；
+//   - 本会话开场一条 rule 都没注入（没有可去重的东西）。
+//
+// 🔴 判据必须是「本会话**实际**注入过的 rule」，不能是「库里所有的 rule」。
+// 开场注入有 --limit（默认 3）与字符预算两道闸；用全库规则当覆盖集合时，
+// 被闸掉的那些规则会**永远**进不来：开场不注入、每轮又被判 notes_duplicate 跳过，
+// 而审计里只表现为「正常去重」。见 internal/store/session_injected.go。
+func notesCoveredPredicate(st *store.Store, sessionID string) func(store.Hit) bool {
 	if !notesEnabled() {
 		return nil
 	}
+	if strings.TrimSpace(sessionID) == "" {
+		// 宿主没给会话标识（session_id / conversation_id 都空）：
+		// 「本会话注入了什么」无从判定，退回改造前的库级判据，保持既有宿主集成
+		// 的行为不变。真实宿主都会带会话标识，这条分支只为「无会话维度」兜底。
+		return libraryWideNotesCovered(st)
+	}
+	ids, err := st.SessionInjectedRuleIDs(sessionID)
+	if err != nil || len(ids) == 0 {
+		return nil
+	}
+	return func(h store.Hit) bool {
+		return h.Kind == "rule" && ids[h.ID]
+	}
+}
+
+// libraryWideNotesCovered 是改造前的库级判据：全库硬规则一律视为已被覆盖。
+//
+// 只在**会话维度不可用**时兜底。它正是本缺陷的来源 —— 全库集合大于开场实际
+// 注入的集合，差集里的规则永远注入不了；有会话标识时绝不能再走这里。
+func libraryWideNotesCovered(st *store.Store) func(store.Hit) bool {
 	rules, err := collectRules(st)
 	if err != nil {
 		return nil
@@ -329,10 +357,14 @@ func notesCoveredPredicate(st *store.Store) func(store.Hit) bool {
 // 等价于 `mem notes` 的规则段。每轮 prompt-submit 若再检索出同一条 rule，
 // 同一知识就在上下文里重复出现、白占预算，故在**检索侧**过滤掉。
 //
+// 「出现过」以本会话的开场轨迹为准（sessionID）：开场因 limit/budget 没注入的规则
+// 不在此列，它仍有资格在后续每轮被检索注入。sessionID 为空时退回库级判据
+// （见 notesCoveredPredicate）。
+//
 // 注意：本函数只给检索侧用。开场注入侧若也调用它，规则将无处可去
 // （钩子不注入 notes 文本），等于静默丢规则 —— 见 sessionStartContext 的注释。
-func filterRulesCoveredByNotes(st *store.Store, hits []store.Hit) []store.Hit {
-	pred := notesCoveredPredicate(st)
+func filterRulesCoveredByNotes(st *store.Store, sessionID string, hits []store.Hit) []store.Hit {
+	pred := notesCoveredPredicate(st, sessionID)
 	if pred == nil {
 		return hits
 	}
@@ -573,7 +605,7 @@ func promptSubmitContext(st *store.Store, project, prompt string, limit, maxChar
 		Query: prompt, Project: project, Scope: "current",
 		SessionID: meta.SessionID, Harness: meta.Harness,
 		Limit: limit, Budget: budget, ContentRunes: maxHitRunes,
-		NotesCovered: notesCoveredPredicate(st),
+		NotesCovered: notesCoveredPredicate(st, meta.SessionID),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 检索失败（不影响会话）:", err)

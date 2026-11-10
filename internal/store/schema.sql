@@ -317,6 +317,9 @@ CREATE TABLE IF NOT EXISTS read_traces (
   created_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_read_traces_created ON read_traces(created_at);
+-- 每轮 prompt-submit 都要按会话取「开场注入过哪些规则」（SessionInjectedRuleIDs）。
+-- 这条查询在钩子的关键路径上，没有索引就得全表扫 read_traces。
+CREATE INDEX IF NOT EXISTS ix_read_traces_session ON read_traces(session_id);
 
 CREATE TABLE IF NOT EXISTS read_trace_items (
   trace_id      TEXT NOT NULL REFERENCES read_traces(id) ON DELETE CASCADE,
