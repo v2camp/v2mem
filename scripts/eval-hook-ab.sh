@@ -109,7 +109,7 @@ if [ -z "$USER_MEM_BIN" ]; then
       echo "RED: 构建 $MEM_BIN 失败" >&2; exit 2; }
   fi
 else
-  echo "→ 使用用户指定的 MEM_BIN=$MEM_BIN（不校验新鲜度）" >&2
+  echo "→ 使用用户指定的 MEM_BIN=${MEM_BIN}（不校验新鲜度）" >&2
 fi
 [ -x "$MEM_BIN" ] || { echo "RED: MEM_BIN 不可执行: $MEM_BIN" >&2; exit 2; }
 
@@ -408,8 +408,8 @@ else
   say "RED: 注入路径评测未达标  n=$ON_N  parity=$PARITY" >&2
   awk -v r="$ON_RECALL" -v m="$MIN" 'BEGIN{ exit !(r >= m) }' \
     || echo "  Recall@$K=$ON_RECALL < 门槛 hook_recall5_min=$MIN" >&2
-  [ "$MISS_OK" = "$MISS_TOTAL" ] || echo "  客套/无检索意图的 query 被注入了内容：$MISS_OK/$MISS_TOTAL（应为 $MISS_TOTAL/$MISS_TOTAL）" >&2
-  [ "$BUDGET_OK" = "$BUDGET_TOTAL" ] || echo "  预算不足时整块弃答：$BUDGET_OK/$BUDGET_TOTAL（应为 $BUDGET_TOTAL/$BUDGET_TOTAL）" >&2
+  [ "$MISS_OK" = "$MISS_TOTAL" ] || echo "  客套/无检索意图的 query 被注入了内容：$MISS_OK/${MISS_TOTAL}（应为 $MISS_TOTAL/${MISS_TOTAL}）" >&2
+  [ "$BUDGET_OK" = "$BUDGET_TOTAL" ] || echo "  预算不足时整块弃答：$BUDGET_OK/${BUDGET_TOTAL}（应为 $BUDGET_TOTAL/${BUDGET_TOTAL}）" >&2
   [ "$EXEC_ERRORS" -eq 0 ] || echo "  执行失败 $EXEC_ERRORS 条（不是被评测的行为，见上方明细）" >&2
 fi
 
