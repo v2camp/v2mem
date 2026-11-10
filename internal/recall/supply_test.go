@@ -119,6 +119,157 @@ func TestContainsIdentBoundary(t *testing.T) {
 	}
 }
 
+// ---------- broad 单路（弱相关） ----------
+
+func TestQueryTermsSplitsHanBigramsAndLatinTokens(t *testing.T) {
+	got := queryTerms("临时记忆库能不能放在 iCloud 同步目录")
+	want := []string{"临时", "时记", "记忆", "忆库", "库能", "能不", "不能", "能放",
+		"放在", "icloud", "同步", "步目", "目录"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("词项切分不符:\n got %v\nwant %v", got, want)
+	}
+	// 单字不成项、停用词不进覆盖率分母。
+	if n := len(queryTerms("好")); n != 0 {
+		t.Fatalf("单字不应成为词项, got %d", n)
+	}
+	if got := queryTerms("how to use the thing"); len(got) != 0 {
+		t.Fatalf("停用词不应成为词项, got %v", got)
+	}
+	// 重复出现的二字词只算一次，否则覆盖率会被同一个词灌水。
+	if got := queryTerms("记忆记忆"); strings.Join(got, "|") != "记忆|忆记" {
+		t.Fatalf("重复词项应去重, got %v", got)
+	}
+}
+
+func TestEvaluateBroadOnlySupport(t *testing.T) {
+	// 只有 broad 一路带回，但正文覆盖了提问的多数词项（6/12，≥1/3）。
+	p := QueryProfile{Terms: queryTerms("临时记忆库能不能放同步目录")}
+	weak := Evaluate(store.Hit{
+		Content: "记忆库不能放进同步目录", Signals: &store.HitSignals{Broad: 0.0164},
+	}, p, SupportContext{})
+	if weak.MatchClass() != classBroadOnly || weak.Score != scoreBroadOnly {
+		t.Fatalf("broad 单路应得 %s/%v，got %+v", classBroadOnly, scoreBroadOnly, weak)
+	}
+	if weak.Score <= 0 {
+		t.Fatal("broad 单路必须给正分，否则供给层仍会整段丢弃")
+	}
+
+	// 排序不变式：precise 单路 > broad 单路 > 无支持；多路仍最高。
+	precise := Evaluate(store.Hit{
+		Content: "记忆库不能放进同步目录", Signals: &store.HitSignals{Precise: 0.9},
+	}, p, SupportContext{})
+	if precise.Score != scorePrecise || precise.Score <= weak.Score {
+		t.Fatalf("precise 单路应高于 broad 单路，got %+v vs %+v", precise, weak)
+	}
+	multi := Evaluate(store.Hit{
+		Content: "记忆库不能放进同步目录", Signals: &store.HitSignals{Precise: 0.3, Broad: 0.3},
+	}, p, SupportContext{})
+	if multi.Score <= precise.Score || !strings.Contains(multi.MatchClass(), "multi") {
+		t.Fatalf("多路支持应最高，got %+v vs %+v", multi, precise)
+	}
+	if none := Evaluate(store.Hit{Content: "记忆库不能放进同步目录"}, p, SupportContext{}); none.Score != 0 {
+		t.Fatalf("无信号仍然无支持: %+v", none)
+	}
+
+	// 字面撞词但覆盖不足：仍是 0（质量门没被拆掉）。
+	noise := Evaluate(store.Hit{
+		Content: "同步网盘的历史记录", Signals: &store.HitSignals{Broad: 0.0164},
+	}, p, SupportContext{})
+	if noise.Score != 0 || len(noise.Classes) != 0 {
+		t.Fatalf("覆盖不足的 broad 单路不应获得支持: %+v", noise)
+	}
+
+	// 两路以上不带 precise（broad+fuzzy）走 multi，不冒充 broad_only。
+	bf := Evaluate(store.Hit{
+		Content: "记忆库不能放进同步目录", Signals: &store.HitSignals{Broad: 0.3, Fuzzy: 0.2},
+	}, p, SupportContext{})
+	if bf.MatchClass() != "multi" {
+		t.Fatalf("broad+fuzzy 应记 multi，got %+v", bf)
+	}
+}
+
+// 附加条件的边界：至少 3 个词项，且覆盖率 ≥ 1/3。两条都必须卡。
+func TestBroadOnlyBoundary(t *testing.T) {
+	terms := []string{"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh", "ii"}
+	sig := &store.HitSignals{Broad: 0.0164}
+	// 9 个词项覆盖 3 个：恰好 1/3，放行。
+	if !broadOnlySupported(store.Hit{Content: "aa bb cc", Signals: sig}, QueryProfile{Terms: terms}) {
+		t.Fatal("3/9 应刚好满足覆盖率下限")
+	}
+	// 10 个词项覆盖 3 个：3/10 < 1/3，不放行。
+	ten := append(append([]string{}, terms...), "jj")
+	if broadOnlySupported(store.Hit{Content: "aa bb cc", Signals: sig}, QueryProfile{Terms: ten}) {
+		t.Fatal("3/10 应刚好不满足覆盖率下限")
+	}
+	// 短提问里覆盖 2 个：不足 3 个词项，不放行。
+	if broadOnlySupported(store.Hit{Content: "aa bb", Signals: sig}, QueryProfile{Terms: terms[:3]}) {
+		t.Fatal("只共享 2 个词项不应放行")
+	}
+	// 没有词项（极短/纯客套）时不给通行证。
+	if broadOnlySupported(store.Hit{Content: "aa bb cc", Signals: sig}, QueryProfile{}) {
+		t.Fatal("无词项时不应放行")
+	}
+	if termCoverage("", terms) != 0 || termCoverage("aa", nil) != 0 {
+		t.Fatal("空正文或空词项应覆盖 0 个")
+	}
+	// 拉丁 token 走边界匹配：aa 不应命中 aab。
+	if n := termCoverage("aab", []string{"aa"}); n != 0 {
+		t.Fatalf("aa 不应命中 aab, got %d", n)
+	}
+	// broad 之外还有其它路时不走这条判据。
+	if broadOnlySupported(store.Hit{Content: "aa bb cc", Signals: &store.HitSignals{Broad: 1, Fuzzy: 1}}, QueryProfile{Terms: terms}) {
+		t.Fatal("非 broad 单路不应走 broad_only 判据")
+	}
+}
+
+func TestQueryInjectsBroadOnlyAndRendersWeakMark(t *testing.T) {
+	sig := &store.HitSignals{Broad: 0.0164}
+	f := &fakeStore{hits: []store.Hit{
+		hit("aaaaaaaa", "记忆库不能放进同步目录", "demo", sig),
+		hit("bbbbbbbb", "同步网盘的历史记录", "demo", &store.HitSignals{Broad: 0.0161}),
+	}}
+	res, err := Query(f, QueryOptions{Query: "临时记忆库能不能放同步目录", Project: "demo"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if res.Outcome != OutcomeInjected || len(res.Injected) != 1 || res.Injected[0].Hit.ID != "aaaaaaaa" {
+		t.Fatalf("覆盖充分的 broad 单路应被注入、覆盖不足的仍应丢弃: %+v", res)
+	}
+	if res.Items[0].MatchClass != classBroadOnly {
+		t.Fatalf("应记 broad_only: %+v", res.Items[0])
+	}
+	if res.Items[1].DropReason != dropUnsupported || res.Items[1].Eligible {
+		t.Fatalf("覆盖不足的候选应记 unsupported_quality: %+v", res.Items[1])
+	}
+	line := RenderLine(res.Injected[0].Hit, res.Injected[0].Provenance, 120)
+	if !strings.Contains(line, "（弱相关）") || !strings.Contains(line, "mem:aaaaaaaa") {
+		t.Fatalf("broad 单路注入行应带弱相关标记: %q", line)
+	}
+	// 标记只看 Signals：被丢弃的候选若渲染也会带标记，且只出现一次。
+	if n := strings.Count(RenderLine(res.Items[1].Hit, "", 120), "（弱相关）"); n != 1 {
+		t.Fatalf("弱相关标记应恰好出现一次, got %d", n)
+	}
+}
+
+func TestRenderLineWeakMarkOnlyForBroadOnly(t *testing.T) {
+	h := store.Hit{ID: "0123456789abcdef", Kind: "fact", Content: "正文"}
+	if line := RenderLine(h, "p", 120); strings.Contains(line, "（弱相关）") {
+		t.Fatalf("precise 命中不应带弱相关标记: %q", line)
+	}
+	h.Signals = &store.HitSignals{Precise: 0.5, Broad: 0.5}
+	if line := RenderLine(h, "p+b", 120); strings.Contains(line, "（弱相关）") {
+		t.Fatalf("多路命中不应带弱相关标记: %q", line)
+	}
+	h.Signals = &store.HitSignals{Broad: 0.0164}
+	line := RenderLine(h, "b", 120)
+	if !strings.HasSuffix(strings.TrimSuffix(line, "\n"), "（弱相关） · b") {
+		t.Fatalf("弱相关标记应在正文之后、provenance 之前: %q", line)
+	}
+	if got := RenderLine(h, "b", 0); got != line {
+		t.Fatalf("contentRunes<=0 应退回默认 120: %q vs %q", got, line)
+	}
+}
+
 // ---------- 供给（假 store） ----------
 
 type fakeStore struct {

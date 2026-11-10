@@ -56,8 +56,9 @@ func TestHookGateSkipsPleasantryWithoutEmptyAudit(t *testing.T) {
 	}
 }
 
-// 只有 broad 单路支持的命中属于弱证据：无其它结构支持时弃答，不凑数。
-func TestHookBroadOnlyAbstains(t *testing.T) {
+// 只有 broad 单路支持的命中不再一律弃答：当正文确实覆盖了提问的词项（≥3 个且
+// ≥1/3）时，按「弱相关」注入 —— 检索已经找到的东西不该在供给层被整段丢掉。
+func TestHookBroadOnlyInjectsAsWeak(t *testing.T) {
 	db := testDB(t)
 	proj, name := hookProjectDir(t, "demo-repo")
 	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进同步目录"}); err != nil {
@@ -69,8 +70,11 @@ func TestHookBroadOnlyAbstains(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdHook: %v", err)
 	}
-	if strings.TrimSpace(out) != "" {
-		t.Fatalf("仅 broad 单路支持应弃答，got:\n%s", out)
+	if !strings.Contains(out, "记忆库不能放进同步目录") {
+		t.Fatalf("broad 单路支持应被注入，got:\n%s", out)
+	}
+	if !strings.Contains(out, "（弱相关）") {
+		t.Fatalf("broad 单路命中必须带弱相关标记，got:\n%s", out)
 	}
 
 	st, _ := store.Open(db)
@@ -78,6 +82,42 @@ func TestHookBroadOnlyAbstains(t *testing.T) {
 	tr, items, err := st.GetReadTrace(mustLatestTraceID(t, st))
 	if err != nil {
 		t.Fatalf("GetReadTrace: %v", err)
+	}
+	if tr.Outcome != "injected" || tr.Injected != 1 {
+		t.Fatalf("结局应为注入: %+v", tr)
+	}
+	if len(items) != 1 || !items[0].Eligible || items[0].MatchClass != "broad_only" {
+		t.Fatalf("应记录 broad_only 支持类别: %+v", items)
+	}
+}
+
+// 反向用例：正文与提问只有字面撞词、没有结构重合时仍然不注入。
+// 「目录权限怎么配置」与「记忆库不能放进同步目录」只共享一个二字词「目录」，
+// broad 路会把它带进候选，但覆盖率不足 —— 质量门必须仍然拦住。
+func TestHookUnrelatedPromptStillAbstains(t *testing.T) {
+	db := testDB(t)
+	proj, name := hookProjectDir(t, "demo-repo")
+	if err := cmdAdd([]string{"--db", db, "--project", name, "记忆库不能放进同步目录"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	out, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "目录权限怎么配置"), func() error {
+		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
+	})
+	if err != nil {
+		t.Fatalf("cmdHook: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("只有字面撞词的无关提问不应注入，got:\n%s", out)
+	}
+
+	st, _ := store.Open(db)
+	defer st.Close()
+	tr, items, err := st.GetReadTrace(mustLatestTraceID(t, st))
+	if err != nil {
+		t.Fatalf("GetReadTrace: %v", err)
+	}
+	if tr.RawHits == 0 {
+		t.Fatalf("前置条件不成立：broad 路本应带回候选: %+v", tr)
 	}
 	if tr.Outcome != "abstained_low_quality" || tr.Injected != 0 {
 		t.Fatalf("结局应为低质量弃答: %+v", tr)
