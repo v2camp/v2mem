@@ -10,9 +10,17 @@ set -uo pipefail
 # 两臂 + 一个只报告的 PROD 臂（同一个临时库、同一批 query、同样 k=5）：
 #   OFF   `mem search --db <tmp> --limit 5 --scope all --json`，逐条 query 取回的记忆 id。
 #         这就是「只做检索、不做注入」，也就是现有 eval-gate 量的那条路径。
-#   ON    `mem hook --event prompt-submit --limit 5 --max-chars <预算>`，逐条 query 跑
-#         真实钩子。**注入 id 从审计里读**（audit.jsonl 的 hashes = 实际注入的记忆 id，
-#         见 cmd/mem/hook.go 的审计写入），不解析渲染文本 —— 文本是给人看的、没有 id。
+#   ON    每条 query 用**同一个 session_id** 依次跑两个事件，命中取两事件 hashes 的并集：
+#           ① `mem hook --event session-start`   —— 开场注入（硬规则 / 全局 / 本工程三段）
+#           ② `mem hook --event prompt-submit`   —— 提问注入（真实钩子）
+#         并集 = 提问那一刻会话里**累计**的记忆，这才是模型真正看得见的东西。
+#         为什么必须跑开场：开场已经注入过的规则，prompt-submit 会有意不再重复注入
+#         （notes 去重，见 cmd/mem/hook.go 的 filterRulesCoveredByNotes）—— 那是设计行为。
+#         只跑 prompt-submit 会把「开场已给过」记成「注入丢失」，纯属评测构造出来的伪丢失。
+#         两个事件的贡献**分开报告**（开场贡献 / 提问贡献 / 并集）：并集只说明「有没有」，
+#         分开才知道是哪一段给的；否则以后再出现丢失，仍然定位不到阶段。
+#         注入 id 一律从审计读（audit.jsonl 的 hashes = 实际注入的记忆 id，见
+#         cmd/mem/hook.go 的审计写入），不解析渲染文本 —— 文本是给人看的、没有 id。
 #         这样 ON 臂量的是生产真实路径，不是对它的模拟。
 #   PROD  同 ON 臂但 --limit 3（生产默认值），只报告不判级，用来看「按生产配置实际注入几条」。
 #
@@ -59,7 +67,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --budget) BUDGET="${2:-}"; shift 2 || { echo "RED: --budget 需要数值" >&2; exit 2; } ;;
     --verbose) VERBOSE=1; shift ;;
-    -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "RED: 未知参数: $1（可用 --budget N / --verbose）" >&2; exit 2 ;;
   esac
 done
@@ -142,9 +150,20 @@ say() { printf '%s\n' "$*"; }
 # ---------- 1) 灌临时库 ----------
 # 只灌 layer=memory 的行。观测行（layer=observation）跳过：CLI 没有写入观测的命令，
 # 且 prompt-submit 只查 memory 层（store.SearchQuery.Layer 默认），对两条臂都没有影响。
+#
+# 每条之间隔 1 秒：ON 臂的开场段（session-start 的「本工程记忆」）按
+# `salience DESC, last_seen_at DESC, updated_at DESC, id ASC` 排序（internal/store.List），
+# 种子全是同一个 salience、又在同一秒内灌入时，排序会落到 `id ASC` —— 而 id 是
+# crypto/rand 生成的（internal/store.newID），于是开场每次注入的 5 条都不一样，
+# ON 臂的并集召回会随运行抖动（实测三次三套结果）。last_seen_at 是 INTEGER 秒，
+# 隔 1 秒就能让它严格递增：开场集合因此唯一确定 = 最近灌入的 5 条，与生产里
+# 「同 salience 时先给最近见过的」的语义也是一致的。
+MEM_ROWS="$(jq -r 'select((.layer // "memory") == "memory") | .content' "$SANDBOX/seed.jsonl" \
+  | wc -l | tr -d ' ')"
 SEEDED=0
 while IFS=$'\t' read -r kind proj src ch content; do
   [ -z "${content:-}" ] && continue
+  [ "$SEEDED" -eq 0 ] || sleep 1
   # --no-audit 是硬要求：`mem add` 默认会把每条写入记进 ~/.v2mem/audit.jsonl，
   # 评测灌库不该在个人审计里留下 8 条合成样本（也不能碰用户的个人目录）。
   "$MEM_BIN" add --db "$DB" --no-audit --kind "$kind" --project "$proj" \
@@ -155,6 +174,8 @@ done < <(jq -r 'select((.layer // "memory") == "memory")
   | [ (.kind // "fact"), (.project // ""), (.source // "human"), (.channel // ""), .content ]
   | @tsv' "$SANDBOX/seed.jsonl")
 [ "$SEEDED" -gt 0 ] || { echo "RED: seed.jsonl 没有灌进任何记忆" >&2; exit 2; }
+[ "$SEEDED" -eq "$MEM_ROWS" ] || {
+  echo "RED: 灌库条数($SEEDED) 与 seed.jsonl 的 memory 行数($MEM_ROWS) 不一致" >&2; exit 2; }
 
 # id → content_hash 前 12 位。夹具的 gold 用 hash 前缀（与 recall.gold.jsonl 同口径），
 # 而审计里的 hashes 是**记忆 id** —— 这层映射是 ON 臂能做哈希前缀匹配的唯一途径。
@@ -210,15 +231,55 @@ count_hits() { # $1=空格分隔 gold 前缀  $2=逗号分隔 实际 hash 前缀
   printf '%s' "$n"
 }
 
+# ---------- 3c) 审计记录 → hash 前缀 ----------
+# 开场与提问各写一条审计记录，hashes 是记忆 id，这里统一换成 content_hash 前 12 位。
+hashes_csv() { # $1=审计记录 JSON → 逗号分隔 hash 前缀
+  local csv="" id h
+  for id in $(printf '%s' "$1" | jq -r '(.hashes // []) | .[]'); do
+    h="$(h12_of "$id")"
+    [ -n "$h" ] || h="unknown"
+    csv="${csv:+$csv,}$h"
+  done
+  printf '%s' "$csv"
+}
+
+# 两事件命中集合的并集（按 hash 前缀去重）：模拟「会话累计上下文」。
+csv_union() { # $1,$2 逗号分隔 hash 前缀 → 去重后的并集
+  local csv="" x
+  for x in $(printf '%s,%s' "$1" "$2" | tr ',' ' '); do
+    case ",$csv," in *",$x,"*) continue ;; esac
+    csv="${csv:+$csv,}$x"
+  done
+  printf '%s' "$csv"
+}
+
 # ---------- 4) ON / PROD / OFF 臂 ----------
+# 结果 TSV 的列（两臂同一格式，parity 只比 $7/$8）：
+#   1 arm  2 idx  3 case  4 limit  5 max_chars  6 gold_n
+#   7 并集命中数  8 并集 ratio  9 并集注入 hash 前缀
+#  10 prompt-submit inject_bytes  11 status  12 query
+#  13 开场命中数 14 开场 ratio  15 提问命中数 16 提问 ratio
+#  17 开场 inject_bytes  18 开场注入 hash 前缀  19 提问注入 hash 前缀
+# 13-19 是为「分开报告开场贡献 / 提问贡献」加的分阶段列：只给并集的话，
+# 以后看不出并集里每一条是哪个事件给的，归因就断了。
+#
+# row_fail <TSV> <臂> <idx> <case> <limit> <max_chars> <gold_n> <status> <query>
+# 失败行也写满 19 列：汇总/断言按列号取值，列数不一致会把后面的行读错位。
+row_fail() {
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t0\t0\t-\t0\t%s\t%s\t0\t0\t0\t0\t0\t-\t-\n' \
+    "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" >>"$1"
+}
+
 # run_arm <臂名> <limit> <审计文件> <结果TSV>
-# 每条 query 用**独立 session_id**：hook 的幂等去重键含 session_id，同一 session
-# 连跑 10 次会让后 9 次被判成重复触发、审计里只有 suppressed、没有 hashes。
+# 每条 query 用**独立 session_id**：hook 的幂等去重键含（事件 + session_id + prompt + cwd），
+# 同一 session 连跑 10 次会让后 9 次被判成重复触发、审计里只有 suppressed、没有 hashes。
 # 选「独立 session」而不是 `--dedup-window 0`，是为了让 ON 臂保留生产的去重逻辑。
+# 同一 session 内开场只跑一次（幂等去重会挡住第二次），这也正是真实会话的形状。
 run_arm() {
   local arm="$1" limit="$2" audit="$3" out="$4"
   : > "$audit"; : > "$out"
-  local idx=0 line q ck mc golds gold_n g ratio hits bytes sid payload rec inj_csv
+  local idx=0 line q ck mc golds gold_n sid pl_start pl_prompt rec st_rec
+  local st_csv ps_csv un_csv st_hits ps_hits hits st_ratio ps_ratio ratio st_bytes bytes
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     idx=$((idx + 1))
@@ -229,41 +290,57 @@ run_arm() {
     gold_n="$(echo "$line" | jq -r '(.gold // []) | length')"
     sid="ab-${arm}-${idx}"
 
-    payload="$(jq -nc --arg p "$q" --arg s "$sid" --arg c "$WORK" \
-      '{prompt:$p, session_id:$s, cwd:$c}')"
-    if ! printf '%s' "$payload" | "$MEM_BIN" hook --event prompt-submit \
+    # (a) 开场：session-start 没有 prompt，只有 session_id + cwd
+    pl_start="$(jq -nc --arg s "$sid" --arg c "$WORK" '{session_id:$s, cwd:$c}')"
+    if ! printf '%s' "$pl_start" | "$MEM_BIN" hook --event session-start \
         --db "$DB" --audit "$audit" --limit "$limit" --max-chars "$mc" \
-        >"$TMPD/stdout" 2>"$TMPD/stderr"; then
+        >"$TMPD/stdout.start" 2>"$TMPD/stderr.start"; then
       # 钩子的设计红线是「绝不阻断宿主、异常也返回 0」。非零退出说明二进制或参数
       # 本身有问题（不是被评测的行为），必须单独记下来，不能算成「注入丢失」。
       printf '%s\t%s\t%s\n' "$arm" "$idx" "$q" >>"$EXEC_ERR"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t0\t0\t-\t0\thook_exit_nonzero\t%s\n' \
-        "$arm" "$idx" "$ck" "$limit" "$mc" "$gold_n" "$q" >>"$out"
+      row_fail "$out" "$arm" "$idx" "$ck" "$limit" "$mc" "$gold_n" "hook_exit_nonzero_start" "$q"
       continue
     fi
+    st_rec="$(jq -c --arg s "$sid" 'select(.session_id == $s and .event == "session-start" and ((.suppressed // false) | not))' "$audit" | tail -1)"
+    if [ -z "$st_rec" ]; then
+      printf '%s\t%s\t%s\n' "$arm" "$idx" "$q" >>"$EXEC_ERR"
+      row_fail "$out" "$arm" "$idx" "$ck" "$limit" "$mc" "$gold_n" "audit_missing_start" "$q"
+      continue
+    fi
+    st_bytes="$(printf '%s' "$st_rec" | jq -r '.inject_bytes // 0')"
+    st_csv="$(hashes_csv "$st_rec")"
 
-    rec="$(jq -c --arg s "$sid" 'select(.session_id == $s and ((.suppressed // false) | not))' "$audit" | tail -1)"
+    # (b) 提问：真实钩子，同一 session_id
+    pl_prompt="$(jq -nc --arg p "$q" --arg s "$sid" --arg c "$WORK" \
+      '{prompt:$p, session_id:$s, cwd:$c}')"
+    if ! printf '%s' "$pl_prompt" | "$MEM_BIN" hook --event prompt-submit \
+        --db "$DB" --audit "$audit" --limit "$limit" --max-chars "$mc" \
+        >"$TMPD/stdout" 2>"$TMPD/stderr"; then
+      printf '%s\t%s\t%s\n' "$arm" "$idx" "$q" >>"$EXEC_ERR"
+      row_fail "$out" "$arm" "$idx" "$ck" "$limit" "$mc" "$gold_n" "hook_exit_nonzero" "$q"
+      continue
+    fi
+    rec="$(jq -c --arg s "$sid" 'select(.session_id == $s and .event == "prompt-submit" and ((.suppressed // false) | not))' "$audit" | tail -1)"
     if [ -z "$rec" ]; then
       printf '%s\t%s\t%s\n' "$arm" "$idx" "$q" >>"$EXEC_ERR"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t0\t0\t-\t0\taudit_missing\t%s\n' \
-        "$arm" "$idx" "$ck" "$limit" "$mc" "$gold_n" "$q" >>"$out"
+      row_fail "$out" "$arm" "$idx" "$ck" "$limit" "$mc" "$gold_n" "audit_missing" "$q"
       continue
     fi
-    bytes="$(echo "$rec" | jq -r '.inject_bytes // 0')"
-    n_inj="$(echo "$rec" | jq -r '(.hashes // []) | length')"
+    bytes="$(printf '%s' "$rec" | jq -r '.inject_bytes // 0')"
+    ps_csv="$(hashes_csv "$rec")"
 
-    # 记忆 id → hash 前缀，再和 gold 前缀逐个比对（与 internal/eval 的命中判定同口径）
-    inj_csv=""
-    for id in $(echo "$rec" | jq -r '(.hashes // []) | .[]'); do
-      h="$(h12_of "$id")"
-      [ -n "$h" ] || h="unknown"
-      inj_csv="${inj_csv:+$inj_csv,}$h"
-    done
-    hits="$(count_hits "$golds" "${inj_csv:--}")"
+    # (c) 打分：并集是 ON 臂的口径，开场/提问各自单算只用于归因。
+    un_csv="$(csv_union "$st_csv" "$ps_csv")"
+    hits="$(count_hits "$golds" "${un_csv:--}")"
+    st_hits="$(count_hits "$golds" "${st_csv:--}")"
+    ps_hits="$(count_hits "$golds" "${ps_csv:--}")"
     ratio="$(awk -v h="$hits" -v n="$gold_n" 'BEGIN{ if (n > 0) printf "%.4f", h/n; else printf "0" }')"
+    st_ratio="$(awk -v h="$st_hits" -v n="$gold_n" 'BEGIN{ if (n > 0) printf "%.4f", h/n; else printf "0" }')"
+    ps_ratio="$(awk -v h="$ps_hits" -v n="$gold_n" 'BEGIN{ if (n > 0) printf "%.4f", h/n; else printf "0" }')"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tok\t%s\n' \
-      "$arm" "$idx" "$ck" "$limit" "$mc" "$gold_n" "$hits" "$ratio" "${inj_csv:--}" "$bytes" "$q" >>"$out"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tok\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$arm" "$idx" "$ck" "$limit" "$mc" "$gold_n" "$hits" "$ratio" "${un_csv:--}" "$bytes" "$q" \
+      "$st_hits" "$st_ratio" "$ps_hits" "$ps_ratio" "$st_bytes" "${st_csv:--}" "${ps_csv:--}" >>"$out"
   done < "$FIXTURE"
 }
 
@@ -319,44 +396,61 @@ fi
 
 # ---------- 5) 汇总 ----------
 # 汇总用 awk：bash 没有浮点。分母是「gold 非空」的用例（与 --gold 的口径一致）。
-summarize() { # $1=tsv → 打印 "recall n"
-  awk -F'\t' '$6 > 0 { s += $8; n++ } END { if (n > 0) printf "%.4f %d\n", s/n, n; else printf "0.0000 0\n" }' "$1"
+# $2=ratio 列号：8=并集（ON 臂口径） 14=开场 16=提问。三者的分母相同、可逐项对照。
+summarize() { # <tsv> [ratio 列号] → 打印 "recall n"
+  awk -F'\t' -v c="${2:-8}" '$6 > 0 { s += $c; n++ } END { if (n > 0) printf "%.4f %d\n", s/n, n; else printf "0.0000 0\n" }' "$1"
 }
-read -r ON_RECALL ON_N <<<"$(summarize "$ON_TSV")"
-read -r PROD_RECALL PROD_N <<<"$(summarize "$PROD_TSV")"
-read -r OFF_RECALL OFF_N <<<"$(summarize "$OFF_TSV")"
+read -r ON_RECALL ON_N <<<"$(summarize "$ON_TSV" 8)"
+read -r OPEN_RECALL _ <<<"$(summarize "$ON_TSV" 14)"
+read -r PS_RECALL _ <<<"$(summarize "$ON_TSV" 16)"
+read -r PROD_RECALL PROD_N <<<"$(summarize "$PROD_TSV" 8)"
+read -r OFF_RECALL OFF_N <<<"$(summarize "$OFF_TSV" 8)"
 
 BYTES_MAX="$(awk -F'\t' '$10 > m { m = $10 } END { print m+0 }' "$ON_TSV")"
+ST_BYTES_MAX="$(awk -F'\t' '$17 > m { m = $17 } END { print m+0 }' "$ON_TSV")"
 PROD_BYTES_MAX="$(awk -F'\t' '$10 > m { m = $10 } END { print m+0 }' "$PROD_TSV")"
 
+# 客套/无检索意图的判据落在 **prompt-submit** 上：开场段不经 query gate、按工程整段转储，
+# 对任何提问（包括「谢谢」）都会注入 —— 那是会话基线，不是「往上下文里灌噪声」。
 MISS_TOTAL="$(awk -F'\t' '$3 == "miss"' "$ON_TSV" | wc -l | tr -d ' ')"
-MISS_OK="$(awk -F'\t' '$3 == "miss" && $9 == "-"' "$ON_TSV" | wc -l | tr -d ' ')"
+MISS_OK="$(awk -F'\t' '$3 == "miss" && $19 == "-"' "$ON_TSV" | wc -l | tr -d ' ')"
+MISS_OPEN="$(awk -F'\t' '$3 == "miss" && $18 != "-"' "$ON_TSV" | wc -l | tr -d ' ')"
+# 预算压力测的是 prompt-submit 的按条裁剪，故看 $15（提问命中）而不是并集。
 BUDGET_TOTAL="$(awk -F'\t' '$3 == "budget-stress"' "$ON_TSV" | wc -l | tr -d ' ')"
-BUDGET_OK="$(awk -F'\t' '$3 == "budget-stress" && $7 >= 1' "$ON_TSV" | wc -l | tr -d ' ')"
+BUDGET_OK="$(awk -F'\t' '$3 == "budget-stress" && $15 >= 1' "$ON_TSV" | wc -l | tr -d ' ')"
+# 开场真正补上的用例：并集有 gold，而单看提问没有。
+OPEN_ONLY="$(awk -F'\t' '$6 > 0 && $13 > $15' "$ON_TSV" | wc -l | tr -d ' ')"
 EXEC_ERRORS="$(wc -l < "$EXEC_ERR" | tr -d ' ')"
 
 PARITY="$(awk -v a="$ON_RECALL" -v b="$OFF_RECALL" 'BEGIN{ printf "%+.1f", (a-b)*100 }')"
+OPEN_GAIN="$(awk -v a="$ON_RECALL" -v b="$PS_RECALL" 'BEGIN{ printf "%+.1f", (a-b)*100 }')"
 
 # ---------- 6) 输出 ----------
 say "v2mem 钩子注入路径 ON/OFF 评测"
 say "  夹具    ${FIXTURE}（$CASES 条：${DIST}）"
 say "  临时库  $TMPD/mem.db（灌入 $SEEDED 条；不读 ~/.v2mem/mem.db）"
 say "  OFF 臂   mem search --db <tmp> --limit $K --scope all    Recall@$K=${OFF_RECALL}（$OFF_N 条可评分；只检索不注入）"
-say "  ON  臂   mem hook --event prompt-submit --limit $ON_LIMIT --max-chars $BUDGET   Recall@$K=${ON_RECALL}（$ON_N 条可评分）"
+say "  ON  臂   session-start → prompt-submit（同一 sid，命中取并集） --limit $ON_LIMIT --max-chars $BUDGET   Recall@$K=${ON_RECALL}（$ON_N 条可评分）"
+say "             ├ 开场贡献 session-start   Recall@$K=${OPEN_RECALL}"
+say "             └ 提问贡献 prompt-submit   Recall@$K=${PS_RECALL}（并集比只算提问 ${OPEN_GAIN}pt；$OPEN_ONLY 条用例是开场补上的）"
 say "  PROD 臂  同上但 --limit ${PROD_LIMIT}（生产默认）              Recall@$PROD_LIMIT=${PROD_RECALL}（只报告，不判级）"
 say "  参照值   mem eval recall --sandbox eval/sandbox（7 条金标准，发布门禁口径）  Recall@5=${OFF_SANDBOX}"
-say "  注入体量  ON bytes_max=${BYTES_MAX}（审计 inject_bytes，字节不是 rune）；PROD bytes_max=$PROD_BYTES_MAX"
+say "  注入体量  ON bytes_max: 开场=${ST_BYTES_MAX} prompt-submit=${BYTES_MAX}（审计 inject_bytes，字节不是 rune）；PROD bytes_max=$PROD_BYTES_MAX"
 say "  ON − OFF（同一打分函数，仅 detail 不判级）: parity=$PARITY"
 say ""
-say "  结构断言  客套不注入 $MISS_OK/${MISS_TOTAL}；预算不足仍保住至少一条 gold $BUDGET_OK/$BUDGET_TOTAL"
+say "  结构断言  客套不注入（prompt-submit）$MISS_OK/${MISS_TOTAL}；预算压力下 prompt-submit 仍保住至少一条 gold $BUDGET_OK/$BUDGET_TOTAL"
+if [ "$MISS_TOTAL" -gt 0 ]; then
+  say "            （客套 case 的开场段 ${MISS_OPEN}/${MISS_TOTAL} 有注入：开场不经 query gate、按工程整段转储，属预期基线，不计入该断言）"
+fi
 say ""
 
 # 注入阶段丢失：OFF 命中了、ON 少了 —— 这才是「注入把检索找到的东西弄丢」的直接证据。
-# 两臂同一打分函数、同一批 query、同一个库，所以逐条可比。
+# 两臂同一打分函数、同一批 query、同一个库，所以逐条可比。ON 取的是并集；括号里是
+# 分阶段命中数，用来判断丢在开场还是丢在提问。
 INJ_LOST="$(awk -F'\t' '
   NR == FNR { oh[$2] = $7; og[$2] = $6; ock[$2] = $3; oq[$2] = $12; next }
   { if (og[$2] + 0 > 0 && oh[$2] + 0 > $7 + 0) {
-      printf "  · #%s [%s] OFF %s/%s → ON %s/%s    query: %s\n", $2, ock[$2], oh[$2], og[$2], $7, $6, oq[$2]
+      printf "  · #%s [%s] OFF %s/%s → ON(并集) %s/%s（开场 %s、提问 %s）    query: %s\n", $2, ock[$2], oh[$2], og[$2], $7, $6, $13, $15, oq[$2]
       n++
     } }
   END { exit !(n > 0) }' "$OFF_TSV" "$ON_TSV" 2>/dev/null)"
@@ -368,24 +462,35 @@ fi
 
 # 结构断言失败项（与上面的「注入阶段丢失」不重复：那里讲召回损失，这里讲行为违约）。
 ASSERT_FAIL=0
-while IFS=$'\t' read -r arm idx ck lim mc gn hits ratio inj bytes st q; do
+while IFS=$'\t' read -r arm idx ck lim mc gn hits ratio inj bytes st q \
+    st_hits st_ratio ps_hits ps_ratio st_bytes st_inj ps_inj; do
   [ -z "${ck:-}" ] && continue
   failed=0
-  [ "$ck" = "miss" ] && [ "$inj" != "-" ] && failed=1
-  [ "$ck" = "budget-stress" ] && [ "$hits" -lt 1 ] && failed=1
+  [ "$ck" = "miss" ] && [ "$ps_inj" != "-" ] && failed=1
+  [ "$ck" = "budget-stress" ] && [ "$ps_hits" -lt 1 ] && failed=1
   [ "$st" != "ok" ] && failed=1
   [ "$failed" = 1 ] || continue
   ASSERT_FAIL=$((ASSERT_FAIL + 1))
   golds_desc="$(jq -r --arg q "$q" 'select(.query == $q) | (.gold // []) | join(",")' "$FIXTURE" | head -1)"
-  printf '  ✗ ON #%s [%s] limit=%s budget=%s 期望 gold=[%s] 实际命中 %s/%s 注入=[%s] bytes=%s 状态=%s\n    query: %s\n' \
-    "$idx" "$ck" "$lim" "$mc" "${golds_desc:--}" "${hits:-0}" "${gn:-0}" "${inj}" "${bytes:-0}" "$st" "$q"
+  printf '  ✗ ON #%s [%s] limit=%s budget=%s 期望 gold=[%s] 并集 %s/%s（开场 %s、提问 %s）注入=[%s] bytes=开场%s/提问%s 状态=%s\n    query: %s\n' \
+    "$idx" "$ck" "$lim" "$mc" "${golds_desc:--}" "${hits:-0}" "${gn:-0}" "${st_hits:-0}" "${ps_hits:-0}" \
+    "${inj}" "${st_bytes:-0}" "${bytes:-0}" "$st" "$q"
 done < "$ON_TSV"
 [ "$ASSERT_FAIL" -eq 0 ] || say ""
+
+# --verbose 时逐条列出 ON 臂：并集与分阶段命中数并排，方便看「这条是谁给的」。
+if [ "$VERBOSE" = 1 ]; then
+  say "  ON 臂逐条（并集 = 开场 ∪ 提问；两个数是各自命中的 gold 条数，可能重叠）："
+  awk -F'\t' '{ printf "    #%s [%s] 并集 %s/%s　开场 %s、提问 %s　注入=[%s] bytes=开场%s/提问%s\n", \
+    $2, $3, $7, $6, $13, $15, $9, $17, $10 }' "$ON_TSV"
+  say ""
+fi
 
 # PROD 臂只报告不判级；--verbose 时逐条列出，方便对照「生产 3 条上限少放了什么」。
 if [ "$VERBOSE" = 1 ]; then
   say "  PROD 臂逐条（--limit ${PROD_LIMIT}，仅供参考）："
-  awk -F'\t' '{ printf "    #%s [%s] 命中 %s/%s 注入=[%s] bytes=%s\n", $2, $3, $7, $6, $9, $10 }' "$PROD_TSV"
+  awk -F'\t' '{ printf "    #%s [%s] 并集 %s/%s（开场 %s、提问 %s）注入=[%s] bytes=开场%s/提问%s\n", \
+    $2, $3, $7, $6, $13, $15, $9, $17, $10 }' "$PROD_TSV"
   say ""
 fi
 
@@ -402,22 +507,23 @@ awk -v r="$ON_RECALL" -v m="$MIN" 'BEGIN{ exit !(r >= m) }' || VERDICT_OK=0
 [ "$EXEC_ERRORS" -eq 0 ] || VERDICT_OK=0
 
 if [ "$VERDICT_OK" = 1 ]; then
-  say "GREEN: 注入 Recall@$K=$ON_RECALL ≥ ${MIN}（hook_recall5_min）  n=$ON_N  parity=$PARITY"
+  say "GREEN: 注入 Recall@$K=$ON_RECALL ≥ ${MIN}（hook_recall5_min）  n=$ON_N  parity=${PARITY}（开场 ${OPEN_RECALL} / 提问 ${PS_RECALL}）"
 else
   # 逐条说清是哪一项没过：只说「RED」的话，下一次改动的人要自己再猜一遍。
-  say "RED: 注入路径评测未达标  n=$ON_N  parity=$PARITY" >&2
+  say "RED: 注入路径评测未达标  n=$ON_N  parity=${PARITY}（开场 ${OPEN_RECALL} / 提问 ${PS_RECALL}）" >&2
   awk -v r="$ON_RECALL" -v m="$MIN" 'BEGIN{ exit !(r >= m) }' \
     || echo "  Recall@$K=$ON_RECALL < 门槛 hook_recall5_min=$MIN" >&2
-  [ "$MISS_OK" = "$MISS_TOTAL" ] || echo "  客套/无检索意图的 query 被注入了内容：$MISS_OK/${MISS_TOTAL}（应为 $MISS_TOTAL/${MISS_TOTAL}）" >&2
-  [ "$BUDGET_OK" = "$BUDGET_TOTAL" ] || echo "  预算不足时整块弃答：$BUDGET_OK/${BUDGET_TOTAL}（应为 $BUDGET_TOTAL/${BUDGET_TOTAL}）" >&2
+  [ "$MISS_OK" = "$MISS_TOTAL" ] || echo "  客套/无检索意图的 query 被 prompt-submit 注入了内容：$MISS_OK/${MISS_TOTAL}（应为 $MISS_TOTAL/${MISS_TOTAL}）" >&2
+  [ "$BUDGET_OK" = "$BUDGET_TOTAL" ] || echo "  预算不足时 prompt-submit 整块弃答：$BUDGET_OK/${BUDGET_TOTAL}（应为 $BUDGET_TOTAL/${BUDGET_TOTAL}）" >&2
   [ "$EXEC_ERRORS" -eq 0 ] || echo "  执行失败 $EXEC_ERRORS 条（不是被评测的行为，见上方明细）" >&2
 fi
 
 say ""
 say "  注：$CASES 条合成夹具只回答「注入这一步有没有把检索已找到的东西弄丢」，"
 say "      不是检索质量结论，也不能替代 L2 的真实会话金标准。"
-# 机器可读摘要（单行，便于脚本/CI 抓取）
-say "HOOK_AB on_recall5=$ON_RECALL off_search5=$OFF_RECALL off_sandbox5=$OFF_SANDBOX parity=${PARITY}pt n=$ON_N cases=$CASES budget=$BUDGET bytes_max=$BYTES_MAX prod_recall3=$PROD_RECALL miss_abstain=$MISS_OK/$MISS_TOTAL budget_keep=$BUDGET_OK/$BUDGET_TOTAL exec_errors=$EXEC_ERRORS"
+# 机器可读摘要（单行，便于脚本/CI 抓取）。on_recall5 是并集口径：
+# 看「有没有」用它，看「是谁给的」用 open/ps 两个分阶段值。
+say "HOOK_AB on_recall5=$ON_RECALL open_recall5=$OPEN_RECALL ps_recall5=$PS_RECALL open_gain=${OPEN_GAIN}pt open_only_cases=$OPEN_ONLY off_search5=$OFF_RECALL off_sandbox5=$OFF_SANDBOX parity=${PARITY}pt n=$ON_N cases=$CASES budget=$BUDGET bytes_max=$BYTES_MAX st_bytes_max=$ST_BYTES_MAX prod_recall3=$PROD_RECALL miss_abstain=$MISS_OK/$MISS_TOTAL budget_keep=$BUDGET_OK/$BUDGET_TOTAL exec_errors=$EXEC_ERRORS"
 
 [ "$VERDICT_OK" = 1 ] || exit 1
 exit 0
