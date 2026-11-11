@@ -251,6 +251,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |
 | [`docs/setup.md`](./docs/setup.md) | 使用者 | **安装/接入规范**：合规接入五守则、hooks/MCP 分层、各宿主标准流程、监听面板引导、卸载回退 |
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |
+| [`docs/exp-project-seed.md`](./docs/exp-project-seed.md) | 所有者 / 开发者 | **实验**：工程记忆覆盖度对注入的影响（0%→57%）、写入粒度与配额竞争的实测、已部署种子与回退方式 |
 | [`docs/design-ref-landscape.md`](./docs/design-ref-landscape.md) | 所有者 / 开发者 | **架构参考**：mem0 与 agentmemory 的全面对照，可借鉴/不借鉴/待评估三档，两边踩过的坑 |
 | [`docs/design-anti-agentmemory.md`](./docs/design-anti-agentmemory.md) | 所有者 / 开发者 | 为何不照搬常驻 iii 与 54 个 MCP 工具；默认零常驻 |
 | [`docs/design-db-stamp.md`](./docs/design-db-stamp.md) | 开发者 | **库版本台账**：`db_meta` 写入者版本戳、库比二进制新时拒绝打开、与 `user_version` 门控的边界 |
