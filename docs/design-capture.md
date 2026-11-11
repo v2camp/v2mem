@@ -20,7 +20,7 @@
 | **T4 adapter**：`cmd/mem/hook.go` 的 `hookInput` 补 `last_assistant_message` / `text_content`；`observationText` 不再把 `"stop"` 事件名当正文，按内容标注 `Fidelity`（有正文 full / summary，无正文 none）。 | |
 | **适配器映射表（本波 T1）**：`cmd/mem/adapters.go` 的 `adapterTable` 按宿主规范名分派字段映射（`claude` / `traecode` / `traework`，别名经 `harness.Get` 归一；未知宿主走 `defaultAdapter`）。每项只描述「去哪取字段」（`stopReply` 优先级列表、`toolInput` / `toolOutput`、`allowMetaSummary`），Fidelity 判定仍统一在 `observationText`；`cmd/mem/adapters_test.go` 提供每家分派 / 字段映射 / 新增宿主只加表项的 fixture 测试。**不新建 `CaptureEvent` 第四层契约。** | |
 | **灰度开关（本波 T2）**：`cmd/mem/distill_hook.go:69` 的 `proposalHookEnabled(host)` 让 `MEM_PROPOSAL_HOOK` 接受逗号分隔宿主名单（如 `MEM_PROPOSAL_HOOK=traecode`），宿主名两侧都经 `normalizeHarness` 归一到规范名；`1` / `all` / `on` 仍为全量。**默认值未改**：未设置 / 空 / `0` → 旧规则蒸馏。 | |
-| **spawn gate 一致化**：`distillSpawnEnabled()`（`distill_hook.go:96`）成为所有蒸馏子进程的总闸，`distillPendingFailOpen`（SessionStart）与 `maybeSpawnDistill`（Stop / SessionEnd）共用同一判定；`MEM_DISTILL_SPAWN` 未设时三条路径都不拉子进程，SessionStart 退回内联旧规则。 | |
+| **spawn gate 一致化**：`distillSpawnEnabled()`（`distill_hook.go`）成为**常规**蒸馏子进程的总闸，`distillPendingFailOpen`（SessionStart）与 `maybeSpawnDistill`（Stop / SessionEnd）共用同一判定；`MEM_DISTILL_SPAWN` 未设时三条常规路径都不拉子进程，SessionStart 退回内联旧规则。**唯一例外**是每个工程首次 `SessionEnd` 的冷启动前移（`coldstart.go`，见 §13.1 与 design-write-governance §5）。 | |
 | **工具载荷准入收窄**：`PostToolUse` 与 transcript 的 `tool-use` / `tool-result` 一律 `ProposalEligible=false`（`observe.go:296` / `:476`），`Fidelity` 不变；旧按工具名判定的 `isPipelineTool` / `memoryToolNames` 已删除。裁决见 §13.2。 | |
 
 ## 0. 关键决策（待复核）
@@ -441,6 +441,9 @@ Trae 一次任务跨多个 Stop 是常态，不能把第 N 个 Stop 当收工。
   该变量**默认关闭**。开关打开后，`proposalHookEnabled(host)` 决定走 `--proposal` 还是
   `--session <sid> --provider none`，其默认（未设置 / 空 / `0`）为 **false**，且名单灰度只影响
   「哪些宿主进 Proposal」，不改变默认值。
+- **唯一例外**：每个工程首次 `SessionEnd` 的冷启动前移（`coldstart.go`）。它不受
+  `MEM_DISTILL_SPAWN` 约束、固定零 LLM，只把该工程首会话的规则蒸馏从下一次 `SessionStart`
+  挪到会话收尾；`MEM_NO_COLDSTART=1` 关闭。详见 [`design-write-governance.md`](./design-write-governance.md) §5。
 - `closeout` 是**独立于 Hook 开关的显式动作**：它由 MCP / CLI / skill 主动调用，不依赖
   `MEM_DISTILL_SPAWN`，也不依赖 `MEM_PROPOSAL_HOOK`。
 - `closeout` 落地后，**也不**把 Hook 默认值改成「自动启用 Proposal」。二者的关系是单向补充，

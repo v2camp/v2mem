@@ -57,6 +57,7 @@
 - 同一会话的同一批观测只蒸馏一次（`distill_runs.window_key`）。Stop 每轮都触发时不会放大噪声。
 - 无 `transcript_path` 的 Stop 不拉起 distill，观测仍保留。
 - 可选：`MEM_DISTILL_SPAWN=1` 时 Stop / SessionEnd 末尾 `Start` 一次 `mem distill --provider none`（非常驻）。默认不拉起。
+- **冷启动前移（一次性例外）**：`SessionEnd` 时若当前工程尚无已采纳记忆、且未打过 `coldstart:v1:<project>` 标记，拉起一次 detached 的 `mem distill --session <sid> --provider none`，成功 `Start` 后写标记。它不受 `MEM_DISTILL_SPAWN` 约束（该变量仍是常规蒸馏的总闸），固定零 LLM、只写 candidates；失败不写标记，下一次 `SessionStart` 的 `distillPendingFailOpen` 兜底。`MEM_NO_COLDSTART=1` 关闭。
 - `SessionStart` 在 spool drain 之后机会性跑 `distill --pending`，**只用规则抽取**，约 200ms 上限，失败不阻断注入。`MEM_NO_DISTILL=1` 关掉这一步。
 - `mem eval activity` 默认排除 `source∈{bench,test,distill-pending}`。观测侧另计 `obs / distill_ok / distill_fail / accept / reject`。有观测且无人采纳时结论为「有观测无采纳」。accept 计入写侧，`source=distill-accept`。
 - PreCompact 仍只重注入，不写观测、不蒸馏。见 [`design-harness.md`](./design-harness.md)。为何不照搬常驻 consolidate，见 [`design-anti-agentmemory.md`](./design-anti-agentmemory.md)。
