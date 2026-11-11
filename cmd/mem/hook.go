@@ -144,6 +144,9 @@ func cmdHook(args []string) error {
 		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started, *noScrub)
 		if observeEventMayDistill(event) {
 			maybeSpawnDistill(c.db, in, harnessName(*harnessFlag, in))
+			// 冷启动只挂在 SessionEnd：把首会话的规则蒸馏从下一次 SessionStart
+			// 前移到会话收尾，热路径不再承担这次蒸馏。
+			maybeSpawnColdStart(c.db, in, project, event)
 		}
 		return nil
 	}

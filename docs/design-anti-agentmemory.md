@@ -18,7 +18,7 @@ v2mem 默认**零常驻、无 HTTP、无 iii**。可以借鉴的是事件模型�
 
 | 模式 | 行为 |
 |:---|:---|
-| 默认 | hook 同步写 `observations`。蒸馏靠下次 `SessionStart` 的规则抽取，或用户手动 `mem distill` |
+| 默认 | hook 同步写 `observations`。蒸馏靠下次 `SessionStart` 的规则抽取，或用户手动 `mem distill`；每个工程首次 `SessionEnd` 另有一次性冷启动蒸馏，把首会话蒸馏前移 |
 | `MEM_DISTILL_SPAWN=1` | Stop / SessionEnd 末尾再拉起一次短命 `mem distill --provider none`。进程退出即结束，不是服务 |
 | spool | 写库失败时追加 `~/.v2mem/spool/<session>.jsonl`（0600）。SessionStart 有界 drain |
 

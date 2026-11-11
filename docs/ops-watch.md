@@ -256,21 +256,23 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 ### 8.1 灰度开关
 
-`MEM_DISTILL_SPAWN=1` 是**所有**蒸馏子进程的总闸（`distillSpawnEnabled`，`cmd/mem/distill_hook.go:96`）；
+`MEM_DISTILL_SPAWN=1` 是**常规**蒸馏子进程的总闸（`distillSpawnEnabled`，`cmd/mem/distill_hook.go`）；
 `MEM_PROPOSAL_HOOK` 只决定「拉起的是 Proposal 还是旧规则蒸馏」。两者**缺一不生效**：
 
 | 路径 | 入口 | 受 `MEM_DISTILL_SPAWN` 约束 | 走 Proposal 的条件 |
 |:---|:---|:---|:---|
-| Stop / SessionEnd | `maybeSpawnDistill`（`distill_hook.go:102`） | **是**：`:103` 先判 gate，未设直接返回、什么都不做 | `MEM_DISTILL_SPAWN=1` **且** `proposalHookEnabled(host)` 为真 |
-| SessionStart | `distillPendingFailOpen`（`distill_hook.go:158`） | **是**：`:162` 要求 gate 与名单同时成立 | 同上；否则**继续往下**内联跑旧规则 `--pending`（200ms 上限，受 `MEM_NO_DISTILL` 约束） |
+| Stop / SessionEnd | `maybeSpawnDistill`（`distill_hook.go`） | **是**：先判 gate，未设直接返回、什么都不做 | `MEM_DISTILL_SPAWN=1` **且** `proposalHookEnabled(host)` 为真 |
+| SessionEnd（仅首会话） | `maybeSpawnColdStart`（`coldstart.go`） | **否**：一次性例外，见下 | **不走** Proposal，固定 `--provider none` |
+| SessionStart | `distillPendingFailOpen`（`distill_hook.go`） | **是**：要求 gate 与名单同时成立 | 同上；否则**继续往下**内联跑旧规则 `--pending`（200ms 上限，受 `MEM_NO_DISTILL` 约束） |
 
-- `MEM_DISTILL_SPAWN` 未设 / 非 `1` → Stop / SessionEnd 与 SessionStart 都不拉子进程，SessionStart 退回内联旧规则——这是**默认**。
+- `MEM_DISTILL_SPAWN` 未设 / 非 `1` → 常规 Stop / SessionEnd 与 SessionStart 都不拉子进程，SessionStart 退回内联旧规则——这是**默认**。
+- **冷启动例外**：每个工程首次 `SessionEnd`、且该工程还没有已采纳记忆时，拉一次 detached 规则蒸馏并把成本移出下一次 `SessionStart`；靠 `coldstart:v1:<project>` 标记保证只尝试一次。它固定零 LLM、只写 candidates，失败由 SessionStart 内联蒸馏兜底。`MEM_NO_COLDSTART=1` 可关，`MEM_NO_DISTILL=1` 同样覆盖它。
 - `MEM_PROPOSAL_HOOK` 未设 / 空 / `0` → 全部走旧规则蒸馏，取值见 8.2。
 - SessionStart 在 gate 不成立时**不是静默跳过**：内联旧规则仍会蒸馏 pending 会话，所以不会丢蒸馏。
 
 **运维结论：灰度期两个都设**（`MEM_DISTILL_SPAWN=1` + `MEM_PROPOSAL_HOOK=<宿主>`）。
-只设 `MEM_PROPOSAL_HOOK` 时三条路径全部不动（等于什么都没开），不会出现「半开」——
-但也不会产生任何 Proposal 数据，观察期白跑。
+只设 `MEM_PROPOSAL_HOOK` 时三条常规路径全部不动（等于什么都没开），不会出现「半开」——
+首会话冷启动仍可能跑一次，但它固定走规则蒸馏，不产生 Proposal 数据，观察期依然白跑。
 
 > 口径变更记录：本节在 `6ed7e8b` 之前写的是「SessionStart 不受 gate 约束」。该不一致已在
 > `6ed7e8b` 修复（`distillPendingFailOpen` 纳入同一 gate），现在两个变量是真正的「缺一不生效」。

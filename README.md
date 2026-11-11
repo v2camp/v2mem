@@ -127,7 +127,7 @@ mem init --dry-run           # 只看会写什么
 配置写入遵守四条纪律：**合并不覆盖**、**幂等**、**只备份一次**（`.v2mem.bak`）、**绝对路径**。
 个别工具需额外动作（Codex 首次要 trust 钩子、QoderWork 改完要重启等），`mem init` 会逐一打印。
 Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 MCP）。
-`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`。这些痕迹可以用 `mem search --layer observation` 查到，默认的 `mem search` 和开场注入仍然只看已定记忆。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（候选仍不进检索，要 `mem accept` 才进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏。默认没有常驻进程。
+`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`。这些痕迹可以用 `mem search --layer observation` 查到，默认的 `mem search` 和开场注入仍然只看已定记忆。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（候选仍不进检索，要 `mem accept` 才进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏；每个工程的首次 `SessionEnd` 另有一次性冷启动蒸馏，把下一次开场的规则蒸馏前移，`MEM_NO_COLDSTART=1` 可关。默认没有常驻进程。
 全部卸载：`mem uninstall --all`（或 `--harness <名字>` 单个），只摘掉带 `# v2mem` 标记的条目，不动你自己的配置。
 
 ### MCP server
