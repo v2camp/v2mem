@@ -1,0 +1,4 @@
+{"layer":"memory","content":"Java 轨 lesson13-14-shop-basic 不读 .env，只读 System.getenv 的 LLM_API_KEY / LLM_MODEL / LLM_BASE_URL；不配 key 也能跑完，四节点全走规则兜底并打印 fallback。","kind":"pitfall","project":"training-products","source":"human","channel":"import"}
+{"layer":"memory","content":"TS 轨 13-16 的 .env 由 apps/lesson13-16-shop/src/config/env.ts 按候选路径加载，且不覆盖已有进程变量；提示未配置 api key 时先查它的候选路径顺序与工程根 .env。","kind":"pitfall","project":"training-products","source":"human","channel":"import"}
+{"layer":"memory","content":"图表题采用两层契约：LLM 只产出 ChartIntent，代码查库回填 ChartData，渲染器只吃 ChartData——LLM 不碰数字，渲染库可替换。","kind":"decision","project":"training-products","source":"human","channel":"import"}
+{"layer":"memory","content":"Text-to-SQL 不做全量 schema 注入，改成检索 + schema linking 流水线：全量注入会超出上下文并 context rot，而 linking 召回率决定 SQL 准确率上限。","kind":"decision","project":"training-products","source":"human","channel":"import"}
