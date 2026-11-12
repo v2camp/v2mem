@@ -238,8 +238,10 @@ assert_r13 r13_no_read_side    "$(printf '{"ts":%s,"event":"obs-append","ms":9}\
 assert_r13 r13_mixed_old_over  "$(oldline prompt-submit)$(iline 8001)"    FAIL '8001'
 
 # R14 夹具：evidence 的落盘量。必须**实写**——APFS 上 truncate 出来的稀疏文件 `du` 记 0，
-# 拿它当样本会永远 PASS。同一目录增量追加，避免为两个边界值各写一遍 512MiB。
-# 口径是 du -sk 的块数（含文件，不含目录项），故 512MiB 单文件恰好落在阈值上、判 PASS。
+# 拿它当样本会永远 PASS。同一目录增量追加，避免为两个边界值各写一遍。
+# 不断言 detail 里的具体 MiB 数：`du` 统计分配块，实测物理占用比逻辑大小高 1–2%
+# （写 500MiB 报 507–519MiB 不等），贴着阈值构造会偶发误判。故两侧各留 ~100MiB 余量，
+# 只断言判级的**语义**（「未超」「超过 512MiB」），阈值本身的改动由 sync 检查守住。
 R14_DIR="$TMP/r14"
 R14_NODIR="$TMP/r14-nodir"
 build_fixture "$R14_DIR" 100 0 no
@@ -271,11 +273,11 @@ assert_r14() {
 assert_r14 r14_no_dir        "$R14_NODIR" INFO '不存在'
 # 目录存在但空 → PASS（尚无观测落盘），与「无目录」的措辞必须不同。
 assert_r14 r14_empty_dir     "$R14_DIR"   PASS '无归档文件'
-# 512MiB 恰在阈值上 → PASS（判据是 ≤512MiB）。
-ev_write a 512
-assert_r14 r14_pass_512mib   "$R14_DIR"   PASS '512MiB'
-# 再 +1MiB → 513MiB → WARN；只判字节，不因文件数少而放行。
-ev_write b 1
-assert_r14 r14_warn_513mib   "$R14_DIR"   WARN '513MiB'
+# 400MiB → PASS（距 512MiB 水位有余量，吸收 du 的分配抖动）。
+ev_write a 400
+assert_r14 r14_pass_under    "$R14_DIR"   PASS '未超 512MiB'
+# 再 +200MiB → 约 600MiB → WARN；只判字节，文件数仍是 2 也要按体积判。
+ev_write b 200
+assert_r14 r14_warn_over     "$R14_DIR"   WARN '超过 512MiB'
 
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"
