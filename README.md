@@ -3,13 +3,13 @@
 **个人 Agent 记忆系统** —— 一个本地 CLI（命令名 `mem`），存"跨会话该记住的东西"，
 让 AI 工具在**需要时**查得到，而不是把它们塞进每轮注入的上下文里。
 
-**轻量** —— 单文件二进制约 **11 MB**：零 CGO、零外部服务、零常驻进程，直接依赖只有 1 个
+**轻量** —— 单文件二进制约 **17 MB**（各平台 16.7–17.9 MB）：零 CGO、零外部服务、零常驻进程，直接依赖只有 1 个
 （`modernc.org/sqlite`，纯 Go 转译）
 **快** —— 200 条记忆库检索平均 **~9 ms/次**（FTS5 + bm25：精确优先、空手才放宽）
 **多工具** —— 原生接入 **12 个 AI 工具**（Claude Code / Codex / Cursor / TraeCode / WorkBuddy / CodeBuddy / Qoder …），
 另提供 **MCP server**，任何支持 MCP 的工具一行配置即接入
 **跨会话** —— 记忆持久在本地 SQLite，会话之间、工程之间共享，不依赖任何云服务
-**跨平台** —— mac / linux / windows 预编译单文件，同一套记忆三端通用
+**跨平台** —— mac / linux / windows 预编译单文件，同一套记忆三端通用（Windows 路径尚未在 runner 实测，见安装节）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh | bash
@@ -65,10 +65,13 @@ make build                                                   # → bin/mem
 ln -sf "$PWD/bin/mem" "$(go env GOPATH)/bin/mem"             # 覆盖式软链
 ```
 
-预编译文件名：`mem-darwin-amd64`、`mem-darwin-arm64`、`mem-linux-amd64`、`mem-linux-arm64`、`mem-windows-amd64.exe`。
-`latest` 下载 `…/releases/latest/download/<文件名>`；`--version vX.Y.Z` 下载 `…/releases/download/vX.Y.Z/<文件名>`。
+预编译文件名：`mem-darwin-amd64`、`mem-darwin-arm64`、`mem-linux-amd64`、`mem-linux-arm64`、`mem-windows-amd64.exe`，
+另有 `checksums.txt`（五个文件的 SHA256）。`latest` 下载 `…/releases/latest/download/<文件名>`；`--version vX.Y.Z` 下载 `…/releases/download/vX.Y.Z/<文件名>`。
 
-这些文件由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `vX.Y.Z` tag，或于 Actions 里手动跑 `release` 时上传。main 上自动打 tag 仍先过 `eval-gate`；托管 runner 没有金标准对应的记忆库时这一步会失败，不会上传。推 tag 或手动跑 workflow 只再要求覆盖率门禁。某个版本的 Release 里还没有这些文件时，安装脚本回退到源码构建（需要本机已有 `git` 和 `go`）。
+安装脚本会下载 `checksums.txt` 校验目标二进制：哈希不符即拒绝落地并回退源码构建；**v0.5.1 及更早的 Release 没有该清单**，此时打印一次 WARN 并跳过校验（向后兼容）。
+清单与二进制同源于同一个 Release，只防传输损坏与错配，**不等于发布者签名**。
+
+这些文件由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `vX.Y.Z` tag，或于 Actions 里手动跑 `release` 时上传。main 上自动打 tag 仍先过 `eval-gate`；托管 runner 没有金标准对应的记忆库时这一步会失败，不会上传。推 tag 或手动跑 workflow 只再要求覆盖率门禁。某个版本的 Release 里还没有这些产物、或 SHA256 校验不符时，安装脚本回退到源码构建（需要本机已有 `git` 和 `go`）。
 
 Windows 只有 amd64 预编译，且脚本要在 Git Bash / MSYS 里跑（cmd.exe 不行）。默认 `~/.local/bin` 通常不在 Windows Path 中，请加 `--dir`。这条路径没有在 Windows runner 上实测。
 
@@ -78,6 +81,18 @@ Windows 只有 amd64 预编译，且脚本要在 Git Bash / MSYS 里跑（cmd.ex
 > 只更新该 worktree 自己的产物。要验证分支行为，得在该 worktree 里重跑一次上面的 `ln -sf`（`$PWD` 即该 worktree），
 > 切回主仓库后再跑一次。也因此**分支合入 main 并清理后要重建主分支**，否则验证到的仍是旧二进制（见 `AGENTS.md` 任务流程）。
 > 发版步骤见 [`docs/DEVELOPER.md`](./docs/DEVELOPER.md)。
+
+### 安装失败排查
+
+一行 `curl | bash` 若卡在拉取脚本本身（`raw.githubusercontent.com` 不可达），脚本没执行就不会有任何回退提示。拆成分步执行，可以看清是哪一段断了：
+
+```bash
+curl -fsSL -o /tmp/v2mem-install.sh https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh
+bash /tmp/v2mem-install.sh --dry-run
+bash /tmp/v2mem-install.sh
+```
+
+`--dry-run` 只打印将使用的 URL、校验清单 URL 与安装目录，不联网、不建目录。源码回退同样需要 `git` + `go` 且要能访问 GitHub；机器没有 Go 时，优先保证预编译下载通道可达，或从 Release 页面手动下载对应平台的二进制，改名为 `mem` 放进 PATH。
 
 ---
 

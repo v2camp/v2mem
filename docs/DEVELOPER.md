@@ -54,6 +54,9 @@ make cover-update # 用当前实测值刷新下限（棘轮：只允许上调；
 
 `scripts/install.sh` 优先下载 GitHub Release 上的预编译文件。`latest` 用
 `/releases/latest/download/<文件名>`，不是 `/releases/download/latest/…`。
+下载成功后还会取同版本的 `checksums.txt` 做 SHA256 校验：哈希不符即拒绝落地并回退源码构建；
+**v0.5.1 及更早的 Release 没有该清单**，此时打印一次 WARN 后跳过校验，历史 tag 保持可安装。
+清单与二进制同源于同一个 Release，只防传输损坏与错配，**不是发布者签名**。
 下载前会创建安装目录。下载失败或 `--from-source` 时浅克隆到临时目录，再
 `CGO_ENABLED=0 go build`（`curl|bash` 时没有仓库目录，不能在当前目录直接构建）。
 已有 `GOPROXY` / `GOSUMDB` 原样保留；国内模块超时可先
@@ -70,10 +73,13 @@ workflow 里交叉编译并上传（`GITHUB_TOKEN` 推上去的 tag 不会再触
 （tag 还不存在时，会在所选 ref 上创建）时，只再跑 `cover-gate`，不再跑 `eval-gate`。
 
 产物文件名：`mem-darwin-amd64`、`mem-darwin-arm64`、`mem-linux-amd64`、
-`mem-linux-arm64`、`mem-windows-amd64.exe`（`make release-assets` 写到 `dist/`）。
+`mem-linux-arm64`、`mem-windows-amd64.exe`，以及 `checksums.txt`
+（`make release-assets` 写到 `dist/`；Linux 用 `sha256sum`、macOS 用 `shasum -a 256` 生成）。
+`release-assets.sh` / `publish-release.sh` / `install.sh` 三处的文件名是同一份契约，由 `make test-install` 断言。
 
 验证：`curl -fsSL …/scripts/install.sh | bash -s -- --version vX.Y.Z`。
-脚本断言：`make test-install`。CI job `install-script` 额外跑 shellcheck。
+脚本断言：`make test-install`（覆盖校验通过、清单缺失降级、哈希不符拒绝落地三条分支）。
+CI job `install-script` 额外跑 shellcheck。
 
 Windows 预编译只有 amd64；安装脚本只支持 Git Bash / MSYS，没有 Windows runner 实测。
 
@@ -94,9 +100,9 @@ internal/
   audit/            审计日志读写与汇总
   eval/             评测指标（纯函数，口径可独立测试）
 scripts/
-  install.sh        curl 一键安装：预编译下载，失败则浅克隆再构建
-  release-assets.sh 交叉编译五个 Release 文件
-  publish-release.sh 把 dist/ 上传到 GitHub Release
+  install.sh        curl 一键安装：预编译下载 + SHA256 校验，失败则浅克隆再构建
+  release-assets.sh 交叉编译五个 Release 文件并生成 checksums.txt
+  publish-release.sh 把 dist/（含 checksums.txt）上传到 GitHub Release
   cover-gate.sh     覆盖率门禁实现
 ```
 
