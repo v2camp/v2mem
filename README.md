@@ -146,7 +146,7 @@ Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 M
 - 其余工具看各自的 MCP 配置格式，指向同一个 `mem mcp` 即可
 
 MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval activity` 的评测样本。
-没有 hook 时，把 `skills/mem-recall`、`skills/mem-remember`、`skills/mem-distill` 拷到 `~/.cursor/skills/`（或项目 `.cursor/skills/`）。`mem init` 不写 skills。
+清单内宿主都走 hooks 通道（11 个 native + 1 个桥接，含 Cursor 的六个原生事件），不需要 skill 兜底；无 hook 的临时环境直接用 CLI 或 MCP，命令要点见 [`docs/setup.md`](./docs/setup.md) §3A.4。
 
 ---
 

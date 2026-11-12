@@ -1,6 +1,6 @@
 # 安装与接入规范（setup guide）
 
-- 日期：2026-09-18（最近更新 2026-11-02：补录 WorkBuddy 接入实机验证）
+- 日期：2026-09-18（最近更新 2026-11-12：移除 skill 兜底，补 CLI/MCP 手工速查 §3A.4）
 - 状态：草案待复核
 - 关联：`docs/DEVELOPER.md`（本地开发部署）、`docs/design-harness-memory-replace.md`（读/写接入）、`docs/design-workbuddy.md`、`docs/design-harness.md`
 
@@ -34,7 +34,9 @@ v2mem 对宿主提供**两种合规接入**，定位互补，不可互相替代�
 
 ## 3. 支持工具（harness）清单
 
-v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 `native`（原生 hooks），仅选一个有桥接位。源码：`internal/harness/harness.go`（顺序即展示顺序）。
+v2mem 内置 12 个已知 harness：11 个按**应用内置运行时**判定为 `native`（原生 hooks），
+`dsh` 为 `bridge`（复用官方桥接包）；另有 `instruction` 兜底通道，不占清单行。
+源码：`internal/harness/harness.go`（顺序即展示顺序）。
 
 | Name | 别名 | Label（产品） | Tier | 配置位置 | 实测 |
 |:---|:---|:---|:---|:---|:---|
@@ -49,6 +51,7 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 | dsh | deepseek-harness | DeepSeek Harness | bridge | 复用 `~/.claude/settings.json` | — |
 | traework | trae-work, tw, trae-solo | TraeWork（原 TRAE SOLO） | native | `~/.trae-local` / `~/.trae-cn` / `~/.trae/hooks.json` | ⚠️ 面板未暴露 |
 | workbuddy | work-buddy, wb | WorkBuddy | native | `~/.workbuddy/settings.json` | ✅ 已验证生效（内置 CLI 实测） |
+| cursor | cursor-ide | Cursor | native | `~/.cursor/hooks.json` | 六个原生事件，见 README「接入 AI 工具」 |
 
 关键事实：
 - **traecode 已验证**：2026-11-02 面板启用（本地自动运行）+ 提问后，审计出现 `prompt-submit | traecode`，`hook_dedup` 同步落库——读侧注入与写侧闭环均已打通。
@@ -134,6 +137,21 @@ v2mem 内置 11 个已知 harness，全部按**应用内置运行时**判定为 
 - 产出一份 `.mcp.json`（或宿主等价配置），把 `mem mcp` 注册为 stdio 工具服务器；
 - 首次须在宿主里**信任/允许**该 MCP server；
 - 之后 agent 可在对话中显式调用 mem 的 search/add/ls/touch/recall_context，并用 candidates_ls/accept/reject 就近裁决本工程候选。
+
+### 3A.4 无 hooks 时的手工兜底（不装 skill）
+
+§3 清单里 11 个 `native` harness 都有原生 hooks（含 Cursor 的六个事件），`dsh` 走桥接，
+**没有 hook 时也不需要安装 skill**：直接用 CLI，或按 §3A.3 注册 MCP。仓库原有的三个 `skills/mem-*` 只服务「Cursor 只能配 MCP」的旧路径，
+随原生 hooks 落地已退役。命令全表见 `README.md` 「命令一览」，此处只记容易写错的几点：
+
+| 场景 | 要点 |
+|---|---|
+| 检索 | MCP `search` / `recall_context` 的 `query` 必填；`layer=observation` 才看得到近期痕迹（hook 注入只带已定记忆）。已有 hook 注入时不必每轮重查已定记忆 |
+| 写入 | MCP `add` 的 `content` 必填；一条只记一个原子事实，`kind` 取 `preference` / `decision` / `pitfall` / `task` / `fact`。真正用上了某条记忆再 `touch` |
+| 蒸馏 | `distill` 不在 MCP 里，走 CLI `mem distill --provider none --session <id>`（规则抽取，无需 API key）；候选必须经 `mem accept` / MCP `accept` **显式**裁决才升格，采纳后 `source=distill-accept` 才可被检索 |
+
+P/D/X/T 类码的触发条件见 `docs/VALUE.md` §1.2；显式裁决的设计约束见
+`docs/design-write-governance.md` §12。候选与蒸馏结果不要直接写成永久记忆。
 
 ## 4. `mem setup`（理想接口形态）
 
