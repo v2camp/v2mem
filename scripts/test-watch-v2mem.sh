@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # 回归：R8 候选积压 / R9 载荷残留 / R10 写侧延迟 / R11 WAL 堆积 /
-# R12 写侧自动决策链路 / R13 注入体量 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
+# R12 写侧自动决策链路 / R13 注入体量 / R14 归档体量 的分级边界，逐格对应
+# docs/ops-watch.md §3 判据表。
 # 用临时 V2MEM_DIR + mem stub，不触碰生产库；只断言 --json 输出的级别。
 # 重点守住四条口径：R8 按工程分组取最大值（跨工程不相加）、R10 只取 stop
 # （不与 obs-append 双计）、无样本记 INFO 而非 PASS、R12 判级只依赖 audit
-# （eval activity 读不到时仍须独立判级）。
+# （eval activity 读不到时仍须独立判级）。R14 的口径是**落盘量**：样本必须实写
+# 到 evidence 目录（APFS 上 truncate 的稀疏文件 du 记 0），且只判字节不判条数。
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WATCH="$ROOT/scripts/watch-v2mem.sh"
 TMP="$(mktemp -d)"
@@ -23,11 +25,12 @@ cand_json() {
 
 merge_json() { jq -nc --argjson a "$1" --argjson b "$2" '$a + $b'; }
 
-# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json> [audit_extra] [activity_json] [audit_lines]
-run_case() {
-  local name="$1" stop_ms="$2" frames="$3" with_obs="$4" cands="$5"
-  local extra_audit="${6:-}" activity="${7:-}" audit_lines="${8:-}"
-  local d="$TMP/$name"
+# build_fixture <dir> <stop_ms|none> <wal_frames> <obs yes/no> [audit_extra] [audit_lines]
+# 造 mem stub + 四事件 settings + 审计日志 + 按需的 -wal。R14 复用同一套夹具，
+# 只额外往 evidence 目录写文件，所以抽出来而不是在 run_case 里内联。
+build_fixture() {
+  local d="$1" stop_ms="$2" frames="$3" with_obs="$4"
+  local extra_audit="${5:-}" audit_lines="${6:-}"
   mkdir -p "$d/v2mem" "$d/wb" "$d/home"
 
   cat > "$d/mem-stub" <<'STUB'
@@ -41,7 +44,7 @@ exit 0
 STUB
   chmod +x "$d/mem-stub"
 
-  # 四个事件齐全，避免 I2=FAIL 让脚本以非零退出；本测试只断言 R8/R9/R10/R11。
+  # 四个事件齐全，避免 I2=FAIL 让脚本以非零退出；本测试只断言 R8–R14。
   cat > "$d/wb/settings.json" <<'SETTINGS'
 {"hooks":{
   "SessionStart":     [{"hooks":[{"type":"command","command":"mem hook # v2mem"}]}],
@@ -73,7 +76,11 @@ SETTINGS
   if [ "$frames" -gt 0 ]; then
     dd if=/dev/zero of="$d/v2mem/mem.db-wal" bs=4096 count="$frames" 2>/dev/null
   fi
+}
 
+# run_watch <dir> [candidates_json] [activity_json]
+run_watch() {
+  local d="$1" cands="${2:-[]}" activity="${3:-}"
   V2MEM_DIR="$d/v2mem" \
   WORKBUDDY_CONFIG_DIR="$d/wb" \
   HOME="$d/home" \
@@ -81,6 +88,15 @@ SETTINGS
   STUB_CAND_JSON="$cands" \
   STUB_ACTIVITY_JSON="$activity" \
     bash "$WATCH" --json 2>/dev/null || true
+}
+
+# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json> [audit_extra] [activity_json] [audit_lines]
+run_case() {
+  local name="$1" stop_ms="$2" frames="$3" with_obs="$4" cands="$5"
+  local extra_audit="${6:-}" activity="${7:-}" audit_lines="${8:-}"
+  local d="$TMP/$name"
+  build_fixture "$d" "$stop_ms" "$frames" "$with_obs" "$extra_audit" "$audit_lines"
+  run_watch "$d" "$cands" "$activity"
 }
 
 # assert_case <名称> <stop_ms|none> <wal_frames> <obs> <cands> <R10> <R11> [R8] [R9]
@@ -220,5 +236,46 @@ assert_r13 r13_precompact_over "$(iline 9000 pre-compact)"                FAIL '
 assert_r13 r13_no_read_side    "$(printf '{"ts":%s,"event":"obs-append","ms":9}\n' "$NOW")" INFO '无读侧记录'
 # 混合：旧记录 + 8001 必须 FAIL，证明缺失字段不会被当 0 拉低最大值。
 assert_r13 r13_mixed_old_over  "$(oldline prompt-submit)$(iline 8001)"    FAIL '8001'
+
+# R14 夹具：evidence 的落盘量。必须**实写**——APFS 上 truncate 出来的稀疏文件 `du` 记 0，
+# 拿它当样本会永远 PASS。同一目录增量追加，避免为两个边界值各写一遍 512MiB。
+# 口径是 du -sk 的块数（含文件，不含目录项），故 512MiB 单文件恰好落在阈值上、判 PASS。
+R14_DIR="$TMP/r14"
+R14_NODIR="$TMP/r14-nodir"
+build_fixture "$R14_DIR" 100 0 no
+build_fixture "$R14_NODIR" 100 0 no
+mkdir -p "$R14_DIR/v2mem/evidence"
+ev_write() { dd if=/dev/zero of="$R14_DIR/v2mem/evidence/$1" bs=1m count="$2" 2>/dev/null; }
+
+# assert_r14 <名称> <dir> <want_level> [detail 子串]
+assert_r14() {
+  local name="$1" d="$2" want="$3" needle="${4:-}"
+  local out got detail
+  out="$(run_watch "$d")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R14") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R14") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL ${name}: R14 want=${want} got=${got}" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL ${name}: R14 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R14=%-4s\n' "$name" "$want"
+}
+
+# 无归档目录 → INFO（无样本），不得判 PASS 掩盖「未启用归档」。
+assert_r14 r14_no_dir        "$R14_NODIR" INFO '不存在'
+# 目录存在但空 → PASS（尚无观测落盘），与「无目录」的措辞必须不同。
+assert_r14 r14_empty_dir     "$R14_DIR"   PASS '无归档文件'
+# 512MiB 恰在阈值上 → PASS（判据是 ≤512MiB）。
+ev_write a 512
+assert_r14 r14_pass_512mib   "$R14_DIR"   PASS '512MiB'
+# 再 +1MiB → 513MiB → WARN；只判字节，不因文件数少而放行。
+ev_write b 1
+assert_r14 r14_warn_513mib   "$R14_DIR"   WARN '513MiB'
 
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"

@@ -18,6 +18,8 @@
 # audit.jsonl 与 mem eval activity --json，不调用 distill/accept/reject/gc。
 # R13 取读侧审计 inject_bytes 的最大值（**字节**，不是 rune）：宿主对 hook stdout
 # 有硬上限，越线会整块换占位且仍报成功，R2 的命中率看不出来。
+# R14 只量 evidence 归档目录的落盘量（文件数 + 字节），不折算成观测条数：gc 之后
+# 行数会降而文件数不降，两者本就会脱钩；归档是只写事实源，无自动回收路径。
 # 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
@@ -35,7 +37,7 @@ while [ $# -gt 0 ]; do
     --window) WINDOW="${2:-12h}"; shift 2 ;;
     --json)   JSON_OUT=1; shift ;;
     --quiet)  QUIET=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -411,6 +413,32 @@ elif [ "$A_INJ_MAX" -le 8000 ]; then
   add R13 WARN "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，落在 3601–8000，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次，查预算变量是否被调高"
 elif [ "$A_INJ_MAX" -gt 8000 ]; then
   add R13 FAIL "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，超过 8000，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次。宿主可能整块替换为占位且仍报成功，记忆会静默消失"
+fi
+
+# R14 归档体量：evidence 是只写事实源（VALUE §4.1），一条观测一份 .jsonl.gz，且没有自动
+# 回收路径——mem gc --obs 删的是 observations 表行，不碰归档文件。故只量落盘量（文件数 +
+# 字节），不折算成「多少条观测」：gc 之后行数降而文件数不降，两者本就会脱钩。
+# 阈值与「为何不设 FAIL」见 docs/ops-watch.md §3 R14。
+EV_DIR="$V2MEM_DIR/evidence"
+EV_FILES=0; EV_BYTES=0
+if [ -d "$EV_DIR" ]; then
+  EV_FILES=$(find "$EV_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+  EV_KB=$(du -sk "$EV_DIR" 2>/dev/null | awk '{print $1}')
+  EV_BYTES=$(( ${EV_KB:-0} * 1024 ))
+fi
+EV_FILES=${EV_FILES:-0}; EV_BYTES=${EV_BYTES:-0}
+EV_MIB=$(( EV_BYTES / 1048576 ))
+DB_BYTES=$( "$MEM_BIN" stats --json 2>/dev/null | jq -r '.size_bytes // 0' 2>/dev/null )
+DB_BYTES=${DB_BYTES:-0}
+DB_MIB=$(( ${DB_BYTES:-0} / 1048576 ))
+if [ ! -d "$EV_DIR" ]; then
+  add R14 INFO "无归档目录" "${EV_DIR} 不存在；未捕获过观测，或来自未启用证据归档的旧版本"
+elif [ "$EV_FILES" -eq 0 ]; then
+  add R14 PASS "归档为空" "evidence 目录无归档文件（主库 ${DB_MIB}MiB）；尚无观测落盘"
+elif [ "$EV_BYTES" -le 536870912 ]; then
+  add R14 PASS "归档 ${EV_MIB}MiB" "${EV_FILES} 个归档 / ${EV_MIB}MiB（主库 ${DB_MIB}MiB），未超 512MiB 水位"
+else
+  add R14 WARN "归档 ${EV_MIB}MiB" "${EV_FILES} 个归档 / ${EV_MIB}MiB（主库 ${DB_MIB}MiB），超过 512MiB 水位；归档只增不减，按 §5 R14 裁决保留策略，勿删目录"
 fi
 
 # ---------- 输出 ----------

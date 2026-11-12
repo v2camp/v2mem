@@ -88,6 +88,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R11** | WAL 堆积 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0） | ≤1000 帧 | 1001–2000 | >2000 |
 | **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `source` 分流）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
 | **R13** | 注入体量 | 窗口内读侧（`session-start` / `prompt-submit` / `pre-compact`）审计记录 `inject_bytes` 的**最大值**（无样本记 `INFO`） | ≤3600 | 3601–8000 | >8000 |
+| **R14** | 归档体量 | `~/.v2mem/evidence` 下文件数与总字节（`find` / `du`，只读）；detail 附 `mem stats --json` 的 `size_bytes` 作对照 | ≤512MiB | >512MiB | —（不设 FAIL，见依据） |
 
 阈值依据（不凭空定）：
 
@@ -172,6 +173,24 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   - **字段缺失 = 升级前的旧记录**：脚本按「无样本」处理，不当 0 算——把旧记录当 0 会拉低最大值、
     掩盖真实越线。`A_INJ_READ`（读侧记录总数，含 `pre-compact`）用来区分「窗口内真无读侧记录」
     与「读侧记录全是旧格式」，`A_INJ_N` 是其中带 `inject_bytes` 字段的样本数。
+- **R14 的 512MiB（2026-11-13 新增，只有 PASS / WARN 两档）**：量的是观测归档
+  `~/.v2mem/evidence` 的**磁盘水位**。它是 [`VALUE.md`](./VALUE.md) §4.1 定义的
+  「只写的事实源」，一条观测一份 `.jsonl.gz`，**没有任何自动回收路径**：
+  `mem gc --obs` 删的是 `observations` 表行，不碰归档文件（`internal/store/observe.go` 的
+  `GCObservations` 只发 `DELETE FROM observations`）；而手工删归档会破坏 `memory_evidence`
+  的溯源目标——记忆会显示「有证据」却打不开原始记录。因此这条判据回答的是「水位要不要裁决」，
+  不是「是否故障」。
+  - **512MiB ≈ 10 万份归档**：实测 2026-11-12 为 8215 份 / 41MiB（均值 5.1KB/条）。
+    `GCObservations` 的 `maxKeep` 默认 50000 条是产品自己声明的观测保留上限，
+    512MiB ≈ 其 2 倍。越过说明归档量已超出「自己认为需要保留」的量级，应显式裁决保留策略。
+  - **为什么不设 FAIL 档**：归档按设计只增不减，任何 FAIL 线都会被自然增长永久触发，
+    与 R12 断链不判 FAIL 同理——恒久误报会让判据失去意义。越过 512MiB 后按 §5 R14 处置；
+    确认接受现状就上调阈值并留记录（口径同 §5 R13）。
+  - **口径是磁盘占用，不是条数**：`du -sk` 的块数（APFS 稀疏文件不占块，故样本必须实写）
+    加文件数。**不做「折算成多少条观测」的推算**：`gc` 之后行数会降而文件数不降，两者本就会脱钩，
+    判据只量落盘量，不量语义。主库 `size_bytes` 仅作对照——主库与归档通常同源增长（观测行），
+    但主库会因 freelist 复用而平台化，归档不会。
+  - **不随冷启动降级**：它是累计量，与库里有几条记忆无关。
 
 ---
 
@@ -182,9 +201,9 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 判据必须阶段化，否则「符合预期」这四个字没有定义。跨过 20 条后自动启用完整阈值。
 
-**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13 不降级：候选载荷残留是输入过滤失效、写侧延迟
+**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13、R14 不降级：候选载荷残留是输入过滤失效、写侧延迟
 是同步 hook 的耗时、WAL 堆积是 checkpoint 未跟上、写侧决策断链是自动链路没推进、注入体量是
-单次注入的字节数，都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
+单次注入的字节数、归档体量是累计落盘量，都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
 与 R3 / R10 / R13 的「无样本」同类，**不是**本节的降级。
 
 ---
@@ -206,6 +225,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | R11 WAL 帧数越线 | 被动 checkpoint 未跟上 | `sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(TRUNCATE);"` 并记下返回三元组 `(busy,log,checkpointed)`；`busy=1` 说明有长读事务，查各 harness 的 `mem mcp` 连接。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务 |
 | R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
+| R14 归档体量越线 | 归档只增不减，且没有回收用例 | 先分因：① **量增长**（文件数与字节同步涨）→ 裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（32000 rune 上限）与 `MEM_EVIDENCE_*` 是否被抬高。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处；也**不要**用 `mem gc --obs` 期待回收字节（它只删观测行）。确认接受现状就上调阈值并在提交信息里写明原因 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
@@ -234,7 +254,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R13） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R14） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |
