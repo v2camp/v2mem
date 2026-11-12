@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh 的 dry-run 与 mock 路径断言，外加发布产物文件名契约。
+# install.sh 的 dry-run 与 mock 路径断言，外加发布产物文件名契约与 SHA256 校验分支。
 # 不访问网络，不编译真正的 mem。
 set -euo pipefail
 
@@ -58,12 +58,16 @@ if [[ "${CURL_FORBID:-}" == 1 ]]; then
 	exit 99
 fi
 out=""
+url=""
 prev=""
 for a in "$@"; do
 	if [[ "$prev" == "-o" ]]; then
 		out="$a"
 	fi
 	prev="$a"
+	case "$a" in
+	https://*) url="$a" ;;
+	esac
 done
 if [[ -z "$out" ]]; then
 	echo "mock curl: missing -o" >&2
@@ -73,6 +77,20 @@ printf '%s\n' "$*" >>"${CURL_LOG:?}"
 if [[ "${CURL_FAIL:-}" == 1 ]]; then
 	echo "mock curl fail" >&2
 	exit 22
+fi
+if [[ "$url" == *checksums.txt ]]; then
+	if [[ "${CURL_SUM_MISSING:-}" == 1 ]]; then
+		echo "mock curl: checksums 404" >&2
+		exit 22
+	fi
+	h="$(printf 'MZ-fake-binary\n' | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
+	if [[ "${CURL_SUM_BAD:-}" == 1 ]]; then
+		h="0000000000000000000000000000000000000000000000000000000000000000"
+	fi
+	for n in mem-darwin-amd64 mem-darwin-arm64 mem-linux-amd64 mem-linux-arm64 mem-windows-amd64.exe; do
+		printf '%s  %s\n' "$h" "$n"
+	done >"$out"
+	exit 0
 fi
 if [[ "${CURL_HTML:-}" == 1 ]]; then
 	printf '<html>nope</html>\n' >"$out"
@@ -153,6 +171,8 @@ EOF
 	line_is V2MEM_DRY_BIN mem-darwin-arm64 "$out" || true
 	line_is V2MEM_DRY_EXE mem "$out" || true
 	line_is V2MEM_DRY_URL "https://github.com/v2camp/v2mem/releases/latest/download/mem-darwin-arm64" "$out" || true
+	line_is V2MEM_DRY_SUM checksums.txt "$out" || true
+	line_is V2MEM_DRY_SUM_URL "https://github.com/v2camp/v2mem/releases/latest/download/checksums.txt" "$out" || true
 	line_is V2MEM_DRY_CLONE_REF main "$out" || true
 	line_is V2MEM_DRY_CLONE_URL "https://github.com/v2camp/v2mem.git" "$out" || true
 	line_is V2MEM_DRY_SOURCE clone "$out" || true
@@ -171,6 +191,7 @@ EOF
 	out="$(dry V2MEM_INSTALL_OS=linux V2MEM_INSTALL_ARCH=x86_64 HOME="$home_dir" -- --version v0.1.0 --dir "$missing")"
 	line_is V2MEM_DRY_BIN mem-linux-amd64 "$out" || true
 	line_is V2MEM_DRY_URL "https://github.com/v2camp/v2mem/releases/download/v0.1.0/mem-linux-amd64" "$out" || true
+	line_is V2MEM_DRY_SUM_URL "https://github.com/v2camp/v2mem/releases/download/v0.1.0/checksums.txt" "$out" || true
 	line_is V2MEM_DRY_DIR "$missing" "$out" || true
 	if [[ -e "$missing" ]]; then
 		fail_case "dry-run must not mkdir" "$missing"
@@ -246,8 +267,78 @@ EOF
 		fail_case "download success should not clone" "$(cat "$logs/git")"
 	elif ! grep -q 'releases/download/v9.9.9/mem-darwin-arm64' "$logs/curl"; then
 		fail_case "curl url" "$(cat "$logs/curl")"
+	elif ! grep -q 'checksums.txt' "$logs/curl"; then
+		fail_case "should fetch checksums" "$(cat "$logs/curl")"
+	elif ! printf '%s\n' "$err" | grep -q 'SHA256 校验通过'; then
+		fail_case "verify pass message" "$err"
 	else
-		say "ok download mkdir and skip clone"
+		say "ok download mkdir, verify and skip clone"
+	fi
+	rm -rf "$mocks" "$logs" "$dest_root"
+}
+
+# ---------- 早期 Release 无校验清单：WARN 降级，仍能安装 ----------
+{
+	mocks="$(mock_bin)"
+	logs="$(mktemp -d)"
+	dest_root="$(mktemp -d)"
+	: >"$logs/curl"
+	: >"$logs/git"
+	: >"$logs/gitdest"
+	: >"$logs/go"
+	set +e
+	err="$(
+		CURL_LOG="$logs/curl" CURL_SUM_MISSING=1 GIT_LOG="$logs/git" GIT_DEST_LOG="$logs/gitdest" GO_LOG="$logs/go" \
+			V2MEM_INSTALL_OS=darwin V2MEM_INSTALL_ARCH=arm64 \
+			PATH="$mocks:$PATH" \
+			bash "$INSTALL" --dir "$dest_root/bin" --version v0.5.1 2>&1
+	)"
+	code=$?
+	set -e
+	if [[ "$code" -ne 0 ]]; then
+		fail_case "missing checksums exit" "$err"
+	elif [[ ! -x "$dest_root/bin/mem" ]]; then
+		fail_case "missing checksums binary" "$err"
+	elif ! printf '%s\n' "$err" | grep -q '跳过完整性校验'; then
+		fail_case "missing checksums warn" "$err"
+	elif [[ -s "$logs/git" ]]; then
+		fail_case "missing checksums should not clone" "$(cat "$logs/git")"
+	else
+		say "ok missing checksums degrades to warn"
+	fi
+	rm -rf "$mocks" "$logs" "$dest_root"
+}
+
+# ---------- 校验不符：拒绝落地坏二进制，回退源码构建 ----------
+{
+	mocks="$(mock_bin)"
+	logs="$(mktemp -d)"
+	dest_root="$(mktemp -d)"
+	: >"$logs/curl"
+	: >"$logs/git"
+	: >"$logs/gitdest"
+	: >"$logs/go"
+	set +e
+	err="$(
+		CURL_LOG="$logs/curl" CURL_SUM_BAD=1 GIT_LOG="$logs/git" GIT_DEST_LOG="$logs/gitdest" GO_LOG="$logs/go" \
+			V2MEM_INSTALL_OS=darwin V2MEM_INSTALL_ARCH=arm64 \
+			PATH="$mocks:$PATH" \
+			bash "$INSTALL" --dir "$dest_root/bin" --version v9.9.9 2>&1
+	)"
+	code=$?
+	set -e
+	if [[ "$code" -ne 0 ]]; then
+		fail_case "bad checksum exit" "$err"
+	elif ! printf '%s\n' "$err" | grep -q 'SHA256 校验失败'; then
+		fail_case "bad checksum message" "$err"
+	elif [[ ! -s "$logs/go" ]]; then
+		fail_case "bad checksum should fall back to source" "$err"
+	elif [[ ! -f "$dest_root/bin/mem" ]]; then
+		fail_case "fallback binary missing" "$err"
+	elif grep -q 'MZ-fake-binary' "$dest_root/bin/mem"; then
+		fail_case "bad binary must not land" "$err"
+	else
+		say "ok bad checksum rejects binary and falls back"
 	fi
 	rm -rf "$mocks" "$logs" "$dest_root"
 }
@@ -425,7 +516,7 @@ EOF
 
 # ---------- 发布产物文件名与 install.sh / publish-release.sh 一致 ----------
 assets="mem-darwin-amd64 mem-darwin-arm64 mem-linux-amd64 mem-linux-arm64 mem-windows-amd64.exe"
-for name in $assets; do
+for name in $assets checksums.txt; do
 	if ! grep -q "$name" "$RELEASE"; then
 		fail_case "release-assets missing $name"
 	fi
@@ -433,6 +524,9 @@ for name in $assets; do
 		fail_case "publish-release missing $name"
 	fi
 done
+if ! grep -q 'checksums.txt' "$INSTALL"; then
+	fail_case "install.sh missing checksums.txt"
+fi
 {
 	out="$(dry V2MEM_INSTALL_OS=darwin V2MEM_INSTALL_ARCH=amd64 --)"
 	line_is V2MEM_DRY_BIN mem-darwin-amd64 "$out" || true
@@ -467,6 +561,7 @@ done
 	for name in $assets; do
 		printf 'x' >"$dist/$name"
 	done
+	printf 'x' >"$dist/checksums.txt"
 	: >"$logs/gh"
 	set +e
 	err="$(GH_LOG="$logs/gh" GH_RELEASE_EXISTS=0 PATH="$mocks:$PATH" bash "$PUBLISH" "$dist" v0.9.9 2>&1)"
@@ -477,6 +572,8 @@ done
 		fail_case "publish create exit" "$err"
 	elif ! printf '%s\n' "$gh_log" | grep -q 'release create v0.9.9'; then
 		fail_case "publish create" "$gh_log"
+	elif ! printf '%s\n' "$gh_log" | grep -q 'checksums.txt'; then
+		fail_case "publish create checksums asset" "$gh_log"
 	else
 		for name in $assets; do
 			if ! printf '%s\n' "$gh_log" | grep -q "$name"; then
@@ -497,6 +594,8 @@ done
 		fail_case "publish upload" "$gh_log"
 	elif ! printf '%s\n' "$gh_log" | grep -q -- '--clobber'; then
 		fail_case "publish clobber" "$gh_log"
+	elif ! printf '%s\n' "$gh_log" | grep -q 'checksums.txt'; then
+		fail_case "publish upload checksums asset" "$gh_log"
 	else
 		say "ok publish upload"
 	fi

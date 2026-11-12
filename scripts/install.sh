@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # v2mem 一键安装：优先下载预编译二进制，失败则浅克隆后源码构建。
+# 预编译产物用同版本 Release 的 checksums.txt 做 SHA256 校验：
+# 校验不符即拒绝落地；缺清单的早期版本打印 WARN 后跳过，保持向后兼容。
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh | bash
@@ -25,6 +27,7 @@ set -euo pipefail
 
 REPO="${V2MEM_INSTALL_REPO:-v2camp/v2mem}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+CHECKSUM_NAME="checksums.txt"
 VERSION="latest"
 FROM_SOURCE=0
 DRY_RUN=0
@@ -36,6 +39,8 @@ usage() {
 		"  latest 下载 https://github.com/${REPO}/releases/latest/download/<asset>" \
 		"  指定 tag 下载 https://github.com/${REPO}/releases/download/<tag>/<asset>" \
 		"" \
+		"预编译下载会同时取同版本的 checksums.txt 做 SHA256 校验；" \
+		"缺清单的早期版本打印 WARN 并跳过，校验不符则拒绝落地该二进制。" \
 		"源码回退会浅克隆到临时目录再 CGO_ENABLED=0 go build（curl|bash 时没有仓库目录）。" \
 		"已有 GOPROXY / GOSUMDB 原样保留。国内超时可 export GOPROXY=https://goproxy.cn,direct"
 }
@@ -104,7 +109,7 @@ detect_platform() {
 	x86_64 | amd64) arch="amd64" ;;
 	aarch64 | arm64) arch="arm64" ;;
 	*)
-		die "不支持的架构: $arch（当前支持 amd64/arm64）"
+		die "不支持的架构: ${arch}（当前支持 amd64/arm64）"
 		;;
 	esac
 
@@ -130,12 +135,21 @@ detect_platform() {
 	esac
 }
 
-asset_url() {
+release_url() {
+	local name="$1"
 	if [[ "$VERSION" == "latest" ]]; then
-		printf 'https://github.com/%s/releases/latest/download/%s' "$REPO" "$BIN_NAME"
+		printf 'https://github.com/%s/releases/latest/download/%s' "$REPO" "$name"
 	else
-		printf 'https://github.com/%s/releases/download/%s/%s' "$REPO" "$VERSION" "$BIN_NAME"
+		printf 'https://github.com/%s/releases/download/%s/%s' "$REPO" "$VERSION" "$name"
 	fi
+}
+
+asset_url() {
+	release_url "$BIN_NAME"
+}
+
+checksum_url() {
+	release_url "$CHECKSUM_NAME"
 }
 
 clone_ref() {
@@ -161,6 +175,8 @@ print_dry_run() {
 	printf 'V2MEM_DRY_BIN=%s\n' "$BIN_NAME"
 	printf 'V2MEM_DRY_EXE=%s\n' "$EXE_NAME"
 	printf 'V2MEM_DRY_URL=%s\n' "$(asset_url)"
+	printf 'V2MEM_DRY_SUM=%s\n' "$CHECKSUM_NAME"
+	printf 'V2MEM_DRY_SUM_URL=%s\n' "$(checksum_url)"
 	printf 'V2MEM_DRY_DIR=%s\n' "$INSTALL_DIR"
 	printf 'V2MEM_DRY_MKDIR=mkdir -p %s\n' "$INSTALL_DIR"
 	printf 'V2MEM_DRY_CLONE_REF=%s\n' "$(clone_ref)"
@@ -194,6 +210,49 @@ reject_not_binary() {
 	return 0
 }
 
+hash_of() {
+	local file="$1"
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$file" | awk '{print $1}'
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$file" | awk '{print $1}'
+	else
+		return 1
+	fi
+}
+
+verify_checksum() {
+	local bin="$1" sum_tmp sum_url expected actual
+	sum_tmp="${bin}.sum"
+	SUM_TMP="$sum_tmp"
+	sum_url="$(checksum_url)"
+	if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+		printf '✗ 找不到 sha256sum / shasum，无法校验 %s。\n' "$CHECKSUM_NAME" >&2
+		return 1
+	fi
+	# 早期 Release 没有清单：降级为跳过，否则历史 tag 会全部装不上。
+	if ! curl -fsSL --connect-timeout 15 --retry 2 --retry-delay 1 -o "$sum_tmp" "$sum_url"; then
+		printf '⚠ 未取到 %s（版本 %s 未提供校验清单或网络不可达），跳过完整性校验。\n' "$CHECKSUM_NAME" "$VERSION" >&2
+		rm -f "$sum_tmp"
+		SUM_TMP=""
+		return 0
+	fi
+	expected="$(awk -v n="$BIN_NAME" '$2 == n { print $1; exit }' "$sum_tmp" | tr '[:upper:]' '[:lower:]')"
+	actual="$(hash_of "$bin" | tr '[:upper:]' '[:lower:]')" || true
+	rm -f "$sum_tmp"
+	SUM_TMP=""
+	if [[ -z "$expected" ]]; then
+		printf '✗ %s 里没有 %s 的条目，拒绝安装。\n' "$CHECKSUM_NAME" "$BIN_NAME" >&2
+		return 1
+	fi
+	if [[ -z "$actual" || "$actual" != "$expected" ]]; then
+		printf '✗ SHA256 校验失败：%s 与 %s 不符，拒绝落地该二进制。\n' "$BIN_NAME" "$CHECKSUM_NAME" >&2
+		return 1
+	fi
+	printf '✓ SHA256 校验通过：%s\n' "$BIN_NAME" >&2
+	return 0
+}
+
 download_release() {
 	local url="$1" dest="$2"
 	DL_TMP="${dest}.download.$$"
@@ -206,6 +265,11 @@ download_release() {
 	fi
 	if curl -fsSL --connect-timeout 15 --retry 2 --retry-delay 1 -o "$DL_TMP" "$url" \
 		&& reject_not_binary "$DL_TMP"; then
+		if ! verify_checksum "$DL_TMP"; then
+			rm -f "$DL_TMP"
+			DL_TMP=""
+			return 1
+		fi
 		mv -f "$DL_TMP" "$dest"
 		DL_TMP=""
 		chmod +x "$dest"
@@ -215,6 +279,7 @@ download_release() {
 	DL_TMP=""
 	printf '✗ 预编译下载失败：%s\n' "$url" >&2
 	printf '  版本 %s 可能还没有 %s 产物，将改为浅克隆源码构建。\n' "$VERSION" "$BIN_NAME" >&2
+	printf '  若 GitHub 整体不可达，源码回退同样需要网络与 git；可先把脚本落盘分步排查（见 README「安装失败排查」）。\n' >&2
 	return 1
 }
 
@@ -260,6 +325,9 @@ install_from_source() {
 	url="$(clone_url)"
 	mkdir -p "$INSTALL_DIR"
 	src="$(mktemp -d "${TMPDIR:-/tmp}/v2mem-src.XXXXXX")"
+	# macOS 的 TMPDIR 以 / 结尾，mktemp 会给出 ...//v2mem-src.*；
+	# cd 之后 PWD 会规范化掉重复斜杠，故先把 src 规范化再传给 git，避免路径比对不一致。
+	src="$(cd "$src" && pwd)"
 	WORKDIR="$src"
 	printf '→ 浅克隆 %s @ %s\n' "$url" "$ref"
 	if ! GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$ref" "$url" "$src"; then
@@ -295,12 +363,16 @@ finish_path_hint() {
 
 WORKDIR=""
 DL_TMP=""
+SUM_TMP=""
 cleanup() {
 	if [[ -n "$WORKDIR" ]]; then
 		rm -rf "$WORKDIR"
 	fi
 	if [[ -n "$DL_TMP" ]]; then
 		rm -f "$DL_TMP"
+	fi
+	if [[ -n "$SUM_TMP" ]]; then
+		rm -f "$SUM_TMP"
 	fi
 }
 trap cleanup EXIT
