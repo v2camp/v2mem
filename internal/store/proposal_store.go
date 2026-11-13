@@ -310,22 +310,23 @@ type CandidateEvidence struct {
 // 与 CandidateInput 分开：Proposal 候选必须携带 Bundle/Run/证据引用，
 // 缺了它们就退化成「无来源的候选」，T3 无法做自动提交判定。
 type ProposalCandidateInput struct {
-	SessionID   string
-	Project     string
-	BundleID    string
-	RunID       string
-	ProposalIdx int
-	Kind        string
-	Scope       string
-	Content     string
-	SubjectKey  string
-	TaskState   string
-	Rationale   string
-	ReviewClass string
-	Revision    int
-	Salience    float64
-	ObsIDs      []string
-	Evidence    []CandidateEvidence
+	SessionID    string
+	Project      string
+	BundleID     string
+	RunID        string
+	ProposalIdx  int
+	Kind         string
+	Scope        string
+	Content      string
+	SubjectKey   string
+	TaskState    string
+	Rationale    string
+	AttributedTo string
+	ReviewClass  string
+	Revision     int
+	Salience     float64
+	ObsIDs       []string
+	Evidence     []CandidateEvidence
 }
 
 // ProposalCandidateResult 描述写入结果。Created=false 表示命中同会话同内容的去重。
@@ -403,12 +404,13 @@ func (s *Store) insertProposalCandidateTx(in ProposalCandidateInput, hash string
 	if _, err := tx.Exec(`INSERT INTO candidates(
 		id, session_id, project, kind, content, content_hash, status, source, channel,
 		salience, obs_ids_json, created_at, run_id, bundle_id, proposal_index, scope,
-		subject_key, task_state, rationale, review_class, revision, schema_version
-	) VALUES (?,?,?,?,?,?, 'pending', 'distill', 'agent', ?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		subject_key, task_state, rationale, review_class, revision, schema_version,
+		attributed_to
+	) VALUES (?,?,?,?,?,?, 'pending', 'distill', 'agent', ?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		id, in.SessionID, in.Project, in.Kind, in.Content, hash, salience,
 		marshalObsIDs(in.ObsIDs), now, in.RunID, in.BundleID, in.ProposalIdx,
 		in.Scope, in.SubjectKey, in.TaskState, in.Rationale, in.ReviewClass,
-		in.Revision, 1); err != nil {
+		in.Revision, 1, normalizeAttributedTo(in.AttributedTo)); err != nil {
 		return nil, err
 	}
 	for _, ev := range in.Evidence {

@@ -16,7 +16,8 @@
 | **C 定期观测** | 每 12h | 第 3 节的 R 组判据 | 定时任务跑脚本 |
 
 **B 阶段"自动运行"的含义**：用户与 Agent 都不需要记得「该记了 / 该查了」。
-`SessionStart` 注入类码表，`UserPromptSubmit` 按 query 检索，`Stop`/`SessionEnd` 落观测。
+`SessionStart` 注入类码表，`UserPromptSubmit` 按 query 检索并顺带落一条 `user-prompt` 证据，
+`Stop`/`SessionEnd` 落观测。说话人归属的完整设计见 [`design-speaker-attribution.md`](./design-speaker-attribution.md)。
 这些是 `native` 钩子，**代码强制**，不是靠模型自觉。唯一概率性的一环是模型是否照着类码表去检索——
 这一点只能靠命中率衡量，不能靠约定保证。
 
@@ -27,10 +28,13 @@
 | 事件 | 动作 | 产物 | 期望 |
 |:---|:---|:---|:---|
 | `SessionStart` | 注入类码表 P/D/X/T + `kind=rule` 硬规则小字条；有界 drain `spool/`；机会性规则抽取 | stdout 注入块 | 恒定极小，不随库增长 |
-| `UserPromptSubmit` | 用提问原文检索 `memories`，命中则注入 | stdout 注入块 | 命中注入 ≤ 预算；空命中只留类码表 |
+| `UserPromptSubmit` | 用提问原文检索 `memories`，命中则注入；**另落一条 `user-prompt` 证据**（不新增审计行） | stdout 注入块 + `observations` 一行 | 命中注入 ≤ 预算；空命中只留类码表 |
 | `PostToolUse` / `Stop` / `SessionEnd` | 有界摘要写 `observations`（**不**调 `mem add`） | `obs-append` 审计 | 不进检索面 |
 | 写库失败 | 追加 `~/.v2mem/spool/<session>.jsonl`（0600） | spool 文件 | 下次 SessionStart 补写并清空 |
-| 手动 `mem distill` / 规则抽取 | 观测 → 候选 | `candidates`（隔离区） | **不进检索**，须 `mem accept` |
+| 手动 `mem distill` / 规则抽取 | 观测 → 候选（带 `attributed_to`） | `candidates`（隔离区） | **不进检索**，须 `mem accept` |
+
+> `UserPromptSubmit` 的证据写入**不额外记 `obs-append` 审计**：R1 / R5 / R12 的计数口径
+> 保持原样，R5 的「观测落库」仍只统计写事件产生的 `obs-append`。
 
 三条不变量，违反即视为动线异常：
 

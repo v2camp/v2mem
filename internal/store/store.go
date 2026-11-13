@@ -173,6 +173,7 @@ func ensureCaptureSchema(db *sql.DB) error {
 		{"observations", "channel", "TEXT NOT NULL DEFAULT ''"},
 		{"observations", "event_id", "TEXT NOT NULL DEFAULT ''"},
 		{"candidates", "channel", "TEXT NOT NULL DEFAULT ''"},
+		{"candidates", "attributed_to", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, c := range cols {
 		if err := ensureColumn(db, c.table, c.column, c.ddl); err != nil {

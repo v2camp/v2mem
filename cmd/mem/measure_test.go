@@ -49,9 +49,9 @@ func TestCmdHookWritesAuditRecord(t *testing.T) {
 	}
 }
 
-// 钩子只读护栏：SessionStart / UserPromptSubmit 这类读事件只能查库，
-// 绝不能因为钩子被触发就往 memories 灌内容 —— 这是「注入内容冒充真实记忆」的守门。
-// 钩子允许触碰的只有内部去重表（hook_dedup），memories 必须一条都不多。
+// 钩子只读护栏：SessionStart / UserPromptSubmit 绝不能往 memories 灌内容 ——
+// 这是「注入内容冒充真实记忆」的守门。UserPromptSubmit 现在会落一条
+// user-prompt 证据（观测层），但 memories 必须一条都不多；内部 hook_dedup 同理。
 func TestCmdHookReadOnly(t *testing.T) {
 	db := testDB(t)
 	proj, name := hookProjectDir(t, "demo-repo")

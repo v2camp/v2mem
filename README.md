@@ -247,6 +247,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-synonym-library.md`](./docs/design-synonym-library.md) | 使用者/开发者 | 同义词词库：起步配置/查询期展开/有效迭代闭环/初始化 agent 提取管线/自动维护闭环（§8：LLM 提取 × 试用回测） |
 | [`docs/design-provenance.md`](./docs/design-provenance.md) | 使用者/开发者 | 记忆溯源：`provenance` 字段走向、ALTER 迁移、ingest 写入、sync 传播与后续资产/词库联动设想 |
 | [`docs/design-capture.md`](./docs/design-capture.md) | 所有者 / 开发者 | **捕获层架构**：多 harness 的 `CaptureEvent` 契约、A/B/C/D 捕获阶梯、适配器一致性测试、artifact 扫描边界与「事实源/查询源」划分 |
+| [`docs/design-speaker-attribution.md`](./docs/design-speaker-attribution.md) | 所有者 / 开发者 | **说话人归属**：用户请求与 AI 产出怎么进记忆；参照应用对照、分源提炼、`attributed_to`、反回声规则与验收数据 |
 | [`docs/design-write-governance.md`](./docs/design-write-governance.md) | 所有者 / 开发者 | **写侧治理**：三态（观测/候选/采纳）、写必由 LLM 决策、channel 与来源标记；§12 候选裁决自动化闭环（触发点、MCP 显式裁决、R8 分组、采纳率前提） |
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |
 | [`docs/setup.md`](./docs/setup.md) | 使用者 | **安装/接入规范**：合规接入五守则、hooks/MCP 分层、各宿主标准流程、监听面板引导、卸载回退 |
@@ -256,7 +257,8 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 
 设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
 `design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 ·
-`design-capture` 多 harness 捕获层与事件契约 · `design-workbuddy` WorkBuddy 结合 ·
+`design-capture` 多 harness 捕获层与事件契约 · `design-speaker-attribution` 说话人归属与分源提炼 ·
+`design-workbuddy` WorkBuddy 结合 ·
 `design-eval` 激活与评测 · `design-maintenance` 收尾运维 ·
 `design-write-governance` 写侧治理与短/跨会话记忆分配 · `design-provenance` 记忆溯源 ·
 `design-write-batch` 写侧延迟治本（批量归档）。
