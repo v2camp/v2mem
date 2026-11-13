@@ -61,8 +61,12 @@ func DefaultObsChannel(event, explicit string) (string, error) {
 	if ch != "" {
 		return ch, nil
 	}
-	if strings.TrimSpace(event) == "post-tool-use" {
+	switch strings.TrimSpace(event) {
+	case "post-tool-use":
 		return ChannelTool, nil
+	case "user-prompt":
+		return ChannelUser, nil
+	default:
+		return ChannelAgent, nil
 	}
-	return ChannelAgent, nil
 }

@@ -34,6 +34,18 @@ type Candidate struct {
 	CreatedAt int64    `json:"created_at"`
 	DecidedAt int64    `json:"decided_at,omitempty"`
 	MemoryID  string   `json:"memory_id,omitempty"`
+	// AttributedTo 是事实的原始来源，不是写候选的人：user|assistant|空串（旧行）。
+	AttributedTo string `json:"attributed_to,omitempty"`
+}
+
+// normalizeAttributedTo 收敛写入值，避免第三类来源悄悄进库。
+func normalizeAttributedTo(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "user", "assistant":
+		return strings.ToLower(strings.TrimSpace(s))
+	default:
+		return ""
+	}
 }
 
 // CandidateInput 是写入一条候选的参数。
@@ -46,6 +58,8 @@ type CandidateInput struct {
 	Channel   string
 	Salience  float64
 	ObsIDs    []string
+	// AttributedTo：规则蒸馏按观测事件类型推导，见 internal/distill.SpeakerForEvent。
+	AttributedTo string
 }
 
 // CandidateResult 描述写入结果。Created=false 表示命中同会话同内容的去重。
@@ -162,10 +176,10 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 	now := time.Now().Unix()
 	_, err = s.db.Exec(`INSERT INTO candidates(
 		id, session_id, project, kind, content, content_hash, status, source, channel,
-		salience, obs_ids_json, created_at
-	) VALUES (?,?,?,?,?,?, 'pending', ?,?,?,?,?)`,
+		salience, obs_ids_json, created_at, attributed_to
+	) VALUES (?,?,?,?,?,?, 'pending', ?,?,?,?,?,?)`,
 		id, in.SessionID, in.Project, in.Kind, in.Content, hash, in.Source, in.Channel,
-		in.Salience, marshalObsIDs(in.ObsIDs), now)
+		in.Salience, marshalObsIDs(in.ObsIDs), now, normalizeAttributedTo(in.AttributedTo))
 	if err != nil {
 		if isUniqueViolation(err) {
 			// 并发插入命中部分唯一索引（status IN pending/accepted）：按去重处理。
@@ -196,7 +210,8 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 
 func (s *Store) candidateByID(id string) (*Candidate, error) {
 	row := s.db.QueryRow(`SELECT id, session_id, project, kind, content, content_hash,
-		status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id
+		status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id,
+		attributed_to
 		FROM candidates WHERE id = ?`, id)
 	return scanCandidate(row)
 }
@@ -211,7 +226,8 @@ func scanCandidate(row rowScanner) (*Candidate, error) {
 	var decided sql.NullInt64
 	var memory sql.NullString
 	if err := row.Scan(&c.ID, &c.SessionID, &c.Project, &c.Kind, &c.Content, &c.Hash,
-		&c.Status, &c.Source, &c.Channel, &c.Salience, &obsJSON, &c.CreatedAt, &decided, &memory); err != nil {
+		&c.Status, &c.Source, &c.Channel, &c.Salience, &obsJSON, &c.CreatedAt, &decided, &memory,
+		&c.AttributedTo); err != nil {
 		return nil, err
 	}
 	c.ObsIDs = unmarshalObsIDs(obsJSON)
@@ -240,7 +256,8 @@ func (s *Store) ListCandidatesByProject(status, session, project string, limit i
 		limit = 50
 	}
 	q := `SELECT id, session_id, project, kind, content, content_hash,
-		status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id
+		status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id,
+		attributed_to
 		FROM candidates WHERE 1=1`
 	var args []any
 	if status != "" {

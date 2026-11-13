@@ -290,14 +290,32 @@ func (r *Runner) candidateInput(b *store.ProposalBundle, refs []evidence.Ref, d 
 	if sessionID == "" {
 		sessionID = "unknown"
 	}
+	// attributed_to 以被引证据为准，不信任模型回填：同一事实若同时引到
+	// 用户与助手，按「用户原话优先」记 user（mem0 No Echo Extraction 同义）。
+	// 证据类型认不出来时才退回模型给的标注。
+	attributedTo := ""
+	for _, n := range d.EvidenceIdx {
+		s := SpeakerOf(refs[n-1].EventType)
+		if s == "" {
+			continue
+		}
+		attributedTo = s
+		if s == SpeakerUser {
+			break
+		}
+	}
+	if attributedTo == "" {
+		attributedTo = d.AttributedTo
+	}
 	return store.ProposalCandidateInput{
 		SessionID: sessionID, Project: project, BundleID: b.ID, RunID: runID,
 		ProposalIdx: idx, Kind: d.Kind, Scope: d.Scope,
-		Content:    scrub.Apply(d.Content, r.NoScrub),
-		SubjectKey: scrub.Apply(d.SubjectKey, r.NoScrub),
-		TaskState:  scrub.Apply(d.TaskState, r.NoScrub),
-		Rationale:  scrub.Apply(d.Rationale, r.NoScrub),
-		Salience:   0.6, ObsIDs: ids, Evidence: evs,
+		Content:      scrub.Apply(d.Content, r.NoScrub),
+		SubjectKey:   scrub.Apply(d.SubjectKey, r.NoScrub),
+		TaskState:    scrub.Apply(d.TaskState, r.NoScrub),
+		Rationale:    scrub.Apply(d.Rationale, r.NoScrub),
+		AttributedTo: attributedTo,
+		Salience:     0.6, ObsIDs: ids, Evidence: evs,
 	}, nil
 }
 

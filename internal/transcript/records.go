@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -147,7 +148,9 @@ func parseLine(line []byte, start int64) []Record {
 	if cwd := jsonString(raw, "cwd"); cwd != "" {
 		base.Project = filepath.Base(cwd)
 	}
-	uuid := jsonString(raw, "uuid")
+	// 宿主原生 id 有两种写法：Claude 给 uuid，WorkBuddy/CodeBuddy 给 id。
+	// 两者都只作为事件身份，不参与正文。
+	uuid := jsonString(raw, "uuid", "id")
 	lineType := jsonString(raw, "type")
 
 	// 明确的宿主控制行才可解释地丢弃；其余「看不懂」的行必须留原文。
@@ -155,6 +158,14 @@ func parseLine(line []byte, start int64) []Record {
 	// 的用户/助手原文永久丢失（计划 §7 停止条件第 1 条）。
 	if metadataTypes[lineType] {
 		return nil
+	}
+
+	// WorkBuddy / CodeBuddy 的原生 message 行：role 与 content 在顶层，
+	// 块类型是 input_text / output_text，且另有一个 usage 用的 message 字段
+	// （不是 Claude 的 message.content）。若不先分流，会误判成 unparsed，
+	// 整份会话只剩 pointer 证据，用户请求永远进不了提案。
+	if isNativeMessage(raw) {
+		return parseNativeMessage(base, raw, line)
 	}
 
 	msg := raw["message"]
@@ -202,6 +213,83 @@ func parseLine(line []byte, start int64) []Record {
 	// 合法 content 数组、但全是 thinking/空块：属于「模型中间态」的设计跳过，
 	// 不造 unparsed，避免把宿主正常元数据当噪声归档。
 	return out
+}
+
+// isNativeMessage 判定「role / content 在顶层」的宿主原生消息行。
+//
+// Claude 风格是 {"type":"user","message":{"role":...,"content":...}}，顶层没有
+// role；WorkBuddy 的 assistant 行虽也有 message 字段，但那是 usage 统计。
+// 因此「顶层 role + 顶层 content」是干净、不会误判的分流条件。
+func isNativeMessage(raw map[string]json.RawMessage) bool {
+	switch jsonString(raw, "role") {
+	case "user", "assistant":
+	default:
+		return false
+	}
+	_, ok := raw["content"]
+	return ok
+}
+
+// parseNativeMessage 把 WorkBuddy 风格的消息行翻成 user-prompt / assistant-text。
+//
+// Text 保持块内原文，不做剥离：注入的 system-reminder 与 <user_query> 都属于
+// 「归档要保真、提案要清洗」的范畴，清洗交给 UserQueryText 在 cmd 层做。
+// 其余类型的行（function_call / reasoning / session-meta …）一律继续走
+// unparsed，原文照存、语义不猜测。
+func parseNativeMessage(base Record, raw map[string]json.RawMessage, line []byte) []Record {
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(raw["content"], &blocks); err != nil {
+		return []Record{unparsedRecord(base, line)}
+	}
+	role := jsonString(raw, "role")
+	uuid := jsonString(raw, "uuid", "id")
+	base.Role = role
+	var out []Record
+	for i, rawBlock := range blocks {
+		var b map[string]json.RawMessage
+		if err := json.Unmarshal(rawBlock, &b); err != nil {
+			continue
+		}
+		switch jsonString(b, "type") {
+		case "text", "input_text", "output_text":
+			text := jsonString(b, "text")
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			r := base
+			r.Block, r.Text = i, text
+			r.EventType, r.HostUID = lineEventType(role), blockUID(uuid, i)
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+var (
+	userQueryRe      = regexp.MustCompile(`(?s)<user_query>(.*?)</user_query>`)
+	systemReminderRe = regexp.MustCompile(`(?s)<system-reminder\b[^>]*>.*?</system-reminder>`)
+)
+
+// UserQueryText 从宿主拼装的用户消息里取出「用户真正说的话」。
+//
+// WorkBuddy 的 input_text 把 system-reminder（user_info / 身份文件 / 连接器状态 /
+// 当前时间…）全部塞在同一条消息前面，真正的提问包在 <user_query> 里。若整段
+// 原样进提案，400 rune 的投影会全被注入上下文占满，用户请求反而看不到。
+// 优先取 <user_query>；没有该标签时只剥掉 system-reminder 块。
+// 只用于查询源（summary / 提案输入），归档 Raw 仍保留完整原文。
+func UserQueryText(s string) string {
+	if ms := userQueryRe.FindAllStringSubmatch(s, -1); len(ms) > 0 {
+		parts := make([]string, 0, len(ms))
+		for _, m := range ms {
+			if v := strings.TrimSpace(m[1]); v != "" {
+				parts = append(parts, v)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+	return strings.TrimSpace(systemReminderRe.ReplaceAllString(s, ""))
 }
 
 // unparsedRecord 把看不懂的行整行保留下来，交给调用方按原文归档。

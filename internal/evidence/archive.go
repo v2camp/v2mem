@@ -36,6 +36,10 @@ type segmentRecord struct {
 	ParserVersion    string `json:"parser_version,omitempty"`
 	ProposalEligible bool   `json:"proposal_eligible,omitempty"`
 	Raw              []byte `json:"raw"`
+	// SummaryOverride 只写在「需要清洗查询源」的事件上（宿主把注入上下文与
+	// 用户原话拼在一条消息里）。omitempty 保证其余 segment 字节不变，
+	// 且 spool 回放能还原清洗后的查询源，而不是拿全文去生成摘要。
+	SummaryOverride string `json:"summary_override,omitempty"`
 }
 
 func recordOf(ev RawEvent) segmentRecord {
@@ -45,6 +49,7 @@ func recordOf(ev RawEvent) segmentRecord {
 		SessionID: ev.SessionID, Project: ev.Project, Harness: ev.Harness,
 		EventType: ev.EventType, ParserVersion: ev.ParserVersion,
 		ProposalEligible: ev.ProposalEligible, Raw: ev.Raw,
+		SummaryOverride: ev.SummaryOverride,
 	}
 }
 
@@ -54,6 +59,7 @@ func (r segmentRecord) event() RawEvent {
 		OccurredAtNS: r.OccurredAtNS, SessionID: r.SessionID, Project: r.Project,
 		Harness: r.Harness, EventType: r.EventType, ParserVersion: r.ParserVersion,
 		ProposalEligible: r.ProposalEligible, Raw: r.Raw,
+		SummaryOverride: r.SummaryOverride,
 	}
 }
 

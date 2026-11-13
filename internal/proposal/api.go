@@ -6,13 +6,16 @@ package proposal
 // Draft 是执行器返回的一条 ADD-only 草案。
 // EvidenceIdx 使用 Bundle 内的 1 起短序号，禁止让模型回填 UUID。
 type Draft struct {
-	Kind        string
-	Scope       string
-	Content     string
-	Rationale   string
-	SubjectKey  string
-	TaskState   string
-	EvidenceIdx []int
+	Kind       string
+	Scope      string
+	Content    string
+	Rationale  string
+	SubjectKey string
+	TaskState  string
+	// AttributedTo 是这条事实的原始来源（user / assistant）。模型可给出建议值，
+	// 落库时以被引证据的 EventType 为准覆盖，见 runner.candidateInput。
+	AttributedTo string
+	EvidenceIdx  []int
 }
 
 // Candidate 是经校验、准备进入隔离区的候选。

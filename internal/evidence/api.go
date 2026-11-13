@@ -57,6 +57,10 @@ type RawEvent struct {
 	ProposalEligible bool
 	Fidelity         Fidelity
 	Raw              []byte
+	// SummaryOverride 让调用方给出「查询源」摘要，而不改动归档 Raw。
+	// 宿主把注入上下文和用户原话拼在一条消息里时，归档要保真、提案要看真正
+	// 的提问，两者必须分开（mem0 的 system 消息排除同理）。空则按 Raw 生成。
+	SummaryOverride string
 }
 
 // Bundle 是一段连续、可重放的证据窗口。

@@ -366,10 +366,10 @@ type distillJob struct {
 // 事实（design-capture §4.3、observe.go 的 pointer 标注）。把这类 summary 交给
 // distill.Run 会产出 240 字符的 JSON 截断片段当候选，见 ops-watch §3 R9。
 //
-// 旧行没有 proposal_eligible 键时按兼容语义视为可提案：历史窗口依赖 legacy 观测
-// 收敛，全部挡掉会让这些窗口永远停在 pending。判定本身复用 proposal.Eligible，
-// 这里只做 meta_json 到 evidence.Ref 的映射。
-func distillObservationEligible(metaJSON string) bool {
+// 旧行没有 proposal_eligible 键时按事件类型兜底：工具载荷 / 未解析行不算事实，
+// 其余仍按兼容语义放行（历史窗口要能收敛）。判定本身复用 proposal.Eligible，
+// 这里只做 meta_json + event 到 evidence.Ref 的映射。
+func distillObservationEligible(metaJSON, event string) bool {
 	var m struct {
 		ProposalEligible *bool  `json:"proposal_eligible"`
 		Fidelity         string `json:"fidelity,omitempty"`
@@ -380,6 +380,12 @@ func distillObservationEligible(metaJSON string) bool {
 	eligible := true
 	if m.ProposalEligible != nil {
 		eligible = *m.ProposalEligible
+	} else if distill.SpeakerForEvent(event) == "" {
+		// 旧行没有 proposal_eligible 键：不能一律放行。post-tool-use /
+		// unparsed 这类不是事实陈述的行，正是 R9 里 20 条 JSON 噪音的来源。
+		// 其余（stop / user-prompt / 空事件夹具）仍按兼容语义放行，
+		// 避免历史窗口永远停在 pending。
+		eligible = false
 	}
 	return proposal.Eligible(evidence.Ref{
 		ProposalEligible: eligible,
@@ -414,7 +420,7 @@ func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 	in := make([]distill.Observation, 0, len(obs))
 	for i, o := range obs {
 		ids[i] = o.ID
-		if !distillObservationEligible(o.MetaJSON) {
+		if !distillObservationEligible(o.MetaJSON, o.Event) {
 			continue
 		}
 		if project == "" {
@@ -422,7 +428,7 @@ func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 		}
 		in = append(in, distill.Observation{
 			ID: o.ID, SessionID: o.SessionID, Project: o.Project,
-			Summary: scrub.Apply(o.Summary, job.NoScrub),
+			Event: o.Event, Summary: scrub.Apply(o.Summary, job.NoScrub),
 		})
 	}
 	if len(in) == 0 {
@@ -486,7 +492,7 @@ func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 		res, err := st.InsertCandidate(store.CandidateInput{
 			SessionID: job.Session, Project: project, Kind: f.Kind,
 			Content: scrub.Apply(f.Content, job.NoScrub), Source: "distill", Channel: store.ChannelAgent,
-			Salience: f.Salience, ObsIDs: f.ObsIDs,
+			Salience: f.Salience, ObsIDs: f.ObsIDs, AttributedTo: f.AttributedTo,
 		})
 		if err != nil {
 			report.Failed++
