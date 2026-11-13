@@ -136,7 +136,7 @@ func TestGCUsesDecayedScoreNotRawSalience(t *testing.T) {
 func TestGCHonorsIdleGateEvenAtFloor(t *testing.T) {
 	s := newTestStore(t)
 	id := mustAdd(t, s, "刚写入且声望极低的记忆")
-	setColumn(t, s, id, "salience", 0.0)                       // 派生分会落到 floor
+	setColumn(t, s, id, "salience", 0.0)                                   // 派生分会落到 floor
 	setColumn(t, s, id, "last_seen_at", time.Now().Add(-time.Hour).Unix()) // 但只闲置 1 小时
 
 	res, err := s.GC(720*time.Hour, 0.2)

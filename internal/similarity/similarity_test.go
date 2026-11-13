@@ -12,7 +12,7 @@ func TestEnoughShingles(t *testing.T) {
 	}{
 		{"", false},
 		{"日志", false},
-		{"搬进记忆库", false},          // 5 字 → 3 个 trigram
+		{"搬进记忆库", false},     // 5 字 → 3 个 trigram
 		{"日志怎么放进记忆库里", true}, // 10 字 → 8 个 trigram
 		{"日志怎么搬进记忆库里", true}, // 10 字 → 8 个 trigram
 	}
