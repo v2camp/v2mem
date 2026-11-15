@@ -168,6 +168,16 @@ assert_case r8_multi_worst     100 0 no "$(merge_json "$(cand_json A 16)" "$(can
 
 # R9 等价性：content 含 transcript 原始 JSON 载荷 → WARN（与旧版 grep 口径一致）。
 assert_case r9_noise_warn      100 0 no "$(cand_json A 1 '{"id":1,"type":"x"}')" PASS PASS PASS WARN
+# R9 第二种形态：工具调用载荷的文本形态（工具名 + 对象字面量）。旧检测式只认
+# {"id"…}/{"type"…}，把 `Shell {"command"…` / `Grep {"pattern"…` 判成干净候选——
+# 2026-11-15 本机 2 条 11-02 存量候选就是这样漏掉的。
+assert_case r9_shell_payload   100 0 no "$(cand_json A 1 'Shell {"command":"git log --oneline"}')" PASS PASS PASS WARN
+assert_case r9_grep_payload    100 0 no "$(cand_json A 1 'Grep {"pattern":"Exit Code|stderr"}')" PASS PASS PASS WARN
+# 前导空白与换行后紧跟工具名同样算残留。
+assert_case r9_indented_payload 100 0 no "$(cand_json A 1 '  Read {"file_path":"/tmp/a"}')" PASS PASS PASS WARN
+# 反向保护：正文里提到工具名但不是载荷开头（没有对象字面量紧随）不算残留。
+assert_case r9_mention_ok      100 0 no "$(cand_json A 1 '排查时先用 Grep 过滤 stderr，再看 Exit Code')" PASS PASS PASS PASS
+assert_case r9_json_in_prose_ok 100 0 no "$(cand_json A 1 '边界样例 {"command": "ls"} 不是载荷开头')" PASS PASS PASS PASS
 
 # R2 按工程口径：只有「该工程库内 ≥20 条」的样本才进命中率分母。
 # 旧实现用全局 empty/A_PROMPT 算，窗口内提问全落在空库工程上时会稳定误判 FAIL。
