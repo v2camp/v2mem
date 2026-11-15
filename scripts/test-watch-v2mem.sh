@@ -13,12 +13,13 @@ trap 'rm -rf "$TMP"' EXIT
 NOW="$(date +%s)"
 N=0
 
-# cand_json <project> <n> [content]：造 n 条 pending 候选。
+# cand_json <project> <n> [content] [created_at]：造 n 条 pending 候选。
 # content 可塞 transcript 载荷用于 R9；默认是可读的原子事实。
+# created_at 默认取 NOW（窗口内），传更早的时间戳即「存量」。
 cand_json() {
-  jq -nc --arg p "$1" --argjson n "$2" --arg c "${3:-ok}" \
+  jq -nc --arg p "$1" --argjson n "$2" --arg c "${3:-ok}" --argjson ts "${4:-$NOW}" \
     '[range(0;$n) | {id: ("c" + $p + (.|tostring)), project:$p,
-                     status:"pending", content:$c, kind:"fact"}]'
+                     status:"pending", content:$c, kind:"fact", created_at:$ts}]'
 }
 
 merge_json() { jq -nc --argjson a "$1" --argjson b "$2" '$a + $b'; }
@@ -178,6 +179,32 @@ assert_case r9_indented_payload 100 0 no "$(cand_json A 1 '  Read {"file_path":"
 # 反向保护：正文里提到工具名但不是载荷开头（没有对象字面量紧随）不算残留。
 assert_case r9_mention_ok      100 0 no "$(cand_json A 1 '排查时先用 Grep 过滤 stderr，再看 Exit Code')" PASS PASS PASS PASS
 assert_case r9_json_in_prose_ok 100 0 no "$(cand_json A 1 '边界样例 {"command": "ls"} 不是载荷开头')" PASS PASS PASS PASS
+
+# R9 新鲜度口径：判级统计全部 pending，但 detail 必须区分「窗口内新增」与「存量」。
+# 旧文案恒写「单窗口内产生」，把 11-02 的存量残留说成过滤刚失效（2026-11-16 实测误报）。
+OLD=$(( NOW - 14*86400 ))
+assert_r9_detail() { # <名称> <cands> <detail 子串>
+  local name="$1" cands="$2" needle="$3" out detail got
+  out="$(run_case "$name" 100 0 no "$cands")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R9") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R9") | .detail')"
+  if [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R9 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R9=%-4s detail 含 %s\n' "$name" "$got" "$needle"
+}
+# 窗口内新增：才允许断言过滤失效。
+assert_r9_detail r9_fresh_says_fresh "$(cand_json A 1 'Shell {"command":"ls"}' "$NOW")" "窗口内新增 1 条"
+# 存量残留：不得再写「单窗口内产生」，要给出年龄。
+assert_r9_detail r9_legacy_says_legacy "$(cand_json A 1 'Shell {"command":"ls"}' "$OLD")" "全为存量（最早 14 天前）"
+# 混合：新鲜数只算窗口内的，存量单独计数。
+assert_r9_detail r9_mixed_counts_fresh \
+  "$(merge_json "$(cand_json A 1 'Grep {"pattern":"x"}' "$NOW")" "$(cand_json A 2 'Read {"file_path":"/tmp/a"}' "$OLD")")" \
+  "窗口内新增 1 条（另有存量 2 条"
+# >3 且全为存量：判 FAIL，但结论落在「先清理、再复查」，不诬指准入逻辑。
+assert_r9_detail r9_legacy_fail "$(cand_json A 4 'Shell {"command":"ls"}' "$OLD")" "全为存量（最早 14 天前），非本窗口新增"
 
 # R2 按工程口径：只有「该工程库内 ≥20 条」的样本才进命中率分母。
 # 旧实现用全局 empty/A_PROMPT 算，窗口内提问全落在空库工程上时会稳定误判 FAIL。

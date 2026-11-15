@@ -372,19 +372,49 @@ fi
 #   - 工具调用载荷的文本形态：「Grep {」「Shell {」等工具名 + 对象字面量开头。
 #     2026-11-15 发现本机 2 条 11-02 存量候选（`Shell {"command"…` / `Grep {"pattern"…`）
 #     只有后一种形态，旧检测式判 PASS，属漏判——载荷残留正是 R9 要拦的东西。
-NOISE=$(printf '%s' "$CAND_PENDING" | jq -r '
-  [.[] | (.content // "") as $c
+#
+# 新鲜度：R9 统计的是**全部 pending**，不按 created_at 切片（存量残留不清就一直计数）。
+# 只报条数会把 14 天前的存量说成「单窗口内产生」，把历史遗留误诊成「过滤刚失效」，
+# 诱导去改本来正常的准入逻辑。故把命中集拆成「窗口内新增 / 存量」两段报出来：
+# 窗口内新增 >0 才能断言过滤失效；全为存量时只说清理，不提过滤。
+NOISE_STAT=$(printf '%s' "$CAND_PENDING" | jq -r --argjson cut "$CUTOFF" --argjson now "$NOW" '
+  [ .[] | (.content // "") as $c
        | select(($c | test("\\{\"(id|parentId|callId|type)\""))
-                or ($c | test("^\\s*(Grep|Shell|Read|Bash|Edit|Write|Glob|WebFetch|TodoWrite|MultiEdit)\\s*\\{")))] | length' 2>/dev/null || echo 0)
-NOISE=${NOISE:-0}
+                or ($c | test("^\\s*(Grep|Shell|Read|Bash|Edit|Write|Glob|WebFetch|TodoWrite|MultiEdit)\\s*\\{")))
+       | (.created_at // 0) ] as $ts
+  | if ($ts | length) == 0 then "0 0 -1"
+    else "\($ts | length) \([$ts[] | select(. > $cut)] | length) "
+         + "\(((($now - ([$ts[] | select(. > 0)] | min // $now)) / 86400) | floor))"
+    end' 2>/dev/null || echo "0 0 -1")
+read -r NOISE NOISE_FRESH NOISE_AGE <<<"${NOISE_STAT:-0 0 -1}"
+case "$NOISE" in ''|*[!0-9]*) NOISE=0 ;; esac
+case "$NOISE_FRESH" in ''|*[!0-9]*) NOISE_FRESH=0 ;; esac
+case "$NOISE_AGE" in ''|*[!0-9-]*) NOISE_AGE=-1 ;; esac
+NOISE_OLD=$(( NOISE - NOISE_FRESH ))
+if [ "$NOISE_AGE" -lt 0 ]; then
+  NOISE_AGE_TXT="创建时间不可读"
+elif [ "$NOISE_AGE" -eq 0 ]; then
+  NOISE_AGE_TXT="最早为今日"
+else
+  NOISE_AGE_TXT="最早 ${NOISE_AGE} 天前"
+fi
+NOISE_OLD_TXT=""
+if [ "$NOISE_OLD" -gt 0 ]; then NOISE_OLD_TXT="（另有存量 ${NOISE_OLD} 条，${NOISE_AGE_TXT}）"; fi
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
   add R9 WARN "候选内容未校验" "pending 内容未读取；按 WARN 观察"
 elif [ "$NOISE" -eq 0 ]; then
   add R9 PASS "候选内容无载荷残留" "pending ${CAND} 条，未发现 transcript JSON 或工具载荷"
+elif [ "$NOISE_FRESH" -gt 0 ]; then
+  # 窗口内确有新增：这才是「蒸馏输入没按 proposalEligible 过滤」的证据。
+  if [ "$NOISE" -le 3 ]; then
+    add R9 WARN "候选含载荷残留 ${NOISE} 条" "窗口内新增 ${NOISE_FRESH} 条${NOISE_OLD_TXT}；用 mem reject 清理并核查 distill 输入过滤"
+  else
+    add R9 FAIL "候选含载荷残留 ${NOISE} 条" "窗口内新增 ${NOISE_FRESH} 条${NOISE_OLD_TXT}，蒸馏输入未过滤 pointer 观测；先修准入，再逐条 mem reject"
+  fi
 elif [ "$NOISE" -le 3 ]; then
-  add R9 WARN "候选含载荷残留 ${NOISE} 条" "单窗口内产生，用 mem reject 清理并核查 distill 输入过滤"
+  add R9 WARN "候选含载荷残留 ${NOISE} 条" "全为存量（${NOISE_AGE_TXT}），非本窗口新增；用 mem reject 清理即可，过滤逻辑暂无失效证据"
 else
-  add R9 FAIL "候选含载荷残留 ${NOISE} 条" "蒸馏输入未过滤 pointer 观测；先修准入，再逐条 mem reject"
+  add R9 FAIL "候选含载荷残留 ${NOISE} 条" "全为存量（${NOISE_AGE_TXT}），非本窗口新增；先逐条 mem reject，再复查是否仍有新增"
 fi
 
 # R10 写侧延迟：stop 与 obs-append 共用同一个 Stop 计时器，只取 stop 避免双计。
