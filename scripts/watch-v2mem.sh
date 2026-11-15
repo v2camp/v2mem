@@ -367,14 +367,20 @@ else
 fi
 
 # R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤。
-# 检测式与旧版 grep '\{"(id|parentId|callId|type)"' 等价，只是改读 JSON 的 content 字段。
+# 检测式有两种形态，缺一不可：
+#   - transcript 原始 JSON：{"id"…} / {"type"…}（旧版 grep 口径，保持等价）；
+#   - 工具调用载荷的文本形态：「Grep {」「Shell {」等工具名 + 对象字面量开头。
+#     2026-11-15 发现本机 2 条 11-02 存量候选（`Shell {"command"…` / `Grep {"pattern"…`）
+#     只有后一种形态，旧检测式判 PASS，属漏判——载荷残留正是 R9 要拦的东西。
 NOISE=$(printf '%s' "$CAND_PENDING" | jq -r '
-  [.[] | select((.content // "") | test("\\{\"(id|parentId|callId|type)\""))] | length' 2>/dev/null || echo 0)
+  [.[] | (.content // "") as $c
+       | select(($c | test("\\{\"(id|parentId|callId|type)\""))
+                or ($c | test("^\\s*(Grep|Shell|Read|Bash|Edit|Write|Glob|WebFetch|TodoWrite|MultiEdit)\\s*\\{")))] | length' 2>/dev/null || echo 0)
 NOISE=${NOISE:-0}
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
   add R9 WARN "候选内容未校验" "pending 内容未读取；按 WARN 观察"
 elif [ "$NOISE" -eq 0 ]; then
-  add R9 PASS "候选内容无载荷残留" "pending ${CAND} 条，未发现 transcript 原始 JSON"
+  add R9 PASS "候选内容无载荷残留" "pending ${CAND} 条，未发现 transcript JSON 或工具载荷"
 elif [ "$NOISE" -le 3 ]; then
   add R9 WARN "候选含载荷残留 ${NOISE} 条" "单窗口内产生，用 mem reject 清理并核查 distill 输入过滤"
 else
