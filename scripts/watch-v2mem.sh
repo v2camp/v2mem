@@ -56,14 +56,32 @@ RESULTS=()
 add() { RESULTS+=("$1|$2|$3|$4"); }
 
 # I1 二进制
+# STATS_RAW 留一份原始输出：R2 要按工程算库内条数，只解析一次，避免为每个
+# prompt 再开一次库。PROJ_TABLE 是 "project=count" 的多行表，缺「按工程」行
+# （旧版 stats 或 stub）时为空，R2 自动退回全局口径。
+STATS_RAW=""
+PROJ_TABLE=""
 if "$MEM_BIN" stats >/dev/null 2>&1; then
-  TOTAL=$("$MEM_BIN" stats 2>/dev/null | awk '/^总条数/{print $2}')
+  STATS_RAW=$("$MEM_BIN" stats 2>/dev/null)
+  TOTAL=$(printf '%s\n' "$STATS_RAW" | awk '/^总条数/{print $2}')
   TOTAL=${TOTAL:-0}
+  PROJ_TABLE=$(printf '%s\n' "$STATS_RAW" | awk '
+    /^按工程/ { for (i = 2; i <= NF; i++) { if (split($i, a, "=") == 2) print a[1]"="a[2] } }')
   add I1 PASS "二进制可执行" "mem stats 正常，库内 ${TOTAL} 条"
 else
   TOTAL=0
   add I1 FAIL "二进制不可执行" "$MEM_BIN stats 失败"
 fi
+
+# proj_total <project>：该工程库内记忆条数。未出现在「按工程」里就是 0 条。
+proj_total() {
+  local want="$1" n
+  n=$(printf '%s\n' "$PROJ_TABLE" | awk -F= -v p="$want" '$1 == p { print $2; exit }')
+  case "$n" in
+    ''|*[!0-9]*) printf '0' ;;
+    *)           printf '%s' "$n" ;;
+  esac
+}
 
 # I2 hooks 四个事件
 HOOK_EVENTS=0
@@ -202,16 +220,55 @@ else
 fi
 
 # R2 检索命中率（仅 prompt-submit 有意义；session-start 的 empty 恒 false）
+#
+# 口径按 project 分组，与 R8「跨工程不相加」同源：库是全局的、project 是列。
+# 旧实现用全局 EMPTY/A_PROMPT 算，只要窗口内提问集中在「库内 0 条」的工程上，
+# 就会得到稳定但无意义的 FAIL——空注入是冷启动的设计预期，不是检索失效。
+# 这里把「该工程库内 <20 条」的样本单列为冷启动剔除，只在有料工程上判级。
+PROMPT_BY_PROJ=""
+if [ -f "$AUDIT" ]; then
+  PROMPT_BY_PROJ=$(jq -sr --argjson c "$CUTOFF" '
+    map(select(.ts >= $c and .event=="prompt-submit")) as $p
+    | $p | group_by(.project // "")
+    | map([(.[0].project // ""), (length), ([.[] | select(.empty==true)] | length)] | @tsv)
+    | .[]' "$AUDIT" 2>/dev/null)
+fi
+
 if [ "$A_PROMPT" -gt 0 ]; then
-  HIT_RATE=$(( (A_PROMPT - A_PROMPT_EMPTY) * 100 / A_PROMPT ))
-  if [ "$TOTAL" -lt 20 ]; then
-    add R2 INFO "检索命中率 ${HIT_RATE}%" "prompt-submit ${A_PROMPT} 次，空 ${A_PROMPT_EMPTY} 次；库仅 ${TOTAL} 条，冷启动期空注入属预期"
-  elif [ "$HIT_RATE" -ge 30 ]; then
-    add R2 PASS "检索命中率 ${HIT_RATE}%" "prompt-submit ${A_PROMPT} 次，空 ${A_PROMPT_EMPTY} 次"
-  elif [ "$HIT_RATE" -ge 10 ]; then
-    add R2 WARN "检索命中率偏低 ${HIT_RATE}%" "库 ${TOTAL} 条仍大量空命中，考虑补记忆或查同义词表"
+  R2_N=0; R2_EMPTY=0; R2_COLD=0; R2_COLD_PROJ=""
+  if [ -n "$PROMPT_BY_PROJ" ]; then
+    while IFS=$'\t' read -r pj tot emp; do
+      case "${tot:-}${emp:-}" in ''|*[!0-9]*) continue ;; esac
+      # 旧审计没有 project 字段：按全局口径判断，避免把「未知工程」一律当冷启动。
+      if [ -z "$pj" ]; then pc=$TOTAL; else pc=$(proj_total "$pj"); fi
+      if [ "$pc" -lt 20 ]; then
+        R2_COLD=$((R2_COLD + tot))
+        R2_COLD_PROJ="$R2_COLD_PROJ${R2_COLD_PROJ:+, }${pj:-(未标注)}"
+        continue
+      fi
+      R2_N=$((R2_N + tot)); R2_EMPTY=$((R2_EMPTY + emp))
+    done <<< "$PROMPT_BY_PROJ"
   else
-    add R2 FAIL "检索基本不命中 ${HIT_RATE}%" "库 ${TOTAL} 条但几乎全空；检查中文分词与 FTS 索引"
+    # 分组拿不到（jq 失败 / 空审计）：退回全局口径，宁可旧行为也不静默判 PASS。
+    R2_N=$A_PROMPT; R2_EMPTY=$A_PROMPT_EMPTY
+  fi
+
+  if [ "$R2_N" -eq 0 ]; then
+    add R2 INFO "窗口内提问全部来自冷启动工程" \
+      "prompt-submit ${A_PROMPT} 次全落在库内 <20 条的工程（${R2_COLD_PROJ:-未标注}），空注入属设计预期，不计命中率"
+  else
+    HIT_RATE=$(( (R2_N - R2_EMPTY) * 100 / R2_N ))
+    COLD_NOTE=""
+    if [ "$R2_COLD" -gt 0 ]; then
+      COLD_NOTE="；已剔除冷启动工程 ${R2_COLD} 次（${R2_COLD_PROJ}）"
+    fi
+    if [ "$HIT_RATE" -ge 30 ]; then
+      add R2 PASS "检索命中率 ${HIT_RATE}%" "有效样本 ${R2_N} 次，空 ${R2_EMPTY} 次${COLD_NOTE}"
+    elif [ "$HIT_RATE" -ge 10 ]; then
+      add R2 WARN "检索命中率偏低 ${HIT_RATE}%" "有效样本 ${R2_N} 次，空 ${R2_EMPTY} 次${COLD_NOTE}；该工程库内 ≥20 条仍大量空命中，考虑补记忆或查同义词表"
+    else
+      add R2 FAIL "检索基本不命中 ${HIT_RATE}%" "有效样本 ${R2_N} 次，空 ${R2_EMPTY} 次${COLD_NOTE}；检查中文分词与 FTS 索引"
+    fi
   fi
 else
   add R2 INFO "窗口内无提问" "窗口内没有 prompt-submit 事件，无法评估命中率"
