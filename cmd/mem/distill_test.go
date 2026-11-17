@@ -36,7 +36,7 @@ func TestDistillNoneThenAcceptAndReject(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.AppendObservation(store.ObsInput{
-		SessionID: "sess", Project: "demo", Event: "post-tool-use",
+		SessionID: "sess", Project: "demo", Event: "user-prompt",
 		Summary: "决策：记忆库放在用户目录，不放代码目录",
 	}); err != nil {
 		t.Fatal(err)
@@ -228,7 +228,7 @@ func TestSessionStartDistillPendingDoesNotWriteMemories(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.AppendObservation(store.ObsInput{
-		SessionID: "pend", Project: "demo-repo", Event: "post-tool-use",
+		SessionID: "pend", Project: "demo-repo", Event: "user-prompt",
 		Summary: "决策：SessionStart 只产候选",
 	}); err != nil {
 		t.Fatal(err)
@@ -330,7 +330,7 @@ func TestDistillDryRunPrintsAndSkipsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := st.AppendObservation(store.ObsInput{
-		SessionID: "sess", Event: "post-tool-use", Summary: "决定：dry-run 不落库",
+		SessionID: "sess", Event: "user-prompt", Summary: "决定：dry-run 不落库",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -445,9 +445,9 @@ func TestDistillJSONDistinguishesTriState(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, o := range []store.ObsInput{
-		{SessionID: "s-ok", Event: "post-tool-use", Summary: "决策：JSON 要能看出成功"},
+		{SessionID: "s-ok", Event: "user-prompt", Summary: "决策：JSON 要能看出成功"},
 		{SessionID: "s-empty", Event: "stop", Summary: "stop status=completed"},
-		{SessionID: "s-fail", Event: "post-tool-use", Summary: "决策：模型不可用要能看出来"},
+		{SessionID: "s-fail", Event: "user-prompt", Summary: "决策：模型不可用要能看出来"},
 	} {
 		if _, err := st.AppendObservation(o); err != nil {
 			t.Fatal(err)
@@ -506,8 +506,8 @@ func TestDistillPartialInsertReportsBothCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, o := range []store.ObsInput{
-		{SessionID: "s", Event: "post-tool-use", Summary: "决策：甲条要进库"},
-		{SessionID: "s", Event: "post-tool-use", Summary: "报错：乙条会写失败"},
+		{SessionID: "s", Event: "user-prompt", Summary: "决策：甲条要进库"},
+		{SessionID: "s", Event: "user-prompt", Summary: "报错：乙条会写失败"},
 	} {
 		if _, err := st.AppendObservation(o); err != nil {
 			t.Fatal(err)

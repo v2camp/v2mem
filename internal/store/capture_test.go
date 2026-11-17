@@ -43,6 +43,10 @@ func TestDefaultChannelMatrix(t *testing.T) {
 	if err != nil || obs != ChannelAgent {
 		t.Fatalf("stop 默认 agent，got %s %v", obs, err)
 	}
+	obs, err = DefaultObsChannel("user-prompt", "")
+	if err != nil || obs != ChannelUser {
+		t.Fatalf("user-prompt 默认 user，got %s %v", obs, err)
+	}
 }
 
 func TestAddChannelFirstWriterWins(t *testing.T) {

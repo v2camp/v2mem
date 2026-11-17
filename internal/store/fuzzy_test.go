@@ -214,7 +214,7 @@ func containsStr(xs []string, x string) bool {
 // 其中 trigram 也接近的记忆同时是模糊候选，融合后仍应排前。
 func TestSearchFuzzyBroadFallbackStillWorks(t *testing.T) {
 	s := newTestStore(t)
-	idC := mustAdd(t, s, "日志搬进记忆库里")     // broad + fuzzy 都命中
+	idC := mustAdd(t, s, "日志搬进记忆库里")  // broad + fuzzy 都命中
 	idC2 := mustAdd(t, s, "日志归档到别的库") // 只 broad 命中（trigram 无交集）
 
 	hits, err := s.Search(SearchQuery{Query: "日志怎么搬进记忆库里", Scope: "all", Limit: 10})

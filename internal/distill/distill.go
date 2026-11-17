@@ -61,15 +61,34 @@ type Observation struct {
 	SessionID string
 	Project   string
 	Summary   string
+	// Event 是观测事件类型（user-prompt / assistant-text / stop / post-tool-use…）。
+	// 空串表示旧夹具未声明事件，按 user 兼容，避免历史窗口永远收敛不了。
+	Event string
 }
 
 // Fact 是一条候选事实，对应方案里的一行 JSON。
 type Fact struct {
-	Kind      string   `json:"kind"`
-	Content   string   `json:"content"`
-	Salience  float64  `json:"salience"`
-	ObsIDs    []string `json:"obs_ids"`
-	Rationale string   `json:"rationale"`
+	Kind         string   `json:"kind"`
+	Content      string   `json:"content"`
+	Salience     float64  `json:"salience"`
+	ObsIDs       []string `json:"obs_ids"`
+	Rationale    string   `json:"rationale"`
+	AttributedTo string   `json:"attributed_to,omitempty"`
+}
+
+// SpeakerForEvent 把观测事件类型映射到事实的原始来源。
+//
+// 与 internal/proposal.SpeakerOf 同源规则，但不跨包依赖（distill 是更底层的一层）。
+// 工具事件与未解析行返回空串：它们不是事实陈述，规则蒸馏一律跳过。
+func SpeakerForEvent(event string) string {
+	switch strings.ToLower(strings.TrimSpace(event)) {
+	case "", "user-prompt", "user.prompt":
+		return "user" // 空串 = 旧夹具兼容
+	case "assistant-text", "assistant.final", "stop", "session-end":
+		return "assistant"
+	default:
+		return ""
+	}
 }
 
 // Outcome 是一次蒸馏的结果。Status 取 ok|empty|fail|skipped。
@@ -173,7 +192,39 @@ func Run(obs []Observation, opt Options) Outcome {
 		}
 		return failOutcome(name, err)
 	}
-	return Outcome{Provider: name, Status: StatusOK, Facts: facts}
+	return Outcome{Provider: name, Status: StatusOK, Facts: attributeFacts(facts, obs)}
+}
+
+// attributeFacts 把模型没填或填错的 attributed_to 按被引观测的事件类型补齐。
+// 来源以证据为准，不信任模型自报；用户优先（同一事实同时引到双方时记 user）。
+func attributeFacts(facts []Fact, obs []Observation) []Fact {
+	byID := make(map[string]string, len(obs))
+	for _, o := range obs {
+		byID[o.ID] = SpeakerForEvent(o.Event)
+	}
+	for i := range facts {
+		want := ""
+		for _, id := range facts[i].ObsIDs {
+			s := byID[id]
+			if s == "" {
+				continue
+			}
+			want = s
+			if s == "user" {
+				break
+			}
+		}
+		if want == "" {
+			want = facts[i].AttributedTo
+		}
+		switch want {
+		case "user", "assistant":
+			facts[i].AttributedTo = want
+		default:
+			facts[i].AttributedTo = ""
+		}
+	}
+	return facts
 }
 
 func resolve(opt Options) (string, ModelSpec, error) {
@@ -232,6 +283,11 @@ func ollamaAlive(parent time.Duration) bool {
 
 // ExtractRules 用启发式从观测摘要里抽决策 / 踩坑 / 偏好 / 待办。
 // 纯 stop / session-end 套话且没有这些词时不产出。
+//
+// 分源约束（对齐 mem0 的 USER/AGENT 双提示词）：
+//   - 工具载荷 / 未解析行不产事实（它们不是事实陈述，R9 的噪音根因）；
+//   - preference 只从用户原话产，助手不该替用户定义偏好；
+//   - 每条事实带 attributed_to，供裁决时看出「谁说的」。
 func ExtractRules(obs []Observation) []Fact {
 	var out []Fact
 	seen := map[string]bool{}
@@ -240,8 +296,12 @@ func ExtractRules(obs []Observation) []Fact {
 		if summary == "" {
 			continue
 		}
+		speaker := SpeakerForEvent(o.Event)
+		if speaker == "" {
+			continue
+		}
 		kind := matchKind(summary)
-		if kind == "" {
+		if kind == "" || (speaker == "assistant" && kind == "preference") {
 			continue
 		}
 		content := truncate(oneLine(summary), 240)
@@ -252,6 +312,7 @@ func ExtractRules(obs []Observation) []Fact {
 		out = append(out, Fact{
 			Kind: kind, Content: content, Salience: 0.6,
 			ObsIDs: []string{o.ID}, Rationale: "规则抽取",
+			AttributedTo: speaker,
 		})
 	}
 	return out
@@ -281,10 +342,14 @@ func truncate(s string, n int) string {
 func promptFor(obs []Observation) string {
 	var b strings.Builder
 	b.WriteString("从下面的会话观测抽出原子事实。一行一个 JSON，不要其它文字。\n")
-	b.WriteString(`字段：{"kind":"decision|pitfall|preference|task","content":"原子事实","salience":0.6,"obs_ids":["id"],"rationale":"一句话"}` + "\n")
+	b.WriteString(`字段：{"kind":"decision|pitfall|preference|task","content":"原子事实","salience":0.6,"obs_ids":["id"],"rationale":"一句话","attributed_to":"user|assistant"}` + "\n")
 	b.WriteString("不要输出 fact。没有可抽取的事实就输出空行。\n")
+	b.WriteString("用户原话是主来源；偏好只从 user 观测提取。assistant 观测只贡献用户没说过的新增信息，\n")
+	b.WriteString("仅复述/总结/确认用户原话的内容一律不提取（No Echo Extraction）。\n")
+	b.WriteString("attributed_to 标事实的原始来源；工具载荷不产事实。\n")
 	for _, o := range obs {
-		fmt.Fprintf(&b, "- id=%s %s\n", o.ID, oneLine(o.Summary))
+		fmt.Fprintf(&b, "- id=%s (%s/%s) %s\n", o.ID, SpeakerForEvent(o.Event), o.Event,
+			oneLine(o.Summary))
 	}
 	return b.String()
 }

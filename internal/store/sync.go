@@ -521,8 +521,26 @@ func (s *Store) SyncMerge(remote []ExportRecord) (*SyncStats, error) {
 			stats.NewerLocal++
 
 		default:
-			// 时间戳撞车：冲突并存。内容归一化后本就相同，保留本地写法，
-			// 但打上 sync 冲突标记，把远端设备的来源噪音显式留下，不静默吞掉。
+			// 时间戳撞车：冲突并存。内容归一化后本就相同，保留本地写法与本地
+			// updated_at，但元数据必须做幂等格连接（MIN/MAX/COALESCE）——
+			// 这些运算是交换且结合的，两侧算出的结果一致；整行保留本地值则会让
+			// 两台设备各自守着本机的 created_at/last_seen_at，双向同步永不收敛。
+			if _, err := tx.Exec(
+				`UPDATE memories SET
+				   kind = MIN(kind, ?),
+				   salience = MAX(salience, ?),
+				   access_count = MAX(access_count, ?),
+				   created_at = MIN(created_at, ?),
+				   last_seen_at = MAX(last_seen_at, ?),
+				   expires_at = CASE WHEN expires_at IS NULL OR ? IS NULL
+				                    THEN NULL ELSE MAX(expires_at, ?) END,
+				   channel = CASE WHEN channel = '' THEN ? ELSE channel END
+				 WHERE id = ?`,
+				kind, r.Salience, r.AccessCount, r.CreatedAt, r.LastSeenAt,
+				r.ExpiresAt, r.ExpiresAt, channel, local.id,
+			); err != nil {
+				return nil, err
+			}
 			if _, err := tx.Exec(
 				`INSERT OR IGNORE INTO tags(memory_id, key, value) VALUES (?, ?, ?)`,
 				local.id, "sync", "conflict:"+r.OriginDevice,

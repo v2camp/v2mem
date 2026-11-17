@@ -9,8 +9,17 @@ build:
 install:
 	CGO_ENABLED=0 go install $(PKG)
 
-test:
+test: fmt-check
 	CGO_ENABLED=0 go test ./...
+
+# 格式门禁：任一 .go 未 gofmt 即非零退出。挂在 test 前，避免格式漂移脱离门禁
+# 漂进 main（2026-11-14 巡检发现 16 个文件尾换行缺失）。
+fmt-check:
+	@bash scripts/fmt-check.sh .
+
+# 格式门禁自身的回归：证明门禁真的会拦，不是恒返回 0。
+test-fmt:
+	@bash scripts/test-fmt-check.sh
 
 # 安装脚本：dry-run / mock curl·git·go，不访问网络。
 test-install:

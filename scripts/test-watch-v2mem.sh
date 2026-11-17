@@ -15,28 +15,34 @@ trap 'rm -rf "$TMP"' EXIT
 NOW="$(date +%s)"
 N=0
 
-# cand_json <project> <n> [content]：造 n 条 pending 候选。
+# cand_json <project> <n> [content] [created_at]：造 n 条 pending 候选。
 # content 可塞 transcript 载荷用于 R9；默认是可读的原子事实。
+# created_at 默认取 NOW（窗口内），传更早的时间戳即「存量」。
 cand_json() {
-  jq -nc --arg p "$1" --argjson n "$2" --arg c "${3:-ok}" \
+  jq -nc --arg p "$1" --argjson n "$2" --arg c "${3:-ok}" --argjson ts "${4:-$NOW}" \
     '[range(0;$n) | {id: ("c" + $p + (.|tostring)), project:$p,
-                     status:"pending", content:$c, kind:"fact"}]'
+                     status:"pending", content:$c, kind:"fact", created_at:$ts}]'
 }
 
 merge_json() { jq -nc --argjson a "$1" --argjson b "$2" '$a + $b'; }
 
-# build_fixture <dir> <stop_ms|none> <wal_frames> <obs yes/no> [audit_extra] [audit_lines]
+# build_fixture <dir> <stop_ms|none> <wal_frames> <obs yes/no> [audit_extra] [audit_lines] [prompts]
 # 造 mem stub + 四事件 settings + 审计日志 + 按需的 -wal。R14 复用同一套夹具，
 # 只额外往 evidence 目录写文件，所以抽出来而不是在 run_case 里内联。
+# prompts 覆盖默认的单条 prompt-submit（R2 按工程口径要造多条提问）；
+# audit_lines 非空时整段替换审计体（R13 要区分「无读侧记录」与「只有旧格式记录」）。
 build_fixture() {
   local d="$1" stop_ms="$2" frames="$3" with_obs="$4"
-  local extra_audit="${5:-}" audit_lines="${6:-}"
+  local extra_audit="${5:-}" audit_lines="${6:-}" prompts="${7:-}"
   mkdir -p "$d/v2mem" "$d/wb" "$d/home"
 
   cat > "$d/mem-stub" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
-  stats) echo "总条数 10" ;;
+  stats)
+    echo "总条数 ${STUB_TOTAL:-10}"
+    if [ -n "${STUB_PROJ_STATS:-}" ]; then printf '按工程   %s\n' "$STUB_PROJ_STATS"; fi
+    ;;
   candidates) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
   eval) printf '%s\n' "${STUB_ACTIVITY_JSON:-}" ;;
 esac
@@ -56,7 +62,11 @@ SETTINGS
 
   {
     printf '{"ts":%s,"event":"session-start","ms":10,"empty":false}\n' "$NOW"
-    printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false}\n' "$NOW"
+    if [ -n "$prompts" ]; then
+      printf '%s' "$prompts"
+    else
+      printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false}\n' "$NOW"
+    fi
     if [ "$stop_ms" != "none" ]; then
       printf '{"ts":%s,"event":"stop","ms":%s}\n' "$NOW" "$stop_ms"
     fi
@@ -78,25 +88,29 @@ SETTINGS
   fi
 }
 
-# run_watch <dir> [candidates_json] [activity_json]
+# run_watch <dir> [candidates_json] [activity_json] [proj_stats] [total]
 run_watch() {
-  local d="$1" cands="${2:-[]}" activity="${3:-}"
+  local d="$1" cands="${2:-[]}" activity="${3:-}" proj_stats="${4:-}" total="${5:-}"
   V2MEM_DIR="$d/v2mem" \
   WORKBUDDY_CONFIG_DIR="$d/wb" \
   HOME="$d/home" \
   MEM_BIN="$d/mem-stub" \
   STUB_CAND_JSON="$cands" \
   STUB_ACTIVITY_JSON="$activity" \
+  STUB_PROJ_STATS="$proj_stats" \
+  STUB_TOTAL="$total" \
     bash "$WATCH" --json 2>/dev/null || true
 }
 
-# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json> [audit_extra] [activity_json] [audit_lines]
+# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json>
+#          [audit_extra] [activity_json] [audit_lines] [prompts_json] [proj_stats] [total]
 run_case() {
   local name="$1" stop_ms="$2" frames="$3" with_obs="$4" cands="$5"
   local extra_audit="${6:-}" activity="${7:-}" audit_lines="${8:-}"
+  local prompts="${9:-}" proj_stats="${10:-}" total="${11:-}"
   local d="$TMP/$name"
-  build_fixture "$d" "$stop_ms" "$frames" "$with_obs" "$extra_audit" "$audit_lines"
-  run_watch "$d" "$cands" "$activity"
+  build_fixture "$d" "$stop_ms" "$frames" "$with_obs" "$extra_audit" "$audit_lines" "$prompts"
+  run_watch "$d" "$cands" "$activity" "$proj_stats" "$total"
 }
 
 # assert_case <名称> <stop_ms|none> <wal_frames> <obs> <cands> <R10> <R11> [R8] [R9]
@@ -178,6 +192,87 @@ assert_case r8_multi_worst     100 0 no "$(merge_json "$(cand_json A 16)" "$(can
 
 # R9 等价性：content 含 transcript 原始 JSON 载荷 → WARN（与旧版 grep 口径一致）。
 assert_case r9_noise_warn      100 0 no "$(cand_json A 1 '{"id":1,"type":"x"}')" PASS PASS PASS WARN
+# R9 第二种形态：工具调用载荷的文本形态（工具名 + 对象字面量）。旧检测式只认
+# {"id"…}/{"type"…}，把 `Shell {"command"…` / `Grep {"pattern"…` 判成干净候选——
+# 2026-11-15 本机 2 条 11-02 存量候选就是这样漏掉的。
+assert_case r9_shell_payload   100 0 no "$(cand_json A 1 'Shell {"command":"git log --oneline"}')" PASS PASS PASS WARN
+assert_case r9_grep_payload    100 0 no "$(cand_json A 1 'Grep {"pattern":"Exit Code|stderr"}')" PASS PASS PASS WARN
+# 前导空白与换行后紧跟工具名同样算残留。
+assert_case r9_indented_payload 100 0 no "$(cand_json A 1 '  Read {"file_path":"/tmp/a"}')" PASS PASS PASS WARN
+# 反向保护：正文里提到工具名但不是载荷开头（没有对象字面量紧随）不算残留。
+assert_case r9_mention_ok      100 0 no "$(cand_json A 1 '排查时先用 Grep 过滤 stderr，再看 Exit Code')" PASS PASS PASS PASS
+assert_case r9_json_in_prose_ok 100 0 no "$(cand_json A 1 '边界样例 {"command": "ls"} 不是载荷开头')" PASS PASS PASS PASS
+
+# R9 新鲜度口径：判级统计全部 pending，但 detail 必须区分「窗口内新增」与「存量」。
+# 旧文案恒写「单窗口内产生」，把 11-02 的存量残留说成过滤刚失效（2026-11-16 实测误报）。
+OLD=$(( NOW - 14*86400 ))
+assert_r9_detail() { # <名称> <cands> <detail 子串>
+  local name="$1" cands="$2" needle="$3" out detail got
+  out="$(run_case "$name" 100 0 no "$cands")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R9") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R9") | .detail')"
+  if [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R9 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R9=%-4s detail 含 %s\n' "$name" "$got" "$needle"
+}
+# 窗口内新增：才允许断言过滤失效。
+assert_r9_detail r9_fresh_says_fresh "$(cand_json A 1 'Shell {"command":"ls"}' "$NOW")" "窗口内新增 1 条"
+# 存量残留：不得再写「单窗口内产生」，要给出年龄。
+assert_r9_detail r9_legacy_says_legacy "$(cand_json A 1 'Shell {"command":"ls"}' "$OLD")" "全为存量（最早 14 天前）"
+# 混合：新鲜数只算窗口内的，存量单独计数。
+assert_r9_detail r9_mixed_counts_fresh \
+  "$(merge_json "$(cand_json A 1 'Grep {"pattern":"x"}' "$NOW")" "$(cand_json A 2 'Read {"file_path":"/tmp/a"}' "$OLD")")" \
+  "窗口内新增 1 条（另有存量 2 条"
+# >3 且全为存量：判 FAIL，但结论落在「先清理、再复查」，不诬指准入逻辑。
+assert_r9_detail r9_legacy_fail "$(cand_json A 4 'Shell {"command":"ls"}' "$OLD")" "全为存量（最早 14 天前），非本窗口新增"
+
+# R2 按工程口径：只有「该工程库内 ≥20 条」的样本才进命中率分母。
+# 旧实现用全局 empty/A_PROMPT 算，窗口内提问全落在空库工程上时会稳定误判 FAIL。
+plines() { # plines <project> <n> <empty>；project 传空串表示该行不带 project 字段
+  local p="$1" n="$2" e="$3" i emp
+  for (( i = 0; i < n; i++ )); do
+    emp=false
+    if [ "$i" -lt "$e" ]; then emp=true; fi
+    if [ -z "$p" ]; then
+      printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":%s}\n' "$NOW" "$emp"
+    else
+      printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":%s,"project":"%s"}\n' "$NOW" "$emp" "$p"
+    fi
+  done
+}
+
+assert_r2() { # <名称> <prompts> <proj_stats> <total> <want_level> [detail 子串]
+  local name="$1" prompts="$2" pstats="$3" total="$4" want="$5" needle="${6:-}"
+  local out got detail
+  out="$(run_case "$name" 100 0 no "$EMPTY" '' '' '' "$prompts" "$pstats" "$total")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R2") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R2") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R2 want=$want got=$got（${detail}）" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R2 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R2=%-4s\n' "$name" "$want"
+}
+
+# 核心回归：库全局 200 条、但窗口内 6 次提问全来自库内 0 条的工程 →
+# 旧版按全局算得 0% 判 FAIL，新版应剔除冷启动样本、判 INFO 并点明原因。
+assert_r2 r2_cold_project     "$(plines cold 6 6)"                   ''        200 INFO '全落在库内 <20 条'
+# 冷启动样本被剔除，不稀释有料工程的命中率：hot 10 次空 2 次 → 80% PASS。
+assert_r2 r2_cold_excluded    "$(plines hot 10 2)$(plines cold 5 5)"  'hot=50'  200 PASS '已剔除冷启动工程 5 次'
+# 反向保护：有料工程全空仍须判 FAIL，剔除逻辑不能把真故障一起吞掉。
+assert_r2 r2_hot_all_empty    "$(plines hot 10 10)"                  'hot=50'  200 FAIL
+assert_r2 r2_hot_warn         "$(plines hot 10 8)"                   'hot=50'  200 WARN
+# 旧审计无 project 字段且「按工程」缺失 → 退回全局口径，不把未知工程当冷启动。
+assert_r2 r2_legacy_no_proj   "$(plines '' 4 4)"                     ''         10 INFO
 
 # 采集失败保护：不可解析的 JSON 不得静默判 PASS。
 assert_case r8_read_fail       100 0 no 'not-json' PASS PASS WARN WARN

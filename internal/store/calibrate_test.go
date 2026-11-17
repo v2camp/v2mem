@@ -20,9 +20,9 @@ import (
 
 // 簇定义：簇名 → 该簇的同义词集合。
 var calibClusters = map[string][]string{
-	"ingest":  {"搬进", "导入", "灌库", "摄入", "载入"},
-	"search":  {"查找", "查询", "搜索", "捞取", "检索"},
-	"sync":    {"归并", "合并", "merge", "冲突解决", "同步"},
+	"ingest": {"搬进", "导入", "灌库", "摄入", "载入"},
+	"search": {"查找", "查询", "搜索", "捞取", "检索"},
+	"sync":   {"归并", "合并", "merge", "冲突解决", "同步"},
 }
 
 // 每个簇一条「术语清单式」标准记忆（specs/plans/glossary 的形态）。
@@ -167,8 +167,8 @@ func TestCalibThresholdSweep(t *testing.T) {
 	}
 
 	metrics := map[string]func(a, b []string) float64{
-		"jaccard":      jaccard,
-		"containment":  containment,
+		"jaccard":     jaccard,
+		"containment": containment,
 	}
 	for name, metric := range metrics {
 		for _, k := range []int{3, 5, 8} {

@@ -146,7 +146,9 @@ CREATE TABLE IF NOT EXISTS candidates (
   rationale     TEXT NOT NULL DEFAULT '',
   review_class  TEXT NOT NULL DEFAULT '',
   revision      INTEGER NOT NULL DEFAULT 0,
-  schema_version INTEGER NOT NULL DEFAULT 0
+  schema_version INTEGER NOT NULL DEFAULT 0,
+  -- 事实的原始来源（非写候选的人）：user|assistant|空串（旧行）
+  attributed_to TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_cand_status ON candidates(status, created_at);
 -- 同一会话里相同内容的 pending/accepted 不双插。rejected 不占这个键，允许改写后再来。

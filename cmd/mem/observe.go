@@ -345,6 +345,70 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 	}
 }
 
+// appendUserPromptFailOpen 在 UserPromptSubmit 落一条 user-prompt 证据。
+//
+// 为什么单独一条路径：isObserveHook 只收写事件（post-tool-use / stop / session-end），
+// UserPromptSubmit 是读路径（检索注入），过去完全不写库。于是用户原话只留在
+// audit.jsonl，不在证据链里；提案唯一能看到的正文是 Stop 的助手收尾回复 ——
+// 正是 mem0 提示词里明确要求跳过的「回声」。这里补上主来源。
+//
+// 只写证据，不写 memories、不产生候选，也不额外记 audit（prompt-submit 本来就有
+// 审计行），避免改变 R1 等巡检判据的计数口径。失败一律 fail-open。
+func appendUserPromptFailOpen(c common, harnessFlag, project string, in hookInput, noScrub bool) {
+	prompt := strings.TrimSpace(in.Prompt)
+	if prompt == "" {
+		return
+	}
+	sid := in.sessionID()
+	if sid == "" {
+		return
+	}
+	hname := harnessName(harnessFlag, in)
+	source := observeSourceID(hname, sid)
+	raw := []byte(truncateRunes(scrub.Apply(prompt, noScrub), observeRawMaxRunes))
+	uid := observeHostUID(in, harness.EventPromptSubmit, source)
+	if uid == "" {
+		uid = synthPromptUID(source, raw)
+	}
+	ev := evidence.RawEvent{
+		SourceID:         source,
+		SessionID:        sid,
+		Project:          project,
+		Harness:          hname,
+		EventType:        transcript.EventUserPrompt,
+		OccurredAtNS:     time.Now().UnixNano(),
+		ProposalEligible: true,
+		Fidelity:         evidence.FidelityFull,
+		EventUID:         uid,
+		Raw:              raw,
+		// hook 的 prompt 已是用户原话（不含注入上下文），无需清洗；
+		// 但走同一字段可让查询源与归档源口径一致。
+		SummaryOverride: truncateRunes(transcript.UserQueryText(string(raw)), 500),
+	}
+
+	es, err := openEvidenceSession(c.db)
+	if err != nil {
+		ev.EventUID = orSpoolUID(ev)
+		if spoolErr := spoolEvidence(c.db, ev); spoolErr != nil {
+			fmt.Fprintln(os.Stderr, "v2mem hook: 用户提问写 spool 失败，已放过:", spoolErr)
+		}
+		return
+	}
+	defer es.Close()
+	if _, _, cerr := captureEvidence(es, ev); cerr != nil {
+		fmt.Fprintln(os.Stderr, "v2mem hook: 用户提问证据写入失败，已放过:", cerr)
+	}
+}
+
+// synthPromptUID 给没有宿主 event_id 的提问一个稳定身份：同一会话同一句原话
+// 只落一条。宿主重复触发由 hook 去重窗口挡住，这里挡的是跨配置重放。
+func synthPromptUID(source string, raw []byte) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00", source)
+	h.Write(raw)
+	return "hook:prompt:" + hex.EncodeToString(h.Sum(nil))[:32]
+}
+
 // captureTranscriptFailOpen 从 transcript 增量解析用户/助手/工具事件。
 //
 // 增量靠游标（库旁 evidence/transcripts/<session>.cursor）；游标丢失或文件被截断
@@ -503,13 +567,6 @@ func recordEvidence(source, sid, project, hname, path string, rec transcript.Rec
 	}
 	text = truncateRunes(scrub.Apply(text, noScrub), observeRawMaxRunes)
 
-	uid := ""
-	if rec.HostUID != "" {
-		uid = "tx:" + rec.HostUID
-	} else {
-		// 身份用**打码前**的正文：切 --no-scrub 不该让整份历史换身份。
-		uid = transcriptFallbackUID(path, rec, rec.Text)
-	}
 	// unparsed 行只保住原文、语义未解析：标 pointer 且不进 Proposal；
 	// 正常解析的 transcript 行带真实正文，标 full。
 	fidelity := evidence.FidelityFull
@@ -521,6 +578,28 @@ func recordEvidence(source, sid, project, hname, path string, rec transcript.Rec
 	// 就是这两类行，根因在准入而不在蒸馏）；unparsed 行语义未解析，同样不进。
 	eligible := rec.EventType != transcript.EventToolUse &&
 		rec.EventType != transcript.EventToolResult && !rec.Unparsed
+
+	// 宿主把注入上下文和真正的提问拼在同一条 user 消息里：归档保留全文，
+	// 但查询源（summary / 提案输入）只留用户原话，否则 400 rune 投影会被
+	// system-reminder 占满。清洗只影响 SummaryOverride，Raw 一字节不动。
+	var summaryOverride string
+	if rec.EventType == transcript.EventUserPrompt {
+		clean := transcript.UserQueryText(text)
+		if strings.TrimSpace(clean) == "" {
+			// 整条都是注入上下文：没有用户的话，不该进提案。
+			fidelity, eligible = evidence.FidelityNone, false
+		} else {
+			summaryOverride = truncateRunes(clean, 500)
+		}
+	}
+
+	uid := ""
+	if rec.HostUID != "" {
+		uid = "tx:" + rec.HostUID
+	} else {
+		// 身份用**打码前**的正文：切 --no-scrub 不该让整份历史换身份。
+		uid = transcriptFallbackUID(path, rec, rec.Text)
+	}
 	return evidence.RawEvent{
 		EventUID:         uid,
 		SourceID:         source,
@@ -532,6 +611,7 @@ func recordEvidence(source, sid, project, hname, path string, rec transcript.Rec
 		ProposalEligible: eligible,
 		Fidelity:         fidelity,
 		Raw:              []byte(text),
+		SummaryOverride:  summaryOverride,
 	}
 }
 

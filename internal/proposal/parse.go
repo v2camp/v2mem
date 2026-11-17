@@ -37,13 +37,35 @@ const (
 // wireDraft 是模型的输出契约。EvidenceIdx 是 Bundle 内的 1 起短序号，
 // 模型永远不需要（也不允许）回填 UUID。
 type wireDraft struct {
-	Kind        string `json:"kind"`
-	Scope       string `json:"scope"`
-	Content     string `json:"content"`
-	Rationale   string `json:"rationale"`
-	SubjectKey  string `json:"subject_key"`
-	TaskState   string `json:"task_state"`
-	EvidenceIdx []int  `json:"evidence_idx"`
+	Kind         string `json:"kind"`
+	Scope        string `json:"scope"`
+	Content      string `json:"content"`
+	Rationale    string `json:"rationale"`
+	SubjectKey   string `json:"subject_key"`
+	TaskState    string `json:"task_state"`
+	AttributedTo string `json:"attributed_to"`
+	EvidenceIdx  []int  `json:"evidence_idx"`
+}
+
+// Speaker 常量：attributed_to 只取这两个值。空串表示来源不明（旧行）。
+const (
+	SpeakerUser      = "user"
+	SpeakerAssistant = "assistant"
+)
+
+// SpeakerOf 把证据事件类型映射到说话人。
+//
+// 与 mem0 的 attributed_to 同义：标记「这条事实的原始来源」，而不是写候选的人。
+// 工具事件、unparsed、未知事件返回空串 —— 它们本来就不该进提案。
+func SpeakerOf(eventType string) string {
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case "user-prompt", "user.prompt":
+		return SpeakerUser
+	case "assistant-text", "assistant.final", "stop", "session-end":
+		return SpeakerAssistant
+	default:
+		return ""
+	}
 }
 
 const maxRawForRepair = 2000
@@ -95,16 +117,57 @@ func BuildPrompt(refs []evidence.Ref) string {
 	var b strings.Builder
 	b.WriteString("从下面的会话证据提炼长期记忆。只允许新增（ADD-only），不要改写或删除已有记忆。\n")
 	b.WriteString("输出一行一个 JSON，不要任何解释；没有可提炼的事实就输出 []。\n")
-	b.WriteString(`字段：{"kind":"decision|pitfall|preference|task","scope":"session|project|global","content":"原子事实","rationale":"一句话","subject_key":"可选","task_state":"可选","evidence_idx":[1]}` + "\n")
-	b.WriteString("evidence_idx 必须是下面证据的序号，且每条候选至少引用一条。\n\n")
+	b.WriteString(`字段：{"kind":"decision|pitfall|preference|task","scope":"session|project|global","content":"原子事实","rationale":"一句话","attributed_to":"user|assistant","subject_key":"可选","task_state":"可选","evidence_idx":[1]}` + "\n")
+	b.WriteString("evidence_idx 必须是下面证据的序号，且每条候选至少引用一条。序号不连续属正常（被跳过或重复的条目保留空位）。\n")
+	b.WriteString("证据按说话人分组，必须遵守：\n")
+	b.WriteString("1. 用户原话是主来源；偏好、约束、意图、身份类事实只从 USER 组提取。\n")
+	b.WriteString("2. ASSISTANT 组只贡献用户没说过的新增信息（排查结论、根因、方案）；\n")
+	b.WriteString("   仅仅复述、总结或确认用户已说过的内容一律不提取（No Echo Extraction）。\n")
+	b.WriteString("3. 同一事实在 USER 与 ASSISTANT 都出现时只提一次，引用 USER 组的序号。\n")
+	b.WriteString("4. attributed_to 标这条事实的原始来源；引用 USER 组填 user，引用 ASSISTANT 组填 assistant。\n")
+	b.WriteString("5. 完全相同的正文被不同来源重复采集时只保留首次出现的那条。\n\n")
+
+	type line struct {
+		idx  int
+		ref  evidence.Ref
+		body string
+	}
+	var userLines, assistantLines, otherLines []line
+	seen := map[string]bool{}
 	for i, r := range refs {
 		idx := i + 1
 		if !proposalEligible(r) {
 			continue
 		}
-		fmt.Fprintf(&b, "[%d] (%s/%s) %s\n", idx, r.EventType, r.SessionID,
-			proposalPayload(r.Summary))
+		body := proposalPayload(r.Summary)
+		key := SpeakerOf(r.EventType) + "\x00" + body
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		l := line{idx: idx, ref: r, body: body}
+		switch SpeakerOf(r.EventType) {
+		case SpeakerUser:
+			userLines = append(userLines, l)
+		case SpeakerAssistant:
+			assistantLines = append(assistantLines, l)
+		default:
+			otherLines = append(otherLines, l)
+		}
 	}
+	writeSection := func(title string, lines []line) {
+		if len(lines) == 0 {
+			return
+		}
+		fmt.Fprintf(&b, "=== %s ===\n", title)
+		for _, l := range lines {
+			fmt.Fprintf(&b, "[%d] (%s/%s) %s\n", l.idx, l.ref.EventType, l.ref.SessionID, l.body)
+		}
+		b.WriteString("\n")
+	}
+	writeSection("USER", userLines)
+	writeSection("ASSISTANT", assistantLines)
+	writeSection("OTHER", otherLines)
 	return b.String()
 }
 
@@ -239,12 +302,20 @@ func validateDraft(w wireDraft, evidenceCount int) (Draft, bool) {
 		return Draft{}, false
 	}
 	sort.Ints(idx)
+	attributedTo := strings.ToLower(strings.TrimSpace(w.AttributedTo))
+	switch attributedTo {
+	case SpeakerUser, SpeakerAssistant, "":
+	default:
+		// 来源标注不允许模型自造第三种值；空串表示旧格式，由落库层按证据推导。
+		attributedTo = ""
+	}
 	return Draft{
 		Kind: kind, Scope: scope, Content: content,
-		Rationale:   strings.TrimSpace(w.Rationale),
-		SubjectKey:  strings.TrimSpace(w.SubjectKey),
-		TaskState:   strings.TrimSpace(w.TaskState),
-		EvidenceIdx: idx,
+		Rationale:    strings.TrimSpace(w.Rationale),
+		SubjectKey:   strings.TrimSpace(w.SubjectKey),
+		TaskState:    strings.TrimSpace(w.TaskState),
+		AttributedTo: attributedTo,
+		EvidenceIdx:  idx,
 	}, true
 }
 

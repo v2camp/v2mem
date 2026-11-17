@@ -181,7 +181,7 @@ func (e *Engine) CaptureBatch(evs []RawEvent) ([]Ref, error) {
 			Generation: ev.Generation, Seq: ev.Seq, OccurredAtNS: ev.OccurredAtNS,
 			SessionID: ev.SessionID, Project: ev.Project, Harness: ev.Harness,
 			EventType: ev.EventType, Channel: channel, ParserVersion: ev.ParserVersion,
-			ProposalEligible: ev.ProposalEligible, Summary: summarizeRaw(ev.Raw, ev.EventType),
+			ProposalEligible: ev.ProposalEligible, Summary: eventSummary(ev),
 			Fidelity: string(ev.Fidelity), Adapter: ev.Harness,
 			ArchiveHash: seg.hash, ArchivePath: seg.path,
 			RawRecordHash: rawHash, ByteSize: seg.size,
@@ -257,7 +257,7 @@ func (e *Engine) capture(ev RawEvent, allowSpool bool) (Ref, error) {
 	}
 
 	rawHash := sha256Hex(ev.Raw)
-	summary := summarizeRaw(ev.Raw, ev.EventType)
+	summary := eventSummary(ev)
 	seg, err := e.writeArchive(ev)
 	if err != nil {
 		return Ref{}, fmt.Errorf("归档原始证据失败: %w", err)
@@ -369,6 +369,15 @@ func sha256Hex(b []byte) string {
 // 列已经记录事件类型；FidelityNone / 空 Raw 已经表达「无正文」。再把事件名塞进
 // 摘要只会把伪造内容当正文展示给使用者。eventType 参数保留只为固定调用点签名
 // （engine.Capture 仍传 ev.EventType），本函数不再消费它。
+// eventSummary 生成查询源摘要。SummaryOverride 非空时优先用它：
+// 归档 Raw 一个字节都不动，只是展示与提案输入换成清洗过的用户原话。
+func eventSummary(ev RawEvent) string {
+	if s := strings.TrimSpace(ev.SummaryOverride); s != "" {
+		return summarizeRaw([]byte(s), ev.EventType)
+	}
+	return summarizeRaw(ev.Raw, ev.EventType)
+}
+
 func summarizeRaw(raw []byte, _ string) string {
 	s := strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' || r == '\t' {

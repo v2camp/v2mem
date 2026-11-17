@@ -983,6 +983,54 @@ func TestSyncMergeConvergesBothDirections(t *testing.T) {
 	}
 }
 
+// 撞车窗口内（|Δupdated_at| <= SyncTolerance）双向同步必须收敛。
+//
+// 回归：冲突分支曾只打 sync/conflict 标记、整行保留本地写法，两侧各自的
+// created_at / last_seen_at 都不做格连接（MIN/MAX），于是「同一两秒内写成」
+// 的两台设备交叉导入后永久停在 1 秒差上。TestSyncMergeConvergesBothDirections
+// 只有在两次 Add 恰好跨过秒边界时才暴露，表现为偶发 FAIL。
+func TestSyncMergeConflictWithinToleranceConverges(t *testing.T) {
+	const proj = "p1"
+	const content = "同秒撞车的事实"
+	a := newTestStore(t)
+	b := newTestStore(t)
+	idA := addWith(t, a, AddInput{Content: content, Project: proj, Salience: 0.5})
+	idB := addWith(t, b, AddInput{Content: content, Project: proj, Salience: 0.5})
+
+	// 制造 1 秒差（<= SyncTolerance=2）：A 早一秒，B 晚一秒，必然落进冲突分支。
+	pin := func(s *Store, id string, at int64) {
+		t.Helper()
+		if _, err := s.db.Exec(
+			`UPDATE memories SET created_at = ?, updated_at = ?, last_seen_at = ? WHERE id = ?`,
+			at, at, at, id); err != nil {
+			t.Fatalf("pin timestamps: %v", err)
+		}
+	}
+	const early, late = int64(1_700_000_000), int64(1_700_000_001)
+	pin(a, idA, early)
+	pin(b, idB, late)
+
+	if _, err := b.SyncMerge(exportOf(t, a)); err != nil {
+		t.Fatalf("b.SyncMerge(a): %v", err)
+	}
+	if _, err := a.SyncMerge(exportOf(t, b)); err != nil {
+		t.Fatalf("a.SyncMerge(b): %v", err)
+	}
+
+	sa, sb := stripTags(snapshot(t, a)), stripTags(snapshot(t, b))
+	if !reflect.DeepEqual(sa, sb) {
+		t.Fatalf("撞车窗口内双向同步应收敛\nA: %s\nB: %s", dumpSnap(sa), dumpSnap(sb))
+	}
+	for k, v := range sa {
+		if v.CreatedAt != early {
+			t.Errorf("%s 的 created_at 应取两侧最早值 %d，got %d", k, early, v.CreatedAt)
+		}
+		if v.LastSeenAt != late {
+			t.Errorf("%s 的 last_seen_at 应取两侧最晚值 %d，got %d", k, late, v.LastSeenAt)
+		}
+	}
+}
+
 // stripTags 抛出 tags 投影，仅保留「事实 + 位置元数据」用于收敛比较。
 func stripTags(m map[string]snap) map[string]snap {
 	out := make(map[string]snap, len(m))

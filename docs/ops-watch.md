@@ -16,7 +16,8 @@
 | **C 定期观测** | 每 12h | 第 3 节的 R 组判据 | 定时任务跑脚本 |
 
 **B 阶段"自动运行"的含义**：用户与 Agent 都不需要记得「该记了 / 该查了」。
-`SessionStart` 注入类码表，`UserPromptSubmit` 按 query 检索，`Stop`/`SessionEnd` 落观测。
+`SessionStart` 注入类码表，`UserPromptSubmit` 按 query 检索并顺带落一条 `user-prompt` 证据，
+`Stop`/`SessionEnd` 落观测。说话人归属的完整设计见 [`design-speaker-attribution.md`](./design-speaker-attribution.md)。
 这些是 `native` 钩子，**代码强制**，不是靠模型自觉。唯一概率性的一环是模型是否照着类码表去检索——
 这一点只能靠命中率衡量，不能靠约定保证。
 
@@ -27,10 +28,13 @@
 | 事件 | 动作 | 产物 | 期望 |
 |:---|:---|:---|:---|
 | `SessionStart` | 注入类码表 P/D/X/T + `kind=rule` 硬规则小字条；有界 drain `spool/`；机会性规则抽取 | stdout 注入块 | 恒定极小，不随库增长 |
-| `UserPromptSubmit` | 用提问原文检索 `memories`，命中则注入 | stdout 注入块 | 命中注入 ≤ 预算；空命中只留类码表 |
+| `UserPromptSubmit` | 用提问原文检索 `memories`，命中则注入；**另落一条 `user-prompt` 证据**（不新增审计行） | stdout 注入块 + `observations` 一行 | 命中注入 ≤ 预算；空命中只留类码表 |
 | `PostToolUse` / `Stop` / `SessionEnd` | 有界摘要写 `observations`（**不**调 `mem add`） | `obs-append` 审计 | 不进检索面 |
 | 写库失败 | 追加 `~/.v2mem/spool/<session>.jsonl`（0600） | spool 文件 | 下次 SessionStart 补写并清空 |
-| 手动 `mem distill` / 规则抽取 | 观测 → 候选 | `candidates`（隔离区） | **不进检索**，须 `mem accept` |
+| 手动 `mem distill` / 规则抽取 | 观测 → 候选（带 `attributed_to`） | `candidates`（隔离区） | **不进检索**，须 `mem accept` |
+
+> `UserPromptSubmit` 的证据写入**不额外记 `obs-append` 审计**：R1 / R5 / R12 的计数口径
+> 保持原样，R5 的「观测落库」仍只统计写事件产生的 `obs-append`。
 
 三条不变量，违反即视为动线异常：
 
@@ -76,14 +80,14 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **I4** | MCP 进程 | `pgrep -f "mem mcp"` | ≥1 | 0 | — |
 | **I5** | Trae 钩子执行环境 | `agent-hooks.log` 中 traecode 块的 `ExecEnv` | `Host` | `Sandbox`（读得到、写不进） | 未匹配到 traecode 块时 `INFO` |
 | **R1** | 钩子被真实触发 | 窗口内审计事件数 | ≥1 | — | 0 |
-| **R2** | 检索命中率 | `1 - prompt-submit.empty 占比` | ≥30% | 10–30% | <10% |
+| **R2** | 检索命中率 | **按 `project` 分组**：仅统计「该工程库内 ≥20 条」的 `prompt-submit`，`1 - empty 占比`；库内 <20 条的工程样本单列为冷启动剔除 | ≥30% | 10–30% | <10% |
 | **R3** | 检索延迟 | 窗口内 `prompt-submit` / `session-start` 的 `ms` 均值（写侧不计入，见下） | <50ms | 50–200ms | >200ms |
 | **R4** | 写侧活动 | 窗口内 `manual-add` 数 | ≥1 | 0（库≥20 条时） | — |
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
 | **R6** | 库规模 | `mem stats` 总条数 vs 上次快照 | 未下降 | 下降 | — |
 | **R7** | spool 积压 | `spool/*.jsonl` 数 | 0 | 1–3 | >3 |
 | **R8** | 候选积压 | `mem candidates ls --json` 按 `project` 分组后的**单工程** pending 数；窗口取各工程最大值 | ≤5 | 6–15 | >15 |
-| **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中 transcript 原始 JSON 载荷残留条数 | 0 | 1–3 | >3 |
+| **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中载荷残留条数，两种形态都算：transcript 原始 JSON（`{"id"…}`/`{"type"…}`）与工具载荷文本（`Grep {`/`Shell {` 等工具名 + 对象字面量开头） | 0 | 1–3 | >3 |
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
 | **R11** | WAL 堆积 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0） | ≤1000 帧 | 1001–2000 | >2000 |
 | **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `source` 分流）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
@@ -100,6 +104,13 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   脚本另在 R3 detail 展示写侧 Stop 均值供观察，**不对写侧判级**。
 - **R2 的 30%**：`docs/design-eval.md` 的口径是「能取到的细节无限深」，命中率随库内容增长而上升；
   初期低是必然。30% 是"库有料但仍常空手"的告警线。
+- **R2 的分组口径（2026-11-15）**：与 R8 同源——库是全局的、`project` 是列，一个工程库里有料
+  不代表另一个工程也有料。旧实现用全局 `empty / prompt-submit` 算，只要窗口内提问集中在
+  「库内 0 条」的工程上（本机实测 14/15 次落在空库工程），就会得到稳定但无意义的 FAIL。
+  现按 `project` 分组，用 `mem stats` 的「按工程」行取各工程条数，把 <20 条的工程样本单列为
+  冷启动剔除，只在有料工程上判级；**全部样本都被剔除时判 `INFO` 并列出工程名**。
+  「按工程」行缺失（旧版 `mem stats` / 测试 stub）或审计无 `project` 字段时退回全局口径，
+  不把未知工程当冷启动，避免静默判 `PASS`。
 - **库 20 条 / 评测 20 样本**：`mem audit` 自己提示「可评测样本 ≥20 再下结论」，同一口径沿用。
 - **R8 的 15**：候选是隔离区，长期不处理会让下次蒸馏覆盖判断；经验值，可随实测调整。
   **分组口径（2026-11-09）**：阈值按**单个 `project`** 计，跨工程候选不相加，窗口值取各工程计数的
@@ -109,12 +120,23 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   `candidates_ls` 提供就近查看。R9 的采集同步改读 `--json` 的 `content`，检测式与旧版
   `grep '\{"(id|parentId|callId|type)"'` 等价，**判定语义与阈值均未变**。
   `candidates ls --json` 不可解析时 R8/R9 按 `WARN` 观察，不静默判 `PASS`。
+  **检测式补第二种形态（2026-11-15）**：上面那个 grep 只认 transcript JSON。工具调用载荷的
+  文本形态（`Shell {"command"…`、`Grep {"pattern"…`，即工具名 + 对象字面量开头）不含这些键，
+  会被判成干净候选——本机 2 条 11-02 存量候选就是这样漏到 pending 里的，R9 一直报 `PASS`。
+  现同时匹配 `^\s*(Grep|Shell|Read|Bash|Edit|Write|Glob|WebFetch|TodoWrite|MultiEdit)\s*\{`；
+  只锚定**开头**，正文里提到工具名不算残留。阈值不变（0 / 1–3 / >3）。
 - **R9 的 0 / 3**：候选须显式 `mem accept` 才升格（[`design-write-governance.md`](./design-write-governance.md)
   三态），所以结构化载荷残留**不是事实而是污染**，出现即说明蒸馏输入未按
   `proposalEligible` 的准入过滤。判 0 为 PASS；单次 `distill` 实测最多产出 6 条候选
   （`distill_runs` 观测），故 1–3 视为单巡检窗口内可人工清理的余量，>3 判为过滤失效。
   检测为启发式：候选内容含 `{"id"` / `{"parentId"` / `{"callId"` / `{"type"` 等
   transcript 字段即计数。**R9 不随冷启动降级**——污染与库规模无关。
+  **detail 必须区分「窗口内新增」与「存量」（2026-11-16）**：判级仍统计**全部 pending**
+  （存量不清就一直计数，这是有意的），但候选不随窗口淘汰，只报条数会把 11-02 的残留说成
+  「单窗口内产生」，把历史遗留误诊成「过滤刚失效」，诱导去改本来正常的准入逻辑。
+  故 detail 拆两段：命中集里 `created_at > 窗口下界` 的记为**窗口内新增**，其余记为存量并给出
+  最早年龄（`最早 N 天前` / `最早为今日` / `创建时间不可读`）。**只有窗口内新增 >0 才允许
+  写「过滤未生效」**；全为存量时结论落在「用 mem reject 清理」，不提过滤。阈值与级别不变。
 - **R10 的 1000 / 3000ms**：宿主 `Stop` hook 是同步调用，`~/.workbuddy/settings.json`
   给的 `timeout` 为 20s，这是会话收尾的硬上限。1000ms 占预算 5%、3000ms 占 15%，
   越线即应介入，但距中断会话仍有余量。实测对照（`~/.v2mem/audit.jsonl`，
@@ -198,6 +220,10 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 **库条数 < 20 时，R2 与 R4 降级为 `INFO`。** 理由：此时空注入率高、写侧稀疏都是**设计预期**，
 不是故障。用成熟期的阈值去判初期状态，会得到稳定但无意义的 FAIL，最终导致告警疲劳。
+
+R2 的「库条数」是**按工程**读的：某个工程库内 <20 条，落在它上面的提问即视为冷启动样本，
+不参与命中率；只有库内 ≥20 条的工程才按 30% / 10% 判级。这样同一台机器上「A 工程有料、
+B 工程刚起步」不会被混算成一个 FAIL。
 
 判据必须阶段化，否则「符合预期」这四个字没有定义。跨过 20 条后自动启用完整阈值。
 

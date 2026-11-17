@@ -60,14 +60,32 @@ RESULTS=()
 add() { RESULTS+=("$1|$2|$3|$4"); }
 
 # I1 二进制
+# STATS_RAW 留一份原始输出：R2 要按工程算库内条数，只解析一次，避免为每个
+# prompt 再开一次库。PROJ_TABLE 是 "project=count" 的多行表，缺「按工程」行
+# （旧版 stats 或 stub）时为空，R2 自动退回全局口径。
+STATS_RAW=""
+PROJ_TABLE=""
 if "$MEM_BIN" stats >/dev/null 2>&1; then
-  TOTAL=$("$MEM_BIN" stats 2>/dev/null | awk '/^总条数/{print $2}')
+  STATS_RAW=$("$MEM_BIN" stats 2>/dev/null)
+  TOTAL=$(printf '%s\n' "$STATS_RAW" | awk '/^总条数/{print $2}')
   TOTAL=${TOTAL:-0}
+  PROJ_TABLE=$(printf '%s\n' "$STATS_RAW" | awk '
+    /^按工程/ { for (i = 2; i <= NF; i++) { if (split($i, a, "=") == 2) print a[1]"="a[2] } }')
   add I1 PASS "二进制可执行" "mem stats 正常，库内 ${TOTAL} 条"
 else
   TOTAL=0
   add I1 FAIL "二进制不可执行" "$MEM_BIN stats 失败"
 fi
+
+# proj_total <project>：该工程库内记忆条数。未出现在「按工程」里就是 0 条。
+proj_total() {
+  local want="$1" n
+  n=$(printf '%s\n' "$PROJ_TABLE" | awk -F= -v p="$want" '$1 == p { print $2; exit }')
+  case "$n" in
+    ''|*[!0-9]*) printf '0' ;;
+    *)           printf '%s' "$n" ;;
+  esac
+}
 
 # I2 hooks 四个事件
 HOOK_EVENTS=0
@@ -227,16 +245,55 @@ else
 fi
 
 # R2 检索命中率（仅 prompt-submit 有意义；session-start 的 empty 恒 false）
+#
+# 口径按 project 分组，与 R8「跨工程不相加」同源：库是全局的、project 是列。
+# 旧实现用全局 EMPTY/A_PROMPT 算，只要窗口内提问集中在「库内 0 条」的工程上，
+# 就会得到稳定但无意义的 FAIL——空注入是冷启动的设计预期，不是检索失效。
+# 这里把「该工程库内 <20 条」的样本单列为冷启动剔除，只在有料工程上判级。
+PROMPT_BY_PROJ=""
+if [ -f "$AUDIT" ]; then
+  PROMPT_BY_PROJ=$(jq -sr --argjson c "$CUTOFF" '
+    map(select(.ts >= $c and .event=="prompt-submit")) as $p
+    | $p | group_by(.project // "")
+    | map([(.[0].project // ""), (length), ([.[] | select(.empty==true)] | length)] | @tsv)
+    | .[]' "$AUDIT" 2>/dev/null)
+fi
+
 if [ "$A_PROMPT" -gt 0 ]; then
-  HIT_RATE=$(( (A_PROMPT - A_PROMPT_EMPTY) * 100 / A_PROMPT ))
-  if [ "$TOTAL" -lt 20 ]; then
-    add R2 INFO "检索命中率 ${HIT_RATE}%" "prompt-submit ${A_PROMPT} 次，空 ${A_PROMPT_EMPTY} 次；库仅 ${TOTAL} 条，冷启动期空注入属预期"
-  elif [ "$HIT_RATE" -ge 30 ]; then
-    add R2 PASS "检索命中率 ${HIT_RATE}%" "prompt-submit ${A_PROMPT} 次，空 ${A_PROMPT_EMPTY} 次"
-  elif [ "$HIT_RATE" -ge 10 ]; then
-    add R2 WARN "检索命中率偏低 ${HIT_RATE}%" "库 ${TOTAL} 条仍大量空命中，考虑补记忆或查同义词表"
+  R2_N=0; R2_EMPTY=0; R2_COLD=0; R2_COLD_PROJ=""
+  if [ -n "$PROMPT_BY_PROJ" ]; then
+    while IFS=$'\t' read -r pj tot emp; do
+      case "${tot:-}${emp:-}" in ''|*[!0-9]*) continue ;; esac
+      # 旧审计没有 project 字段：按全局口径判断，避免把「未知工程」一律当冷启动。
+      if [ -z "$pj" ]; then pc=$TOTAL; else pc=$(proj_total "$pj"); fi
+      if [ "$pc" -lt 20 ]; then
+        R2_COLD=$((R2_COLD + tot))
+        R2_COLD_PROJ="$R2_COLD_PROJ${R2_COLD_PROJ:+, }${pj:-(未标注)}"
+        continue
+      fi
+      R2_N=$((R2_N + tot)); R2_EMPTY=$((R2_EMPTY + emp))
+    done <<< "$PROMPT_BY_PROJ"
   else
-    add R2 FAIL "检索基本不命中 ${HIT_RATE}%" "库 ${TOTAL} 条但几乎全空；检查中文分词与 FTS 索引"
+    # 分组拿不到（jq 失败 / 空审计）：退回全局口径，宁可旧行为也不静默判 PASS。
+    R2_N=$A_PROMPT; R2_EMPTY=$A_PROMPT_EMPTY
+  fi
+
+  if [ "$R2_N" -eq 0 ]; then
+    add R2 INFO "窗口内提问全部来自冷启动工程" \
+      "prompt-submit ${A_PROMPT} 次全落在库内 <20 条的工程（${R2_COLD_PROJ:-未标注}），空注入属设计预期，不计命中率"
+  else
+    HIT_RATE=$(( (R2_N - R2_EMPTY) * 100 / R2_N ))
+    COLD_NOTE=""
+    if [ "$R2_COLD" -gt 0 ]; then
+      COLD_NOTE="；已剔除冷启动工程 ${R2_COLD} 次（${R2_COLD_PROJ}）"
+    fi
+    if [ "$HIT_RATE" -ge 30 ]; then
+      add R2 PASS "检索命中率 ${HIT_RATE}%" "有效样本 ${R2_N} 次，空 ${R2_EMPTY} 次${COLD_NOTE}"
+    elif [ "$HIT_RATE" -ge 10 ]; then
+      add R2 WARN "检索命中率偏低 ${HIT_RATE}%" "有效样本 ${R2_N} 次，空 ${R2_EMPTY} 次${COLD_NOTE}；该工程库内 ≥20 条仍大量空命中，考虑补记忆或查同义词表"
+    else
+      add R2 FAIL "检索基本不命中 ${HIT_RATE}%" "有效样本 ${R2_N} 次，空 ${R2_EMPTY} 次${COLD_NOTE}；检查中文分词与 FTS 索引"
+    fi
   fi
 else
   add R2 INFO "窗口内无提问" "窗口内没有 prompt-submit 事件，无法评估命中率"
@@ -335,18 +392,54 @@ else
 fi
 
 # R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤。
-# 检测式与旧版 grep '\{"(id|parentId|callId|type)"' 等价，只是改读 JSON 的 content 字段。
-NOISE=$(printf '%s' "$CAND_PENDING" | jq -r '
-  [.[] | select((.content // "") | test("\\{\"(id|parentId|callId|type)\""))] | length' 2>/dev/null || echo 0)
-NOISE=${NOISE:-0}
+# 检测式有两种形态，缺一不可：
+#   - transcript 原始 JSON：{"id"…} / {"type"…}（旧版 grep 口径，保持等价）；
+#   - 工具调用载荷的文本形态：「Grep {」「Shell {」等工具名 + 对象字面量开头。
+#     2026-11-15 发现本机 2 条 11-02 存量候选（`Shell {"command"…` / `Grep {"pattern"…`）
+#     只有后一种形态，旧检测式判 PASS，属漏判——载荷残留正是 R9 要拦的东西。
+#
+# 新鲜度：R9 统计的是**全部 pending**，不按 created_at 切片（存量残留不清就一直计数）。
+# 只报条数会把 14 天前的存量说成「单窗口内产生」，把历史遗留误诊成「过滤刚失效」，
+# 诱导去改本来正常的准入逻辑。故把命中集拆成「窗口内新增 / 存量」两段报出来：
+# 窗口内新增 >0 才能断言过滤失效；全为存量时只说清理，不提过滤。
+NOISE_STAT=$(printf '%s' "$CAND_PENDING" | jq -r --argjson cut "$CUTOFF" --argjson now "$NOW" '
+  [ .[] | (.content // "") as $c
+       | select(($c | test("\\{\"(id|parentId|callId|type)\""))
+                or ($c | test("^\\s*(Grep|Shell|Read|Bash|Edit|Write|Glob|WebFetch|TodoWrite|MultiEdit)\\s*\\{")))
+       | (.created_at // 0) ] as $ts
+  | if ($ts | length) == 0 then "0 0 -1"
+    else "\($ts | length) \([$ts[] | select(. > $cut)] | length) "
+         + "\(((($now - ([$ts[] | select(. > 0)] | min // $now)) / 86400) | floor))"
+    end' 2>/dev/null || echo "0 0 -1")
+read -r NOISE NOISE_FRESH NOISE_AGE <<<"${NOISE_STAT:-0 0 -1}"
+case "$NOISE" in ''|*[!0-9]*) NOISE=0 ;; esac
+case "$NOISE_FRESH" in ''|*[!0-9]*) NOISE_FRESH=0 ;; esac
+case "$NOISE_AGE" in ''|*[!0-9-]*) NOISE_AGE=-1 ;; esac
+NOISE_OLD=$(( NOISE - NOISE_FRESH ))
+if [ "$NOISE_AGE" -lt 0 ]; then
+  NOISE_AGE_TXT="创建时间不可读"
+elif [ "$NOISE_AGE" -eq 0 ]; then
+  NOISE_AGE_TXT="最早为今日"
+else
+  NOISE_AGE_TXT="最早 ${NOISE_AGE} 天前"
+fi
+NOISE_OLD_TXT=""
+if [ "$NOISE_OLD" -gt 0 ]; then NOISE_OLD_TXT="（另有存量 ${NOISE_OLD} 条，${NOISE_AGE_TXT}）"; fi
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
   add R9 WARN "候选内容未校验" "pending 内容未读取；按 WARN 观察"
 elif [ "$NOISE" -eq 0 ]; then
-  add R9 PASS "候选内容无载荷残留" "pending ${CAND} 条，未发现 transcript 原始 JSON"
+  add R9 PASS "候选内容无载荷残留" "pending ${CAND} 条，未发现 transcript JSON 或工具载荷"
+elif [ "$NOISE_FRESH" -gt 0 ]; then
+  # 窗口内确有新增：这才是「蒸馏输入没按 proposalEligible 过滤」的证据。
+  if [ "$NOISE" -le 3 ]; then
+    add R9 WARN "候选含载荷残留 ${NOISE} 条" "窗口内新增 ${NOISE_FRESH} 条${NOISE_OLD_TXT}；用 mem reject 清理并核查 distill 输入过滤"
+  else
+    add R9 FAIL "候选含载荷残留 ${NOISE} 条" "窗口内新增 ${NOISE_FRESH} 条${NOISE_OLD_TXT}，蒸馏输入未过滤 pointer 观测；先修准入，再逐条 mem reject"
+  fi
 elif [ "$NOISE" -le 3 ]; then
-  add R9 WARN "候选含载荷残留 ${NOISE} 条" "单窗口内产生，用 mem reject 清理并核查 distill 输入过滤"
+  add R9 WARN "候选含载荷残留 ${NOISE} 条" "全为存量（${NOISE_AGE_TXT}），非本窗口新增；用 mem reject 清理即可，过滤逻辑暂无失效证据"
 else
-  add R9 FAIL "候选含载荷残留 ${NOISE} 条" "蒸馏输入未过滤 pointer 观测；先修准入，再逐条 mem reject"
+  add R9 FAIL "候选含载荷残留 ${NOISE} 条" "全为存量（${NOISE_AGE_TXT}），非本窗口新增；先逐条 mem reject，再复查是否仍有新增"
 fi
 
 # R10 写侧延迟：stop 与 obs-append 共用同一个 Stop 计时器，只取 stop 避免双计。

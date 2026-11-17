@@ -140,6 +140,12 @@ func cmdHook(args []string) error {
 		}
 	}
 
+	// 用户原话是记忆的主来源（mem0 USER_MEMORY_EXTRACTION_PROMPT 的硬约束）。
+	// UserPromptSubmit 仍是读路径，这里只顺带落一条证据，不改变注入行为。
+	if event == harness.EventPromptSubmit {
+		appendUserPromptFailOpen(c, *harnessFlag, project, in, *noScrub)
+	}
+
 	if isObserveHook(event) {
 		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started, *noScrub)
 		if observeEventMayDistill(event) {
