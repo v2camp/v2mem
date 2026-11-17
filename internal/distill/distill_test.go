@@ -126,12 +126,50 @@ func TestExtractRulesAssistantSourceGate(t *testing.T) {
 			summary: "Grep {\"pattern\":\"失败\"}",
 			want:    0,
 		},
+		{
+			// 真实漏网（obs ev_2b5a1 → cand 23ef4adc，2026-11-17 13:08 蒸馏：
+			// 该轮唯一一条 assistant 候选，是「讨论判据的句子」本身被当成判据的产物。
+			name: "助手复述判据原文挡掉", event: "stop",
+			summary: "这个失败用例暴露了一处真实取舍：`决策：…` 这类结构化声明本身就可复用，" +
+				"不该依赖「必须/不要」等词。我加了一条结构化声明判据。",
+			want: 0,
+		},
+		{
+			// 判据的判定对象是引号外的叙述；引号内的词是「被引用的字面」，
+			// 不该反过来把结论判成过程叙述。
+			name: "引号内的过程词不阻断结论", event: "stop",
+			summary: "决策：候选必须带 `已完成` 字样才算数",
+			want:    1,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			facts := ExtractRules([]Observation{{ID: "x", Event: c.event, Summary: c.summary}})
 			if len(facts) != c.want {
 				t.Fatalf("len(facts) = %d, want %d (%+v)", len(facts), c.want, facts)
+			}
+		})
+	}
+}
+
+// TestUnquotedStripsQuotedSpans 覆盖引号剥除本身：只剥成对定界符，半个引号不吞句。
+func TestUnquotedStripsQuotedSpans(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"行内代码", "必须带 `已完成` 字样", "必须带   字样"},
+		{"围栏代码块", "看这段：\n```\nrm -rf /\n```\n以后别这么干", "看这段：\n \n以后别这么干"},
+		{"中文直角引号", "不该依赖「必须/不要」等词", "不该依赖 等词"},
+		{"英文双引号", `日志里说 "no error" 但进程挂了`, "日志里说   但进程挂了"},
+		{"半个反引号不吞句", "这个 ` 后面还有结论要说", "这个 ` 后面还有结论要说"},
+		{"没有引号原样返回", "根因是分词器没建", "根因是分词器没建"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := unquoted(c.in); got != c.want {
+				t.Fatalf("unquoted(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}

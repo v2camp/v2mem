@@ -463,10 +463,38 @@ func ExtractRules(obs []Observation) []Fact {
 // 决定「不整体排除助手」时要保住的那部分。
 // 代价是漏掉不带这些标记的助手结论，这条取舍已知，见该文档 §5。
 func assistantDurable(s string) bool {
+	s = unquoted(s)
 	if progressRe.MatchString(s) {
 		return false
 	}
 	return durableRe.MatchString(s) || declarationRe.MatchString(s)
+}
+
+// quoteSpans 是「引用片段」的成对定界符：围栏代码块、行内代码、中文直角/双引号、英文双引号。
+// 引号里的是被引述的字面（命令、字段名、报错原文），不是叙述者自己的断言。
+var quoteSpans = []*regexp.Regexp{
+	regexp.MustCompile("(?s)```.*?```"),
+	regexp.MustCompile("`[^`]*`"),
+	regexp.MustCompile("「[^」]*」"),
+	regexp.MustCompile("『[^』]*』"),
+	regexp.MustCompile("“[^”]*”"),
+	regexp.MustCompile(`"[^"\n]*"`),
+}
+
+// unquoted 把引用片段替换成空格，只留叙述者自己的表述。
+//
+// 起因（2026-11-17 13:08 蒸馏）：一条**讨论判据本身**的助手正文
+// 「`决策：…` 这类结构化声明本身就可复用，不该依赖「必须/不要」等词」
+// 因为引号里带了「必须/不要」而通过 assistantDurable，成了该轮唯一一条 assistant 候选——
+// 判据被自己的引用文本满足，属于自证。反向的错也在：真正的结论如果写成
+// 「决策：候选必须带 `已完成` 字样」，引号里的过程词又会把结论判成过程叙述。
+//
+// 只剥成对定界符：不成对的半个引号原样保留，避免「一个反引号吞掉整句」。
+func unquoted(s string) string {
+	for _, re := range quoteSpans {
+		s = re.ReplaceAllString(s, " ")
+	}
+	return s
 }
 
 // matchKind 返回首个「非否定语境」命中的 kind。
