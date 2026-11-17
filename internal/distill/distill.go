@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -138,6 +139,135 @@ var kindRes = []struct {
 	{"preference", regexp.MustCompile(`偏好|默认|禁用|优先用|不要用`)},
 	{"task", regexp.MustCompile(`待办|还剩|下次|做到哪|(?i)\bTODO\b`)},
 }
+
+// progressRe 命中表示「过程性叙述」：一次性的进度、状态、完成汇报，会话一结束就失效。
+// 这类内容进候选只会抬高裁决成本——它是 R9 噪音里篇幅最大的一类（18 条同一任务的
+// 「已完成 52/65」「65/65 全部完成」）。
+var progressRe = regexp.MustCompile(`(?i)进度|已完成|全部完成|已经完成|校验通过|已落盘|已生成|已合并|已提交|已修复|已通过|已加上|已处理|已更新|本轮|本次|当前状态|正常退出|无异常|剩余|还剩|进行中|改动[:：]|\bDONE\b|\d+\s*/\s*\d+`)
+
+// durableRe 命中表示「可复用结论」：因果、规则、教训，换一个会话仍然成立。
+// 只有这类 assistant 正文才值得进候选（对齐 mem0 的 additive extraction：
+// 助手只贡献用户没说过的新增信息，而「新增信息」的可机器判定形态就是这类断言）。
+var durableRe = regexp.MustCompile(`根因|原因|之所以|教训|规律|凡是|以后|下次|必须|不要|应该|应当|避免|注意`)
+
+// declarationRe 认「决策：X」这类**结构化声明**。它不依赖 必须/不要 等词就已是
+// 可复用结论，但只认行首或句读之后的冒号形态——口语化的「决定先跑一遍测试」不算。
+var declarationRe = regexp.MustCompile(`(?:^|[\s，。；])决策[:：]`)
+
+// negationWindow 是判定否定语境时前后各看多少个字符。
+const negationWindow = 12
+
+// negTokens 是出现在关键词**紧邻前方**的否定词。
+// 不含裸「不」：「不过」「不仅」会把真踩坑误判成否定。
+var negTokens = []string{"无", "没有", "没", "未", "非", "从未", "零", "不是", "不会", "不再", "一次也没有"}
+
+// negatedMatch 判断某次关键词命中是否处于否定语境。
+//
+// 起因（2026-11-17）：18 条候选全部靠否定句命中 pitfall——「日志无 `FAIL`/`ERROR`」
+// 「一次也没有**失败**」「失败：0 个」。它们说的是「一切正常」，却被 kindRes 当成
+// 踩坑记录。判定层不看语境，是这类噪音的直接根因，因此在命中点做前置判断。
+func negatedMatch(s string, start, end int) bool {
+	return negatedBefore(s[:start]) || negatedAfter(s[end:])
+}
+
+// englishNegRe 认英文否定：「no errors found」「0 failures」。
+var englishNegRe = regexp.MustCompile(`(?i)(?:^|[^a-z])(?:no|not|zero|without)\s+$`)
+
+// negatedBefore 看关键词之前是否紧跟否定词或「0 个」这类计数零。
+//
+// 先把尾部非汉字剥掉再判：枚举式列举（「无 `FAIL`/`ERROR`」）的否定词只出现一次，
+// 后面的英文/数字项挡在中间；同样也让「2026-11-10 报错」这类日期不会被当成计数零。
+func negatedBefore(prefix string) bool {
+	r := []rune(prefix)
+	if len(r) == 0 {
+		return false
+	}
+	if len(r) > negationWindow {
+		r = r[len(r)-negationWindow:]
+	}
+	window := string(r)
+	if englishNegRe.MatchString(window) {
+		return true
+	}
+	t := trimEnumeration(window)
+	if t == "" {
+		return false
+	}
+	for _, tok := range negTokens {
+		if strings.HasSuffix(t, tok) {
+			return true
+		}
+	}
+	return endsWithZeroCount(t)
+}
+
+// cjkPunct 是「小句边界」。中文逗号/分号之后换了语义，否定不再向左传递；
+// 顿号与斜杠是枚举连接，允许继续回看。
+const cjkPunct = "，。；：！？（）【】「」『』《》〈〉…·"
+
+// trimEnumeration 剥掉尾部的英文/数字/半角符号（枚举项），遇到汉字或小句边界就停。
+// 这样「无 `FAIL`/`ERROR`」能回看到「无」，而「日志无 FAIL，决策是…」不会误判。
+func trimEnumeration(s string) string {
+	return strings.TrimRightFunc(s, func(x rune) bool {
+		if unicode.Is(unicode.Han, x) || strings.ContainsRune(cjkPunct, x) {
+			return false
+		}
+		return true
+	})
+}
+
+// endsWithZeroCount 判断文本是否以「0」或「0 个」这类计数零结尾。
+// 排除 10、-0、11/0 这类非计数零（日期、比值）。
+func endsWithZeroCount(t string) bool {
+	for _, unit := range []string{"个", "条", "次", "处", "份"} {
+		if strings.HasSuffix(t, unit) {
+			t = strings.TrimRight(strings.TrimSuffix(t, unit), " ")
+			break
+		}
+	}
+	r := []rune(t)
+	if len(r) == 0 || (r[len(r)-1] != '0' && r[len(r)-1] != '０') {
+		return false
+	}
+	if len(r) == 1 {
+		return true
+	}
+	prev := r[len(r)-2]
+	return !unicode.IsDigit(prev) && prev != '-' && prev != '/' && prev != ':'
+}
+
+// negatedAfter 看关键词之后是否紧跟「：0」「均为 0」这类「没有发生」的表述。
+func negatedAfter(suffix string) bool {
+	r := []rune(suffix)
+	if len(r) > negationWindow {
+		r = r[:negationWindow]
+	}
+	t := strings.TrimLeftFunc(string(r), func(x rune) bool { return !isWordish(x) })
+	for _, lead := range []string{"均为", "为"} {
+		if strings.HasPrefix(t, lead) {
+			t = strings.TrimLeft(strings.TrimPrefix(t, lead), " ")
+			break
+		}
+	}
+	r = []rune(t)
+	if len(r) == 0 {
+		return false
+	}
+	switch r[0] {
+	case '0', '０':
+		// 「0x8007…」是错误码不是计数零。
+		return len(r) == 1 || (r[1] != 'x' && r[1] != 'X')
+	case '零':
+		// 「零常驻」是实义词，只有「零 / 零个 / 零次」才是计数零。
+		return len(r) == 1 || strings.ContainsRune("个条次处份项", r[1])
+	case '无':
+		// 「无法」「无需」是实义词，只有独立成词的「无」才是否定。
+		return len(r) == 1
+	}
+	return false
+}
+
+func isWordish(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
 
 // WindowKey 由观测 id 集合决定。同一集合不重复蒸馏。
 func WindowKey(ids []string) string {
@@ -287,6 +417,7 @@ func ollamaAlive(parent time.Duration) bool {
 // 分源约束（对齐 mem0 的 USER/AGENT 双提示词）：
 //   - 工具载荷 / 未解析行不产事实（它们不是事实陈述，R9 的噪音根因）；
 //   - preference 只从用户原话产，助手不该替用户定义偏好；
+//   - assistant 需通过 assistantDurable 的「可复用结论」判据才产事实（见该函数）；
 //   - 每条事实带 attributed_to，供裁决时看出「谁说的」。
 func ExtractRules(obs []Observation) []Fact {
 	var out []Fact
@@ -298,6 +429,9 @@ func ExtractRules(obs []Observation) []Fact {
 		}
 		speaker := SpeakerForEvent(o.Event)
 		if speaker == "" {
+			continue
+		}
+		if speaker == "assistant" && !assistantDurable(summary) {
 			continue
 		}
 		kind := matchKind(summary)
@@ -318,13 +452,62 @@ func ExtractRules(obs []Observation) []Fact {
 	return out
 }
 
+// assistantDurable 判断 assistant 观测能否作为候选来源。
+//
+// 默认**不能**：assistant 正文的主体是过程叙述——进度汇报、巡检报告、「已修复…」的
+// 收尾确认。这些内容一次为真、会话结束即失效，进候选只会抬高裁决成本，实测 45 条
+// pending 里 35 条来自这一类（2026-11-17 巡检：其中 1 条是巡检报告本身，属自我喂养）。
+//
+// 放行条件取「可复用结论（含结构化声明）且不含过程性标记」：根因、教训、必须/不要
+// 这类规则断言，以及「决策：X」的声明形态，正是 docs/design-speaker-attribution.md §3
+// 决定「不整体排除助手」时要保住的那部分。
+// 代价是漏掉不带这些标记的助手结论，这条取舍已知，见该文档 §5。
+func assistantDurable(s string) bool {
+	if progressRe.MatchString(s) {
+		return false
+	}
+	return durableRe.MatchString(s) || declarationRe.MatchString(s)
+}
+
+// matchKind 返回首个「非否定语境」命中的 kind。
+//
+// 第一处命中被否定时继续找下一个 kind，而不是整条丢弃：
+// 「日志无 FAIL，决策是继续跑」应当落 decision，而不是因为没有踩坑就一并跳过。
+//
+// 枚举式列举（「无 FAIL/ERROR/Traceback」）里，否定词只出现在第一个关键词前面，
+// 后续关键词靠分隔符连缀；因此上一处被否定的命中会沿分隔符向后传递。
 func matchKind(summary string) string {
 	for _, k := range kindRes {
-		if k.re.MatchString(summary) {
-			return k.kind
+		negated := false
+		prevEnd := -1
+		for _, loc := range k.re.FindAllStringIndex(summary, -1) {
+			if prevEnd >= 0 && !onlySeparators(summary[prevEnd:loc[0]]) {
+				negated = false
+			}
+			if !negated && negatedMatch(summary, loc[0], loc[1]) {
+				negated = true
+			}
+			if !negated {
+				return k.kind
+			}
+			prevEnd = loc[1]
 		}
 	}
 	return ""
+}
+
+// onlySeparators 判断两处命中之间是否只有枚举连接（`无 FAIL/ERROR/Traceback`、`A|B`、`A、B`）。
+// 允许英文与数字：枚举项本身可能就是 `FAIL`、`timeout`、`5xx` 这类拉丁串。
+// 只要出现中文等其它字符，就认为换了语义，否定不再向后传递。
+func onlySeparators(s string) bool {
+	for _, r := range s {
+		if strings.ContainsRune(" \t/|、,，;；*`\"'()（）[]_", r) ||
+			unicode.Is(unicode.Latin, r) || unicode.IsDigit(r) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func oneLine(s string) string {
