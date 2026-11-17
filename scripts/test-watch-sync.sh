@@ -56,4 +56,10 @@ grep -q 'A_INJ_MAX" -le 3600' "$SCRIPT" || fail "脚本 R13 的 PASS 线不是 �
 grep -q 'A_INJ_MAX" -gt 8000' "$SCRIPT" || fail "脚本 R13 的 FAIL 线不是 >8000"
 grep -q 'A_INJ_N" -eq 0'      "$SCRIPT" || fail "脚本 R13 缺无样本分支"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；枚举到 R${max_r}"
+# ⑥ §5 处置表必须给 R3 一行。实证：2026-11-17 R3 首次判 FAIL 时，§5 只有 R1/R2/R7/R6/R8/R9/
+# R10/R11/R12/R13/R14 与 I 组，R3 无对应动作可引用。只守 R3——R4/R5 本就无需处置行，不能一刀切。
+if ! sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -qE '^\| R3 '; then
+  fail "§5 缺 R3 处置行（R3 FAIL 时会无动作可引用）"
+fi
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；枚举到 R${max_r}"

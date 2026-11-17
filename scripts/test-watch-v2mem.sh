@@ -278,7 +278,9 @@ assert_r2 r2_legacy_no_proj   "$(plines '' 4 4)"                     ''         
 assert_case r8_read_fail       100 0 no 'not-json' PASS PASS WARN WARN
 
 # R12 边界：无样本 INFO / 有蒸馏且 0 失败 PASS / 断链 WARN / 失败 1–3 WARN / >3 FAIL。
-assert_r12 r12_no_sample        no  '' '' INFO
+# 无样本也要复述四段计数（观测/蒸馏分流/合法空/失败/裁决）：INFO 不比别的级别少信息，
+# 2026-11-15 起连续四个窗口的 INFO 分支都丢了 D12，靠人工发现。
+assert_r12 r12_no_sample        no  '' '' INFO '观测 0'
 assert_r12 r12_pass_rules       yes "$(dline distill ok false)$(dline distill empty false)" "$(activity_json '本次任务有沉淀')" PASS '蒸馏 2'
 assert_r12 r12_broken_chain     yes '' '' WARN 'MEM_DISTILL_SPAWN'
 assert_r12 r12_fail_1           yes "$(dline distill fail true)" '' WARN

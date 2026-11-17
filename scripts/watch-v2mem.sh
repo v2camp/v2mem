@@ -480,7 +480,7 @@ A_DISTILL_RULES=$(( A_DISTILL - A_DISTILL_PROPOSAL ))
 D12="观测 ${A_OBS} / 蒸馏 ${A_DISTILL}（proposal ${A_DISTILL_PROPOSAL} · rules ${A_DISTILL_RULES}） / 合法空 ${A_DISTILL_EMPTY} / 失败 ${A_DISTILL_FAIL} / 裁决 accept ${A_DECIDE_A} reject ${A_DECIDE_R}"
 if [ -n "$ACT_VERDICT" ]; then D12="${D12}；结论: ${ACT_VERDICT}"; fi
 if [ "$A_OBS" -eq 0 ]; then
-  add R12 INFO "无观测样本" "窗口内无 obs-append，无法评估写侧决策链路（无样本，非冷启动降级）"
+  add R12 INFO "无观测样本" "窗口内无 obs-append，无法评估写侧决策链路（无样本，非冷启动降级）；${D12}"
 elif [ "$A_DISTILL_FAIL" -gt 3 ]; then
   add R12 FAIL "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；按 §5 R12 查 distill_runs 的 error 与 attempt，不要重跑 distill 掩盖"
 elif [ "$A_DISTILL" -eq 0 ]; then
