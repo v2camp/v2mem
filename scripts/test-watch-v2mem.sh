@@ -13,6 +13,11 @@ trap 'rm -rf "$TMP"' EXIT
 NOW="$(date +%s)"
 N=0
 
+# R13 默认关掉自动过期：本测试整体保持只读，只有 R13 组显式打开。
+R13_FLAGS="--no-gc"
+GC_LOG="$TMP/gc-calls.log"
+: > "$GC_LOG"
+
 # cand_json <project> <n> [content] [created_at]：造 n 条 pending 候选。
 # content 可塞 transcript 载荷用于 R9；默认是可读的原子事实。
 # created_at 默认取 NOW（窗口内），传更早的时间戳即「存量」。
@@ -40,8 +45,15 @@ case "${1:-}" in
     echo "总条数 ${STUB_TOTAL:-10}"
     if [ -n "${STUB_PROJ_STATS:-}" ]; then printf '按工程   %s\n' "$STUB_PROJ_STATS"; fi
     ;;
-  candidates) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
+  candidates)
+    # R13 要用 --status accepted 单独查已采纳行（判断是否有 90 天前待删行）。
+    case " $* " in
+      *" --status accepted "*) printf '%s\n' "${STUB_ACC_JSON:-[]}" ;;
+      *) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
+    esac
+    ;;
   eval) printf '%s\n' "${STUB_ACTIVITY_JSON:-}" ;;
+  gc) printf 'gc\n' >> "${STUB_GC_LOG:-/dev/null}" ;;
 esac
 exit 0
 STUB
@@ -84,10 +96,12 @@ SETTINGS
   HOME="$d/home" \
   MEM_BIN="$d/mem-stub" \
   STUB_CAND_JSON="$cands" \
+  STUB_ACC_JSON="${STUB_ACC_JSON:-[]}" \
   STUB_ACTIVITY_JSON="$activity" \
   STUB_PROJ_STATS="$proj_stats" \
   STUB_TOTAL="$total" \
-    bash "$WATCH" --json 2>/dev/null || true
+  STUB_GC_LOG="$GC_LOG" \
+    bash "$WATCH" --json $R13_FLAGS 2>/dev/null || true
 }
 
 # assert_case <名称> <stop_ms|none> <wal_frames> <obs> <cands> <R10> <R11> [R8] [R9]
@@ -205,6 +219,55 @@ assert_r9_detail r9_mixed_counts_fresh \
   "窗口内新增 1 条（另有存量 2 条"
 # >3 且全为存量：判 FAIL，但结论落在「先清理、再复查」，不诬指准入逻辑。
 assert_r9_detail r9_legacy_fail "$(cand_json A 4 'Shell {"command":"ls"}' "$OLD")" "全为存量（最早 14 天前），非本窗口新增"
+
+# ---------- R13 候选 TTL 执行 ----------
+# 口径：pending 超 14 天 → WARN 并执行 mem gc --candidates（只做 pending → expired）；
+# 存在 90 天前的已采纳行时转人工不执行（GCCandidates 那一步是 DELETE，不可逆）；
+# --no-gc 只判级不动库。R13 必须排在 R8/R9 之后，故 detail 声明「R8 仍按过期前计数」。
+STALE=$(( NOW - 15*86400 ))      # 越过 14 天阈值
+FRESH_ACC=$(( NOW - 10*86400 ))  # 已采纳但未满 90 天：不触发删除分支
+OLD_ACC=$(( NOW - 100*86400 ))   # 已采纳且超 90 天：必须转人工
+
+assert_r13() { # <名称> <pending_json> <accepted_json> <no_gc 0|1> <want_level> <detail 子串> <gc 次数>
+  local name="$1" cands="$2" acc="$3" nogc="$4" want="$5" needle="$6" want_gc="$7"
+  local out got detail before after calls
+  before="$(wc -l < "$GC_LOG" | tr -d ' ')"
+  if [ "$nogc" -eq 1 ]; then R13_FLAGS="--no-gc"; else R13_FLAGS=""; fi
+  out="$(STUB_ACC_JSON="$acc" run_case "$name" 100 0 no "$cands")"
+  R13_FLAGS="--no-gc"
+  after="$(wc -l < "$GC_LOG" | tr -d ' ')"
+  calls=$(( after - before ))
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R13") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R13") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R13 want=$want got=$got（${detail}）" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R13 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  if [ "$calls" != "$want_gc" ]; then
+    echo "FAIL $name: gc 调用 ${calls} 次，期望 ${want_gc} 次" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R13=%-4s gc=%s\n' "$name" "$got" "$calls"
+}
+
+# 无超期：PASS，且绝不动库。
+assert_r13 r13_no_stale "$(cand_json A 2)" '[]' 0 PASS "无超过 14 天的 pending" 0
+# 有超期：WARN + 执行一次状态迁移。
+assert_r13 r13_stale_gc "$(cand_json A 2 'ok' "$STALE")" '[]' 0 WARN "已执行 mem gc --candidates" 1
+# --no-gc：判级照旧，但不执行（排障与只读复现用）。
+assert_r13 r13_no_gc_flag "$(cand_json A 2 'ok' "$STALE")" '[]' 1 WARN "--no-gc 下不自动过期" 0
+# 有 90 天前已采纳行：DELETE 分支不可逆，转人工，绝不自动执行。
+assert_r13 r13_accepted_guard \
+  "$(cand_json A 2 'ok' "$STALE")" "$(cand_json A 1 'ok' "$OLD_ACC")" 0 WARN "会被连带删除" 0
+# 已采纳但未满 90 天：删除分支不会命中，正常执行迁移。
+assert_r13 r13_accepted_fresh \
+  "$(cand_json A 2 'ok' "$STALE")" "$(cand_json A 1 'ok' "$FRESH_ACC")" 0 WARN "已执行 mem gc --candidates" 1
 
 # R2 按工程口径：只有「该工程库内 ≥20 条」的样本才进命中率分母。
 # 旧实现用全局 empty/A_PROMPT 算，窗口内提问全落在空库工程上时会稳定误判 FAIL。

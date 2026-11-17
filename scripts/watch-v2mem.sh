@@ -9,13 +9,16 @@
 #   scripts/watch-v2mem.sh --window 24h
 #   scripts/watch-v2mem.sh --json          # 机器可读
 #   scripts/watch-v2mem.sh --quiet         # 只输出非 PASS 项
+#   scripts/watch-v2mem.sh --no-gc         # 不执行 R13 的候选过期，只判级
 #
 # 只读：不写库、不改配置。唯一的写入是 ~/.v2mem/watch-state.json 的基线快照。
+# 唯一例外是 R13：候选超期时执行 `mem gc --candidates` 做 pending → expired 的状态迁移
+# （行仍在库、不删 memories）；存在待删的已采纳行时转人工，不执行。`--no-gc` 可关掉。
 # R3 只统计读侧 hook（prompt-submit / session-start）的 ms；写侧 stop / obs-append
 # 共用同一个 Stop 计时器，计入会污染「检索延迟」，详见 docs/ops-watch.md §3。
 # R10 给这部分写侧耗时独立判级（只取 stop，避免与 obs-append 双计）；R11 只读
 # mem.db-wal 的文件大小，绝不修改或删除 -wal。R12 诊断写侧自动决策链路，只读
-# audit.jsonl 与 mem eval activity --json，不调用 distill/accept/reject/gc。
+# audit.jsonl 与 mem eval activity --json，不调用 distill/accept/reject（gc 由 R13 负责）。
 # 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
@@ -27,13 +30,15 @@ WB_DIR="${WORKBUDDY_CONFIG_DIR:-$HOME/.workbuddy}"
 WINDOW="12h"
 JSON_OUT=0
 QUIET=0
+GC_DISABLED=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --window) WINDOW="${2:-12h}"; shift 2 ;;
     --json)   JSON_OUT=1; shift ;;
     --quiet)  QUIET=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-gc)  GC_DISABLED=1; shift ;;
+    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -338,7 +343,7 @@ fi
 # 按 project 分组，窗口值取各工程计数的**最大值**（阈值 5/15 不变）：
 # 跨工程候选不相加——别的项目候选留给它们自己的会话就近裁决，
 # 全局累加会把合法产物误诊成脏数据。见 docs/ops-watch.md §3 R8 / design-write-governance.md §12。
-CAND_JSON=$( "$MEM_BIN" candidates ls --json --limit 100000 2>/dev/null )
+CAND_JSON=$( "$MEM_BIN" candidates ls --json --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null )
 if printf '%s' "$CAND_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
   CAND_READ_FAIL=0
 else
@@ -464,6 +469,48 @@ elif [ "$A_DISTILL_FAIL" -ge 1 ]; then
   add R12 WARN "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；查 distill_runs 的 error 与 evidence_bundles 是否 backlog"
 else
   add R12 PASS "写侧决策链路推进" "${D12}"
+fi
+
+# R13 候选 TTL 执行：pending 超过 14 天仍未转 expired，说明过期机制从来没被跑过。
+# 为什么需要单独一条判据：GCCandidates 在代码里写死 14 天 TTL（`internal/store/candidates.go`），
+# 但唯一执行者是手工 `mem gc --candidates`。2026-11-17 实测本机 2 条 11-02 候选已超期
+# 14.8 天仍是 pending，crontab / LaunchAgents 均无调度——TTL 存在却形同虚设，
+# 后果是 pending 只增不减、R8 长期 FAIL，且这个失效是**静默的**（不报错，只是永远不生效）。
+#
+# 自主边界（重要）：只执行「状态迁移」pending → expired——行仍在库、`--status expired` 可查、
+# 不删 memories、不影响 R6。不执行「行删除」：GCCandidates 还带一条 DELETE（删 90 天以上的
+# accepted 行），所以先查是否存在待删的已采纳行，**有就不执行**，转人工——
+# 删除不可逆，属 design-write-governance.md §12.5 明确要人判的那一类。
+#
+# 顺序要求：R13 必须排在 R8/R9 之后。R8 反映的是过期前的真实积压，先采集再处置，
+# 否则会把自己刚清空的结果当成「没有积压」。
+TTL_DAYS=14
+TTL_ACCEPTED_DAYS=90
+STALE_PENDING=$(printf '%s' "$CAND_PENDING" | jq -r --argjson now "$NOW" --argjson ttl $(( TTL_DAYS * 86400 )) '
+  [ .[] | select(($now - (.created_at // 0)) > $ttl) ] | length' 2>/dev/null || echo 0)
+case "$STALE_PENDING" in ''|*[!0-9]*) STALE_PENDING=0 ;; esac
+
+if [ "$CAND_READ_FAIL" -eq 1 ]; then
+  add R13 WARN "候选 TTL 未核查" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
+elif [ "$STALE_PENDING" -eq 0 ]; then
+  add R13 PASS "候选 TTL 无超期" "无超过 ${TTL_DAYS} 天的 pending（与 GCCandidates 默认阈值同源）"
+elif [ "$GC_DISABLED" -eq 1 ]; then
+  add R13 WARN "候选超期 ${STALE_PENDING} 条" "已超 ${TTL_DAYS} 天仍 pending；--no-gc 下不自动过期，按 §5 手工执行 mem gc --candidates"
+else
+  ACC_JSON=$( "$MEM_BIN" candidates ls --json --status accepted --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null || echo '[]' )
+  ACC_OLD=0
+  if printf '%s' "$ACC_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    ACC_OLD=$(printf '%s' "$ACC_JSON" | jq -r --argjson now "$NOW" --argjson ttl $(( TTL_ACCEPTED_DAYS * 86400 )) '
+      [ .[] | select(($now - (.created_at // 0)) > $ttl) ] | length' 2>/dev/null || echo 0)
+  fi
+  case "$ACC_OLD" in ''|*[!0-9]*) ACC_OLD=0 ;; esac
+  if [ "$ACC_OLD" -gt 0 ]; then
+    add R13 WARN "候选超期 ${STALE_PENDING} 条·未执行" "另有 ${ACC_OLD} 条 ${TTL_ACCEPTED_DAYS} 天前的已采纳行会被连带删除（不可逆），故不自动执行；确认后跑 mem gc --candidates"
+  elif GC_OUT=$( "$MEM_BIN" gc --candidates -db "$V2MEM_DIR/mem.db" 2>&1 ); then
+    add R13 WARN "候选超期已过期 ${STALE_PENDING} 条" "已执行 mem gc --candidates（pending → expired，行仍在库，--status expired 可查，未动 memories）；R8 本窗口仍按过期前计数"
+  else
+    add R13 WARN "候选过期执行失败" "${GC_OUT:-mem gc --candidates 无输出}；按 §5 手工执行并查库权限与磁盘"
+  fi
 fi
 
 # ---------- 输出 ----------

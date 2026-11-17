@@ -91,6 +91,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
 | **R11** | WAL 堆积 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0） | ≤1000 帧 | 1001–2000 | >2000 |
 | **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `source` 分流）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
+| **R13** | 候选 TTL 执行 | `mem candidates ls --json` 中 `created_at` 超过 **14 天**的 pending 条数；超期时执行 `mem gc --candidates` 做 pending → expired（存在 90 天前的已采纳行时**不执行**，转人工） | 0 条超期 | 有超期（已自动过期，或转人工未执行） | — |
 
 阈值依据（不凭空定）：
 
@@ -176,6 +177,25 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   - **采集只读**：`audit.jsonl` + `mem eval activity --json`（`cmdEvalActivity` 不开库），
     不执行 `mem distill` / `accept` / `reject` / `gc`。`distill_runs` 的 `status` / `error` /
     `attempt` 与 `evidence_bundles` 积压留作 §5 的深挖命令，不进脚本采集，避免引入 sqlite 依赖。
+    （R13 的 `gc --candidates` 是**唯一例外**，且只做状态迁移，见下条。）
+- **R13 的 14 天与「单侧自主」（2026-11-17 新增）**：TTL 阈值不是新定的，是照抄
+  `GCCandidates` 的默认值（`internal/store/candidates.go:380`，`cmd/mem/main.go:849`
+  传入 `14*24h` / `90*24h`）。加这条判据的原因是**机制存在但没人执行**：
+  2026-11-17 实测本机 2 条 11-02 候选已超期 14.8 天仍是 `pending`，`crontab` 与
+  `LaunchAgents` 均无调度，而 `mem gc --candidates` 只有手工入口——TTL 形同虚设，
+  且失效是**静默的**（不报错，只是永不生效），表现为 pending 只增不减、R8 长期 FAIL。
+  - 为什么不在 hook 里做：`design-write-governance.md` §12.5 已否决「挂 `SessionStart`
+    自动过期」——撞 §5 hooks 只读护栏、污染 R3 读侧延迟口径、且用户看不见。
+    巡检是宿主侧运维动作（§6），不在这三条理由的适用范围内，故只在此处落地。
+  - **只做状态迁移，不做行删除**：`pending → expired` 行仍在库、`--status expired` 可查、
+    不删 `memories`、不影响 R6。`GCCandidates` 还含一条「删 90 天以上 accepted 行」的
+    `DELETE`，不可逆，属 §12.5 要人判的那一类：脚本先查是否存在待删的已采纳行，
+    **有就不执行**，只报 `WARN` 并给出命令。
+  - 判级无 `FAIL` 档：自动过期后即自愈，下一窗口回 `PASS`；`WARN` 的含义是「本窗口发生了
+    过期处置」或「该处置被转人工」，都需要人知道一次。
+  - **顺序约束**：R13 必须排在 R8 / R9 之后。先按过期前的实际状态判积压，再处置，
+    否则会把自己刚清空的结果误读成「本来就没积压」。detail 会注明「R8 本窗口仍按过期前计数」。
+  - `--no-gc` 关掉处置（只判级不动库），供排障与只读复现使用。
 
 ---
 
@@ -214,6 +234,8 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | R11 WAL 帧数越线 | 被动 checkpoint 未跟上 | `sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(TRUNCATE);"` 并记下返回三元组 `(busy,log,checkpointed)`；`busy=1` 说明有长读事务，查各 harness 的 `mem mcp` 连接。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务 |
 | R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
 
+| R13 候选超期 / 转人工 | TTL 从未被执行，或存在待删的已采纳行 | 看 detail 区分两种情形：①「已过期 N 条」= 本轮已执行迁移，无需动作，下个窗口应回 `PASS`；②「未执行」= 有 90 天前的已采纳行会被连带删除，确认后手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`，或先 `mem candidates ls --status accepted` 复核。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
+
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
 ---
@@ -225,6 +247,10 @@ B 工程刚起步」不会被混算成一个 FAIL。
 - 脚本**只读**库与配置，唯一写入是上述快照。`--quiet` 只输出非 PASS 项，`--json` 供机器消费。
   R12 额外调用的 `mem eval activity --json` 只读 `audit.jsonl`（`cmdEvalActivity` 不打开数据库），
   不写审计、不写库；该命令不可用时 R12 仍按审计独立判级。
+- **R13 是「只读」的唯一例外**：候选超期时脚本会执行一次 `mem gc --candidates`（只做
+  `pending → expired`，不删 `memories`；存在待删已采纳行时转人工不执行）。这是有意的：
+  TTL 机制在代码里，执行者若只有「用户记得跑 CLI」，它就永远不会生效。`--no-gc` 可关掉
+  这一步，使脚本回到纯只读。
 - 告警口径：只有 `FAIL` 需要人介入；`WARN` 观察，`INFO` 忽略。
 
 ---
@@ -241,7 +267,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R12） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R13） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |
