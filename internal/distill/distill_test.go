@@ -41,6 +41,117 @@ func TestExtractRulesFromSyntheticObs(t *testing.T) {
 	}
 }
 
+// TestMatchKindSkipsNegatedMatch 覆盖 C（否定语境前置判断）。
+// 用例取自本机实测的 18 条噪音候选原句：它们都是「一切正常」的表述，
+// 只因含「失败 / FAIL」被 kindRes 判成踩坑。
+func TestMatchKindSkipsNegatedMatch(t *testing.T) {
+	cases := []struct {
+		name    string
+		summary string
+		want    string
+	}{
+		{"日志无FAIL", "日志无 `FAIL`/`ERROR`，进程正常退出", ""},
+		{"一次也没有失败", "完整性校验：一次也没有**失败**", ""},
+		{"失败计数零", "校验结果 失败：0 个", ""},
+		{"管道表零", "FAIL | 0（一次也没有失败）", ""},
+		{"均为零", "润色产物 与 原始 差异 FAIL 均为 0", ""},
+		{"长枚举里否定向后传递", "无 timeout/error/panic/exception 失败", ""},
+		{"真踩坑", "报错：fts 把整句汉字当成一个词", "pitfall"},
+		{"否定后回落下一个kind", "日志无 FAIL，决策是继续跑下一批", "decision"},
+		{"日期不是计数零", "2026-11-10 报错：内存溢出", "pitfall"},
+		{"十六进制错误码不是计数零", "报错 0x8007 权限不足", "pitfall"},
+		{"十次不是零次", "失败了 10 次才定位到", "pitfall"},
+		{"无实义词不否定", "报错无法复现，先加日志", "pitfall"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := matchKind(c.summary); got != c.want {
+				t.Errorf("matchKind(%q) = %q, want %q", c.summary, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExtractRulesAssistantSourceGate 覆盖 A（分源准入）：
+// assistant 的进度汇报默认不产候选，可复用结论仍放行，user 来源不受过程性过滤影响。
+func TestExtractRulesAssistantSourceGate(t *testing.T) {
+	cases := []struct {
+		name    string
+		event   string
+		summary string
+		want    int
+	}{
+		{
+			name: "助手进度汇报挡掉", event: "stop",
+			summary: "## Qwen3-ASR 全量重跑进度 **已完成：52 / 65（80%）**",
+			want:    0,
+		},
+		{
+			name: "助手完成汇报挡掉", event: "stop",
+			summary: "全量重跑已完成。**进度**：已完成 65/65 场，日志末尾出现 `DONE`",
+			want:    0,
+		},
+		{
+			name: "助手巡检报告自身不再自我喂养", event: "stop",
+			summary: "巡检已完成，全程只读。健康度：无 P0，采集链路正常",
+			want:    0,
+		},
+		{
+			name: "助手可复用结论保留", event: "stop",
+			summary: "报错根因是 fts5 把整句汉字当一个词，必须显式建 unicode61 分词器",
+			want:    1,
+		},
+		{
+			name: "结论与过程混在一起也挡掉", event: "stop",
+			summary: "根因是分词器没建，已修复并合并",
+			want:    0,
+		},
+		{
+			name: "结构化声明保留", event: "stop",
+			summary: "决策：记忆库放在用户目录，不放代码目录",
+			want:    1,
+		},
+		{
+			name: "口语化的决定不算声明", event: "stop",
+			summary: "决定先跑一遍测试，再合入",
+			want:    0,
+		},
+		{
+			name: "用户原话不看过程性标记", event: "user-prompt",
+			summary: "进度 52/65，报错了 3 次，先别再重跑",
+			want:    1,
+		},
+		{
+			name: "工具载荷不产事实", event: "post-tool-use",
+			summary: "Grep {\"pattern\":\"失败\"}",
+			want:    0,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			facts := ExtractRules([]Observation{{ID: "x", Event: c.event, Summary: c.summary}})
+			if len(facts) != c.want {
+				t.Fatalf("len(facts) = %d, want %d (%+v)", len(facts), c.want, facts)
+			}
+		})
+	}
+}
+
+func TestNegatedHelpers(t *testing.T) {
+	if negatedAfter("：0 个失败") != true {
+		t.Error("「：0」应判为否定")
+	}
+	if negatedAfter("：2 次") {
+		t.Error("「：2 次」不是否定")
+	}
+	if negatedBefore("日志无 ") != true {
+		t.Error("「无」应判为否定")
+	}
+	if negatedBefore("2026-11-10 ") {
+		t.Error("日期末尾的 0 不是计数零")
+	}
+}
+
 func TestRunProviderNone(t *testing.T) {
 	out := Run([]Observation{{ID: "1", Summary: "决定：钩子不写 memories"}}, Options{Provider: "none"})
 	if out.Status != "ok" || out.Provider != "none" || len(out.Facts) != 1 {
