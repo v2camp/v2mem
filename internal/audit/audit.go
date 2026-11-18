@@ -60,21 +60,26 @@ type Record struct {
 	// Failed 是本次批量操作中未能落库的条数。与 Count 并存才能看出「部分成功」：
 	// 只有 Count 时，inserted=3/failed=7 与 inserted=3/failed=0 长得一模一样。
 	Failed int `json:"failed,omitempty"`
+	// Rows / Batch / OpenMS 这几个新字段**都不用 omitempty**，与 Count 同一个理由：
+	// 字段消失会让「真实值 0 / false」和「这条记录来自没有该字段的旧版本」无法区分，
+	// 而 R3 / R10 的分因正建立在「有没有这个样本」上。宁可每个事件多带几十字节。
+	//
 	// Rows 是本次 Stop 补写的记录数（含 stop 标记本身），只在 stop 上写。
 	// 重放（游标回退）时它略高于实际新增行——幂等跳过的不扣除，量的是「这一次
 	// 干了多少活」，不是「净增多少行」。Count 在写侧不承担这个语义：没有它，
 	// 「一个窗口 3257 行观测只对应 3 个 obs-append」这种脱钩在审计里看不出来，
 	// R5 的「≥1」也就永远 PASS。obs-append 不重复携带，避免按事件求和双计。
-	Rows int `json:"rows,omitempty"`
+	Rows int `json:"rows"`
 	// Batch 表示本次 Stop 的 transcript 补写是否走了批量归档路径（MEM_EVIDENCE_BATCH）。
 	// 灰度开关是否真的传到了 hook 进程，过去只能靠 ps 查宿主环境推断；
 	// 写进事件才是每个窗口自带的事实。
-	Batch bool `json:"batch,omitempty"`
+	Batch bool `json:"batch"`
 	// OpenMS / SearchMS 是读侧 MS 的两个分段：开库、检索+渲染。
 	// 只记总耗时无法区分「检索变慢了」与「开库/进程启动变慢了」——
 	// 2026-11-18 的 R3 越线（hook 210ms、纯读 20ms）正卡在这个盲区上。
-	OpenMS   int64 `json:"open_ms,omitempty"`
-	SearchMS int64 `json:"search_ms,omitempty"`
+	// 检索命中一两条时 search_ms 常为 0，故 0 必须是「真 0」而不是「没写」。
+	OpenMS   int64 `json:"open_ms"`
+	SearchMS int64 `json:"search_ms"`
 }
 
 // Path 返回默认审计日志路径（与库同目录，便于一起备份/清理）。
