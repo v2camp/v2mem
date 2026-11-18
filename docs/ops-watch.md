@@ -106,6 +106,10 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   （3 个 hook 并发时 1737–1873ms，4 个并发时 158–368ms），均值 809ms 判 FAIL，而同一时刻
   纯读路径实测 10–20ms、库仅 29MB、WAL 663 帧。故 R3 越线时**先看样本时间分布与宿主 load**，
   再判检索退化；分因动作见 §5 R3。
+  **`open_ms` / `search_ms` 分段（2026-11-19）**：读侧审计除总 `ms` 外，另记
+  `open_ms`（`store.Open`）与 `search_ms`（检索+渲染）。只记总耗时无法区分
+  「检索变慢」与「开库/进程启动变慢」，2026-11-18 那轮（hook 210ms、纯读 20ms、
+  load 1.60）就卡在这个盲区：三项读数一致地指向「固定开销」，但分不出具体在哪一段。
 - **R2 的 30%**：`docs/design-eval.md` 的口径是「能取到的细节无限深」，命中率随库内容增长而上升；
   初期低是必然。30% 是"库有料但仍常空手"的告警线。
 - **R2 的分组口径（2026-11-15）**：与 R8 同源——库是全局的、`project` 是列，一个工程库里有料
@@ -124,6 +128,9 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   `candidates_ls` 提供就近查看。R9 的采集同步改读 `--json` 的 `content`，检测式与旧版
   `grep '\{"(id|parentId|callId|type)"'` 等价，**判定语义与阈值均未变**。
   `candidates ls --json` 不可解析时 R8/R9 按 `WARN` 观察，不静默判 `PASS`。
+  **detail 附「可先裁决」（2026-11-19）**：越线时按最积压工程取前 3 条，写
+  `id:正文前 40 字`。裁决本身仍是人做的，这一步只省掉裁决前的一次 `candidates ls`——
+  判定语义、阈值与级别均未变。
   **检测式补第二种形态（2026-11-15）**：上面那个 grep 只认 transcript JSON。工具调用载荷的
   文本形态（`Shell {"command"…`、`Grep {"pattern"…`，即工具名 + 对象字面量开头）不含这些键，
   会被判成干净候选——本机 2 条 11-02 存量候选就是这样漏到 pending 里的，R9 一直报 `PASS`。
@@ -150,6 +157,12 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   **采集必须只取 `stop`**：`obs-append` 与其共用同一个计时器，两者都取会双计均值。
   R3 已把写侧排除在「检索延迟」之外，R10 是给这部分耗时一个独立判级出口，
   不是把 R3 的口径改回去。
+  **`rows` / `batch` 字段（2026-11-19）**：`stop` 事件现在带 `rows`（本次实际写入的
+  观测行数，含 stop 标记本身）与 `batch`（本次补写是否走了 `MEM_EVIDENCE_BATCH` 的批量
+  归档路径）。此前 `obs-append` 的 `count` 恒为 0，一个窗口 3257 行观测只对应 3 个事件，
+  体量完全不可见；`batch` 则把「灰度开关有没有真的传到 hook 进程」从 `ps eww` 考古
+  变成事件自带的事实——实测 `launchctl setenv` 对**已运行**的宿主进程无效，
+  同一台机器会因「图形实例启动」与「终端启动」出现两种行为。
 - **R11 的 1000 / 2000 帧**：`internal/store/store.go:70` 只设了 `journal_mode=WAL`、
   `busy_timeout=5000`、`synchronous=NORMAL`，未改 `wal_autocheckpoint`，即 SQLite
   默认 1000 页；超过 1000 帧说明被动 checkpoint 已跟不上写入。2000 帧约为阈值的
@@ -252,7 +265,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |
 | R8 候选积压 | 隔离区长期未裁决 | 先看 detail 里的**按工程分组**计数，在**对应工程的会话里**就近裁决：`mem candidates ls --project P --policy` 或 MCP `candidates_ls` 逐条看；可读候选 `mem accept` / MCP `accept`，载荷残留 `mem reject` / MCP `reject`（顶层命令，非 `mem candidates reject`）。不要跨工程批量 reject |
 | R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
-| R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
+| R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。**2026-11-19 复核：批量开启后生产仍约 15ms/行（748 行 9 秒），设计验收的 0.6ms/行只在小样本上成立**，故 Stop 侧另有 8s 时间预算（`transcriptStopBudget`）：超预算停在块边界、游标只推进到该处、下一次 Stop 续传，这是 20s 硬超时下的兜底，开关只算优化。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
 | R11 WAL 帧数越线 | 被动 checkpoint 未跟上 | `sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(TRUNCATE);"` 并记下返回三元组 `(busy,log,checkpointed)`；`busy=1` 说明有长读事务，查各 harness 的 `mem mcp` 连接。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务 |
 | R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
