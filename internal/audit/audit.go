@@ -60,10 +60,11 @@ type Record struct {
 	// Failed 是本次批量操作中未能落库的条数。与 Count 并存才能看出「部分成功」：
 	// 只有 Count 时，inserted=3/failed=7 与 inserted=3/failed=0 长得一模一样。
 	Failed int `json:"failed,omitempty"`
-	// Rows 是本次触发实际写入的观测行数，只在 stop 上写（含 stop 标记本身与
-	// transcript 回填的全部行）。Count 在写侧不承担这个语义：没有它，
+	// Rows 是本次 Stop 补写的记录数（含 stop 标记本身），只在 stop 上写。
+	// 重放（游标回退）时它略高于实际新增行——幂等跳过的不扣除，量的是「这一次
+	// 干了多少活」，不是「净增多少行」。Count 在写侧不承担这个语义：没有它，
 	// 「一个窗口 3257 行观测只对应 3 个 obs-append」这种脱钩在审计里看不出来，
-	// R5 的「≥1」也就永远 PASS。
+	// R5 的「≥1」也就永远 PASS。obs-append 不重复携带，避免按事件求和双计。
 	Rows int `json:"rows,omitempty"`
 	// Batch 表示本次 Stop 的 transcript 补写是否走了批量归档路径（MEM_EVIDENCE_BATCH）。
 	// 灰度开关是否真的传到了 hook 进程，过去只能靠 ps 查宿主环境推断；

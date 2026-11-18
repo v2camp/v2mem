@@ -358,8 +358,11 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 	}
 	_ = audit.Append(auditPath, rec)
 	if createdUID != "" {
+		// Rows/Batch 只归触发事件：obs-append 复用同一条 rec，
+		// 带着体量会被「按事件求和」的分析双计。
 		rec.Event = "obs-append"
 		rec.Hashes = []string{createdUID}
+		rec.Rows, rec.Batch = 0, false
 		_ = audit.Append(auditPath, rec)
 	}
 }
