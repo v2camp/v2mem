@@ -380,15 +380,21 @@ CAND_GROUPS=$(printf '%s' "$CAND_PENDING" | jq -r '
   group_by(.project) | map({p:(.[0].project // ""), n:length}) | sort_by(-.n)
   | map((if .p == "" then "(全局)" else .p end) + "=" + (.n|tostring))
   | join(", ") | gsub("[\"|]"; "/")' 2>/dev/null || echo '')
+# 越线时直接给出「最积压工程的前 3 条」，省掉裁决前的一次 candidates ls。
+# 只给 id 前半段 + 正文前 40 字：够认出是哪件事，又不把 detail 撑长。
+CAND_TODO=$(printf '%s' "$CAND_PENDING" | jq -r '
+  (group_by(.project) | max_by(length) // [])[0:3]
+  | map(((.id // "")[0:8]) + ":" + (((.content // "")[0:40]) | gsub("[\\n\"|*#]"; "/")))
+  | join(" / ")' 2>/dev/null || echo '')
 
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
   add R8 WARN "候选读取失败" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
 elif [ "$CAND_MAX" -le 5 ]; then
   add R8 PASS "候选待处理 ${CAND_MAX}" "隔离区未积压；按工程：${CAND_GROUPS:-无}"
 elif [ "$CAND_MAX" -le 15 ]; then
-  add R8 WARN "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决"
+  add R8 WARN "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决${CAND_TODO:+；可先裁决：$CAND_TODO}"
 else
-  add R8 FAIL "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响"
+  add R8 FAIL "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响${CAND_TODO:+；可先裁决：$CAND_TODO}"
 fi
 
 # R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤。

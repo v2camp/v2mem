@@ -36,7 +36,10 @@ const (
 	evidenceCaptureAttempts = 5
 	// transcriptStopMaxRecords 是单次 Stop 最多补写的转录事件数。
 	// 只是防病态大文件把钩子拖住；正常一轮增量远小于它。
-	transcriptStopMaxRecords = 5000
+	//
+	// 1000 而非 5000：实测 12–27ms/行，5000 行是宿主 20s 预算的 3–7 倍，
+	// 上限按行数给等于没给。真正兜底的是下面的 transcriptStopBudget。
+	transcriptStopMaxRecords = 1000
 	// transcriptToolMemory 是游标里保留的 tool_use id → 工具名条数，
 	// 供跨次识别 tool_result 属于哪个工具（决定 ProposalEligible）。
 	transcriptToolMemory = 128
@@ -50,6 +53,14 @@ const (
 // 段式 spool 的风险变成「文件数无限增长」，所以按段数守。
 // 变量而非常量只为让测试能把上限压到可测规模。
 var spoolMaxSegments = 4096
+
+// transcriptStopBudget 是单次 Stop 补写 transcript 的时间预算。
+// 宿主 Stop hook 同步调用、timeout=20s（docs/ops-watch.md §3 R10）；首次见到
+// 长 transcript 会整文件回填，实测 749 行耗时 19.7s（预算的 98.5%）。
+// 超预算就停在已完成的块边界，游标只推进到这里，下一次 Stop 续传 ——
+// 这是「不引入常驻进程」红线（VALUE §4）下唯一的等价异步形态。
+// 变量而非常量：测试要把它压到 0 才能复现截断。
+var transcriptStopBudget = 8 * time.Second
 
 func isObserveHook(event harness.Event) bool {
 	switch event {
@@ -305,8 +316,10 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 
 	// Stop 仍是落盘标记；正文（用户/助手/工具事件）从 transcript 增量补在其前面，
 	// 这样 Bundle 的序号顺序与真实时间顺序一致：… → 最后一条助手结论 → stop。
+	transcriptRows := 0
+	batchUsed := false
 	if event == harness.EventStop {
-		captureTranscriptFailOpen(c.db, hname, project, in, noScrub)
+		transcriptRows, batchUsed = captureTranscriptFailOpen(c.db, hname, project, in, noScrub)
 	}
 
 	createdUID := ""
@@ -336,6 +349,12 @@ func appendObservationFailOpen(c common, harnessFlag string, event harness.Event
 		TS: started.Unix(), Event: string(event), Harness: hname,
 		Project: project, SessionID: sid,
 		Source: "hook-observe", MS: time.Since(started).Milliseconds(),
+	}
+	if event == harness.EventStop {
+		// 写侧体量只挂在 stop 上：其它写事件恒定 1 行，写出来只是噪音。
+		// +1 是 stop 标记本身。
+		rec.Rows = transcriptRows + 1
+		rec.Batch = batchUsed
 	}
 	_ = audit.Append(auditPath, rec)
 	if createdUID != "" {
@@ -414,21 +433,21 @@ func synthPromptUID(source string, raw []byte) string {
 // 增量靠游标（库旁 evidence/transcripts/<session>.cursor）；游标丢失或文件被截断
 // 时从头再读也不会重复写：身份要么来自宿主 uuid，要么由「文件路径+偏移+块序号」
 // 合成，重放稳定命中已有证据。
-func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub bool) {
+func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub bool) (rows int, batchUsed bool) {
 	path := strings.TrimSpace(in.TranscriptPath)
 	sid := in.sessionID()
 	if path == "" || sid == "" {
-		return
+		return 0, false
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: transcript 路径无效，已跳过:", err)
-		return
+		return 0, false
 	}
 	fi, err := os.Stat(abs)
 	if err != nil || fi.IsDir() {
 		fmt.Fprintln(os.Stderr, "v2mem hook: transcript 不可读，已跳过:", abs)
-		return
+		return 0, false
 	}
 
 	cursorPath := transcriptCursorPath(db, sid)
@@ -441,24 +460,24 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 		offset, tools, reset = 0, map[string]string{}, true
 	}
 	if offset >= fi.Size() {
-		return
+		return 0, false
 	}
 
 	f, err := os.Open(abs)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: transcript 打开失败，已跳过:", err)
-		return
+		return 0, false
 	}
 	defer f.Close()
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: transcript 定位失败，已跳过:", err)
-		return
+		return 0, false
 	}
 
 	es, err := openEvidenceSession(db)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 打开记忆库失败，transcript 已跳过:", err)
-		return
+		return 0, false
 	}
 	defer es.Close()
 
@@ -492,7 +511,17 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 		return true
 	}
 
+	started := time.Now()
 	for seen < transcriptStopMaxRecords {
+		// 时间预算优先于条数上限：只按条数收口时，5000 行按实测 12–27ms/行
+		// 要跑 1–2 分钟，远超宿主 20s 的同步超时。seen>0 保证至少完成一块，
+		// 否则游标不前进，下次 Stop 会原地重试。
+		if seen > 0 && time.Since(started) >= transcriptStopBudget {
+			fmt.Fprintf(os.Stderr,
+				"v2mem hook: transcript 补写超预算 %s，已停在第 %d 条，剩余留给下次 Stop\n",
+				transcriptStopBudget, seen)
+			break
+		}
 		recs, rerr := rd.Read()
 		if errors.Is(rerr, io.EOF) {
 			break
@@ -553,6 +582,7 @@ func captureTranscriptFailOpen(db, hname, project string, in hookInput, noScrub 
 		fmt.Fprintf(os.Stderr,
 			"v2mem hook: transcript 有 %d 行非本解析器格式，已按原文归档且不可用于提案\n", unparsed)
 	}
+	return seen, batchEnabled
 }
 
 // recordEvidence 把一条 transcript 事件翻成待归档证据。

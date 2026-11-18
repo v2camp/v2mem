@@ -28,6 +28,12 @@ import (
 const (
 	DefaultModel   = "qwen2.5:7b"
 	DefaultTimeout = 45 * time.Second
+
+	// RulesMaxFacts 是单次规则蒸馏产出的候选上限。
+	// 上限不是质量阀，是**供需阀**：一次会话实测能产 6–7 条，而人工裁决
+	// 速率是每窗口 0–2 条，不限流时候选积压只增不减（docs/ops-watch.md §3 R8）。
+	// 取 3：一屏可裁决完，且够覆盖一次会话真正的决策点。
+	RulesMaxFacts = 3
 )
 
 // 蒸馏的四种状态。为什么要有 empty：
@@ -292,6 +298,9 @@ func ExtractRules(obs []Observation) []Fact {
 	var out []Fact
 	seen := map[string]bool{}
 	for _, o := range obs {
+		if len(out) >= RulesMaxFacts {
+			break
+		}
 		summary := strings.TrimSpace(o.Summary)
 		if summary == "" {
 			continue

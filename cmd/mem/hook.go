@@ -185,6 +185,8 @@ func cmdHook(args []string) error {
 			// 与 writeHookStdout 打出去的是同一个串，量的是宿主眼里的大小（字节）。
 			// 未含 Cursor 系的 {"additional_context":...} 信封，包壳后实际更大 ⇒ R13 阈值留了余量。
 			InjectBytes: len(out.Text),
+			OpenMS:      out.OpenMS,
+			SearchMS:    out.SearchMS,
 		}
 		for _, h := range out.Injected {
 			rec.Hashes = append(rec.Hashes, h.ID)
@@ -273,6 +275,10 @@ type hookRender struct {
 	Text     string
 	Injected []store.Hit
 	Gate     recall.Gate
+	// OpenMS / SearchMS 是总耗时 MS 的两个分段，写进审计供 R3 判因：
+	// 「开库慢」与「检索慢」在只记总耗时时分不开，而两者的处置完全不同。
+	OpenMS   int64
+	SearchMS int64
 }
 
 // renderHookContext 构造要注入模型的文本，并返回本次实际注入的记忆。
@@ -280,30 +286,33 @@ type hookRender struct {
 // 返回 hits 是为了审计：没有真实会话的「查询 → 命中」样本，
 // 检索质量就无法评测（见 internal/audit 与 DESIGN.md §15）。
 func renderHookContext(c common, event harness.Event, project, prompt string, limit, maxChars int, meta hookMeta) hookRender {
+	openStart := time.Now()
 	st, err := store.Open(c.db)
+	openMS := time.Since(openStart).Milliseconds()
 	if err != nil {
 		// 库打不开时仍告诉模型「有这么个库」，否则用户会以为记忆系统不存在
 		fmt.Fprintln(os.Stderr, "v2mem hook: 打开记忆库失败:", err)
 		if event == harness.EventSessionStart || event == harness.EventPreCompact {
 			return hookRender{Text: fmt.Sprintf("[v2mem] 本地分层记忆库（Level 2）。当前工程：%s\n%s",
-				orGlobal(project), hintBlock())}
+				orGlobal(project), hintBlock()), OpenMS: openMS}
 		}
-		return hookRender{}
+		return hookRender{OpenMS: openMS}
 	}
 	defer st.Close()
 	if meta.Event == "" {
 		meta.Event = string(event)
 	}
 
+	searchStart := time.Now()
 	switch event {
 	case harness.EventSessionStart, harness.EventPreCompact:
 		text, injected := sessionStartContext(st, project, limit, maxChars, meta)
-		return hookRender{Text: text, Injected: injected}
+		return hookRender{Text: text, Injected: injected, OpenMS: openMS, SearchMS: time.Since(searchStart).Milliseconds()}
 	case harness.EventPromptSubmit:
 		text, injected, gate := promptSubmitContext(st, project, prompt, limit, maxChars, meta)
-		return hookRender{Text: text, Injected: injected, Gate: gate}
+		return hookRender{Text: text, Injected: injected, Gate: gate, OpenMS: openMS, SearchMS: time.Since(searchStart).Milliseconds()}
 	}
-	return hookRender{}
+	return hookRender{OpenMS: openMS}
 }
 
 // notesEnabled 由 MEM_NO_NOTES 控制：置位时读侧回到「仅 v2mem 原始注入」，
