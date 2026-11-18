@@ -176,8 +176,12 @@ func TestNotesCombinedBudgetTruncatesRules(t *testing.T) {
 
 // ---------- WS1.2: 写入分工 + MEM_NO_NOTES 回退 ----------
 
-// 功能级验证去重：同一条规则既作为 hit 又已存在 notes 里时被去掉。
+// 功能级验证去重：本会话开场**实际注入过**的规则，检索侧再次命中时被去掉。
+//
+// 判据是「本会话注入了哪条」（按 id），不是「库里存在哪条」（按正文）。所以这里
+// 必须先造一条开场轨迹 —— 空 session 或没开场时不去重（失败开放，见 notesCoveredPredicate）。
 func TestFilterRulesCoveredByNotesDedups(t *testing.T) {
+	const sid = "sess-notes-dedup"
 	db := testDB(t)
 	if err := cmdAdd([]string{"--db", db, "--global", "--kind", "rule",
 		"commit 前必跑 make cover-gate"}); err != nil {
@@ -190,11 +194,27 @@ func TestFilterRulesCoveredByNotesDedups(t *testing.T) {
 	}
 	defer st.Close()
 
+	all, err := st.List(store.ListQuery{Scope: "all", Limit: 10})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("应只有 1 条 rule, got %d", len(all))
+	}
+	ruleID := all[0].ID
+	// 开场注入了这条 rule（injection_rank > 0）＝ 它已经在上下文里，检索侧该跳过。
+	if _, err := st.WriteReadTrace(store.ReadTrace{
+		SessionID: sid, GateReason: "session_start",
+		Outcome: "injected", RawHits: 1, Qualified: 1, Injected: 1,
+	}, []store.ReadTraceItem{{MemoryID: ruleID, InjectionRank: 1}}); err != nil {
+		t.Fatalf("WriteReadTrace: %v", err)
+	}
+
 	hits := []store.Hit{
-		{Kind: "rule", Content: "commit 前必跑 make cover-gate", Project: ""},
+		{ID: ruleID, Kind: "rule", Content: "commit 前必跑 make cover-gate", Project: ""},
 		{Kind: "decision", Content: "部署用 scripts", Project: ""},
 	}
-	filtered := filterRulesCoveredByNotes(st, hits)
+	filtered := filterRulesCoveredByNotes(st, sid, hits)
 	if len(filtered) != 1 {
 		t.Fatalf("应只剩 1 条非覆盖, got %d: %+v", len(filtered), filtered)
 	}
@@ -213,19 +233,27 @@ func TestHookDedupsRuleAndMEMNoNotesReverts(t *testing.T) {
 		t.Fatalf("cmdAdd: %v", err)
 	}
 
-	// 默认：去重生效 -> 该规则不再被注入（notes 已覆盖）
-	outDefault, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "commit 前要不要跑 cover"),
+	// 先去开场真注入一次：判据是「本会话开场**实际注入**了哪条 rule」，且按 session_id
+	// 取轨迹 —— 两次调用必须共用同一个会话标识，否则判据无据可依、不去重。
+	const sid = "sess-notes-revert"
+	if _, err := withStdin(t, hookStdinWithSession("SessionStart", proj, "", sid),
+		func() error { return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0"}) }); err != nil {
+		t.Fatalf("cmdHook session-start: %v", err)
+	}
+
+	// 默认：去重生效 -> 该规则不再被注入（开场已给过）
+	outDefault, err := withStdin(t, hookStdinWithSession("UserPromptSubmit", proj, "commit 前要不要跑 cover", sid),
 		func() error { return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0"}) })
 	if err != nil {
 		t.Fatalf("cmdHook default: %v", err)
 	}
 	if strings.Contains(outDefault, ruleContent) {
-		t.Errorf("默认（MEM_NO_NOTES 未置位）该 rule 已被 notes 覆盖，不应重复注入，got:\n%s", outDefault)
+		t.Errorf("默认（MEM_NO_NOTES 未置位）该 rule 已被开场注入，不应重复注入，got:\n%s", outDefault)
 	}
 
 	// 置位 MEM_NO_NOTES：回到仅 v2mem 原始注入 -> 该 rule 正常注入
 	t.Setenv("MEM_NO_NOTES", "1")
-	outNoNotes, err := withStdin(t, hookStdin("UserPromptSubmit", proj, "commit 前要不要跑 cover"),
+	outNoNotes, err := withStdin(t, hookStdinWithSession("UserPromptSubmit", proj, "commit 前要不要跑 cover", sid),
 		func() error { return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0"}) })
 	if err != nil {
 		t.Fatalf("cmdHook no-notes: %v", err)

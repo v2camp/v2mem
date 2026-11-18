@@ -46,14 +46,30 @@ printf '%s' "$r12_row" | grep -q '失败 >3' || fail "§3 R12 的 FAIL 线不是
 grep -q 'A_DISTILL_FAIL" -gt 3' "$SCRIPT" || fail "脚本 R12 的 FAIL 线不是 >3"
 grep -q 'A_DISTILL" -eq 0' "$SCRIPT"     || fail "脚本 R12 缺断链判级分支"
 
-# ⑤ R13 阈值与自主边界：TTL 14 天两侧同步；「只迁移不删除」的保护不许被删。
-# 这条判据是唯一会写库的（gc --candidates），边界退化比阈值漂移更危险：
-# 少了 ACC_OLD 检查，脚本就会替人执行 GCCandidates 里那条 DELETE。
+# ⑤ R13 注入体量：文档两档字面量与脚本分级必须同步，无样本分支不许被删。
+# 这条判据守的是「查到了但送不进去」——R2 命中率看不出宿主把 stdout 换成占位。
 r13_row="$(grep -E '^\| \*\*R13\*\*' "$DOC" | head -1)"
 [ -n "$r13_row" ] || fail "§3 找不到 R13 行"
-printf '%s' "$r13_row" | grep -q '14 天' || fail "§3 R13 的 TTL 不是 14 天"
-grep -q 'TTL_DAYS=14'  "$SCRIPT" || fail "脚本 R13 的 TTL_DAYS 不是 14"
-grep -q 'GC_DISABLED'  "$SCRIPT" || fail "脚本 R13 缺 --no-gc 逃生开关"
-grep -q 'ACC_OLD'      "$SCRIPT" || fail "脚本 R13 缺「待删已采纳行则转人工」保护"
+printf '%s' "$r13_row" | grep -q '≤3600' || fail "§3 R13 的 PASS 线不是 ≤3600"
+printf '%s' "$r13_row" | grep -q '>8000' || fail "§3 R13 的 FAIL 线不是 >8000"
+grep -q 'A_INJ_MAX" -le 3600' "$SCRIPT" || fail "脚本 R13 的 PASS 线不是 ≤3600"
+grep -q 'A_INJ_MAX" -gt 8000' "$SCRIPT" || fail "脚本 R13 的 FAIL 线不是 >8000"
+grep -q 'A_INJ_N" -eq 0'      "$SCRIPT" || fail "脚本 R13 缺无样本分支"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 TTL 14 天与转人工保护同步；枚举到 R${max_r}"
+# ⑥ §5 处置表必须给 R3 一行。实证：2026-11-17 R3 首次判 FAIL 时，§5 只有 R1/R2/R7/R6/R8/R9/
+# R10/R11/R12/R13/R14 与 I 组，R3 无对应动作可引用。只守 R3——R4/R5 本就无需处置行，不能一刀切。
+if ! sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -qE '^\| R3 '; then
+  fail "§5 缺 R3 处置行（R3 FAIL 时会无动作可引用）"
+fi
+
+# ⑦ R15 阈值与自主边界：TTL 14 天两侧同步；「只迁移不删除」的保护不许被删。
+# 这条判据是唯一会写库的（gc --candidates），边界退化比阈值漂移更危险：
+# 少了 ACC_OLD 检查，脚本就会替人执行 GCCandidates 里那条 DELETE。
+r15_row="$(grep -E '^\| \*\*R15\*\*' "$DOC" | head -1)"
+[ -n "$r15_row" ] || fail "§3 找不到 R15 行"
+printf '%s' "$r15_row" | grep -q '14 天' || fail "§3 R15 的 TTL 不是 14 天"
+grep -q 'TTL_DAYS=14'  "$SCRIPT" || fail "脚本 R15 的 TTL_DAYS 不是 14"
+grep -q 'GC_DISABLED'  "$SCRIPT" || fail "脚本 R15 缺 --no-gc 逃生开关"
+grep -q 'ACC_OLD'      "$SCRIPT" || fail "脚本 R15 缺「待删已采纳行则转人工」保护"
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；枚举到 R${max_r}"

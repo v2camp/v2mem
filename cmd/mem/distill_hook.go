@@ -18,18 +18,24 @@ import (
 var startDistillProc = defaultStartDistill
 
 func defaultStartDistill(db, session, harness string) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	if strings.HasSuffix(exe, ".test") {
-		return fmt.Errorf("测试二进制不拉起 distill")
-	}
 	args := []string{"distill"}
 	if proposalHookEnabled(harness) {
 		args = append(args, "--proposal", "--executor", "auto", "--max-bundles", "1")
 	} else {
 		args = append(args, "--session", session, "--provider", "none")
+	}
+	return startMemProc(db, args)
+}
+
+// startMemProc 拉起一个短命 mem 子进程，不等待它结束。
+// 冷启动与常规蒸馏共用这一条出口，避免两处各自实现 .test 守卫与参数拼接。
+func startMemProc(db string, args []string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if strings.HasSuffix(exe, ".test") {
+		return fmt.Errorf("测试二进制不拉起 mem 子进程")
 	}
 	args = append(args, "--db", db)
 	cmd := exec.Command(exe, args...)
@@ -90,9 +96,10 @@ func proposalHookEnabled(host string) bool {
 	return false
 }
 
-// distillSpawnEnabled 是所有蒸馏子进程的总闸：Stop / SessionEnd 的规则蒸馏或
+// distillSpawnEnabled 是**常规**蒸馏子进程的总闸：Stop / SessionEnd 的规则蒸馏或
 // Proposal 蒸馏、SessionStart 的 Proposal pending 蒸馏，都只在其为真时拉起。
-// 未设置 / 非 "1" → false，即默认不拉起任何子进程。
+// 首会话冷启动是一次性例外（coldstart.go），不受此闸约束。
+// 未设置 / 非 "1" → false，即默认不拉起任何常规蒸馏子进程。
 func distillSpawnEnabled() bool {
 	return strings.TrimSpace(os.Getenv("MEM_DISTILL_SPAWN")) == "1"
 }

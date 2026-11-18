@@ -9,16 +9,21 @@
 #   scripts/watch-v2mem.sh --window 24h
 #   scripts/watch-v2mem.sh --json          # 机器可读
 #   scripts/watch-v2mem.sh --quiet         # 只输出非 PASS 项
-#   scripts/watch-v2mem.sh --no-gc         # 不执行 R13 的候选过期，只判级
+#   scripts/watch-v2mem.sh --no-gc         # 不执行 R15 的候选过期，只判级
 #
 # 只读：不写库、不改配置。唯一的写入是 ~/.v2mem/watch-state.json 的基线快照。
-# 唯一例外是 R13：候选超期时执行 `mem gc --candidates` 做 pending → expired 的状态迁移
+# 唯一例外是 R15：候选超期时执行 `mem gc --candidates` 做 pending → expired 的状态迁移
 # （行仍在库、不删 memories）；存在待删的已采纳行时转人工，不执行。`--no-gc` 可关掉。
 # R3 只统计读侧 hook（prompt-submit / session-start）的 ms；写侧 stop / obs-append
 # 共用同一个 Stop 计时器，计入会污染「检索延迟」，详见 docs/ops-watch.md §3。
 # R10 给这部分写侧耗时独立判级（只取 stop，避免与 obs-append 双计）；R11 只读
 # mem.db-wal 的文件大小，绝不修改或删除 -wal。R12 诊断写侧自动决策链路，只读
-# audit.jsonl 与 mem eval activity --json，不调用 distill/accept/reject（gc 由 R13 负责）。
+# audit.jsonl 与 mem eval activity --json，不调用 distill/accept/reject/gc。
+# R13 取读侧审计 inject_bytes 的最大值（**字节**，不是 rune）：宿主对 hook stdout
+# 有硬上限，越线会整块换占位且仍报成功，R2 的命中率看不出来。
+# R14 只量 evidence 归档目录的落盘量（文件数 + 字节），不折算成观测条数：gc 之后
+# 行数会降而文件数不降，两者本就会脱钩；归档是只写事实源，无自动回收路径。
+# R15 在候选超期时执行 pending → expired 的状态迁移（行仍在库，不删行）；--no-gc 可关。
 # 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
@@ -38,7 +43,7 @@ while [ $# -gt 0 ]; do
     --json)   JSON_OUT=1; shift ;;
     --quiet)  QUIET=1; shift ;;
     --no-gc)  GC_DISABLED=1; shift ;;
-    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -202,6 +207,27 @@ fi
 A_DISTILL=${A_DISTILL:-0}; A_DISTILL_PROPOSAL=${A_DISTILL_PROPOSAL:-0}
 A_DISTILL_FAIL=${A_DISTILL_FAIL:-0}; A_DISTILL_EMPTY=${A_DISTILL_EMPTY:-0}
 A_DECIDE_A=${A_DECIDE_A:-0}; A_DECIDE_R=${A_DECIDE_R:-0}
+
+# R13 注入体量单独采集：同样用 TSV 后 read 拆列，不往上面的 eval 插值里再嵌字面量。
+# 三列 = 最大值 / 带字段的样本数 / 读侧记录总数（不论有没有字段）。
+# 字段缺失（升级前的旧记录）用 (.inject_bytes // null) != null 判定，不能当 0：
+# 当 0 会拉低最大值、掩盖越线。A_INJ_READ 用来区分「窗口内真无读侧记录」与「全是旧记录」——
+# 读侧事件有三个，只数 session-start / prompt-submit 会漏掉只有 pre-compact 的窗口。
+A_INJ_MAX=0; A_INJ_N=0; A_INJ_READ=0
+if [ -f "$AUDIT" ]; then
+  W13=$(jq -sr --argjson c "$CUTOFF" '
+    map(select(.ts >= $c)) as $e
+    | [$e[] | select(.event=="session-start" or .event=="prompt-submit" or .event=="pre-compact")] as $r
+    | [ ($r | map(select((.inject_bytes // null) != null) | .inject_bytes)
+              | if length > 0 then max else 0 end),
+        ($r | map(select((.inject_bytes // null) != null)) | length),
+        ($r | length) ]
+    | @tsv' "$AUDIT" 2>/dev/null)
+  if [ -n "${W13:-}" ]; then
+    IFS=$'\t' read -r A_INJ_MAX A_INJ_N A_INJ_READ <<< "$W13"
+  fi
+fi
+A_INJ_MAX=${A_INJ_MAX:-0}; A_INJ_N=${A_INJ_N:-0}; A_INJ_READ=${A_INJ_READ:-0}
 
 # R12 诊断文案：mem eval activity --json 只读 audit.jsonl（cmdEvalActivity 不开库）。
 # 读不到或不可解析时只省略文案，R12 仍按上面的审计计数独立判级。
@@ -460,7 +486,7 @@ A_DISTILL_RULES=$(( A_DISTILL - A_DISTILL_PROPOSAL ))
 D12="观测 ${A_OBS} / 蒸馏 ${A_DISTILL}（proposal ${A_DISTILL_PROPOSAL} · rules ${A_DISTILL_RULES}） / 合法空 ${A_DISTILL_EMPTY} / 失败 ${A_DISTILL_FAIL} / 裁决 accept ${A_DECIDE_A} reject ${A_DECIDE_R}"
 if [ -n "$ACT_VERDICT" ]; then D12="${D12}；结论: ${ACT_VERDICT}"; fi
 if [ "$A_OBS" -eq 0 ]; then
-  add R12 INFO "无观测样本" "窗口内无 obs-append，无法评估写侧决策链路（无样本，非冷启动降级）"
+  add R12 INFO "无观测样本" "窗口内无 obs-append，无法评估写侧决策链路（无样本，非冷启动降级）；${D12}"
 elif [ "$A_DISTILL_FAIL" -gt 3 ]; then
   add R12 FAIL "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；按 §5 R12 查 distill_runs 的 error 与 attempt，不要重跑 distill 掩盖"
 elif [ "$A_DISTILL" -eq 0 ]; then
@@ -471,7 +497,50 @@ else
   add R12 PASS "写侧决策链路推进" "${D12}"
 fi
 
-# R13 候选 TTL 执行：pending 超过 14 天仍未转 expired，说明过期机制从来没被跑过。
+# R13 注入体量：宿主对 hook stdout 的硬上限会把超限内容整块换成约 2KB 占位且**仍返回成功**，
+# 用户侧表现为「记忆没出现」而不是报错——R2 只测查得到，测不到送不进去。阈值依据见 §3 R13。
+R13_RUNES=$(( A_INJ_MAX / 3 ))
+if [ "$A_INJ_N" -eq 0 ]; then
+  if [ "$A_INJ_READ" -gt 0 ]; then
+    add R13 INFO "无注入体量样本" "读侧记录均无 inject_bytes 字段（升级前的旧记录），无法评估注入体量；新记录自带该字段"
+  else
+    add R13 INFO "无注入体量样本" "窗口内无读侧记录（session-start / prompt-submit / pre-compact），无法评估注入体量"
+  fi
+elif [ "$A_INJ_MAX" -le 3600 ]; then
+  add R13 PASS "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次，未超 3600 字节"
+elif [ "$A_INJ_MAX" -le 8000 ]; then
+  add R13 WARN "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，落在 3601–8000，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次，查预算变量是否被调高"
+elif [ "$A_INJ_MAX" -gt 8000 ]; then
+  add R13 FAIL "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，超过 8000，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次。宿主可能整块替换为占位且仍报成功，记忆会静默消失"
+fi
+
+# R14 归档体量：evidence 是只写事实源（VALUE §4.1），一条观测一份 .jsonl.gz，且没有自动
+# 回收路径——mem gc --obs 删的是 observations 表行，不碰归档文件。故只量落盘量（文件数 +
+# 字节），不折算成「多少条观测」：gc 之后行数降而文件数不降，两者本就会脱钩。
+# 阈值与「为何不设 FAIL」见 docs/ops-watch.md §3 R14。
+EV_DIR="$V2MEM_DIR/evidence"
+EV_FILES=0; EV_BYTES=0
+if [ -d "$EV_DIR" ]; then
+  EV_FILES=$(find "$EV_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+  EV_KB=$(du -sk "$EV_DIR" 2>/dev/null | awk '{print $1}')
+  EV_BYTES=$(( ${EV_KB:-0} * 1024 ))
+fi
+EV_FILES=${EV_FILES:-0}; EV_BYTES=${EV_BYTES:-0}
+EV_MIB=$(( EV_BYTES / 1048576 ))
+DB_BYTES=$( "$MEM_BIN" stats --json 2>/dev/null | jq -r '.size_bytes // 0' 2>/dev/null )
+DB_BYTES=${DB_BYTES:-0}
+DB_MIB=$(( ${DB_BYTES:-0} / 1048576 ))
+if [ ! -d "$EV_DIR" ]; then
+  add R14 INFO "无归档目录" "${EV_DIR} 不存在；未捕获过观测，或来自未启用证据归档的旧版本"
+elif [ "$EV_FILES" -eq 0 ]; then
+  add R14 PASS "归档为空" "evidence 目录无归档文件（主库 ${DB_MIB}MiB）；尚无观测落盘"
+elif [ "$EV_BYTES" -le 536870912 ]; then
+  add R14 PASS "归档 ${EV_MIB}MiB" "${EV_FILES} 个归档 / ${EV_MIB}MiB（主库 ${DB_MIB}MiB），未超 512MiB 水位"
+else
+  add R14 WARN "归档 ${EV_MIB}MiB" "${EV_FILES} 个归档 / ${EV_MIB}MiB（主库 ${DB_MIB}MiB），超过 512MiB 水位；归档只增不减，按 §5 R14 裁决保留策略，勿删目录"
+fi
+
+# R15 候选 TTL 执行：pending 超过 14 天仍未转 expired，说明过期机制从来没被跑过。
 # 为什么需要单独一条判据：GCCandidates 在代码里写死 14 天 TTL（`internal/store/candidates.go`），
 # 但唯一执行者是手工 `mem gc --candidates`。2026-11-17 实测本机 2 条 11-02 候选已超期
 # 14.8 天仍是 pending，crontab / LaunchAgents 均无调度——TTL 存在却形同虚设，
@@ -482,7 +551,7 @@ fi
 # accepted 行），所以先查是否存在待删的已采纳行，**有就不执行**，转人工——
 # 删除不可逆，属 design-write-governance.md §12.5 明确要人判的那一类。
 #
-# 顺序要求：R13 必须排在 R8/R9 之后。R8 反映的是过期前的真实积压，先采集再处置，
+# 顺序要求：R15 必须排在 R8/R9 之后。R8 反映的是过期前的真实积压，先采集再处置，
 # 否则会把自己刚清空的结果当成「没有积压」。
 TTL_DAYS=14
 TTL_ACCEPTED_DAYS=90
@@ -491,11 +560,11 @@ STALE_PENDING=$(printf '%s' "$CAND_PENDING" | jq -r --argjson now "$NOW" --argjs
 case "$STALE_PENDING" in ''|*[!0-9]*) STALE_PENDING=0 ;; esac
 
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
-  add R13 WARN "候选 TTL 未核查" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
+  add R15 WARN "候选 TTL 未核查" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
 elif [ "$STALE_PENDING" -eq 0 ]; then
-  add R13 PASS "候选 TTL 无超期" "无超过 ${TTL_DAYS} 天的 pending（与 GCCandidates 默认阈值同源）"
+  add R15 PASS "候选 TTL 无超期" "无超过 ${TTL_DAYS} 天的 pending（与 GCCandidates 默认阈值同源）"
 elif [ "$GC_DISABLED" -eq 1 ]; then
-  add R13 WARN "候选超期 ${STALE_PENDING} 条" "已超 ${TTL_DAYS} 天仍 pending；--no-gc 下不自动过期，按 §5 手工执行 mem gc --candidates"
+  add R15 WARN "候选超期 ${STALE_PENDING} 条" "已超 ${TTL_DAYS} 天仍 pending；--no-gc 下不自动过期，按 §5 手工执行 mem gc --candidates"
 else
   ACC_JSON=$( "$MEM_BIN" candidates ls --json --status accepted --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null || echo '[]' )
   ACC_OLD=0
@@ -505,11 +574,11 @@ else
   fi
   case "$ACC_OLD" in ''|*[!0-9]*) ACC_OLD=0 ;; esac
   if [ "$ACC_OLD" -gt 0 ]; then
-    add R13 WARN "候选超期 ${STALE_PENDING} 条·未执行" "另有 ${ACC_OLD} 条 ${TTL_ACCEPTED_DAYS} 天前的已采纳行会被连带删除（不可逆），故不自动执行；确认后跑 mem gc --candidates"
+    add R15 WARN "候选超期 ${STALE_PENDING} 条·未执行" "另有 ${ACC_OLD} 条 ${TTL_ACCEPTED_DAYS} 天前的已采纳行会被连带删除（不可逆），故不自动执行；确认后跑 mem gc --candidates"
   elif GC_OUT=$( "$MEM_BIN" gc --candidates -db "$V2MEM_DIR/mem.db" 2>&1 ); then
-    add R13 WARN "候选超期已过期 ${STALE_PENDING} 条" "已执行 mem gc --candidates（pending → expired，行仍在库，--status expired 可查，未动 memories）；R8 本窗口仍按过期前计数"
+    add R15 WARN "候选超期已过期 ${STALE_PENDING} 条" "已执行 mem gc --candidates（pending → expired，行仍在库，--status expired 可查，未动 memories）；R8 本窗口仍按过期前计数"
   else
-    add R13 WARN "候选过期执行失败" "${GC_OUT:-mem gc --candidates 无输出}；按 §5 手工执行并查库权限与磁盘"
+    add R15 WARN "候选过期执行失败" "${GC_OUT:-mem gc --candidates 无输出}；按 §5 手工执行并查库权限与磁盘"
   fi
 fi
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 把 dist 里的预编译文件挂到已有 GitHub Release；没有 Release 就创建。
+# 把 dist 里的预编译文件与 SHA256 清单挂到已有 GitHub Release；没有 Release 就创建。
 # 依赖 gh，并且 GH_TOKEN / GITHUB_TOKEN 对仓库有 contents: write。
 # 文件名须与 scripts/release-assets.sh、scripts/install.sh 一致。
 set -euo pipefail
@@ -20,12 +20,14 @@ require_asset mem-darwin-arm64
 require_asset mem-linux-amd64
 require_asset mem-linux-arm64
 require_asset mem-windows-amd64.exe
+require_asset checksums.txt
 
 notes="v2mem ${tag} 预编译二进制（CGO_ENABLED=0）。
 
 - mem-darwin-amd64 / mem-darwin-arm64
 - mem-linux-amd64 / mem-linux-arm64
 - mem-windows-amd64.exe
+- checksums.txt（安装脚本据此做 SHA256 校验；早期版本无此清单时会跳过校验）
 
 安装：curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh | bash
 指定版本：curl -fsSL …/scripts/install.sh | bash -s -- --version ${tag}"
@@ -37,6 +39,7 @@ if gh release view "$tag" >/dev/null 2>&1; then
 		"$dist/mem-linux-amd64" \
 		"$dist/mem-linux-arm64" \
 		"$dist/mem-windows-amd64.exe" \
+		"$dist/checksums.txt" \
 		--clobber
 else
 	gh release create "$tag" \
@@ -45,6 +48,7 @@ else
 		"$dist/mem-linux-amd64" \
 		"$dist/mem-linux-arm64" \
 		"$dist/mem-windows-amd64.exe" \
+		"$dist/checksums.txt" \
 		--title "$tag" \
 		--notes "$notes"
 fi

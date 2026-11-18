@@ -150,6 +150,9 @@ func cmdHook(args []string) error {
 		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started, *noScrub)
 		if observeEventMayDistill(event) {
 			maybeSpawnDistill(c.db, in, harnessName(*harnessFlag, in))
+			// 冷启动只挂在 SessionEnd：把首会话的规则蒸馏从下一次 SessionStart
+			// 前移到会话收尾，热路径不再承担这次蒸馏。
+			maybeSpawnColdStart(c.db, in, project, event)
 		}
 		return nil
 	}
@@ -179,6 +182,9 @@ func cmdHook(args []string) error {
 			TS: started.Unix(), Event: string(event), Harness: harnessName(*harnessFlag, in),
 			Project: project, SessionID: in.sessionID(), Query: scrub.Apply(strings.TrimSpace(in.Prompt), *noScrub),
 			Empty: empty, MS: time.Since(started).Milliseconds(),
+			// 与 writeHookStdout 打出去的是同一个串，量的是宿主眼里的大小（字节）。
+			// 未含 Cursor 系的 {"additional_context":...} 信封，包壳后实际更大 ⇒ R13 阈值留了余量。
+			InjectBytes: len(out.Text),
 		}
 		for _, h := range out.Injected {
 			rec.Hashes = append(rec.Hashes, h.ID)
@@ -306,22 +312,33 @@ func notesEnabled() bool {
 	return strings.TrimSpace(os.Getenv("MEM_NO_NOTES")) == ""
 }
 
-// notesCoveredPredicate 返回「这条命中是否已被 notes 覆盖」的判定。
-// nil 表示不去重（MEM_NO_NOTES 置位，或 notes 读不出来 —— 失败开放，宁可多注入）。
-func notesCoveredPredicate(st *store.Store) func(store.Hit) bool {
+// notesCoveredPredicate 返回「这条命中是否已被本会话开场注入覆盖」的判定。
+// nil 表示不去重 —— 失败开放，宁可多注入：
+//   - MEM_NO_NOTES 置位（读侧回退到「仅 v2mem 原始注入」）；
+//   - 判据查询失败；
+//   - 本会话开场一条 rule 都没注入（没有可去重的东西）。
+//
+// 🔴 判据必须是「本会话**实际**注入过的 rule」，不能是「库里所有的 rule」。
+// 开场注入有 --limit（默认 3）与字符预算两道闸；用全库规则当覆盖集合时，
+// 被闸掉的那些规则会**永远**进不来：开场不注入、每轮又被判 notes_duplicate 跳过，
+// 而审计里只表现为「正常去重」。见 internal/store/session_injected.go。
+func notesCoveredPredicate(st *store.Store, sessionID string) func(store.Hit) bool {
 	if !notesEnabled() {
 		return nil
 	}
-	rules, err := collectRules(st)
-	if err != nil {
+	if strings.TrimSpace(sessionID) == "" {
+		// 宿主没给会话标识（session_id / conversation_id 都空）：不知道本会话开场
+		// 注入过什么，就没有可去重的依据 —— 失败开放，宁可多注入一次。
+		// 不能退回「全库规则一律视为已覆盖」：那正是本缺陷的来源，全库集合大于
+		// 开场实际注入的集合，差集里的规则会永远进不来。
 		return nil
 	}
-	covered := make(map[string]bool, len(rules))
-	for _, r := range rules {
-		covered[oneLine(r.Content)] = true
+	ids, err := st.SessionInjectedRuleIDs(sessionID)
+	if err != nil || len(ids) == 0 {
+		return nil
 	}
 	return func(h store.Hit) bool {
-		return h.Kind == "rule" && covered[oneLine(h.Content)]
+		return h.Kind == "rule" && ids[h.ID]
 	}
 }
 
@@ -332,10 +349,13 @@ func notesCoveredPredicate(st *store.Store) func(store.Hit) bool {
 // 等价于 `mem notes` 的规则段。每轮 prompt-submit 若再检索出同一条 rule，
 // 同一知识就在上下文里重复出现、白占预算，故在**检索侧**过滤掉。
 //
+// 「出现过」以本会话的开场轨迹为准（sessionID）：开场因 limit/budget 没注入的规则
+// 不在此列，它仍有资格在后续每轮被检索注入。sessionID 为空时不去重（失败开放）。
+//
 // 注意：本函数只给检索侧用。开场注入侧若也调用它，规则将无处可去
 // （钩子不注入 notes 文本），等于静默丢规则 —— 见 sessionStartContext 的注释。
-func filterRulesCoveredByNotes(st *store.Store, hits []store.Hit) []store.Hit {
-	pred := notesCoveredPredicate(st)
+func filterRulesCoveredByNotes(st *store.Store, sessionID string, hits []store.Hit) []store.Hit {
+	pred := notesCoveredPredicate(st, sessionID)
 	if pred == nil {
 		return hits
 	}
@@ -576,7 +596,7 @@ func promptSubmitContext(st *store.Store, project, prompt string, limit, maxChar
 		Query: prompt, Project: project, Scope: "current",
 		SessionID: meta.SessionID, Harness: meta.Harness,
 		Limit: limit, Budget: budget, ContentRunes: maxHitRunes,
-		NotesCovered: notesCoveredPredicate(st),
+		NotesCovered: notesCoveredPredicate(st, meta.SessionID),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 检索失败（不影响会话）:", err)

@@ -61,6 +61,12 @@ cover-update:
 eval-gate:
 	@./scripts/release-eval.sh --gate-only
 
+# 钩子注入路径的 ON/OFF 评测：检索已找到的东西会不会在注入阶段丢掉（gate/去重/预算）。
+# 预算不足时按条裁剪并向后补位，而不是整块弃答 —— 这是被测的行为，不是假设。
+# 不读个人库，夹具在 eval/sandbox。与 eval-gate 相互独立（门槛键也不同）。
+eval-hook-ab:
+	@./scripts/eval-hook-ab.sh
+
 # 预演：只打印下一个将推导出的版本号（不打 tag、不跑 eval）。
 release-dry:
 	@./scripts/derive-version.sh --repo . --last $$(git describe --tags --abbrev=0 2>/dev/null || echo v0.1.0)
@@ -89,7 +95,8 @@ build-win:
 # ⚠️ ONNX 本地嵌入（M5b）**未实现**，此处刻意不提供目标。
 #
 # 曾有一个 `build-onnx` 目标，但代码里没有任何文件使用 `local_onnx` 构建标签，
-# 于是它产出的二进制与默认构建**逐字节相同**（实测均 11383042 字节）——
+# 于是它产出的二进制与默认构建**逐字节相同**（当时实测均 11383042 字节，
+# 那是旧构建的历史值，不是当前体积口径；当前约 17 MB，见 README）——
 # 一个名字承诺了 ONNX、实际什么也没多出来的目标。按本仓库「预留须显式标注」的
 # 原则，宁可没有目标，也不留一个静默存在的假目标。
 #
@@ -105,4 +112,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test test-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate release-dry release
+.PHONY: build install test test-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release

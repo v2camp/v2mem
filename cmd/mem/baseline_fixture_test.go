@@ -207,7 +207,16 @@ func TestReadPoolBaselineBackfillsAfterRuleDedupOrBudget(t *testing.T) {
 		}
 		// 旧基线：top3 全是全局 rule，notes 去重后不回补 ⇒ 注入 0~1 条。
 		// T4 要求：从合格池补位，把同查询命中的事实补进来，且规则绝不冒充事实。
-		out := renderHookContext(common{db: db}, harness.EventPromptSubmit, "demo", "ALPHA", 3, 1200, hookMeta{})
+		//
+		// 先跑开场：去重判据是「本会话开场**实际注入**了哪条 rule」，没有开场轨迹就
+		// 不去重（失败开放），这个用例就测不到补位。开场段 cap=limit=3，全局硬规则都在内。
+		const sid = "sess-baseline-dedup"
+		if open := renderHookContext(common{db: db}, harness.EventSessionStart, "demo", "", 3, 1200,
+			hookMeta{SessionID: sid}); len(open.Injected) == 0 {
+			t.Fatal("开场应注入全局规则，否则本用例测不到去重后的补位")
+		}
+		out := renderHookContext(common{db: db}, harness.EventPromptSubmit, "demo", "ALPHA", 3, 1200,
+			hookMeta{SessionID: sid})
 		if len(out.Injected) != 1 {
 			t.Fatalf("notes 去重后应从合格池补位（global 配额封顶 1），injected=%d text=%q", len(out.Injected), out.Text)
 		}

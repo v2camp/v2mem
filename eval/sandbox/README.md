@@ -4,6 +4,10 @@
 
 - `seed.jsonl`：灌进**临时库**的记忆和一条合成观测。正文是虚构的，没有个人信息。
 - `recall.gold.jsonl`：查询对应 `content_hash` 前 12 位（`store.HashOf`）。
+- `hook-prompts.jsonl`：钩子注入路径的查询夹具，字段 `query` / `gold`（`content_hash` 前 12 位）/
+  `case` / `note`，可选 `max_chars` 覆盖本次预算。16 条 5 类：`hit` 5 / `miss` 4 /
+  `cjk-heavy` 3 / `budget-stress` 3 / `multi-gold` 1。**只被 `scripts/eval-hook-ab.sh` 读取**，
+  不进 `make eval-gate`（沙箱只认 `*.gold.jsonl`）；`gold` 前缀必须能在 `seed.jsonl` 里查到。
 - 观测行只证明「合成会话可以灌入」；默认 `mem search` 不该靠它得分。
 
 个人标注仍放 `gold/`，用 `mem eval recall --gold-dir gold` 打自己的库。那一步不参与发版。

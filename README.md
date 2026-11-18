@@ -3,13 +3,13 @@
 **个人 Agent 记忆系统** —— 一个本地 CLI（命令名 `mem`），存"跨会话该记住的东西"，
 让 AI 工具在**需要时**查得到，而不是把它们塞进每轮注入的上下文里。
 
-**轻量** —— 单文件二进制约 **11 MB**：零 CGO、零外部服务、零常驻进程，直接依赖只有 1 个
+**轻量** —— 单文件二进制约 **17 MB**（各平台 16.7–17.9 MB）：零 CGO、零外部服务、零常驻进程，直接依赖只有 1 个
 （`modernc.org/sqlite`，纯 Go 转译）
 **快** —— 200 条记忆库检索平均 **~9 ms/次**（FTS5 + bm25：精确优先、空手才放宽）
 **多工具** —— 原生接入 **12 个 AI 工具**（Claude Code / Codex / Cursor / TraeCode / WorkBuddy / CodeBuddy / Qoder …），
 另提供 **MCP server**，任何支持 MCP 的工具一行配置即接入
 **跨会话** —— 记忆持久在本地 SQLite，会话之间、工程之间共享，不依赖任何云服务
-**跨平台** —— mac / linux / windows 预编译单文件，同一套记忆三端通用
+**跨平台** —— mac / linux / windows 预编译单文件，同一套记忆三端通用（Windows 路径尚未在 runner 实测，见安装节）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh | bash
@@ -65,10 +65,13 @@ make build                                                   # → bin/mem
 ln -sf "$PWD/bin/mem" "$(go env GOPATH)/bin/mem"             # 覆盖式软链
 ```
 
-预编译文件名：`mem-darwin-amd64`、`mem-darwin-arm64`、`mem-linux-amd64`、`mem-linux-arm64`、`mem-windows-amd64.exe`。
-`latest` 下载 `…/releases/latest/download/<文件名>`；`--version vX.Y.Z` 下载 `…/releases/download/vX.Y.Z/<文件名>`。
+预编译文件名：`mem-darwin-amd64`、`mem-darwin-arm64`、`mem-linux-amd64`、`mem-linux-arm64`、`mem-windows-amd64.exe`，
+另有 `checksums.txt`（五个文件的 SHA256）。`latest` 下载 `…/releases/latest/download/<文件名>`；`--version vX.Y.Z` 下载 `…/releases/download/vX.Y.Z/<文件名>`。
 
-这些文件由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `vX.Y.Z` tag，或于 Actions 里手动跑 `release` 时上传。main 上自动打 tag 仍先过 `eval-gate`；托管 runner 没有金标准对应的记忆库时这一步会失败，不会上传。推 tag 或手动跑 workflow 只再要求覆盖率门禁。某个版本的 Release 里还没有这些文件时，安装脚本回退到源码构建（需要本机已有 `git` 和 `go`）。
+安装脚本会下载 `checksums.txt` 校验目标二进制：哈希不符即拒绝落地并回退源码构建；**v0.5.1 及更早的 Release 没有该清单**，此时打印一次 WARN 并跳过校验（向后兼容）。
+清单与二进制同源于同一个 Release，只防传输损坏与错配，**不等于发布者签名**。
+
+这些文件由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在推送 `vX.Y.Z` tag，或于 Actions 里手动跑 `release` 时上传。main 上自动打 tag 仍先过 `eval-gate`；托管 runner 没有金标准对应的记忆库时这一步会失败，不会上传。推 tag 或手动跑 workflow 只再要求覆盖率门禁。某个版本的 Release 里还没有这些产物、或 SHA256 校验不符时，安装脚本回退到源码构建（需要本机已有 `git` 和 `go`）。
 
 Windows 只有 amd64 预编译，且脚本要在 Git Bash / MSYS 里跑（cmd.exe 不行）。默认 `~/.local/bin` 通常不在 Windows Path 中，请加 `--dir`。这条路径没有在 Windows runner 上实测。
 
@@ -78,6 +81,18 @@ Windows 只有 amd64 预编译，且脚本要在 Git Bash / MSYS 里跑（cmd.ex
 > 只更新该 worktree 自己的产物。要验证分支行为，得在该 worktree 里重跑一次上面的 `ln -sf`（`$PWD` 即该 worktree），
 > 切回主仓库后再跑一次。也因此**分支合入 main 并清理后要重建主分支**，否则验证到的仍是旧二进制（见 `AGENTS.md` 任务流程）。
 > 发版步骤见 [`docs/DEVELOPER.md`](./docs/DEVELOPER.md)。
+
+### 安装失败排查
+
+一行 `curl | bash` 若卡在拉取脚本本身（`raw.githubusercontent.com` 不可达），脚本没执行就不会有任何回退提示。拆成分步执行，可以看清是哪一段断了：
+
+```bash
+curl -fsSL -o /tmp/v2mem-install.sh https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/install.sh
+bash /tmp/v2mem-install.sh --dry-run
+bash /tmp/v2mem-install.sh
+```
+
+`--dry-run` 只打印将使用的 URL、校验清单 URL 与安装目录，不联网、不建目录。源码回退同样需要 `git` + `go` 且要能访问 GitHub；机器没有 Go 时，优先保证预编译下载通道可达，或从 Release 页面手动下载对应平台的二进制，改名为 `mem` 放进 PATH。
 
 ---
 
@@ -127,7 +142,7 @@ mem init --dry-run           # 只看会写什么
 配置写入遵守四条纪律：**合并不覆盖**、**幂等**、**只备份一次**（`.v2mem.bak`）、**绝对路径**。
 个别工具需额外动作（Codex 首次要 trust 钩子、QoderWork 改完要重启等），`mem init` 会逐一打印。
 Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 MCP）。
-`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`。这些痕迹可以用 `mem search --layer observation` 查到，默认的 `mem search` 和开场注入仍然只看已定记忆。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（候选仍不进检索，要 `mem accept` 才进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏。默认没有常驻进程。
+`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`。这些痕迹可以用 `mem search --layer observation` 查到，默认的 `mem search` 和开场注入仍然只看已定记忆。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（候选仍不进检索，要 `mem accept` 才进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏；每个工程的首次 `SessionEnd` 另有一次性冷启动蒸馏，把下一次开场的规则蒸馏前移，`MEM_NO_COLDSTART=1` 可关。默认没有常驻进程。
 全部卸载：`mem uninstall --all`（或 `--harness <名字>` 单个），只摘掉带 `# v2mem` 标记的条目，不动你自己的配置。
 
 ### MCP server
@@ -146,7 +161,7 @@ Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 M
 - 其余工具看各自的 MCP 配置格式，指向同一个 `mem mcp` 即可
 
 MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval activity` 的评测样本。
-没有 hook 时，把 `skills/mem-recall`、`skills/mem-remember`、`skills/mem-distill` 拷到 `~/.cursor/skills/`（或项目 `.cursor/skills/`）。`mem init` 不写 skills。
+清单内宿主都走 hooks 通道（11 个 native + 1 个桥接，含 Cursor 的六个原生事件），不需要 skill 兜底；无 hook 的临时环境直接用 CLI 或 MCP，命令要点见 [`docs/setup.md`](./docs/setup.md) §3A.4。
 
 ---
 
@@ -252,8 +267,10 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |
 | [`docs/setup.md`](./docs/setup.md) | 使用者 | **安装/接入规范**：合规接入五守则、hooks/MCP 分层、各宿主标准流程、监听面板引导、卸载回退 |
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |
+| [`docs/exp-project-seed.md`](./docs/exp-project-seed.md) | 所有者 / 开发者 | **实验**：工程记忆覆盖度对注入的影响（0%→57%）、写入粒度与配额竞争的实测、已部署种子与回退方式 |
 | [`docs/design-ref-landscape.md`](./docs/design-ref-landscape.md) | 所有者 / 开发者 | **架构参考**：mem0 与 agentmemory 的全面对照，可借鉴/不借鉴/待评估三档，两边踩过的坑 |
 | [`docs/design-anti-agentmemory.md`](./docs/design-anti-agentmemory.md) | 所有者 / 开发者 | 为何不照搬常驻 iii 与 54 个 MCP 工具；默认零常驻 |
+| [`docs/design-db-stamp.md`](./docs/design-db-stamp.md) | 开发者 | **库版本台账**：`db_meta` 写入者版本戳、库比二进制新时拒绝打开、与 `user_version` 门控的边界 |
 
 设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
 `design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 ·
@@ -261,7 +278,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 `design-workbuddy` WorkBuddy 结合 ·
 `design-eval` 激活与评测 · `design-maintenance` 收尾运维 ·
 `design-write-governance` 写侧治理与短/跨会话记忆分配 · `design-provenance` 记忆溯源 ·
-`design-write-batch` 写侧延迟治本（批量归档）。
+`design-write-batch` 写侧延迟治本（批量归档） · `design-db-stamp` 库版本台账与降级守卫。
 「见 §N」这类跨章节引用按 DESIGN 索引页的专题地图定位文件。
 
 ---

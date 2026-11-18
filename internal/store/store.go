@@ -82,6 +82,17 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("建表失败: %w", err)
 	}
+	// 版本台账：确认「这个库不是更新版本写的」之后再动结构。
+	//
+	// 位置在建表之后、各 ensureColumn 迁移之前：库比当前二进制新时立刻退出，
+	// 不拿旧假设去 ALTER 别人的表（旧二进制 `ensureColumn` 的 DDL 可能与新 schema
+	// 冲突，那种失败比「拒绝打开」难诊断得多）。
+	// 首次打戳发生在迁移之前**无害**：迁移是无条件幂等执行的，不靠台账跳过任何一步；
+	// 台账只回答「谁写过这个库」，不回答「迁移跑到哪了」（那是 user_version 的活）。
+	if _, err := EnsureWriterStamp(context.Background(), db, BinVersion(), time.Now().Unix()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// source 列是后加的：既有库没有该列，幂等补齐（ALTER 已存在列会报错，先探测）。
 	if err := ensureColumn(db, "memories", "source", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
@@ -1450,4 +1461,126 @@ func (s *Store) Stats() (*Stats, error) {
 		}
 	}
 	return st, nil
+}
+
+// ---------- 资产联动：按源文件反查 ----------
+
+// AssetHit 是「按源文件反查」的一条结果。
+//
+// 不复用 Hit：Hit 带 Rank/Score/Decayed 这些**检索排序**语义，而按文件反查
+// 的排序依据是「工程 → 锚点行 → 创建时间」，填进去只会误导调用方。
+type AssetHit struct {
+	ID        string  `json:"id"`
+	Kind      string  `json:"kind"`
+	Content   string  `json:"content"`
+	Project   string  `json:"project"`
+	Line      int     `json:"line,omitempty"`    // 0 = provenance 未记录行号
+	Preview   string  `json:"preview,omitempty"` // provenance 里的源片段预览
+	Salience  float64 `json:"salience"`
+	CreatedAt int64   `json:"created_at"`
+}
+
+// assetFileExpr / assetLineExpr / assetPreviewExpr 是读 provenance 的三处唯一入口。
+//
+// 为什么每一处都套 json_valid：SQLite 的 json_extract 遇到**非法 JSON 会直接抛错**
+// （malformed JSON），不是返回 NULL。asset 是「看一眼有什么」的查询，一条历史脏数据
+// （比如写入中断留下的半截 JSON）不该让整次查询失败。
+//
+// 目前 WHERE 里的 assetFileExpr 已经会给脏行返回 NULL，从而把它们挡在 SELECT 之前；
+// 但那是**执行顺序的巧合**，不是契约：哪天 WHERE 换成前缀匹配或有人复用这几个表达式
+// 拼别的语句，没守卫的那个就会成为第一个炸点。三个表达式统一守卫，成本是零。
+//
+// NULL 与空串的 provenance 同样得到 NULL：json_valid(NULL) = 0，因此这里**有意依赖**
+// `= ?` / `IN (...)` 对 NULL 不成立，无需额外加 `provenance IS NOT NULL` 条件。
+const (
+	assetFileExpr    = `(CASE WHEN json_valid(m.provenance) THEN json_extract(m.provenance, '$.file') END)`
+	assetLineExpr    = `(CASE WHEN json_valid(m.provenance) THEN json_extract(m.provenance, '$.line') END)`
+	assetPreviewExpr = `COALESCE(CASE WHEN json_valid(m.provenance) THEN json_extract(m.provenance, '$.preview') END, '')`
+)
+
+// assetDefaultLimit / assetMaxLimit 约束返回条数：默认够一次代码走读，上限防呆。
+const (
+	assetDefaultLimit = 50
+	assetMaxLimit     = 200
+)
+
+// AssetsByFile 查出 provenance.file 命中给定路径字面量集合的记忆。
+//
+// files 是**一组**候选字面量（同一个文件在库里的不同存法：相对工程根、
+// 用户输入的原样、绝对路径），归一化的职责在 CLI 侧，store 只做字面匹配。
+//
+// 可见性复用 visibilityWhere：按文件反查与 mem search 必须同一口径，
+// 否则会出现「搜得到但 asset 查不到」（被归并取代或已过期的记忆两处表现不一致）。
+//
+// 性能取舍：provenance 没有索引，json_extract 是全表扫描。本地库量级（千级）
+// 下毫秒级可接受，且 asset 是按需命令、不在 hook 热路径上。这里**刻意不加**
+// 生成列或表达式索引——那是 schema 变更，属于迁移任务的范围，不该由一条
+// 查询命令顺带引入。
+//
+// 排序：project → 锚点行 → created_at DESC。同一文件的多条记忆按行号读起来
+// 就是一次代码走读。行号**缺失**（`$.line` 不存在 → json_extract 返回 NULL，
+// 不是 0；只有显式写了 `"line": 0` 才是 0）的排在最前：SQLite 升序里 NULL 在前，
+// 这符合「没有锚点定位、只有文件级结论」应先被看到的直觉。
+func (s *Store) AssetsByFile(files []string, project string, limit int) ([]AssetHit, error) {
+	if limit <= 0 {
+		limit = assetDefaultLimit
+	}
+	if limit > assetMaxLimit {
+		limit = assetMaxLimit
+	}
+	// 去重既省占位符也避免 IN 列表里重复值（对结果无影响，但让 SQL 可读）。
+	seen := make(map[string]bool, len(files))
+	uniq := make([]string, 0, len(files))
+	for _, f := range files {
+		if f == "" || seen[f] {
+			continue
+		}
+		seen[f] = true
+		uniq = append(uniq, f)
+	}
+	if len(uniq) == 0 {
+		return nil, nil
+	}
+
+	where := visibilityWhere()
+	args := []any{time.Now().Unix()}
+	if project != "" {
+		where = append(where, "m.project = ?")
+		args = append(args, project)
+	}
+	ph := make([]string, len(uniq))
+	for i, f := range uniq {
+		ph[i] = "?"
+		args = append(args, f)
+	}
+	where = append(where, assetFileExpr+" IN ("+strings.Join(ph, ",")+")")
+	args = append(args, limit)
+
+	rows, err := s.db.Query(
+		`SELECT m.id, m.kind, m.content, m.project, `+assetLineExpr+`,
+		        `+assetPreviewExpr+`,
+		        m.salience, m.created_at
+		   FROM memories m
+		  WHERE `+strings.Join(where, " AND ")+`
+		  ORDER BY m.project, `+assetLineExpr+`, m.created_at DESC
+		  LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AssetHit
+	for rows.Next() {
+		var h AssetHit
+		var line sql.NullInt64
+		if err := rows.Scan(&h.ID, &h.Kind, &h.Content, &h.Project, &line,
+			&h.Preview, &h.Salience, &h.CreatedAt); err != nil {
+			return nil, err
+		}
+		if line.Valid {
+			h.Line = int(line.Int64)
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }

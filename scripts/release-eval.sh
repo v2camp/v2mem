@@ -53,7 +53,7 @@ trap 'rm -f "$TMPJSON" "$TMPERR"' EXIT
 rm -rf "$RECEIPTS_DIR"
 mkdir -p "$RECEIPTS_DIR"
 if ! "$MEM_BIN" eval recall --sandbox "$SANDBOX_DIR" --k 5 --json --receipts "$RECEIPTS_DIR" >"$TMPJSON" 2>"$TMPERR"; then
-  echo "RED: 沙箱 eval 失败（--sandbox $SANDBOX_DIR）" >&2
+  echo "RED: 沙箱 eval 失败（--sandbox ${SANDBOX_DIR}）" >&2
   cat "$TMPERR" >&2 || true
   cat "$TMPJSON" >&2 || true
   exit 1

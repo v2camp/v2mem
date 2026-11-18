@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # 回归：R8 候选积压 / R9 载荷残留 / R10 写侧延迟 / R11 WAL 堆积 /
-# R12 写侧自动决策链路 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
+# R12 写侧自动决策链路 / R13 注入体量 / R14 归档体量 / R15 候选 TTL 的分级边界，逐格对应
+# docs/ops-watch.md §3 判据表。
 # 用临时 V2MEM_DIR + mem stub，不触碰生产库；只断言 --json 输出的级别。
 # 重点守住四条口径：R8 按工程分组取最大值（跨工程不相加）、R10 只取 stop
 # （不与 obs-append 双计）、无样本记 INFO 而非 PASS、R12 判级只依赖 audit
-# （eval activity 读不到时仍须独立判级）。
+# （eval activity 读不到时仍须独立判级）。R14 的口径是**落盘量**：样本必须实写
+# 到 evidence 目录（APFS 上 truncate 的稀疏文件 du 记 0），且只判字节不判条数。
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WATCH="$ROOT/scripts/watch-v2mem.sh"
 TMP="$(mktemp -d)"
@@ -13,8 +15,8 @@ trap 'rm -rf "$TMP"' EXIT
 NOW="$(date +%s)"
 N=0
 
-# R13 默认关掉自动过期：本测试整体保持只读，只有 R13 组显式打开。
-R13_FLAGS="--no-gc"
+# R15 默认关掉自动过期：本测试整体保持只读，只有 R15 组显式打开。
+R15_FLAGS="--no-gc"
 GC_LOG="$TMP/gc-calls.log"
 : > "$GC_LOG"
 
@@ -29,13 +31,14 @@ cand_json() {
 
 merge_json() { jq -nc --argjson a "$1" --argjson b "$2" '$a + $b'; }
 
-# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json> [audit_extra] [activity_json] [prompts_json] [proj_stats] [total]
-# prompts_json：覆盖默认的两条 prompt（用于 R2）；proj_stats：stub 的「按工程」行内容；
-# total：stub 的全局总条数（默认 10）。
-run_case() {
-  local name="$1" stop_ms="$2" frames="$3" with_obs="$4" cands="$5"
-  local extra_audit="${6:-}" activity="${7:-}" prompts="${8:-}" proj_stats="${9:-}" total="${10:-}"
-  local d="$TMP/$name"
+# build_fixture <dir> <stop_ms|none> <wal_frames> <obs yes/no> [audit_extra] [audit_lines] [prompts]
+# 造 mem stub + 四事件 settings + 审计日志 + 按需的 -wal。R14 复用同一套夹具，
+# 只额外往 evidence 目录写文件，所以抽出来而不是在 run_case 里内联。
+# prompts 覆盖默认的单条 prompt-submit（R2 按工程口径要造多条提问）；
+# audit_lines 非空时整段替换审计体（R13 要区分「无读侧记录」与「只有旧格式记录」）。
+build_fixture() {
+  local d="$1" stop_ms="$2" frames="$3" with_obs="$4"
+  local extra_audit="${5:-}" audit_lines="${6:-}" prompts="${7:-}"
   mkdir -p "$d/v2mem" "$d/wb" "$d/home"
 
   cat > "$d/mem-stub" <<'STUB'
@@ -46,7 +49,7 @@ case "${1:-}" in
     if [ -n "${STUB_PROJ_STATS:-}" ]; then printf '按工程   %s\n' "$STUB_PROJ_STATS"; fi
     ;;
   candidates)
-    # R13 要用 --status accepted 单独查已采纳行（判断是否有 90 天前待删行）。
+    # R15 要用 --status accepted 单独查已采纳行（判断是否有 90 天前待删行）。
     case " $* " in
       *" --status accepted "*) printf '%s\n' "${STUB_ACC_JSON:-[]}" ;;
       *) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
@@ -59,7 +62,7 @@ exit 0
 STUB
   chmod +x "$d/mem-stub"
 
-  # 四个事件齐全，避免 I2=FAIL 让脚本以非零退出；本测试只断言 R8/R9/R10/R11。
+  # 四个事件齐全，避免 I2=FAIL 让脚本以非零退出；本测试只断言 R8–R15。
   cat > "$d/wb/settings.json" <<'SETTINGS'
 {"hooks":{
   "SessionStart":     [{"hooks":[{"type":"command","command":"mem hook # v2mem"}]}],
@@ -83,6 +86,11 @@ SETTINGS
       printf '{"ts":%s,"event":"obs-append","ms":9000}\n' "$NOW"
     fi
   } > "$d/v2mem/audit.jsonl"
+  if [ -n "$audit_lines" ]; then
+    # 给了完整审计体就整段替换：R13 要区分「无读侧记录」与「只有旧格式记录」，
+    # 默认夹具恒有两条读侧记录，做不到这两种场景。
+    printf '%s' "$audit_lines" > "$d/v2mem/audit.jsonl"
+  fi
   if [ -n "$extra_audit" ]; then
     printf '%s' "$extra_audit" >> "$d/v2mem/audit.jsonl"
   fi
@@ -90,7 +98,11 @@ SETTINGS
   if [ "$frames" -gt 0 ]; then
     dd if=/dev/zero of="$d/v2mem/mem.db-wal" bs=4096 count="$frames" 2>/dev/null
   fi
+}
 
+# run_watch <dir> [candidates_json] [activity_json] [proj_stats] [total]
+run_watch() {
+  local d="$1" cands="${2:-[]}" activity="${3:-}" proj_stats="${4:-}" total="${5:-}"
   V2MEM_DIR="$d/v2mem" \
   WORKBUDDY_CONFIG_DIR="$d/wb" \
   HOME="$d/home" \
@@ -101,7 +113,18 @@ SETTINGS
   STUB_PROJ_STATS="$proj_stats" \
   STUB_TOTAL="$total" \
   STUB_GC_LOG="$GC_LOG" \
-    bash "$WATCH" --json $R13_FLAGS 2>/dev/null || true
+    bash "$WATCH" --json $R15_FLAGS 2>/dev/null || true
+}
+
+# run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json>
+#          [audit_extra] [activity_json] [audit_lines] [prompts_json] [proj_stats] [total]
+run_case() {
+  local name="$1" stop_ms="$2" frames="$3" with_obs="$4" cands="$5"
+  local extra_audit="${6:-}" activity="${7:-}" audit_lines="${8:-}"
+  local prompts="${9:-}" proj_stats="${10:-}" total="${11:-}"
+  local d="$TMP/$name"
+  build_fixture "$d" "$stop_ms" "$frames" "$with_obs" "$extra_audit" "$audit_lines" "$prompts"
+  run_watch "$d" "$cands" "$activity" "$proj_stats" "$total"
 }
 
 # assert_case <名称> <stop_ms|none> <wal_frames> <obs> <cands> <R10> <R11> [R8] [R9]
@@ -220,32 +243,32 @@ assert_r9_detail r9_mixed_counts_fresh \
 # >3 且全为存量：判 FAIL，但结论落在「先清理、再复查」，不诬指准入逻辑。
 assert_r9_detail r9_legacy_fail "$(cand_json A 4 'Shell {"command":"ls"}' "$OLD")" "全为存量（最早 14 天前），非本窗口新增"
 
-# ---------- R13 候选 TTL 执行 ----------
+# ---------- R15 候选 TTL 执行 ----------
 # 口径：pending 超 14 天 → WARN 并执行 mem gc --candidates（只做 pending → expired）；
 # 存在 90 天前的已采纳行时转人工不执行（GCCandidates 那一步是 DELETE，不可逆）；
-# --no-gc 只判级不动库。R13 必须排在 R8/R9 之后，故 detail 声明「R8 仍按过期前计数」。
+# --no-gc 只判级不动库。R15 必须排在 R8/R9 之后，故 detail 声明「R8 仍按过期前计数」。
 STALE=$(( NOW - 15*86400 ))      # 越过 14 天阈值
 FRESH_ACC=$(( NOW - 10*86400 ))  # 已采纳但未满 90 天：不触发删除分支
 OLD_ACC=$(( NOW - 100*86400 ))   # 已采纳且超 90 天：必须转人工
 
-assert_r13() { # <名称> <pending_json> <accepted_json> <no_gc 0|1> <want_level> <detail 子串> <gc 次数>
+assert_r15() { # <名称> <pending_json> <accepted_json> <no_gc 0|1> <want_level> <detail 子串> <gc 次数>
   local name="$1" cands="$2" acc="$3" nogc="$4" want="$5" needle="$6" want_gc="$7"
   local out got detail before after calls
   before="$(wc -l < "$GC_LOG" | tr -d ' ')"
-  if [ "$nogc" -eq 1 ]; then R13_FLAGS="--no-gc"; else R13_FLAGS=""; fi
+  if [ "$nogc" -eq 1 ]; then R15_FLAGS="--no-gc"; else R15_FLAGS=""; fi
   out="$(STUB_ACC_JSON="$acc" run_case "$name" 100 0 no "$cands")"
-  R13_FLAGS="--no-gc"
+  R15_FLAGS="--no-gc"
   after="$(wc -l < "$GC_LOG" | tr -d ' ')"
   calls=$(( after - before ))
-  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R13") | .level')"
-  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R13") | .detail')"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R15") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R15") | .detail')"
   if [ "$got" != "$want" ]; then
-    echo "FAIL $name: R13 want=$want got=$got（${detail}）" >&2
+    echo "FAIL $name: R15 want=$want got=${got}（${detail}）" >&2
     printf '%s\n' "$out" >&2
     exit 1
   fi
   if [[ "$detail" != *"$needle"* ]]; then
-    echo "FAIL $name: R13 detail 缺 '${needle}'，got: ${detail}" >&2
+    echo "FAIL $name: R15 detail 缺 '${needle}'，got: ${detail}" >&2
     exit 1
   fi
   if [ "$calls" != "$want_gc" ]; then
@@ -253,20 +276,20 @@ assert_r13() { # <名称> <pending_json> <accepted_json> <no_gc 0|1> <want_level
     exit 1
   fi
   N=$((N+1))
-  printf 'ok  %-26s R13=%-4s gc=%s\n' "$name" "$got" "$calls"
+  printf 'ok  %-26s R15=%-4s gc=%s\n' "$name" "$got" "$calls"
 }
 
 # 无超期：PASS，且绝不动库。
-assert_r13 r13_no_stale "$(cand_json A 2)" '[]' 0 PASS "无超过 14 天的 pending" 0
+assert_r15 r15_no_stale "$(cand_json A 2)" '[]' 0 PASS "无超过 14 天的 pending" 0
 # 有超期：WARN + 执行一次状态迁移。
-assert_r13 r13_stale_gc "$(cand_json A 2 'ok' "$STALE")" '[]' 0 WARN "已执行 mem gc --candidates" 1
+assert_r15 r15_stale_gc "$(cand_json A 2 'ok' "$STALE")" '[]' 0 WARN "已执行 mem gc --candidates" 1
 # --no-gc：判级照旧，但不执行（排障与只读复现用）。
-assert_r13 r13_no_gc_flag "$(cand_json A 2 'ok' "$STALE")" '[]' 1 WARN "--no-gc 下不自动过期" 0
+assert_r15 r15_no_gc_flag "$(cand_json A 2 'ok' "$STALE")" '[]' 1 WARN "--no-gc 下不自动过期" 0
 # 有 90 天前已采纳行：DELETE 分支不可逆，转人工，绝不自动执行。
-assert_r13 r13_accepted_guard \
+assert_r15 r15_accepted_guard \
   "$(cand_json A 2 'ok' "$STALE")" "$(cand_json A 1 'ok' "$OLD_ACC")" 0 WARN "会被连带删除" 0
 # 已采纳但未满 90 天：删除分支不会命中，正常执行迁移。
-assert_r13 r13_accepted_fresh \
+assert_r15 r15_accepted_fresh \
   "$(cand_json A 2 'ok' "$STALE")" "$(cand_json A 1 'ok' "$FRESH_ACC")" 0 WARN "已执行 mem gc --candidates" 1
 
 # R2 按工程口径：只有「该工程库内 ≥20 条」的样本才进命中率分母。
@@ -287,11 +310,11 @@ plines() { # plines <project> <n> <empty>；project 传空串表示该行不带 
 assert_r2() { # <名称> <prompts> <proj_stats> <total> <want_level> [detail 子串]
   local name="$1" prompts="$2" pstats="$3" total="$4" want="$5" needle="${6:-}"
   local out got detail
-  out="$(run_case "$name" 100 0 no "$EMPTY" '' '' "$prompts" "$pstats" "$total")"
+  out="$(run_case "$name" 100 0 no "$EMPTY" '' '' '' "$prompts" "$pstats" "$total")"
   got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R2") | .level')"
   detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R2") | .detail')"
   if [ "$got" != "$want" ]; then
-    echo "FAIL $name: R2 want=$want got=$got（${detail}）" >&2
+    echo "FAIL $name: R2 want=$want got=${got}（${detail}）" >&2
     printf '%s\n' "$out" >&2
     exit 1
   fi
@@ -318,7 +341,9 @@ assert_r2 r2_legacy_no_proj   "$(plines '' 4 4)"                     ''         
 assert_case r8_read_fail       100 0 no 'not-json' PASS PASS WARN WARN
 
 # R12 边界：无样本 INFO / 有蒸馏且 0 失败 PASS / 断链 WARN / 失败 1–3 WARN / >3 FAIL。
-assert_r12 r12_no_sample        no  '' '' INFO
+# 无样本也要复述四段计数（观测/蒸馏分流/合法空/失败/裁决）：INFO 不比别的级别少信息，
+# 2026-11-15 起连续四个窗口的 INFO 分支都丢了 D12，靠人工发现。
+assert_r12 r12_no_sample        no  '' '' INFO '观测 0'
 assert_r12 r12_pass_rules       yes "$(dline distill ok false)$(dline distill empty false)" "$(activity_json '本次任务有沉淀')" PASS '蒸馏 2'
 assert_r12 r12_broken_chain     yes '' '' WARN 'MEM_DISTILL_SPAWN'
 assert_r12 r12_fail_1           yes "$(dline distill fail true)" '' WARN
@@ -330,5 +355,89 @@ assert_r12 r12_invalid_mode     yes "$(dline proposal invalid false)" '' WARN
 assert_r12 r12_activity_badjson yes "$(dline distill ok false)" 'not-json' PASS
 assert_r12 r12_activity_verdict yes "$(dline distill ok false)" "$(activity_json '有观测无采纳')" PASS '有观测无采纳'
 assert_r12 r12_decisions_shown  yes "$(dline distill ok false)$(decline accept)$(decline reject)" '' PASS 'accept 1 reject 1'
+
+# R13 夹具：iline 造带 inject_bytes 的读侧记录；oldline 造升级前无该字段的旧记录。
+iline()   { printf '{"ts":%s,"event":"%s","inject_bytes":%s}\n' "$NOW" "${2:-session-start}" "$1"; }
+oldline() { printf '{"ts":%s,"event":"%s","ms":9,"empty":false}\n' "$NOW" "${1:-prompt-submit}"; }
+
+# assert_r15 <名称> <audit_lines> <want_level> [detail 子串]
+assert_r13() {
+  local name="$1" lines="$2" want="$3" needle="${4:-}"
+  local out got detail
+  out="$(run_case "$name" 100 0 no "$EMPTY" '' '' "$lines")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R13") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R13") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R13 want=$want got=$got" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R13 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R13=%-4s\n' "$name" "$want"
+}
+
+# R13 边界：≤3600 PASS（含边界）/ 3601–8000 WARN（含 8000）/ >8000 FAIL。
+assert_r13 r13_pass_3599       "$(iline 3599)"                            PASS
+assert_r13 r13_pass_3600       "$(iline 3600)"                            PASS
+assert_r13 r13_warn_3601       "$(iline 3601)"                            WARN
+assert_r13 r13_warn_8000       "$(iline 8000)"                            WARN
+assert_r13 r13_fail_8001       "$(iline 8001)"                            FAIL '8001'
+# 只有旧记录（无 inject_bytes）：不得当 0 判 PASS，应 INFO 并点明是升级前的记录。
+assert_r13 r13_old_records     "$(oldline prompt-submit)"                 INFO '旧记录'
+# 读侧事件有三个：只有 pre-compact 的旧记录同样算「有读侧记录」，不得错报「无读侧记录」。
+assert_r13 r13_old_precompact  "$(oldline pre-compact)"                  INFO '旧记录'
+# pre-compact 带字段时也必须计入最大值（不只 session-start / prompt-submit）。
+assert_r13 r13_precompact_over "$(iline 9000 pre-compact)"                FAIL '9000'
+# 窗口内无读侧记录（只有写侧观测）：同为 INFO，但说明必须不同。
+assert_r13 r13_no_read_side    "$(printf '{"ts":%s,"event":"obs-append","ms":9}\n' "$NOW")" INFO '无读侧记录'
+# 混合：旧记录 + 8001 必须 FAIL，证明缺失字段不会被当 0 拉低最大值。
+assert_r13 r13_mixed_old_over  "$(oldline prompt-submit)$(iline 8001)"    FAIL '8001'
+
+# R14 夹具：evidence 的落盘量。必须**实写**——APFS 上 truncate 出来的稀疏文件 `du` 记 0，
+# 拿它当样本会永远 PASS。同一目录增量追加，避免为两个边界值各写一遍。
+# 不断言 detail 里的具体 MiB 数：`du` 统计分配块，实测物理占用比逻辑大小高 1–2%
+# （写 500MiB 报 507–519MiB 不等），贴着阈值构造会偶发误判。故两侧各留 ~100MiB 余量，
+# 只断言判级的**语义**（「未超」「超过 512MiB」），阈值本身的改动由 sync 检查守住。
+R14_DIR="$TMP/r14"
+R14_NODIR="$TMP/r14-nodir"
+build_fixture "$R14_DIR" 100 0 no
+build_fixture "$R14_NODIR" 100 0 no
+mkdir -p "$R14_DIR/v2mem/evidence"
+ev_write() { dd if=/dev/zero of="$R14_DIR/v2mem/evidence/$1" bs=1m count="$2" 2>/dev/null; }
+
+# assert_r14 <名称> <dir> <want_level> [detail 子串]
+assert_r14() {
+  local name="$1" d="$2" want="$3" needle="${4:-}"
+  local out got detail
+  out="$(run_watch "$d")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R14") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R14") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL ${name}: R14 want=${want} got=${got}" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL ${name}: R14 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R14=%-4s\n' "$name" "$want"
+}
+
+# 无归档目录 → INFO（无样本），不得判 PASS 掩盖「未启用归档」。
+assert_r14 r14_no_dir        "$R14_NODIR" INFO '不存在'
+# 目录存在但空 → PASS（尚无观测落盘），与「无目录」的措辞必须不同。
+assert_r14 r14_empty_dir     "$R14_DIR"   PASS '无归档文件'
+# 400MiB → PASS（距 512MiB 水位有余量，吸收 du 的分配抖动）。
+ev_write a 400
+assert_r14 r14_pass_under    "$R14_DIR"   PASS '未超 512MiB'
+# 再 +200MiB → 约 600MiB → WARN；只判字节，文件数仍是 2 也要按体积判。
+ev_write b 200
+assert_r14 r14_warn_over     "$R14_DIR"   WARN '超过 512MiB'
 
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"
