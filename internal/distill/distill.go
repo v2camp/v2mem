@@ -431,14 +431,18 @@ func ExtractRules(obs []Observation) []Fact {
 		if speaker == "" {
 			continue
 		}
-		if speaker == "assistant" && !assistantDurable(summary) {
+		// 判定对象必须与存储对象一致：候选落库时只保留 oneLine + 240 rune。
+		// 若按全文放行、按截断存储，就会产出「存下来的那段没有任何可复用标记」的候选——
+		// 2026-11-18 17:41 实例：`根因是……` 在 300 字处，存的 240 字全是
+		// 「全量 Java 测试已执行 / 通过 / 失败」的进度报表，裁决时无法据其判断可复用性。
+		content := truncate(oneLine(summary), 240)
+		if speaker == "assistant" && !assistantDurable(content) {
 			continue
 		}
 		kind := matchKind(summary)
 		if kind == "" || (speaker == "assistant" && kind == "preference") {
 			continue
 		}
-		content := truncate(oneLine(summary), 240)
 		if seen[kind+"\n"+content] {
 			continue
 		}

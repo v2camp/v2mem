@@ -141,6 +141,29 @@ func TestExtractRulesAssistantSourceGate(t *testing.T) {
 			summary: "决策：候选必须带 `已完成` 字样才算数",
 			want:    1,
 		},
+		{
+			// 真实漏网（obs ev_7be27 → cand 1ec0a682，2026-11-18 17:41 蒸馏）：
+			// 「根因是既有的测试范围问题」在 300 字处，落库时被截到 240 rune，
+			// 存下来的整段只剩「测试已执行 / 通过 / 失败」，裁决时无从判断可复用性。
+			// 判定必须看将要存储的那一段，否则门槛形同虚设。
+			name: "结论在截断窗口外不算数", event: "stop",
+			summary: "全量 Java 测试已执行（聚合入口，`-fae` 跑完所有模块）： ```bash mvn -f projects/pom.xml test -fae ``` " +
+				"结果： - **通过**：`agent-shared-core`、5-8（含 basic）、9-12（含 basic）、13-16 basic、17-18 basic、17-20 " +
+				"- **17-20 全量**：483 条测试，0 失败、0 错误、1 跳过，`BUILD SUCCESS` " +
+				"- **失败**：`lesson13-16-shop` 的 2 个护栏测试，共 5 条 - `MetricFormulaGuardTest`：3 条 " +
+				"- `WhitelistSchemaDriftTest`：2 条 根因是既有的测试范围问题，必须按模块重划边界。",
+			want: 0,
+		},
+		{
+			name: "结论在窗口内、进度在窗口外仍保留", event: "stop",
+			summary: "决策：图表题采用两层契约，LLM 只产出 ChartIntent，代码查库回填 ChartData，渲染器只吃 ChartData。" +
+				"这样模型不接触数字，渲染库可以整体替换，也不需要在 prompt 里塞任何表结构。" +
+				"落地时先把 intent 的字段命名收敛到五个维度，再让查询层按维度拼 SQL，最后统一在渲染层做单位换算。" +
+				"字段命名沿用数据字典里已有的中文标签，避免前端再维护一套映射表；单位换算只用整数，避免浮点误差。" +
+				"渲染库的替换成本因此压到只改一个适配器文件，测试也只需覆盖适配器边界。" +
+				"本轮进度：已完成 52/65 场，日志末尾 DONE。",
+			want: 1,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
