@@ -181,6 +181,7 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 | §15 · §16 | 激活模型、评测机制、report 定位 | [`design-eval.md`](./design-eval.md) |
 | §17 | 收尾运维三件套（uninstall/备份/轮转） | [`design-maintenance.md`](./design-maintenance.md) |
 | 写侧治理 | 写必由 LLM 决策、短/跨会话记忆分配、bulk 打标 | [`design-write-governance.md`](./design-write-governance.md) |
+| 准入判定 | 模型只判「要不要」、权限不得宽于 commit 矩阵、影子期与转正门槛 | [`design-admission.md`](./design-admission.md) |
 | 捕获层 | 多 harness 的 `CaptureEvent` 契约、A/B/C/D 捕获阶梯、artifact 扫描边界 | [`design-capture.md`](./design-capture.md) |
 | 说话人归属 | 用户请求 / AI 产出的采集与准入、分源提炼、`attributed_to`、反回声 | [`design-speaker-attribution.md`](./design-speaker-attribution.md) |
 | 写侧性能 | 写侧延迟根因实证、批量归档（方案 B）、P0 契约核查与灰度分期 | [`design-write-batch.md`](./design-write-batch.md) |

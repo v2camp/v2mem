@@ -264,6 +264,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-capture.md`](./docs/design-capture.md) | 所有者 / 开发者 | **捕获层架构**：多 harness 的 `CaptureEvent` 契约、A/B/C/D 捕获阶梯、适配器一致性测试、artifact 扫描边界与「事实源/查询源」划分 |
 | [`docs/design-speaker-attribution.md`](./docs/design-speaker-attribution.md) | 所有者 / 开发者 | **说话人归属**：用户请求与 AI 产出怎么进记忆；参照应用对照、分源提炼、`attributed_to`、反回声规则与验收数据 |
 | [`docs/design-write-governance.md`](./docs/design-write-governance.md) | 所有者 / 开发者 | **写侧治理**：三态（观测/候选/采纳）、写必由 LLM 决策、channel 与来源标记；§12 候选裁决自动化闭环（触发点、MCP 显式裁决、R8 分组、采纳率前提） |
+| [`docs/design-admission.md`](./docs/design-admission.md) | 所有者 / 开发者 | **准入判定**：模型只判「要不要」、权限不得宽于 commit 矩阵、影子期与转正门槛、理由码作为规则沉淀语料 |
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |
 | [`docs/setup.md`](./docs/setup.md) | 使用者 | **安装/接入规范**：合规接入五守则、hooks/MCP 分层、各宿主标准流程、监听面板引导、卸载回退 |
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |
