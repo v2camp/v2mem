@@ -72,4 +72,24 @@ grep -q 'TTL_DAYS=14'  "$SCRIPT" || fail "脚本 R15 的 TTL_DAYS 不是 14"
 grep -q 'GC_DISABLED'  "$SCRIPT" || fail "脚本 R15 缺 --no-gc 逃生开关"
 grep -q 'ACC_OLD'      "$SCRIPT" || fail "脚本 R15 缺「待删已采纳行则转人工」保护"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；枚举到 R${max_r}"
+# ⑧ R3 口径：脚本 detail 与文档依据段都必须写明「端到端」。
+# 实证：文档长期写「实测量级 9–15ms」，而 R3 量的是端到端（进程启动 + 冷缓存 + 注入渲染），
+# 2026-11-19 复核端到端按日中位数已到 45.5ms、长尾 167ms，纯检索仍 10ms。
+# 口径不分，每个窗口都会把「进程启动 + 并发」读成「检索退化」，并去删库/改阈值。
+printf '%s' "$(grep 'add R3 WARN' "$SCRIPT" || true)" | grep -q '端到端' \
+  || fail "脚本 R3 WARN 文案未区分端到端口径"
+r3_basis="$(sed -n '/\*\*R3 的 50ms\*\*/,/\*\*R2 的 30%\*\*/p' "$DOC")"
+[ -n "$r3_basis" ] || fail "§3 找不到 R3 阈值依据段"
+printf '%s' "$r3_basis" | grep -q '端到端' \
+  || fail "§3 R3 依据段未区分端到端口径"
+printf '%s' "$r3_basis" | grep -q '纯检索' \
+  || fail "§3 R3 依据段未保留纯检索对照值"
+# 反向断言：两处都不许再出现「9ms 是典型值 / 实测量级 9–15ms」的旧口径。
+if grep -q '典型值 ~9ms' "$SCRIPT"; then
+  fail "脚本 R3 WARN 退回「典型值 ~9ms」旧口径"
+fi
+if printf '%s' "$r3_basis" | grep -q '实测量级 9–15ms'; then
+  fail "§3 R3 依据段退回「实测量级 9–15ms」旧口径"
+fi
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；R3 端到端/纯检索口径两处同步；枚举到 R${max_r}"
