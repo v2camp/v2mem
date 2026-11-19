@@ -309,11 +309,11 @@ fi
 if [ "$A_MS" -gt 0 ]; then
   R3_NOTE="读侧样本 ${A_READ_N} 次；写侧 Stop ${A_WRITE_MS}ms 由 R10 单独判级，不计入本判据"
   if [ "$A_MS" -lt 50 ]; then
-    add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 目标线；${R3_NOTE}"
+    add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 端到端目标线；${R3_NOTE}"
   elif [ "$A_MS" -lt 200 ]; then
-    add R3 WARN "检索延迟 ${A_MS}ms" "高于典型值 ~9ms，观察是否库膨胀或锁竞争；${R3_NOTE}"
+    add R3 WARN "检索延迟 ${A_MS}ms" "端到端均值越 50ms：先排除冷缓存与同秒多 hook 并发（近 3 天端到端基线 25–45ms，纯检索热态仍 ~10ms），再判是否退化；${R3_NOTE}"
   else
-    add R3 FAIL "检索延迟 ${A_MS}ms" "超过 200ms，检查 WAL 大小与并发写入；${R3_NOTE}"
+    add R3 FAIL "检索延迟 ${A_MS}ms" "端到端超 200ms：先看样本是否同秒并发，再查 WAL 帧数与写锁；${R3_NOTE}"
   fi
 else
   add R3 INFO "无延迟样本" "窗口内没有带 ms 的读侧记录"
