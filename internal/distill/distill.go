@@ -125,6 +125,11 @@ type Options struct {
 	LookPath func(string) (string, error)
 	Getenv   func(string) string
 	Complete func(ctx context.Context, spec ModelSpec, prompt string) (string, error)
+	// APIKey / BaseURL 是调用方（model.json / flag）给的显式覆盖，优先于环境变量。
+	// 没有它们时，兼容 OpenAI 的接入只能靠 OPENAI_API_KEY + OPENAI_BASE_URL 三条变量拼，
+	// 而这正是「换个模型要改一堆环境」的来源。
+	APIKey  string
+	BaseURL string
 }
 
 // ModelSpec 是一次本地或兼容 OpenAI 的调用参数。
@@ -247,15 +252,42 @@ func resolve(opt Options) (string, ModelSpec, error) {
 		}
 		return "ollama", ModelSpec{Name: opt.Model, Kind: "ollama"}, nil
 	case "openai":
-		key := strings.TrimSpace(opt.Getenv("OPENAI_API_KEY"))
+		key := strings.TrimSpace(opt.APIKey)
+		if key == "" {
+			key = strings.TrimSpace(opt.Getenv("OPENAI_API_KEY"))
+		}
 		if key == "" {
 			return "openai", ModelSpec{}, fmt.Errorf("未设置 OPENAI_API_KEY")
 		}
-		base := strings.TrimSpace(opt.Getenv("OPENAI_BASE_URL"))
+		base := strings.TrimSpace(opt.BaseURL)
+		if base == "" {
+			base = strings.TrimSpace(opt.Getenv("OPENAI_BASE_URL"))
+		}
 		if base == "" {
 			base = "https://api.openai.com/v1"
 		}
 		return "openai", ModelSpec{Name: opt.Model, BaseURL: base, APIKey: key, Kind: "openai"}, nil
+	case "deepseek":
+		// DeepSeek 是 OpenAI 兼容协议：同一套 chat/completions，只换 base 与 model 名。
+		key := strings.TrimSpace(opt.APIKey)
+		if key == "" {
+			key = strings.TrimSpace(opt.Getenv("DEEPSEEK_API_KEY"))
+		}
+		if key == "" {
+			return "deepseek", ModelSpec{}, fmt.Errorf("未设置 DEEPSEEK_API_KEY（或 ~/.v2mem/model.json 的 api_key）")
+		}
+		base := strings.TrimSpace(opt.BaseURL)
+		if base == "" {
+			base = strings.TrimSpace(opt.Getenv("DEEPSEEK_BASE_URL"))
+		}
+		if base == "" {
+			base = "https://api.deepseek.com/v1"
+		}
+		name := opt.Model
+		if strings.TrimSpace(name) == "" {
+			name = "deepseek-flash"
+		}
+		return "deepseek", ModelSpec{Name: name, BaseURL: base, APIKey: key, Kind: "openai"}, nil
 	case "auto":
 		if _, err := opt.LookPath("ollama"); err == nil && ollamaAlive(opt.Timeout) {
 			return "ollama", ModelSpec{Name: opt.Model, Kind: "ollama"}, nil
