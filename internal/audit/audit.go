@@ -80,6 +80,16 @@ type Record struct {
 	// 检索命中一两条时 search_ms 常为 0，故 0 必须是「真 0」而不是「没写」。
 	OpenMS   int64 `json:"open_ms"`
 	SearchMS int64 `json:"search_ms"`
+	// ClaimMS / EvidenceMS / MaintMS 补齐 MS 的剩余分段（2026-11-20）。
+	// 只有 open/search 时，R3 只能算出「还有 250ms 在开库与检索之外」，指不出是谁：
+	//   ClaimMS    —— hook 幂等去重事务（claimHookEvent，另开一个库连接）
+	//   EvidenceMS —— prompt-submit 落用户原话证据（openEvidenceSession 再开连接 + 归档 fsync）
+	//   MaintMS    —— session-start 的 spool 排空与挂起蒸馏
+	// 三段与 MS 的差额＝stdout 写 + 审计追加。同样不用 omitempty：0 必须是「真 0」，
+	// 否则「这段没耗时」与「这条记录来自旧版本」分不开，R3 分因会再次落空。
+	ClaimMS    int64 `json:"claim_ms"`
+	EvidenceMS int64 `json:"evidence_ms"`
+	MaintMS    int64 `json:"maint_ms"`
 }
 
 // Path 返回默认审计日志路径（与库同目录，便于一起备份/清理）。
