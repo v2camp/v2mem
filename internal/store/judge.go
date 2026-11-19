@@ -17,6 +17,16 @@ func (s *Store) MarkJudgeVerdict(id, verdict, model, reason string) error {
 	return err
 }
 
+// CountPending 统计全库 pending 候选数，供积压触发判定用。
+//
+// 用全库而不是按工程：judge 一次处理的就是全库最老的一批，触发条件与它处理的
+// 范围保持一致，否则「某工程 30 条却永不触发」取决于别的工程有没有先到阈值。
+func (s *Store) CountPending() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM candidates WHERE status = 'pending'`).Scan(&n)
+	return n, err
+}
+
 // JudgeStat 是按判定结果分组的影子期统计。
 //
 // Accepted / Rejected 数的是「判定之后被裁决成什么」：影子期两个数都由人工产生，
