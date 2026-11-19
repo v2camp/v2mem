@@ -114,12 +114,17 @@ func cmdHook(args []string) error {
 	}
 
 	started := time.Now()
+	// 三个分段只用于 R3 分因（详见 audit.Record 的注释）：早退路径不写审计，
+	// 记了也没人看，故只在最后那条 rec 上带出去。
+	var claimMS, evidenceMS, maintMS int64
 
 	// 幂等去重：同一事件若被**多处配置**并行触发（如 TraeWork 的项目级
 	// .trae/hooks.json 与全局 ~/.trae-cn/hooks.json 都定义了同一事件），
 	// 只让先到的那次注入。详情与设计约束见 hookDedupKey 的注释。
 	if *dedupWindow > 0 {
+		claimStart := time.Now()
 		claimed, derr := claimHookEvent(c.db, in, event, *dedupWindow, started.Unix())
+		claimMS = time.Since(claimStart).Milliseconds()
 		switch {
 		case derr != nil:
 			// 失败开放：判不出是否重复时照常注入。
@@ -143,7 +148,9 @@ func cmdHook(args []string) error {
 	// 用户原话是记忆的主来源（mem0 USER_MEMORY_EXTRACTION_PROMPT 的硬约束）。
 	// UserPromptSubmit 仍是读路径，这里只顺带落一条证据，不改变注入行为。
 	if event == harness.EventPromptSubmit {
+		evidenceStart := time.Now()
 		appendUserPromptFailOpen(c, *harnessFlag, project, in, *noScrub)
+		evidenceMS = time.Since(evidenceStart).Milliseconds()
 	}
 
 	if isObserveHook(event) {
@@ -158,8 +165,10 @@ func cmdHook(args []string) error {
 	}
 
 	if event == harness.EventSessionStart {
+		maintStart := time.Now()
 		drainSpoolFailOpen(c.db, *auditPath)
 		distillPendingFailOpen(c.db, *auditPath, harnessName(*harnessFlag, in))
+		maintMS = time.Since(maintStart).Milliseconds()
 	}
 
 	budget := *maxChars
@@ -187,6 +196,9 @@ func cmdHook(args []string) error {
 			InjectBytes: len(out.Text),
 			OpenMS:      out.OpenMS,
 			SearchMS:    out.SearchMS,
+			ClaimMS:     claimMS,
+			EvidenceMS:  evidenceMS,
+			MaintMS:     maintMS,
 		}
 		for _, h := range out.Injected {
 			rec.Hashes = append(rec.Hashes, h.ID)
