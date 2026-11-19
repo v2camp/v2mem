@@ -46,7 +46,34 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
 `no_generalizable`）。自由文本无法聚合，也挡不住提示词漂移。
 它的第二个用途是**规则沉淀的输入**：同一理由码出现频次足够高时，才谈把它降级成正则/结构判据。
 
-## 5. 数据与观测
+## 5. 模型接入：配置文件优先，环境变量次之
+
+`~/.v2mem/model.json`（权限建议 `chmod 600`）：
+
+```json
+{
+  "provider": "deepseek",
+  "model": "deepseek-flash",
+  "api_key": "sk-...",
+  "base_url": "https://api.deepseek.com/v1"
+}
+```
+
+| 优先级 | 来源 | 场景 |
+|:---|:---|:---|
+| 1 | `--provider` / `--model` | 临时换模型试一次 |
+| 2 | `model.json` | 常态；定时任务不继承交互 shell 环境，只有文件是确定性输入 |
+| 3 | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` 等环境变量 | 文件没配时的兜底 |
+| 4 | `auto`（本地 ollama → openai） | 都没配时 |
+
+- **DeepSeek 走 OpenAI 兼容协议**（`/chat/completions`），只是 base 与 model 名不同；
+  代码里复用同一个 `completeOpenAI`，没有第二套客户端。
+- 模型名留空且 `provider=deepseek` 时默认 `deepseek-flash`，**不会**落到 ollama 的 `qwen2.5:7b`。
+- 密钥写文件而不是走命令行参数：命令行会进 shell history，文件不会。
+- 候选正文会发往该端点，这是 `VALUE.md` §4 例外的边界——所以 `provider` 必须显式配，
+  不允许「没配就随便挑一个远端」。
+
+## 6. 数据与观测
 
 | 项 | 位置 |
 |:---|:---|
@@ -58,7 +85,7 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
 **R8 的口径不变**：`--apply` 后 pending 会降，但知识只是从候选区移到主库，由 R6（库规模）承接。
 不把 R8 变好当成「问题解决」。
 
-## 6. 未做（按顺序，且都有前置条件）
+## 7. 未做（按顺序，且都有前置条件）
 
 1. **规则沉淀**：需要 ≥50 条带理由码的裁决。现在 0 条，先攒语料。产出形态拟为
    `~/.v2mem/admission.jsonl` + dry-run 计数，转正看误杀率（分母来自抽样复核，不是 dry-run 自己）。
@@ -66,9 +93,9 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
    `mem judge --rollback <judge_model>` 同批交付——按 §4 例外条款 (c)，单独放行 `--apply` 视为违约。
 3. **R8 增列**：影子准确率进 detail，需同步改 `docs/ops-watch.md` 与脚本两处。
 
-## 7. 已知限制
+## 8. 已知限制
 
-- `auto` 在本机解析为 `none`（无 ollama、无 OPENAI key），判定器会明确报「不可用」而不是
+- 没有可用模型时（`auto` 落空、或 `deepseek` 缺 key），判定器明确报「不可用」而不是
   「判定 0 条」——后者会被误读成「候选都干净」。
 - 一次调用判一批（默认 20 条），批量大会稀释注意力；超长候选正文截断到 600 rune。
 - 模型看不到全库，判不了「这条是否与已有记忆重复」；去重仍由 `ux_cand_hash` 与采纳时的

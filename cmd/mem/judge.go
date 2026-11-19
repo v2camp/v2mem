@@ -62,8 +62,9 @@ func cmdJudge(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("judge", flag.ContinueOnError)
 	c.register(fs)
-	provider := fs.String("provider", "auto", "模型来源：auto|ollama|openai|none")
-	model := fs.String("model", "", "模型名（默认由 provider 决定）")
+	provider := fs.String("provider", "", "模型来源：deepseek|openai|ollama|auto|none（空=读 model.json，再退回 auto）")
+	model := fs.String("model", "", "模型名（空=读 model.json；deepseek 默认 deepseek-flash）")
+	cfgPath := fs.String("config", "", "模型配置文件（默认 ~/.v2mem/model.json）")
 	timeout := fs.Duration("timeout", 90*time.Second, "单次模型调用超时")
 	limit := fs.Int("limit", judgeDefaultBatch, "本批判定条数上限")
 	project := fs.String("project", "", "只判这个工程的候选（空=不过滤）")
@@ -93,12 +94,32 @@ func cmdJudge(args []string) error {
 		return nil
 	}
 
+	// 优先级：flag > model.json > 环境变量 > none。配置文件在中间，
+	// 因为定时任务不继承交互 shell 的环境，而 flag 只适合临时试一次。
+	cfg, err := distill.LoadModelConfig(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
+	}
+	if strings.TrimSpace(*provider) == "" {
+		*provider = cfg.Provider
+	}
+	if strings.TrimSpace(*provider) == "" {
+		*provider = "auto"
+	}
+	if strings.TrimSpace(*model) == "" {
+		*model = cfg.Model
+	}
+	if strings.TrimSpace(*model) == "" && strings.EqualFold(*provider, "deepseek") {
+		*model = "deepseek-flash"
+	}
+
 	complete, providerName, err := distill.PromptCompleter(distill.Options{
 		Provider: *provider, Model: *model, Timeout: *timeout,
+		APIKey: cfg.APIKey, BaseURL: cfg.BaseURL,
 	})
 	if err != nil {
 		// 明确告诉用户「模型没起来」而不是「判定为 0 条」——后者会被当成「候选都干净」。
-		return fmt.Errorf("判定器不可用（%w）。本机可 `ollama serve` 后重试，或显式 --provider openai（会把候选正文发往远端）", err)
+		return fmt.Errorf("判定器不可用（%w）。在 ~/.v2mem/model.json 配 provider/model/api_key，或用 --provider deepseek 加 DEEPSEEK_API_KEY；候选正文会发往该端点", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
