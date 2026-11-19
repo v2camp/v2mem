@@ -179,3 +179,47 @@ func TestJudgeCandidatesJSONTruncates(t *testing.T) {
 		t.Error("截断后应带省略号")
 	}
 }
+
+// 判定器自己 --apply 的裁决不能算人工样本：否则 once 转正后一致率恒 100%，
+// 「≥95% 才放行」这条门槛会被自己的产出喂饱。
+func TestJudgeStatsExcludesSelfRun(t *testing.T) {
+	st := newJudgeStore(t)
+	c := seedCandidate(t, st, "fact", "判定器自裁的样本")
+	if err := st.MarkJudgeVerdict(c.ID, "reject", "deepseek@judge-v2", "process_narrative"); err != nil {
+		t.Fatalf("MarkJudgeVerdict: %v", err)
+	}
+	if _, err := st.CommitReject(c.ID, -1, "judge", "judge:process_narrative"); err != nil {
+		t.Fatalf("CommitReject: %v", err)
+	}
+	stats, err := st.JudgeStats()
+	if err != nil {
+		t.Fatalf("JudgeStats: %v", err)
+	}
+	if len(stats) != 1 {
+		t.Fatalf("应有 1 组，got %+v", stats)
+	}
+	if stats[0].Rejected != 0 || stats[0].SelfRun != 1 {
+		t.Fatalf("自裁应计入 SelfRun 而非人工否决，got %+v", stats[0])
+	}
+	if !noHuman(stats) {
+		t.Error("只有自裁样本时应判为「无人工样本」")
+	}
+}
+
+// 文本输出是给人看的最后一步：分母口径改了，表头与「无人工样本」提示必须同步。
+func TestPrintJudgeStatsText(t *testing.T) {
+	st := newJudgeStore(t)
+	if err := printJudgeStats(st, false); err != nil { // 空表
+		t.Fatalf("printJudgeStats 空表: %v", err)
+	}
+	c := seedCandidate(t, st, "fact", "人工裁决样本")
+	if err := st.MarkJudgeVerdict(c.ID, "accept", "deepseek@judge-v2", "durable"); err != nil {
+		t.Fatalf("MarkJudgeVerdict: %v", err)
+	}
+	if _, err := st.CommitAccept(c.ID, -1, "human"); err != nil {
+		t.Fatalf("CommitAccept: %v", err)
+	}
+	if err := printJudgeStats(st, false); err != nil {
+		t.Fatalf("printJudgeStats: %v", err)
+	}
+}

@@ -302,6 +302,15 @@ func findByPrefix(list []store.Candidate, prefix string) *store.Candidate {
 	return nil
 }
 
+func noHuman(stats []store.JudgeStat) bool {
+	for _, s := range stats {
+		if s.Accepted+s.Rejected > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func printJudgeStats(st *store.Store, asJSON bool) error {
 	stats, err := st.JudgeStats()
 	if err != nil {
@@ -314,19 +323,24 @@ func printJudgeStats(st *store.Store, asJSON bool) error {
 		fmt.Println("judge: 还没有任何判定记录")
 		return nil
 	}
-	fmt.Println("verdict   总数  人工采纳  人工否决  待定  一致率")
+	fmt.Println("verdict   总数  人工采纳  人工否决  判定器自裁  待定  一致率")
 	for _, s := range stats {
+		// 一致率只用人工样本做分母：accept 看「人工也采纳」，reject 看「人工也否决」。
+		// 判定器自己 --apply 的那些（SelfRun）不进分母，否则门槛会被自己的产出喂饱。
 		decided := s.Accepted + s.Rejected
 		agree := "—"
 		if decided > 0 {
-			// 一致率口径：accept 看「人工也采纳」，reject 看「人工也否决」，unsure 不看。
 			if s.Verdict == "reject" {
 				agree = fmt.Sprintf("%d%%", s.Rejected*100/decided)
 			} else {
 				agree = fmt.Sprintf("%d%%", s.Accepted*100/decided)
 			}
 		}
-		fmt.Printf("%-8s  %4d  %8d  %8d  %4d  %s\n", s.Verdict, s.Total, s.Accepted, s.Rejected, s.Pending, agree)
+		fmt.Printf("%-8s  %4d  %8d  %8d  %10d  %4d  %s\n",
+			s.Verdict, s.Total, s.Accepted, s.Rejected, s.SelfRun, s.Pending, agree)
+	}
+	if noHuman(stats) {
+		fmt.Println("（本批没有任何人工裁决样本，一致率无意义——影子期要的是人怎么判，不是判定器自己怎么判）")
 	}
 	return nil
 }
