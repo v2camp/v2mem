@@ -34,19 +34,29 @@ func (s *Store) CountPending() (int, error) {
 type JudgeStat struct {
 	Verdict  string `json:"verdict"`
 	Total    int    `json:"total"`
-	Accepted int    `json:"accepted"`
-	Rejected int    `json:"rejected"`
+	Accepted int    `json:"accepted"` // 人工采纳
+	Rejected int    `json:"rejected"` // 人工否决
+	SelfRun  int    `json:"self_run"` // 判定器自己 --apply 落下的：不能算人工一致率
 	Pending  int    `json:"pending"`
 }
 
 // JudgeStats 汇总所有已判定的候选。只读单次聚合，命中 ix_cand_status 之外的顺序扫描——
 // 候选表量级在千条以内，不为它加索引。
 func (s *Store) JudgeStats() ([]JudgeStat, error) {
-	rows, err := s.db.Query(`SELECT judge_verdict, COUNT(*),
-		SUM(CASE WHEN status = 'accepted' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN status = 'pending'  THEN 1 ELSE 0 END)
-		FROM candidates WHERE judge_verdict != '' GROUP BY judge_verdict ORDER BY judge_verdict`)
+	// 只把 actor != 'judge' 的裁决算作人工样本。
+	// 否则 --apply 之后判定器自己的决定变成分母，一致率恒为 100%——
+	// 影子期「≥95% 才转正」这条门槛会被自己的产出喂饱，等于没有门槛。
+	rows, err := s.db.Query(`SELECT c.judge_verdict, COUNT(*),
+		SUM(CASE WHEN c.status = 'accepted' AND d.actor != 'judge' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN c.status = 'rejected' AND d.actor != 'judge' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN (c.status = 'accepted' OR c.status = 'rejected') AND d.actor = 'judge' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END)
+		FROM candidates c
+		LEFT JOIN commit_decisions d
+		  ON d.candidate_id = c.id
+		 AND d.created_at = (SELECT MAX(d2.created_at) FROM commit_decisions d2 WHERE d2.candidate_id = c.id)
+		WHERE c.judge_verdict != ''
+		GROUP BY c.judge_verdict ORDER BY c.judge_verdict`)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +64,7 @@ func (s *Store) JudgeStats() ([]JudgeStat, error) {
 	var out []JudgeStat
 	for rows.Next() {
 		var st JudgeStat
-		if err := rows.Scan(&st.Verdict, &st.Total, &st.Accepted, &st.Rejected, &st.Pending); err != nil {
+		if err := rows.Scan(&st.Verdict, &st.Total, &st.Accepted, &st.Rejected, &st.SelfRun, &st.Pending); err != nil {
 			return nil, err
 		}
 		out = append(out, st)
