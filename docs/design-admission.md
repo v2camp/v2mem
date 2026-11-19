@@ -40,6 +40,25 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
 - 一致率的**分母是人工裁决**，所以影子期内不能用 `--apply`，否则分母被判定器自己污染。
 - 转正门槛：`accept` 一致率 ≥95%，且样本 ≥200 条。未达标不放开，不因着急下调。
 
+## 3.1 积压触发（可选，默认关）
+
+判定走网络，不能靠「记得去跑」。挂在写侧事件末尾按阈值触发，四条闸门缺一不发：
+
+| 环境变量 | 默认 | 作用 |
+|:---|:---|:---|
+| `MEM_JUDGE_SPAWN` | 关 | 总闸。未设 `1` 一律不拉起——升级后自己开始烧 API 是最坏的一种惊喜 |
+| `MEM_JUDGE_MIN_PENDING` | 20 | 全库 pending ≥ 该值才触发。取值略高于 R8 的 FAIL 线（>15），避免刚 WARN 就烧一次调用 |
+| `MEM_JUDGE_COOLDOWN_H` | 24 | 冷却小时数。一个会话能 Stop 几十次，没有冷却等于每轮都跑 |
+| `MEM_JUDGE_APPLY` | 关 | 子进程是否带 `--apply`。默认影子，转正前必须保持关 |
+
+- 只挂 `Stop` / `SessionEnd`。**读路径（PromptSubmit / SessionStart）永不触发**——判定要走网络，
+  进了注入链路就直接违约。
+- 拉起后不等：`startMemProc` 是 detach 的子进程，钩子立即返回；失败只写 stderr。
+- 先写 `~/.v2mem/judge-state.json`（上次拉起时间）再 spawn：宁可少跑一次，
+  也不要因写状态失败而反复重跑。
+- 判定条数取阈值本身（`--limit = MEM_JUDGE_MIN_PENDING`）：一次只清一批，
+  不清空积压，避免单次调用把上下文撑爆。
+
 ## 4. 理由码是语料，不是日志
 
 `reason` 是闭集（`durable` / `process_narrative` / `transient_state` / `payload_residue` /

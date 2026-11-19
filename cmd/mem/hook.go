@@ -161,6 +161,9 @@ func cmdHook(args []string) error {
 			// 前移到会话收尾，热路径不再承担这次蒸馏。
 			maybeSpawnColdStart(c.db, in, project, event)
 		}
+		// 积压触发：pending 到阈值就拉起一次判定（默认关，见 judge_hook.go）。
+		// 挂在观测写入之后，保证刚落的候选也在计数里。
+		maybeSpawnJudge(c.db, event)
 		return nil
 	}
 
