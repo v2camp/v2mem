@@ -21,7 +21,7 @@ import (
 // 权限：默认影子，只写痕迹不改状态。理由见设计文档：模型判定是推测，
 // VALUE.md 的红线要求「未标定 + 不可回滚的推测不回写主库」，所以落库必须是显式动作。
 const (
-	judgePromptVersion = "judge-v1"
+	judgePromptVersion = "judge-v2"
 	judgeDefaultBatch  = 20
 	judgeContentRunes  = 600
 )
@@ -33,6 +33,7 @@ var judgeReasons = map[string]bool{
 	"transient_state":   true, // 一次性回执、临时状态
 	"payload_residue":   true, // 纯代码/日志/路径清单
 	"no_generalizable":  true, // 只对这一条会话有意义
+	"unsure":            true, // verdict=unsure 时统一用这个，不沿用模型的猜测理由
 }
 
 const judgePrompt = `你是记忆准入判定器。对每条候选给出 verdict。
@@ -42,8 +43,9 @@ reject：过程叙述（已完成/已构建/已合并/巡检完毕/报告已输�
 unsure：以上都不是，或信息不足以判断。
 
 硬约束：
-- kind 只有 fact 或 task 才可能 accept；pitfall / preference / decision 一律 unsure。
-- scope 为 global 或 cross_project 一律 unsure。
+- kind 只有 fact 或 task 才可能 accept。pitfall / preference / decision **不能 accept，但可以 reject**：内容明显是过程叙述、回执或载荷残渣时，照常 reject。
+- scope 为 global 或 cross_project 不能 accept；同样是「不能要」，不是「不能否」。
+- unsure 只用于「可能是知识，但信息不足」或「既不像知识也不像噪音」。能明确判为过程叙述的，不要给 unsure。
 - 只判断「是否值得长期记住」，不判断内容是否正确。
 
 候选：
@@ -202,7 +204,9 @@ func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVer
 			r.Unsure++
 		}
 		reason := v.Reason
-		if reason == "" || !judgeReasons[reason] {
+		// unsure 的理由统一记成 unsure：模型对 unsure 常顺手带一个「像过程叙述」的猜测，
+		// 存成 process_narrative 会让下一个人以为「判了过程叙述却是 unsure」，自相矛盾。
+		if verdict == "unsure" || reason == "" || !judgeReasons[reason] {
 			reason = "unsure"
 		}
 		if err := st.MarkJudgeVerdict(cand.ID, verdict, modelTag, reason); err != nil {
