@@ -91,5 +91,36 @@ fi
 if printf '%s' "$r3_basis" | grep -q '实测量级 9–15ms'; then
   fail "§3 R3 依据段退回「实测量级 9–15ms」旧口径"
 fi
+# ⑨ R3 副本对照法必须两处都在：这是 2026-11-20 唯一能把「运行态慢」与「代码慢」分开的
+# 手段（同二进制对库副本 6–15ms / 活库 43–205ms）。删了就只剩拍脑袋分因。
+printf '%s' "$(grep 'add R3 WARN' "$SCRIPT" || true)" | grep -q '副本对照' \
+  || fail "脚本 R3 WARN 文案缺「副本对照」分流手段"
+printf '%s' "$r3_basis" | grep -q '库副本对照' \
+  || fail "§3 R3 依据段缺库副本对照法与实测值"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；R3 端到端/纯检索口径两处同步；枚举到 R${max_r}"
+# ⑩ R11 语义：帧数量的是 -wal **文件高水位**，不等于数据滞留。
+# 实证：2026-11-20 仅取主库文件（不含 -wal）的快照仍含 5249/5264 条观测，checkpoint 一直在推进，
+# 而 -wal 稳定 4.0MB；此前 detail 断言「被动 checkpoint 未跟上」，据此外推「WAL 拖慢读侧」缺依据。
+grep -q '被动 checkpoint 未跟上' "$SCRIPT" \
+  && fail "脚本 R11 detail 退回「被动 checkpoint 未跟上」的错误归因"
+printf '%s' "$(grep 'add R11 WARN' "$SCRIPT" || true)" | grep -q '不代表数据滞留' \
+  || fail "脚本 R11 WARN 未说明「帧数≠滞留」"
+printf '%s' "$(grep 'add R11 WARN' "$SCRIPT" || true)" | grep -q '高水位' \
+  || fail "脚本 R11 WARN 未用「高水位」口径"
+r11_row="$(grep -E '^\| \*\*R11\*\*' "$DOC" | head -1)"
+[ -n "$r11_row" ] || fail "§3 找不到 R11 行"
+printf '%s' "$r11_row" | grep -q '高水位' \
+  || fail "§3 R11 名称未改成「WAL 高水位」"
+printf '%s' "$r11_row" | grep -q 'WAL 堆积' \
+  && fail "§3 R11 名称退回「WAL 堆积」"
+r11_basis="$(sed -n '/\*\*R11 的 1000 \/ 2000 帧\*\*/,/\*\*R12 的 0 \/ 3/p' "$DOC")"
+[ -n "$r11_basis" ] || fail "§3 找不到 R11 阈值依据段"
+printf '%s' "$r11_basis" | grep -q '文件高水位' \
+  || fail "§3 R11 依据段未说明帧数是文件高水位"
+printf '%s' "$r11_basis" | grep -q '5249/5264' \
+  || fail "§3 R11 依据段缺主库独立快照的实证数据"
+r11_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R11 ' || true)"
+printf '%s' "$r11_action" | grep -q 'log == checkpointed' \
+  || fail "§5 R11 处置未给「log == checkpointed 即无滞留」的判据"
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"

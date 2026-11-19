@@ -311,7 +311,7 @@ if [ "$A_MS" -gt 0 ]; then
   if [ "$A_MS" -lt 50 ]; then
     add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 端到端目标线；${R3_NOTE}"
   elif [ "$A_MS" -lt 200 ]; then
-    add R3 WARN "检索延迟 ${A_MS}ms" "端到端均值越 50ms：先排除冷缓存与同秒多 hook 并发（近 3 天端到端基线 25–45ms，纯检索热态仍 ~10ms），再判是否退化；${R3_NOTE}"
+    add R3 WARN "检索延迟 ${A_MS}ms" "端到端均值越 50ms：先做副本对照——同一二进制对「库副本」跑同一 prompt（实测中位 6–15ms，但尾部仍有 200–800ms），再比活库同 prompt 均值（11-20 实测 43–205ms）。差值指向运行态（常驻连接 / WAL 常驻 / 宿主 load），不是代码路径；纯检索热态仍 ~10ms。按日中位已 37→46→63→175ms 单调上行（11-17→11-20），不要当离群样本处理；${R3_NOTE}"
   else
     add R3 FAIL "检索延迟 ${A_MS}ms" "端到端超 200ms：先看样本是否同秒并发，再查 WAL 帧数与写锁；${R3_NOTE}"
   fi
@@ -463,7 +463,14 @@ else
   add R10 INFO "无写侧样本" "窗口内没有带 ms 的 stop 事件，无法评估写侧延迟"
 fi
 
-# R11 WAL 堆积：只读文件大小，绝不修改或删除 -wal。
+# R11 WAL 高水位：只读文件大小，绝不修改或删除 -wal。
+#
+# 帧数由文件大小折算，量的是**文件高水位**，不是积压量：SQLite 只在
+# wal_checkpoint(TRUNCATE) 或最后一个连接关闭时才收缩 -wal 文件，被动 checkpoint
+# 只把页回写主库、文件本身不缩。故「帧数 > 1000」只说明历史写过这么多，不等于
+# 数据滞留。2026-11-20 实证：仅取主库文件（不含 -wal）的快照含 5249/5264 条观测
+# （99.7%，最新到 11-19 20:29），checkpoint 实际一直在推进；同期 -wal 稳定 4.0MB。
+# 判「是否真滞留」看 §5 的 (busy,log,checkpointed) 三元组，不要据此推断读侧延迟。
 WAL_FILE="$V2MEM_DIR/mem.db-wal"
 WAL_BYTES=0
 if [ -f "$WAL_FILE" ]; then
@@ -472,11 +479,11 @@ fi
 WAL_BYTES=${WAL_BYTES:-0}
 WAL_FRAMES=$(( WAL_BYTES / 4096 ))
 if [ "$WAL_FRAMES" -le 1000 ]; then
-  add R11 PASS "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，未超 wal_autocheckpoint=1000"
+  add R11 PASS "WAL 高水位 ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，未超 wal_autocheckpoint=1000"
 elif [ "$WAL_FRAMES" -le 2000 ]; then
-  add R11 WARN "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，被动 checkpoint 未跟上；按 §5 执行 wal_checkpoint(TRUNCATE) 并记录返回三元组"
+  add R11 WARN "WAL 高水位 ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，超过 autocheckpoint 水位。帧数取自文件大小，不代表数据滞留（SQLite 只在 TRUNCATE 或最后一个连接关闭时收缩 -wal）；先按 §5 取 (busy,log,checkpointed) 三元组，log 与 checkpointed 相等即无滞留，确有滞留再 TRUNCATE"
 else
-  add R11 FAIL "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，超过阈值 2 倍；按 §5 执行 wal_checkpoint(TRUNCATE)，不要手工删 -wal"
+  add R11 FAIL "WAL 高水位 ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，超过阈值 2 倍。先按 §5 取三元组判滞留，确需回收再 wal_checkpoint(TRUNCATE)，不要手工删 -wal"
 fi
 
 # R12 写侧自动决策链路：观测 → 蒸馏 → 候选 → 显式裁决。
