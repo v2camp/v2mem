@@ -148,7 +148,11 @@ CREATE TABLE IF NOT EXISTS candidates (
   revision      INTEGER NOT NULL DEFAULT 0,
   schema_version INTEGER NOT NULL DEFAULT 0,
   -- 事实的原始来源（非写候选的人）：user|assistant|空串（旧行）
-  attributed_to TEXT NOT NULL DEFAULT ''
+  attributed_to TEXT NOT NULL DEFAULT '',
+  -- 准入判定的痕迹（docs/design-admission.md）：verdict 只记判定，改 status 要 --apply。
+  -- judge_model 带 prompt 版本（ollama:qwen2.5@judge-v1），判定标准一改，历史才能分段看。
+  judge_verdict TEXT NOT NULL DEFAULT '',
+  judge_model   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_cand_status ON candidates(status, created_at);
 -- 同一会话里相同内容的 pending/accepted 不双插。rejected 不占这个键，允许改写后再来。

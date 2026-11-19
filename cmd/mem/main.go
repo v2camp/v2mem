@@ -43,6 +43,8 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
   mem import-transcript [选项]     从 Claude 会话 JSONL 回填观测（默认不写 memories）
   mem distill [选项]                从观测抽出候选（不写 memories）
+  mem judge [选项]                  准入判定：默认影子（只记 verdict，不改状态）
+                                    --stats 看影子期一致率；--apply 才真落库
   mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
   mem reject <id|前缀>             拒绝候选
   mem candidates ls [选项]         列出隔离区候选
@@ -130,7 +132,7 @@ var knownSubcommands = []string{
 	"add", "search", "asset", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
 	"gc", "consolidate", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
-	"distill", "accept", "reject", "candidates",
+	"distill", "accept", "reject", "candidates", "judge",
 }
 
 func main() {
@@ -175,6 +177,8 @@ func main() {
 		err = cmdImportTranscript(os.Args[2:])
 	case "distill":
 		err = cmdDistill(os.Args[2:])
+	case "judge":
+		err = cmdJudge(os.Args[2:])
 	case "accept":
 		err = cmdAccept(os.Args[2:])
 	case "reject":
