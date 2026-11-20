@@ -25,6 +25,14 @@ test-fmt:
 test-install:
 	bash scripts/test-install.sh
 
+# 安装一致性只读校验（判据见 docs/install.md §4）。
+verify-install:
+	@bash scripts/verify-install.sh $(ARGS)
+
+# 安装校验的回归：临时 HOME + mem stub，不触碰真实配置与库。
+test-verify-install:
+	@bash scripts/test-verify-install.sh
+
 # 巡检判据回归：临时 V2MEM_DIR + mem stub，不触碰 ~/.v2mem。
 # 第二项守「改判据必须同步改两处」（ID 集合 + R8 阈值）。
 test-watch:
@@ -112,4 +120,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test test-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release
+.PHONY: build install test test-install test-verify-install verify-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release
