@@ -66,6 +66,10 @@ bash scripts/verify-install.sh --preflight
 
 完成判据：知道本机 mem 的来源（没有 / 发布版 / 开发软链 / `go install`），且 §2 的「阻止」项为零。
 
+> `mem harness` 的 `●` 只表示配置目录存在，不等于宿主真的还在用。换机或清理前再核对
+> `/Applications` 与运行进程；WorkBuddy 的 `~/.codebuddy` 是内置 CodeBuddy 运行时目录，
+> 不是独立的 CodeBuddy 安装，不能按「未使用宿主」删除。
+
 ### S1 选择安装方式
 
 | 方式 | 适用 | 落地 | 更新方式 |
@@ -111,14 +115,22 @@ MCP 与 hooks 相互独立；hooks 负责自动注入，MCP 负责会话内显�
 
 | 宿主 | 注册动作 | 还必须做什么 |
 |:---|:---|:---|
-| WorkBuddy | 在 `~/.workbuddy/mcp.json` 写 `mcpServers.v2mem = { command: "mem", args: ["mcp"] }` | 连接器页打开 v2mem 开关（`mcp-approvals.json` 出现 `*::v2mem`） |
+| WorkBuddy | 在 `~/.workbuddy/mcp.json` 写 `mcpServers.v2mem = { type: "stdio", command: "<mem 绝对路径>", args: ["mcp"] }` | 自定义连接器 → 添加 MCP → 保存 → 点「信任」，开关才会打开（`mcp-approvals.json` 出现 `*::v2mem`） |
 | Claude Code | `claude mcp add v2mem -- mem mcp`（或项目 `.mcp.json`） | 宿主首次信任该 server |
 | Codex | `~/.codex/config.toml` 的 `[mcp_servers.v2mem]`，`command = "mem"`、`args = ["mcp"]` | 首次信任 |
 | Cursor | `~/.cursor/mcp.json` 的 `mcpServers.v2mem` | 宿主 MCP 面板确认 |
-| TraeCode / TraeWork / Qoder 系 | 宿主 MCP 面板新增 stdio server：命令 `mem`，参数 `mcp` | 面板内启用；脚本只能记 INFO |
+| TraeCode / TraeWork | 设置 → 插件市场 → 管理 → MCP → `+ 添加` → 手动配置，粘贴 `{"mcpServers":{"v2mem":{"command":"<mem 绝对路径>","args":["mcp"]}}}` → 确认（Trae 写入 `~/Library/Application Support/Trae CN/User/mcp.json`） | 面板内启用；工具列表出现 8 个 v2mem 工具 |
+| Qoder 系 | 宿主 MCP 面板新增 stdio server：命令 `mem`，参数 `mcp` | 面板内启用；脚本只能记 INFO |
 
 完成判据：会话工具列表出现 `mcp__v2mem__search` 等工具；WorkBuddy 另有批准记录。
 失败回退：删除对应配置条目或关闭面板开关；不影响 hooks 注入。
+
+> GUI 宿主不继承 shell 的 PATH，`command` 建议直接写绝对路径（如 `~/.local/bin/mem`）；
+> 上表的 `mem` 只是简写。多个宿主同时拉起 `mem mcp` 时，首次连接可能短暂报 `SQLITE_BUSY`，
+> 在宿主面板点「重试」即可。
+
+> WorkBuddy 实测（5.11.3）：缺 `type: "stdio"` 时文件里虽有 v2mem，UI 不加载；
+> 补齐后需在「自定义连接器」里点「添加 MCP → 保存」，再点「信任」，开关才会变为开启。
 
 ### S5 安装后校验
 
@@ -150,7 +162,7 @@ bash scripts/verify-install.sh --harness <宿主> --runtime --window 12h   # 追
 | **B5** | 用户规则禁令 | 无命中 | — | INFO：命中文件:行，需人工裁决 |
 | **C1** | 所选宿主已有 v2mem 条目 | 有 `# v2mem` 或 `mem hook` | — | FAIL：没有；`--preflight` 时降 INFO |
 | **C2** | hooks 事件完整度 | ≥2 个事件（或 instruction 块存在） | 仅 1 个事件 | FAIL：0 个；`--preflight` 时降 INFO |
-| **C3** | MCP 声明 | 已知配置文件中找到 `v2mem` | 未找到（文件型宿主） | INFO：GUI 托管宿主（Trae/Qoder 系）无法只读确认 |
+| **C3** | MCP 声明（不代表宿主已加载） | 已知配置文件中找到 `v2mem` | 未找到（文件型宿主） | INFO：GUI 托管宿主（Trae/Qoder 系）无法只读确认 |
 | **C4** | WorkBuddy MCP 批准 | `mcp-approvals.json` 有 `*::v2mem` | 有声明未批准 | INFO：未选 WorkBuddy |
 | **C5** | 面板确认清单 | — | — | INFO：输出所选宿主的 `verify` 提示 |
 | **D1** | 运行态判据 | 引用 `watch-v2mem.sh` 的 I/R 结论 | watch 报 WARN | FAIL：watch 报 FAIL；INFO：未启用 `--runtime` 或 watch 缺失 |

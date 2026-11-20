@@ -95,6 +95,10 @@ v2mem 内置 12 个已知 harness：11 个按**应用内置运行时**判定为 
 | 审计只有 `workbuddy`/`codebuddy` | 写错了宿主文件 | Trae 只读 `~/.trae-cn/hooks.json` |
 
 - MCP 可选：`mem mcp` 与 hooks 共用同一二进制和库，不冲突，也不是 hooks 接入的前置条件。
+  入口：设置 → 插件市场 → 管理 → **MCP** → 「MCP Servers 管理」右上角 **`+ 添加`** → **手动配置**，
+  粘贴 `{"mcpServers":{"v2mem":{"command":"/Users/<你>/.local/bin/mem","args":["mcp"]}}}` → 确认。
+  Trae 自己写入 `~/Library/Application Support/Trae CN/User/mcp.json`；启用后工具列表出现 8 个 v2mem 工具。
+  首次连接若报 `SQLITE_BUSY`，在面板点「重试」即可（多个宿主同时拉起 `mem mcp` 时可能短暂争用）。
 
 ### 3A.2 WorkBuddy（内置 CodeBuddy 运行时）
 
@@ -110,8 +114,10 @@ v2mem 内置 12 个已知 harness：11 个按**应用内置运行时**判定为 
 2. 检查没有 `"disableAllHooks": true`（它为真时全部钩子都不执行，包括 WorkBuddy 自带插件）。
 3. **新开会话**：每轮由新进程读取设置，已开的会话不生效。
 4. MCP（可选，与 hooks 相互独立）：在 `~/.workbuddy/mcp.json` 加 `v2mem` 只是**声明，不会激活**。
-   必须到「专家·技能·连接器 → 连接器页 → 右上角自定义连接器」，或「侧边栏 插件 → MCP 服务器」
-   把 v2mem 开关打开。开启后 `~/.workbuddy/mcp-approvals.json` 出现 `<sha256>::v2mem`，
+   条目必须带 `"type": "stdio"`，否则 UI 不加载：
+   `{ "type": "stdio", "command": "/Users/<你>/.local/bin/mem", "args": ["mcp"] }`。
+   然后到「专家·技能·连接器 → 连接器页 → 右上角自定义连接器」，点「添加 MCP → 保存」，
+   再点该行的「信任」，开关才会打开。开启后 `~/.workbuddy/mcp-approvals.json` 出现 `<sha256>::v2mem`，
    会话内即可看到 `mcp__v2mem__search / add / ls / touch / recall_context`，
    以及候选裁决 `candidates_ls / accept / reject`（显式调用，不自动裁决）。
 5. 验收（只读）：

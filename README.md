@@ -155,8 +155,10 @@ Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 M
 `distill` 仍不进 MCP。裁决工具只是把执行主体从「人跑 CLI」扩到「会话内 Agent 显式调用」，没有把决策自动化。在支持 MCP 的工具里加一行进程配置即可：
 
 ```json
-{ "mcpServers": { "v2mem": { "command": "mem", "args": ["mcp"] } } }
+{ "mcpServers": { "v2mem": { "type": "stdio", "command": "mem", "args": ["mcp"] } } }
 ```
+
+GUI 宿主不继承 shell 的 PATH，实际配置时建议把 `command` 写成绝对路径（如 `~/.local/bin/mem`）。
 
 - **Claude Code**：`claude mcp add v2mem -- mem mcp`（或写入项目 `.mcp.json` 的 `mcpServers`）
 - **Codex**：`~/.codex/config.toml` 的 `[mcp_servers.v2mem] command = "mem" args = ["mcp"]`
