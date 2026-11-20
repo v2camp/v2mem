@@ -529,3 +529,69 @@ func TestParseFactsErrorKinds(t *testing.T) {
 		t.Fatalf("混排应留下好行，got %+v %v", facts, err)
 	}
 }
+
+// Reviewable 是 R8 的读侧口径：对已落库的候选重算「现行准入判据是否放行」。
+// 它必须与写侧规则同源，否则 R8 的绿/红就与产出端的实际行为脱钩。
+func TestReviewableMatchesAdmission(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		attrib  string
+		kind    string
+		want    bool
+	}{
+		{
+			name:    "用户原话一律可裁决",
+			content: "以后提交前必须跑 cover-gate",
+			attrib:  "user", kind: "preference",
+			want: true,
+		},
+		{
+			name:    "用户提问也算可裁决（宁可留噪不误删）",
+			content: "认真看下这个问题：种子绕过了候选裁决吗",
+			attrib:  "user", kind: "decision",
+			want: true,
+		},
+		{
+			name:    "助手进度汇报不可裁决",
+			content: "## Qwen3-ASR 全量重跑进度 已完成 52/65，进程存活",
+			attrib:  "assistant", kind: "pitfall",
+			want: false,
+		},
+		{
+			name:    "助手巡检报告不可裁决",
+			content: "巡检已完成，全程只读。健康度：无 P0",
+			attrib:  "assistant", kind: "decision",
+			want: false,
+		},
+		{
+			name:    "助手可复用结论可裁决",
+			content: "报错根因是 fts5 把整句汉字当一个词，必须显式建 unicode61 分词器",
+			attrib:  "assistant", kind: "pitfall",
+			want: true,
+		},
+		{
+			name:    "助手不产偏好：preference 不可裁决",
+			content: "根因是偏好被助手代填，必须只从用户原话取",
+			attrib:  "assistant", kind: "preference",
+			want: false,
+		},
+		{
+			name:    "来源未知的旧行不替人下结论",
+			content: "已完成 65/65，进程正常退出",
+			attrib:  "", kind: "pitfall",
+			want: true,
+		},
+		{
+			name:    "引用片段里的可复用标记不算断言",
+			content: "这条候选只是复述判据：`根因/必须/不要` 这些词本身不构成结论",
+			attrib:  "assistant", kind: "decision",
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		if got := Reviewable(c.content, c.attrib, c.kind); got != c.want {
+			t.Errorf("%s: Reviewable=%v want=%v（content=%q）", c.name, got, c.want, c.content)
+		}
+	}
+}

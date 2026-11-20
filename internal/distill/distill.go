@@ -474,6 +474,36 @@ func assistantDurable(s string) bool {
 	return durableRe.MatchString(s) || declarationRe.MatchString(s)
 }
 
+// Reviewable 报告一条**已落库**的候选按现行准入判据是否仍值得人工裁决。
+//
+// 为什么需要在读侧重算一遍：准入判据（assistantDurable / 助手不产 preference）是
+// 2026-11-17 才落到写侧的，库里此前灌进去的行按定义都没过这道门。判据只能约束新行，
+// 不能追认旧行——于是 R8 数出的「积压」里混着两类东西：真待裁决的，和当年漏进来的
+// 过程叙述。两者对人工的成本完全不同，混在一起数会让 R8 长期 FAIL 且不可执行。
+//
+// 因此 R8 的口径改为「现行判据下仍可裁决的待处理数」，由本函数统一裁决，
+// 与写侧共用同一套规则（不是脚本里另写一份正则）。旧行不删、不改，仍在库里，
+// `candidates ls` 照常可见，并按 R15 的 TTL 自然过期。
+//
+// 认定规则：
+//   - attributed_to=user：用户原话是主来源，一律可裁决（宁可留噪，不替人丢证据）；
+//   - attributed_to=assistant：必须过 assistantDurable，且不产 preference；
+//   - attributed_to 为空（判据落地前的旧行）：来源未知，不替人下结论，按可裁决处理。
+func Reviewable(content, attributedTo, kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(attributedTo)) {
+	case "user":
+		return true
+	case "assistant":
+		if strings.EqualFold(strings.TrimSpace(kind), "preference") {
+			return false
+		}
+		// 判定对象必须等于存储对象：库里存的已是 oneLine + 240 rune。
+		return assistantDurable(truncate(oneLine(content), 240))
+	default:
+		return true
+	}
+}
+
 // quoteSpans 是「引用片段」的成对定界符：围栏代码块、行内代码、中文直角/双引号、英文双引号。
 // 引号里的是被引述的字面（命令、字段名、报错原文），不是叙述者自己的断言。
 var quoteSpans = []*regexp.Regexp{

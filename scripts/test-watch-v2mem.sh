@@ -204,6 +204,46 @@ assert_case r8_fail_16         100 0 no "$(cand_json A 16)" PASS PASS FAIL PASS
 assert_case r8_multi_no_sum    100 0 no "$(merge_json "$(cand_json A 4)" "$(cand_json B 4)")" PASS PASS PASS PASS
 assert_case r8_multi_worst     100 0 no "$(merge_json "$(cand_json A 16)" "$(cand_json B 2)")" PASS PASS FAIL PASS
 
+# R8 口径（2026-11-20 起）：只数 reviewable != false 的 pending，不可裁决的单独报数。
+# cand_json_triage <project> <可裁决数> <不可裁决数>
+cand_json_triage() {
+  jq -nc --arg p "$1" --argjson r "$2" --argjson e "$3" --argjson ts "$NOW" '
+    [range(0;$r) | {id:("r"+$p+(.|tostring)), project:$p, status:"pending",
+                    content:"根因：建表前必须补幂等迁移", kind:"pitfall",
+                    created_at:$ts, reviewable:true}]
+  + [range(0;$e) | {id:("e"+$p+(.|tostring)), project:$p, status:"pending",
+                    content:"已完成 52/65，进程存活", kind:"pitfall",
+                    created_at:$ts, reviewable:false}]'
+}
+
+# assert_r8_triage <名称> <cands> <want_level> [detail 子串]
+assert_r8_triage() {
+  local name="$1" cands="$2" want="$3" needle="${4:-}"
+  local out got detail
+  out="$(run_case "$name" 100 0 no "$cands")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R8") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R8") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R8 want=$want got=${got}" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R8 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R8=%-4s\n' "$name" "$want"
+}
+
+# 18 条过程叙述 + 2 条可裁决：判级只看 2（PASS），但 18 必须仍在 detail 里报出来，
+# 否则「口径修正」就变成了静默丢弃。
+assert_r8_triage r8_exhaust_excluded  "$(cand_json_triage A 2 18)"  PASS '另有 18 条'
+# 不可裁决不得掩盖真积压：16 条可裁决仍然 FAIL，不能因为总量里混了废气就降级。
+assert_r8_triage r8_exhaust_not_masking "$(cand_json_triage A 16 20)" FAIL '16'
+# 缺 reviewable 键（旧二进制 / 老夹具）按可裁决处理，行为与改口径前一致。
+assert_case r8_no_triage_key   100 0 no "$(cand_json A 6)" PASS PASS WARN PASS
+
 # R9 等价性：content 含 transcript 原始 JSON 载荷 → WARN（与旧版 grep 口径一致）。
 assert_case r9_noise_warn      100 0 no "$(cand_json A 1 '{"id":1,"type":"x"}')" PASS PASS PASS WARN
 # R9 第二种形态：工具调用载荷的文本形态（工具名 + 对象字面量）。旧检测式只认

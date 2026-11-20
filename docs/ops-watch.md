@@ -86,7 +86,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
 | **R6** | 库规模 | `mem stats` 总条数 vs 上次快照 | 未下降 | 下降 | — |
 | **R7** | spool 积压 | `spool/*.jsonl` 数 | 0 | 1–3 | >3 |
-| **R8** | 候选积压 | `mem candidates ls --json` 按 `project` 分组后的**单工程** pending 数；窗口取各工程最大值 | ≤5 | 6–15 | >15 |
+| **R8** | 候选积压 | `mem candidates ls --json --triage` 按 `project` 分组后的**单工程** `reviewable != false` 的 pending 数；窗口取各工程最大值。不可裁决的（过程叙述/助手偏好）单独报数，不计入 | ≤5 | 6–15 | >15 |
 | **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中载荷残留条数，两种形态都算：transcript 原始 JSON（`{"id"…}`/`{"type"…}`）与工具载荷文本（`Grep {`/`Shell {` 等工具名 + 对象字面量开头） | 0 | 1–3 | >3 |
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
 | **R11** | WAL 高水位 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0）；量的是**文件高水位**，不是积压量 | ≤1000 帧 | 1001–2000 | >2000 |
@@ -156,6 +156,18 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   `candidates_ls` 提供就近查看。R9 的采集同步改读 `--json` 的 `content`，检测式与旧版
   `grep '\{"(id|parentId|callId|type)"'` 等价，**判定语义与阈值均未变**。
   `candidates ls --json` 不可解析时 R8/R9 按 `WARN` 观察，不静默判 `PASS`。
+  **只数可裁决（2026-11-20）**：阈值 5/15 未变，**计量对象**改为「现行准入判据下仍可裁决的 pending」。
+  起因：助手准入判据 2026-11-17 才落到写侧，此前入库的行按定义都没过这道门——本机 50 条 pending 里
+  17 条是同一台 cron 的进度汇报、8 条是助手过程叙述、6 条是巡检报告本身。把它们当「待办」，
+  R8 会长期 `FAIL` 且 §5 的处置不可执行：它不是没人裁决，是**不可裁决**。
+  判据只能约束新行、不能追认旧行，故在读侧重算：`--triage` 由 `internal/distill.Reviewable`
+  对每条打分，与写侧共用同一套规则（`assistantDurable` / 助手不产 preference），脚本里不另写正则。
+  认定规则：`attributed_to=user` 一律可裁决；`assistant` 须过准入判据且非 `preference`；
+  来源为空（判据落地前的旧行）按可裁决处理，不替人下结论。
+  旧行**不删不改**，`mem candidates ls --triage` 照常可见，并按 R15 的 TTL 自然过期；
+  detail 固定报出「另有 N 条不可裁决」，口径修正不等于静默丢弃。
+  **脚本与二进制需同批发布**：老 `mem` 不认 `--triage`，脚本会退回纯 pending 口径并在 detail
+  注明「二进制不支持 --triage」，不判「候选读取失败」——否则版本错配会被误诊成库权限故障。
   **检测式补第二种形态（2026-11-15）**：上面那个 grep 只认 transcript JSON。工具调用载荷的
   文本形态（`Shell {"command"…`、`Grep {"pattern"…`，即工具名 + 对象字面量开头）不含这些键，
   会被判成干净候选——本机 2 条 11-02 存量候选就是这样漏到 pending 里的，R9 一直报 `PASS`。
@@ -312,7 +324,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | I2 掉到 1–3 | 宿主升级覆盖配置 | 重跑 `mem init --harness workbuddy`（幂等、带备份） |
 | I5 = WARN（`ExecEnv: Sandbox`） | Trae 钩子跑在沙箱，`~/.v2mem` 禁写 | Hooks 面板运行方式改「本地自动运行」；或在沙箱配置放行 `~/.v2mem` |
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |
-| R8 候选积压 | 隔离区长期未裁决 | 先看 detail 里的**按工程分组**计数，在**对应工程的会话里**就近裁决：`mem candidates ls --project P --policy` 或 MCP `candidates_ls` 逐条看；可读候选 `mem accept` / MCP `accept`，载荷残留 `mem reject` / MCP `reject`（顶层命令，非 `mem candidates reject`）。不要跨工程批量 reject |
+| R8 候选积压 | 隔离区长期未裁决 | 先看 detail 里的**按工程分组**计数，在**对应工程的会话里**就近裁决：`mem candidates ls --project P --triage` 先分清哪些可裁决（`不可裁决` 的是过程叙述/助手偏好，别逐条 reject，交给 R15 的 TTL），再 `--policy` 或 MCP `candidates_ls` 逐条看；可读候选 `mem accept` / MCP `accept`，载荷残留 `mem reject` / MCP `reject`（顶层命令，非 `mem candidates reject`）。不要跨工程批量 reject |
 | R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
 | R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
 | R11 WAL 高水位越线 | 文件不缩是常态（passive checkpoint 不收缩 `-wal`），先判是否真有滞留 | 先取三元组：`sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(PASSIVE);"`（或 `PRAGMA wal_checkpoint;`）并记下 `(busy, log, checkpointed)`——`log == checkpointed` 即无滞留，帧数只是历史高水位，**不必**清。确有滞留（`busy=1` 说明有长读事务）再查各 harness 的 `mem mcp` 长连，确认后 `PRAGMA wal_checkpoint(TRUNCATE);` 回收文件。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务；也**不要**把 R11 的帧数当作 R3 延迟的证据 |

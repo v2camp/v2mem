@@ -30,6 +30,13 @@ printf '%s' "$r8_row" | grep -q '≤5'  || fail "§3 R8 的 PASS 线不是 ≤5"
 printf '%s' "$r8_row" | grep -q '>15' || fail "§3 R8 的 FAIL 线不是 >15"
 grep -q 'CAND_MAX" -le 5'  "$SCRIPT" || fail "脚本 R8 的 PASS 线不是 ≤5"
 grep -q 'CAND_MAX" -le 15' "$SCRIPT" || fail "脚本 R8 的 WARN 上界不是 15"
+# ②b R8 计量对象（2026-11-20 起「只数可裁决」）：文档写了 reviewable 口径，
+# 脚本就必须真的带 --triage 并按 reviewable 过滤；单侧改会退回「数 pending 行数」。
+printf '%s' "$r8_row" | grep -q 'reviewable' \
+  || fail "§3 R8 未写明只数 reviewable（口径与脚本脱钩）"
+grep -q -- '--triage' "$SCRIPT" || fail "脚本 R8 未带 --triage"
+grep -q 'select(.reviewable != false)' "$SCRIPT" || fail "脚本 R8 未按 reviewable 过滤"
+grep -q '另有 \${CAND_EXHAUST} 条' "$SCRIPT" || fail "脚本 R8 未报出不可裁决条数"
 
 # ③ ID 枚举漂移：§7 等处的「I1…Rn」/「R1…Rn」必须与 §3 的实际最大 R 一致。
 # 实证：判据表已扩到 R11 时，§7 仍写「I1…R9」，长期无人发现。
@@ -142,4 +149,4 @@ r11_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R11 ' || true)
 printf '%s' "$r11_action" | grep -q 'log == checkpointed' \
   || fail "§5 R11 处置未给「log == checkpointed 即无滞留」的判据"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"
