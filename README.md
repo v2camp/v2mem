@@ -136,13 +136,18 @@ mem init              # 扫描本机 AI 工具 → 选择要注入钩子的工�
 | `instruction` | 无原生钩子，把指令写进会话级文件靠模型遵守（**概率性**） | 兜底通道，`mem init --scope instruction` 可强制 |
 
 ```bash
-mem init                     # 扫描本机 → 显示 12 个入口（● = 已装）→ 让你选
-mem init --harness claude    # 直接指定
+mem init                     # 扫描本机 → 显示 12 个入口（● = 配置目录存在）→ 让你选
+mem init --harness <宿主>    # 直接指定（推荐，先按 S0.1 确认真装）
 mem init --dry-run           # 只看会写什么
 ```
 
+`●` 只代表配置目录存在，不代表宿主还装着；卸载后的残留目录也会显示 `●`。
+先按 [`docs/install.md`](./docs/install.md) S0.1 核实真实安装，**只对真装宿主点名 `--harness`**，
+不要用 `--all` 扫全量，否则会产生空接入。
+
 配置写入遵守四条纪律：**合并不覆盖**、**幂等**、**只备份一次**（`.v2mem.bak`）、**绝对路径**。
-个别工具需额外动作（Codex 首次要 trust 钩子、QoderWork 改完要重启等），`mem init` 会逐一打印。
+写出配置 ≠ 已启用：TraeCode 要开 Hooks 总开关并选「本地自动运行」，Codex 要 trust，
+CodeBuddy 要在面板审核，QoderWork 要重启；`mem init` 会打印各宿主的额外动作。
 Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 MCP）。
 `postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`。这些痕迹可以用 `mem search --layer observation` 查到，默认的 `mem search` 和开场注入仍然只看已定记忆。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（候选仍不进检索，要 `mem accept` 才进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏；每个工程的首次 `SessionEnd` 另有一次性冷启动蒸馏，把下一次开场的规则蒸馏前移，`MEM_NO_COLDSTART=1` 可关。默认没有常驻进程。
 全部卸载：`mem uninstall --all`（或 `--harness <名字>` 单个），只摘掉带 `# v2mem` 标记的条目，不动你自己的配置。
@@ -152,7 +157,8 @@ Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 M
 `mem mcp` 暴露 8 个工具：`search`（检索；`layer` 为 `memory` / `observation` / `both`，默认只查已定记忆）、`add`（写入，相同内容自动覆盖）、
 `ls`（列出）、`touch`（记录命中）、`recall_context`（只读，把类码和命中拼成一段文本；`query` 必填，`layer` 与 search 相同），
 以及隔离区裁决三件：`candidates_ls`（列出候选，可用 `project` 限定工程）、`accept` / `reject`（**显式**采纳/拒绝，走 revision CAS）。
-`distill` 仍不进 MCP。裁决工具只是把执行主体从「人跑 CLI」扩到「会话内 Agent 显式调用」，没有把决策自动化。在支持 MCP 的工具里加一行进程配置即可：
+`distill` 仍不进 MCP。裁决工具只是把执行主体从「人跑 CLI」扩到「会话内 Agent 显式调用」，没有把决策自动化。
+MCP **不是安装脚本的一部分**：`install.sh` 只放二进制，`mem init` 只写 hooks；MCP 要完成「声明 + 宿主信任/开关」两步才算接入。
 
 ```json
 { "mcpServers": { "v2mem": { "type": "stdio", "command": "mem", "args": ["mcp"] } } }
@@ -160,9 +166,10 @@ Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 M
 
 GUI 宿主不继承 shell 的 PATH，实际配置时建议把 `command` 写成绝对路径（如 `~/.local/bin/mem`）。
 
-- **Claude Code**：`claude mcp add v2mem -- mem mcp`（或写入项目 `.mcp.json` 的 `mcpServers`）
-- **Codex**：`~/.codex/config.toml` 的 `[mcp_servers.v2mem] command = "mem" args = ["mcp"]`
-- 其余工具看各自的 MCP 配置格式，指向同一个 `mem mcp` 即可
+- **Claude Code**：`claude mcp add v2mem -- mem mcp`（或写入项目 `.mcp.json` 的 `mcpServers`），首次需信任
+- **Codex**：`~/.codex/config.toml` 的 `[mcp_servers.v2mem]`，首次需信任
+- **WorkBuddy**：`~/.workbuddy/mcp.json` 必须带 `"type": "stdio"`；再到「自定义连接器 → 添加 MCP → 保存 → 信任」
+- **Trae / Qoder 系**：走宿主 MCP 面板，不靠手写文件；步骤见 [`docs/install.md`](./docs/install.md) S4
 
 MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval activity` 的评测样本。
 清单内宿主都走 hooks 通道（11 个 native + 1 个桥接，含 Cursor 的六个原生事件），不需要 skill 兜底；无 hook 的临时环境直接用 CLI 或 MCP，命令要点见 [`docs/setup.md`](./docs/setup.md) §3A.4。

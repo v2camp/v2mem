@@ -27,7 +27,7 @@ v2mem 对宿主提供**两种合规接入**，定位互补，不可互相替代�
 
 | 接入 | 载体 | 解决什么 | 官方要求 |
 |---|---|---:|---|
-| **读侧注入（hooks）** | `mem hook` | 会话开始/提问时**自动塞相关记忆进上下文**（"记得住"） | hooks 事件 + 面板启用/审核 |
+| **读侧注入（hooks）** | `mem hook` | 会话开始/提问时**自动塞相关记忆进上下文**（"记得住"） | hooks 事件 + 宿主差异化的启用动作（见 §3A） |
 | **检索能力（MCP）** | `mem mcp` (stdio) | 把 search/add/ls/touch/recall_context 与候选裁决 candidates_ls/accept/reject **作为工具暴露**给支持 MCP 的宿主 | `.mcp.json` + 信任确认 |
 
 - hooks 负责**自动喂上下文**（读侧确定性入口）；MCP 负责**能力暴露**（供 agent 显式调用）。互斥？不——v2mem 两条都提供，方向一致。
@@ -38,6 +38,10 @@ v2mem 对宿主提供**两种合规接入**，定位互补，不可互相替代�
 v2mem 内置 12 个已知 harness：11 个按**应用内置运行时**判定为 `native`（原生 hooks），
 `dsh` 为 `bridge`（复用官方桥接包）；另有 `instruction` 兜底通道，不占清单行。
 源码：`internal/harness/harness.go`（顺序即展示顺序）。
+
+> 这张表是**支持矩阵，不是本机安装清单**。`~/.qoder`、`~/.cursor` 等目录存在只说明曾配置过；
+> 应用卸载后目录仍会留着。接入前按 [`install.md`](./install.md) S0.1 用 app/CLI/进程核实；
+> 残留目录不要执行 `mem init`，否则只是空接入。
 
 | Name | 别名 | Label（产品） | Tier | 配置位置 | 实测 |
 |:---|:---|:---|:---|:---|:---|
@@ -180,6 +184,7 @@ mem setup --harness <trae|workbuddy|codebuddy|mcp>
 ## 5. 卸载与回退
 
 - `mem uninstall --harness <x>`：只摘 `# v2mem` 标记的条目，不动宿主用户自有 hooks/配置。
+  它不会删除宿主目录；确认宿主已卸载后，残留目录需另行清理。
 - 每次安装前自动备份为 `<配置>.v2mem.bak`；需要原样回退时手工用该备份覆盖（`mem uninstall` 没有 `--restore` 参数）。
 
 ## 6. 与其他文档的分工

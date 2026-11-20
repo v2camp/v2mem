@@ -1,7 +1,7 @@
 # 整体安装协议（v2mem）
 
 本文是**端到端安装协议**：装二进制 → 接 hooks → 注册 MCP → 安装后校验 → 回滚。
-它不自动写宿主配置；所有写动作仍由 `install.sh`、`mem init` 和宿主面板完成。
+它不自动写宿主配置；所有写动作仍由 `install.sh`、`mem init`、宿主面板或手工 MCP 配置完成。
 
 - 各宿主的配置落点、面板动作、故障对照：见 [`setup.md`](./setup.md)。
 - 装好之后的稳态判据（I/R 组）：见 [`ops-watch.md`](./ops-watch.md)。
@@ -66,9 +66,33 @@ bash scripts/verify-install.sh --preflight
 
 完成判据：知道本机 mem 的来源（没有 / 发布版 / 开发软链 / `go install`），且 §2 的「阻止」项为零。
 
-> `mem harness` 的 `●` 只表示配置目录存在，不等于宿主真的还在用。换机或清理前再核对
-> `/Applications` 与运行进程；WorkBuddy 的 `~/.codebuddy` 是内置 CodeBuddy 运行时目录，
-> 不是独立的 CodeBuddy 安装，不能按「未使用宿主」删除。
+### S0.1 再确认宿主真的装了
+
+`mem harness` 的 `●` 只代表**配置目录存在**：卸载后残留的 `~/.qoder`、`~/.cursor` 也会显示为已装。
+只对下面能对上号的宿主执行 S3/S4；对残留目录执行 `mem init` 只会产生空接入。
+
+| 宿主 | 真装证据（任一） |
+|:---|:---|
+| TraeCode / TraeWork | `/Applications/Trae CN.app`（或国际版 `Trae.app`）、`trae` CLI |
+| WorkBuddy | `/Applications/WorkBuddy.app`、运行中的 WorkBuddy 进程 |
+| CodeBuddy | `CodeBuddy.app` 或 `codebuddy` CLI；**WorkBuddy 的 `~/.codebuddy` 不算** |
+| Codex | `codex` CLI |
+| Cursor | `Cursor.app` 或 `cursor` CLI |
+| Qoder / QoderWork / CN | 对应 app 或 CLI |
+| Claude Code | `claude` CLI |
+| dsh | `dsh` CLI + `dsh-hooks-claude-code` 桥接包 |
+
+```bash
+ls /Applications | grep -iE 'trae|workbuddy|codebuddy|cursor|qoder'
+for c in trae codebuddy codex cursor qoder qoderwork claude dsh; do command -v "$c"; done
+ps aux | grep -iE 'Trae|WorkBuddy|Cursor|Qoder|CodeBuddy' | grep -v grep
+```
+
+三条纪律：
+
+1. 只用 `mem init --harness <名字>` 点名安装，**不要用 `--all` 扫全量**。
+2. 配置目录存在、但上面查不到 → 视为残留：先清理，不安装、不写入。
+3. WorkBuddy 的 `~/.codebuddy` 是内置 CodeBuddy 运行时目录，保留；不要当作独立 CodeBuddy。
 
 ### S1 选择安装方式
 
@@ -96,31 +120,49 @@ ln -sf "$PWD/bin/mem" "$(go env GOPATH)/bin/mem"
 
 ### S3 接 hooks
 
+`mem init` 只写 hooks 配置，**不代表宿主已启用**；先过 S0.1，只对真装宿主执行。
+
 ```bash
 mem init --harness <宿主> --dry-run   # 先看会写什么
 mem init --harness <宿主>             # 合并写入，带 # v2mem 标记与 .v2mem.bak 备份
 ```
 
-完成判据（两段都满足）：
+完成判据（三段都满足）：
 
 1. 配置里出现 `# v2mem` 条目；`disableAllHooks` 不为 true。
-2. 按 `setup.md` 完成宿主面板动作，**新开会话**后 `mem audit --tail 5` 出现对应宿主的
-   `session-start` / `prompt-submit`。
+2. 完成该宿主的启用动作（细节与故障对照见 `setup.md` §3A）：
+
+| 宿主 | 写完配置后还必须做 |
+|:---|:---|
+| TraeCode | 设置 → Hooks → 全局：确认条目、打开总开关、运行方式选「本地自动运行」 |
+| TraeWork | 与 TraeCode 共用 `~/.trae-cn/hooks.json`；面板未暴露，新开会话后用审计确认 |
+| WorkBuddy | 新开会话（hooks 不需要面板） |
+| CodeBuddy | `/hooks` 面板审核并启用 |
+| Codex | `/hooks` 里 trust v2mem（改动后需重新 trust） |
+| Cursor | Hooks 面板确认 |
+| Qoder / Qoder CN | `/hooks` 查看；IDE 侧新开会话 |
+| QoderWork / QoderWork CN | 重启应用（不支持热加载） |
+
+3. **新开会话**后 `mem audit --tail 5` 出现对应宿主的 `session-start` / `prompt-submit`。
+
+> TraeCode 与 TraeWork 共用 `~/.trae-cn/hooks.json`，装一次即可，不要对两个名字重复 `mem init`。
 
 失败回退：`mem uninstall --harness <宿主>` 只摘 `# v2mem` 条目，不动用户自有配置。
 
 ### S4 注册 MCP（默认包含）
 
-MCP 与 hooks 相互独立；hooks 负责自动注入，MCP 负责会话内显式调用 8 个工具。
+**MCP 不是 `install.sh` 或 `mem init` 装的**：前者只放二进制，后者只写 hooks。
+MCP 必须两步都完成才算接入：宿主侧声明（文件或面板）+ 宿主侧信任/开关。
+只写 `mcp.json` 而没做第二列动作 = 未接入。
 
 | 宿主 | 注册动作 | 还必须做什么 |
 |:---|:---|:---|
 | WorkBuddy | 在 `~/.workbuddy/mcp.json` 写 `mcpServers.v2mem = { type: "stdio", command: "<mem 绝对路径>", args: ["mcp"] }` | 自定义连接器 → 添加 MCP → 保存 → 点「信任」，开关才会打开（`mcp-approvals.json` 出现 `*::v2mem`） |
 | Claude Code | `claude mcp add v2mem -- mem mcp`（或项目 `.mcp.json`） | 宿主首次信任该 server |
-| Codex | `~/.codex/config.toml` 的 `[mcp_servers.v2mem]`，`command = "mem"`、`args = ["mcp"]` | 首次信任 |
+| Codex | `~/.codex/config.toml` 的 `[mcp_servers.v2mem]`，`command = "<mem 绝对路径>"`、`args = ["mcp"]` | 首次信任 |
 | Cursor | `~/.cursor/mcp.json` 的 `mcpServers.v2mem` | 宿主 MCP 面板确认 |
 | TraeCode / TraeWork | 设置 → 插件市场 → 管理 → MCP → `+ 添加` → 手动配置，粘贴 `{"mcpServers":{"v2mem":{"command":"<mem 绝对路径>","args":["mcp"]}}}` → 确认（Trae 写入 `~/Library/Application Support/Trae CN/User/mcp.json`） | 面板内启用；工具列表出现 8 个 v2mem 工具 |
-| Qoder 系 | 宿主 MCP 面板新增 stdio server：命令 `mem`，参数 `mcp` | 面板内启用；脚本只能记 INFO |
+| Qoder 系 | 宿主 MCP 面板新增 stdio server：命令 `<mem 绝对路径>`，参数 `mcp` | 面板内启用；脚本只能记 INFO |
 
 完成判据：会话工具列表出现 `mcp__v2mem__search` 等工具；WorkBuddy 另有批准记录。
 失败回退：删除对应配置条目或关闭面板开关；不影响 hooks 注入。
@@ -162,7 +204,7 @@ bash scripts/verify-install.sh --harness <宿主> --runtime --window 12h   # 追
 | **B5** | 用户规则禁令 | 无命中 | — | INFO：命中文件:行，需人工裁决 |
 | **C1** | 所选宿主已有 v2mem 条目 | 有 `# v2mem` 或 `mem hook` | — | FAIL：没有；`--preflight` 时降 INFO |
 | **C2** | hooks 事件完整度 | ≥2 个事件（或 instruction 块存在） | 仅 1 个事件 | FAIL：0 个；`--preflight` 时降 INFO |
-| **C3** | MCP 声明（不代表宿主已加载） | 已知配置文件中找到 `v2mem` | 未找到（文件型宿主） | INFO：GUI 托管宿主（Trae/Qoder 系）无法只读确认 |
+| **C3** | MCP 声明（不代表宿主已加载） | 已知配置文件中找到 `v2mem` | 未找到（文件型宿主） | INFO：GUI 托管（Trae/Qoder 系）；Trae 的 `User/mcp.json` 可读但脚本暂未纳入 |
 | **C4** | WorkBuddy MCP 批准 | `mcp-approvals.json` 有 `*::v2mem` | 有声明未批准 | INFO：未选 WorkBuddy |
 | **C5** | 面板确认清单 | — | — | INFO：输出所选宿主的 `verify` 提示 |
 | **D1** | 运行态判据 | 引用 `watch-v2mem.sh` 的 I/R 结论 | watch 报 WARN | FAIL：watch 报 FAIL；INFO：未启用 `--runtime` 或 watch 缺失 |
