@@ -53,7 +53,7 @@ CASE_DB=""
 new_home() {
 	H="$TMP/home-$1"
 	rm -rf "$H"
-	mkdir -p "$H/bin" "$H/.local/bin" "$H/go/bin" "$H/.workbuddy" "$H/.trae-cn" "$H/.v2mem"
+	mkdir -p "$H/bin" "$H/.local/bin" "$H/go/bin" "$H/.workbuddy" "$H/.trae-cn" "$H/.v2mem" "$H/Applications"
 	cat >"$H/bin/mem" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -85,6 +85,7 @@ run() {
 			MEM_BIN="${CASE_MEM_BIN-$H/bin/mem}" \
 			V2MEM_DIR="${CASE_DB:-$H/.v2mem}" \
 			WORKBUDDY_CONFIG_DIR="$H/.workbuddy" \
+			VERIFY_APP_DIR="$H/Applications" \
 			GOPATH="$H/go" \
 			bash "$SCRIPT" "$@"
 	)
@@ -100,10 +101,21 @@ write_hooks() { # n events
 	' >"$f"
 }
 
+write_trae_hooks() {
+	local f="$H/.trae-cn/hooks.json"
+	jq -n --arg cmd "$H/bin/mem hook --harness traecode  # v2mem" '
+		{hooks: {
+			SessionStart: [{hooks: [{type: "command", command: $cmd}]}],
+			UserPromptSubmit: [{hooks: [{type: "command", command: $cmd}]}],
+			Stop: [{hooks: [{type: "command", command: $cmd}]}]
+		}}
+	' >"$f"
+}
+
 # ---------- T1 正常态 ----------
 new_home good
 write_hooks 4
-jq -n --arg c "$H/bin/mem" '{mcpServers: {v2mem: {command: $c, args: ["mcp"]}}}' >"$H/.workbuddy/mcp.json"
+jq -n --arg c "$H/bin/mem" '{mcpServers: {v2mem: {type: "stdio", command: $c, args: ["mcp"]}}}' >"$H/.workbuddy/mcp.json"
 printf '{"abc::v2mem":{}}' >"$H/.workbuddy/mcp-approvals.json"
 OUT="$(run --harness workbuddy)"
 RC=$?
@@ -228,7 +240,7 @@ expect_has "T15 C3 WARN" 'WARN C3' "$OUT"
 # ---------- T16 MCP 已声明未批准 ----------
 new_home c4
 write_hooks 4
-jq -n --arg c "$H/bin/mem" '{mcpServers: {v2mem: {command: $c, args: ["mcp"]}}}' >"$H/.workbuddy/mcp.json"
+jq -n --arg c "$H/bin/mem" '{mcpServers: {v2mem: {type: "stdio", command: $c, args: ["mcp"]}}}' >"$H/.workbuddy/mcp.json"
 OUT="$(run --harness workbuddy)"
 expect_has "T16 C4 WARN" 'WARN C4' "$OUT"
 
@@ -266,6 +278,21 @@ BEFORE="$(find "$H" -type f ! -name '*.json.tmp' -exec cksum {} + 2>/dev/null | 
 run --harness workbuddy >/dev/null 2>&1
 AFTER="$(find "$H" -type f ! -name '*.json.tmp' -exec cksum {} + 2>/dev/null | sort)"
 if [ "$BEFORE" = "$AFTER" ]; then ok "T20 运行前后文件未变"; else no "T20 运行前后文件被修改"; fi
+
+# ---------- T22 WorkBuddy 缺 type: stdio ----------
+new_home wbtype
+write_hooks 4
+jq -n --arg c "$H/bin/mem" '{mcpServers: {v2mem: {command: $c, args: ["mcp"]}}}' >"$H/.workbuddy/mcp.json"
+OUT="$(run --harness workbuddy)"
+expect_has "T22 C3 缺 type WARN" 'WARN C3.*type' "$OUT"
+
+# ---------- T23 Trae 的 User/mcp.json 可被读取 ----------
+new_home traemcp
+write_trae_hooks
+mkdir -p "$H/Library/Application Support/Trae CN/User"
+jq -n --arg c "$H/bin/mem" '{mcpServers: {v2mem: {command: $c, args: ["mcp"]}}}' >"$H/Library/Application Support/Trae CN/User/mcp.json"
+OUT="$(run --harness traecode)"
+expect_has "T23 C3 读取 Trae MCP" 'PASS C3.*Trae CN' "$OUT"
 
 # ---------- T21 --runtime 转述 watch ----------
 new_home d1

@@ -18,6 +18,7 @@ set -uo pipefail
 MEM_BIN="${MEM_BIN:-$(command -v mem 2>/dev/null || true)}"
 V2MEM_DIR="${V2MEM_DIR:-$HOME/.v2mem}"
 WB_DIR="${WORKBUDDY_CONFIG_DIR:-$HOME/.workbuddy}"
+APP_DIR="${VERIFY_APP_DIR:-/Applications}"
 WINDOW="12h"
 PREFLIGHT=0
 RUNTIME=0
@@ -172,6 +173,24 @@ h_global_configs() {
 h_instruction_paths() {
 	printf '%s' "$HARNESS_JSON" | jq -r --arg n "$1" \
 		'.[] | select(.name == $n) | (.instruction // [])[]' 2>/dev/null
+}
+
+# 宿主是否真的装有：app bundle 或 CLI。配置目录存在不算（可能是卸载残留）。
+real_install_evidence() {
+	case "$1" in
+	traecode | traework) [ -d "$APP_DIR/Trae CN.app" ] || [ -d "$APP_DIR/Trae.app" ] || command -v trae >/dev/null 2>&1 ;;
+	workbuddy) [ -d "$APP_DIR/WorkBuddy.app" ] || command -v workbuddy >/dev/null 2>&1 ;;
+	codebuddy) [ -d "$APP_DIR/CodeBuddy.app" ] || command -v codebuddy >/dev/null 2>&1 ;;
+	codex) command -v codex >/dev/null 2>&1 ;;
+	cursor) [ -d "$APP_DIR/Cursor.app" ] || command -v cursor >/dev/null 2>&1 ;;
+	qoder) [ -d "$APP_DIR/Qoder.app" ] || command -v qoder >/dev/null 2>&1 ;;
+	qoder-cn) [ -d "$APP_DIR/Qoder CN.app" ] || command -v qodercn >/dev/null 2>&1 ;;
+	qoderwork) [ -d "$APP_DIR/QoderWork.app" ] || command -v qoderwork >/dev/null 2>&1 ;;
+	qoderwork-cn) [ -d "$APP_DIR/QoderWork CN.app" ] || command -v qoderworkcn >/dev/null 2>&1 ;;
+	claude) command -v claude >/dev/null 2>&1 ;;
+	dsh) command -v dsh >/dev/null 2>&1 ;;
+	*) return 1 ;;
+	esac
 }
 
 pick_config() { # name -> first global config whose parent dir exists, else first
@@ -450,8 +469,9 @@ fi
 # B3 / C3 共用 MCP 扫描
 _mcp_found=""
 _mcp_bad=""
+_mcp_type_bad=""
 _scan_json_mcp() {
-	local f="$1" cmd
+	local f="$1" cmd _t
 	[ -f "$f" ] || return
 	cmd="$(jq -r '.mcpServers.v2mem.command? // empty' "$f" 2>/dev/null || true)"
 	[ -z "$cmd" ] && return
@@ -460,6 +480,11 @@ _scan_json_mcp() {
 	mem) ;;
 	*) _mcp_bad="${_mcp_bad}${_mcp_bad:+, }$f(command=$cmd)" ;;
 	esac
+	# WorkBuddy 实测：缺 type: stdio 时文件里有 v2mem，UI 也不加载。
+	if [ "$f" = "$WB_DIR/mcp.json" ]; then
+		_t="$(jq -r '.mcpServers.v2mem.type? // empty' "$f" 2>/dev/null || true)"
+		[ "$_t" != "stdio" ] && _mcp_type_bad="${_mcp_type_bad}${_mcp_type_bad:+, }$f(缺 type:stdio)"
+	fi
 }
 _scan_toml_mcp() {
 	local f="$1" cmd
@@ -482,6 +507,8 @@ if [ "$HAS_JQ" -eq 1 ]; then
 	_scan_json_mcp "$HOME/.cursor/mcp.json"
 	_scan_json_mcp "$HOME/.claude.json"
 	_scan_json_mcp "$PWD/.mcp.json"
+	_scan_json_mcp "$HOME/Library/Application Support/Trae CN/User/mcp.json"
+	_scan_json_mcp "$HOME/Library/Application Support/Trae/User/mcp.json"
 	_scan_toml_mcp "$HOME/.codex/config.toml"
 fi
 
@@ -530,6 +557,27 @@ else
 fi
 
 # ---------- C. 接入 ----------
+_c0_bad=""
+_c0_ok=""
+if [ -z "$SELECTED" ]; then
+	add C0 INFO "未选定宿主" "跳过真实安装证据"
+else
+	while IFS=$'\t' read -r _name _tier _cfg; do
+		[ -z "$_name" ] && continue
+		[ "$_tier" = "instruction" ] && continue
+		if real_install_evidence "$_name"; then
+			_c0_ok="${_c0_ok}${_c0_ok:+, }$_name"
+		else
+			_c0_bad="${_c0_bad}${_c0_bad:+, }$_name"
+		fi
+	done <<<"$SELECTED"
+	if [ -n "$_c0_bad" ]; then
+		add C0 WARN "仅配置目录存在，可能未安装" "${_c0_bad}；先按 S0.1 核实，不要继续写入"
+	else
+		add C0 PASS "宿主有 app/CLI 证据" "$_c0_ok"
+	fi
+fi
+
 _c1_bad=""
 _c1_ok=""
 _c2_min=99
@@ -593,10 +641,12 @@ else
 fi
 
 if [ "$HAS_JQ" -eq 1 ]; then
-if [ -n "$_mcp_found" ] && [ -z "$_mcp_bad" ]; then
+if [ -n "$_mcp_found" ] && [ -z "$_mcp_bad" ] && [ -z "$_mcp_type_bad" ]; then
 	add C3 PASS "MCP 已声明" "$_mcp_found"
 elif [ -n "$_mcp_bad" ]; then
 	add C3 WARN "MCP 声明存在错配" "$_mcp_bad"
+elif [ -n "$_mcp_type_bad" ]; then
+	add C3 WARN "WorkBuddy MCP 缺少 type: stdio" "${_mcp_type_bad}；补 type 后在连接器页添加并信任"
 else
 	_gui=""
 	_file_host=""
