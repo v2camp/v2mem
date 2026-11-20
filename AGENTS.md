@@ -25,7 +25,8 @@ curl 发布版或 `make install` 落地的是真实文件，重建仓库不影�
 
 判据表在 `docs/ops-watch.md`，可执行形态是 `scripts/watch-v2mem.sh`；**改判据必须同步改两处**。
 
-1. **安装只校验一次**：首次 / 换机 / 升级宿主或 mem 之后跑 I 组检查。在该机完成
+1. **安装只校验一次**：首次 / 换机 / 升级宿主或 mem 之后按 `docs/install.md` 安装并跑
+   `scripts/verify-install.sh`（安装态 I 组判据仍以 `docs/ops-watch.md` 为准）。在该机完成
    `mem init --harness <宿主>` 并通过宿主要求的面板确认后，后续会话才交给钩子自动运行
    （`native`，代码强制，不靠模型自觉）。
 2. **稳态运行不干预**：`SessionStart` 注入类码表、`UserPromptSubmit` 按 query 检索、`Stop`/`SessionEnd`

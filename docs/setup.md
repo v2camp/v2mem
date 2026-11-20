@@ -3,6 +3,7 @@
 - 日期：2026-09-18（最近更新 2026-11-12：移除 skill 兜底，补 CLI/MCP 手工速查 §3A.4）
 - 状态：草案待复核
 - 关联：`docs/DEVELOPER.md`（本地开发部署）、`docs/design-harness-memory-replace.md`（读/写接入）、`docs/design-workbuddy.md`、`docs/design-harness.md`
+- 端到端安装协议见 [`install.md`](./install.md)；本文只保留各宿主接入细节。
 
 ## 1. 背景与原则：为什么要有这份规范
 
@@ -173,7 +174,7 @@ mem setup --harness <trae|workbuddy|codebuddy|mcp>
 ## 5. 卸载与回退
 
 - `mem uninstall --harness <x>`：只摘 `# v2mem` 标记的条目，不动宿主用户自有 hooks/配置。
-- 每次安装前自动备份，可 `--restore <备份>` 回退。
+- 每次安装前自动备份为 `<配置>.v2mem.bak`；需要原样回退时手工用该备份覆盖（`mem uninstall` 没有 `--restore` 参数）。
 
 ## 6. 与其他文档的分工
 
