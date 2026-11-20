@@ -256,6 +256,9 @@ fi
 # 旧实现用全局 EMPTY/A_PROMPT 算，只要窗口内提问集中在「库内 0 条」的工程上，
 # 就会得到稳定但无意义的 FAIL——空注入是冷启动的设计预期，不是检索失效。
 # 这里把「该工程库内 <20 条」的样本单列为冷启动剔除，只在有料工程上判级。
+# 剔除不等于注入为空：规则段与观测注入不看 memories 条数，所以冷启动 INFO 会把
+# 实际的注入次数一并报出（见下方 R2_COLD_INJ），否则「确实注入了」会被读成
+# 「没有可注入内容」，把检索失效藏在 INFO 背后。
 PROMPT_BY_PROJ=""
 if [ -f "$AUDIT" ]; then
   PROMPT_BY_PROJ=$(jq -sr --argjson c "$CUTOFF" '
@@ -266,7 +269,7 @@ if [ -f "$AUDIT" ]; then
 fi
 
 if [ "$A_PROMPT" -gt 0 ]; then
-  R2_N=0; R2_EMPTY=0; R2_COLD=0; R2_COLD_PROJ=""
+  R2_N=0; R2_EMPTY=0; R2_COLD=0; R2_COLD_INJ=0; R2_COLD_PROJ=""
   if [ -n "$PROMPT_BY_PROJ" ]; then
     while IFS=$'\t' read -r pj tot emp; do
       case "${tot:-}${emp:-}" in ''|*[!0-9]*) continue ;; esac
@@ -274,6 +277,9 @@ if [ "$A_PROMPT" -gt 0 ]; then
       if [ -z "$pj" ]; then pc=$TOTAL; else pc=$(proj_total "$pj"); fi
       if [ "$pc" -lt 20 ]; then
         R2_COLD=$((R2_COLD + tot))
+        # 冷启动样本仍可能注入（规则段与观测不依赖 memories 条数），
+        # 只报「空注入属设计预期」会把「确实注入了」读成「没有可注入内容」。
+        R2_COLD_INJ=$((R2_COLD_INJ + tot - emp))
         R2_COLD_PROJ="$R2_COLD_PROJ${R2_COLD_PROJ:+, }${pj:-(未标注)}"
         continue
       fi
@@ -285,8 +291,15 @@ if [ "$A_PROMPT" -gt 0 ]; then
   fi
 
   if [ "$R2_N" -eq 0 ]; then
+    # 冷启动样本的注入次数要如实报出：库内 <20 条只说明「不按 30% 判级」，
+    # 不说明「一定注入为空」。规则段 / 观测注入不受 memories 条数约束。
+    if [ "$R2_COLD_INJ" -gt 0 ]; then
+      R2_COLD_TAIL="其中 ${R2_COLD_INJ} 次仍注入（来自规则段/观测，非记忆库命中）、$((R2_COLD - R2_COLD_INJ)) 次为空；样本同源，不计命中率"
+    else
+      R2_COLD_TAIL="空注入属设计预期，不计命中率"
+    fi
     add R2 INFO "窗口内提问全部来自冷启动工程" \
-      "prompt-submit ${A_PROMPT} 次全落在库内 <20 条的工程（${R2_COLD_PROJ:-未标注}），空注入属设计预期，不计命中率"
+      "prompt-submit ${A_PROMPT} 次全落在库内 <20 条的工程（${R2_COLD_PROJ:-未标注}），${R2_COLD_TAIL}"
   else
     HIT_RATE=$(( (R2_N - R2_EMPTY) * 100 / R2_N ))
     COLD_NOTE=""

@@ -347,9 +347,10 @@ plines() { # plines <project> <n> <empty>；project 传空串表示该行不带 
   done
 }
 
-assert_r2() { # <名称> <prompts> <proj_stats> <total> <want_level> [detail 子串]
-  local name="$1" prompts="$2" pstats="$3" total="$4" want="$5" needle="${6:-}"
-  local out got detail
+assert_r2() { # <名称> <prompts> <proj_stats> <total> <want_level> [detail 子串...]
+  local name="$1" prompts="$2" pstats="$3" total="$4" want="$5"
+  shift 5
+  local out got detail needle
   out="$(run_case "$name" 100 0 no "$EMPTY" '' '' '' "$prompts" "$pstats" "$total")"
   got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R2") | .level')"
   detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R2") | .detail')"
@@ -358,17 +359,22 @@ assert_r2() { # <名称> <prompts> <proj_stats> <total> <want_level> [detail 子
     printf '%s\n' "$out" >&2
     exit 1
   fi
-  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
-    echo "FAIL $name: R2 detail 缺 '${needle}'，got: ${detail}" >&2
-    exit 1
-  fi
+  for needle in "$@"; do
+    if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+      echo "FAIL $name: R2 detail 缺 '${needle}'，got: ${detail}" >&2
+      exit 1
+    fi
+  done
   N=$((N+1))
   printf 'ok  %-26s R2=%-4s\n' "$name" "$want"
 }
 
 # 核心回归：库全局 200 条、但窗口内 6 次提问全来自库内 0 条的工程 →
 # 旧版按全局算得 0% 判 FAIL，新版应剔除冷启动样本、判 INFO 并点明原因。
-assert_r2 r2_cold_project     "$(plines cold 6 6)"                   ''        200 INFO '全落在库内 <20 条'
+assert_r2 r2_cold_project     "$(plines cold 6 6)"                   ''        200 INFO '全落在库内 <20 条' '空注入属设计预期'
+# 冷启动剔除 ≠ 注入为空：规则段与观测注入不看 memories 条数，4 次里 3 次有注入时
+# INFO 必须报出注入次数，否则「确实注入了」会被读成「没有可注入内容」。
+assert_r2 r2_cold_some_inject "$(plines cold 4 1)"                   ''        200 INFO '全落在库内 <20 条' '其中 3 次仍注入'
 # 冷启动样本被剔除，不稀释有料工程的命中率：hot 10 次空 2 次 → 80% PASS。
 assert_r2 r2_cold_excluded    "$(plines hot 10 2)$(plines cold 5 5)"  'hot=50'  200 PASS '已剔除冷启动工程 5 次'
 # 反向保护：有料工程全空仍须判 FAIL，剔除逻辑不能把真故障一起吞掉。
