@@ -1,37 +1,28 @@
-# 整体安装协议（v2mem）
+# 整体安装与接入（v2mem）
 
-本文是**端到端安装协议**：装二进制 → 接 hooks → 注册 MCP → 安装后校验 → 回滚。
-它不自动写宿主配置；所有写动作仍由 `install.sh`、`mem init`、宿主面板或手工 MCP 配置完成。
+本文是 v2mem **唯一的安装/接入文档**：装二进制 → 接 hooks → 注册 MCP → 安装后校验 → 回滚。
+它不自动写宿主配置；写动作由 `install.sh`、`mem init`、宿主面板或手工 MCP 配置完成。
 
-- 各宿主的配置落点、面板动作、故障对照：见 [`setup.md`](./setup.md)。
 - 装好之后的稳态判据（I/R 组）：见 [`ops-watch.md`](./ops-watch.md)。
-- 本文的 A–D 判据只用于「来源 / 冲突 / 接入一致性」，是这四组的唯一真理源。
+- 构建、测试、覆盖率、发版：见 [`DEVELOPER.md`](./DEVELOPER.md)。
+- 日常命令与 MCP 片段：见 [`README.md`](../README.md)。
 
-## 1. 适用与边界
+## 1. 原则与接入分层
 
-适用：新机器首次安装、换机、升级宿主或 mem 之后的重新校验；同一协议在每台机器各跑一遍。
+> 1. **不绕过宿主面板**：接入 = 产出合规配置 + 引导用户在宿主面板确认启用。
+>    是否需要面板因宿主而异（见 §8）：Trae 要开 Hooks 总开关并选「本地自动运行」；
+>    WorkBuddy 的 hooks 不需要面板，但 MCP 要在连接器页开开关。
+> 2. **一份配置、一种 schema**：按目标宿主的官方 schema 产出，先校验再提示。
+> 3. **引导而非静默**：安装后必须给出「到哪个面板做什么」的可操作清单，不假设外部生效。
+> 4. **只读护栏**：hooks / MCP 的读侧被触发时，绝不往 memories 写内容。
+> 5. **可回退**：每次写入前备份；卸载只摘本工具的 `# v2mem` 条目，不碰用户自有配置。
 
-不适用：日常记忆读写（见 README「命令一览」）、稳态巡检（见 `ops-watch.md`）。
+v2mem 有两条互补通道，不能互相替代：
 
-前置：
-
-| 依赖 | 用途 | 缺失时 |
-|:---|:---|:---|
-| `bash` + 常用文本工具 | 安装与校验脚本 | 无法继续；Windows 用 Git Bash / MSYS |
-| `jq` | 校验脚本解析宿主 JSON 配置 | 记 A0 WARN，结构化检查降级为 INFO，其余继续 |
-| `git` + `go` | 仅 `--from-source` 回退需要 | 优先走预编译下载 |
-| 宿主本体 | 接 hooks / MCP | 只装二进制，接入留到宿主装好后再跑 S3 |
-
-校验脚本有两种运行方式，任选：
-
-```bash
-# 仓库内（开发者机器）
-bash scripts/verify-install.sh --preflight
-
-# 无仓库的机器：与 install.sh 相同的信任模型
-curl -fsSL https://raw.githubusercontent.com/v2camp/v2mem/main/scripts/verify-install.sh \
-  | bash -s -- --preflight
-```
+| 接入 | 载体 | 解决什么 | 完成条件 |
+|:---|:---|:---|:---|
+| **hooks** | `mem hook` | 会话开始/提问时自动注入相关记忆 | 配置写入 + 宿主启用动作 + 审计出现事件 |
+| **MCP** | `mem mcp`（stdio） | 把 search/add/ls/touch/recall_context 与候选裁决暴露为工具 | 宿主侧声明 + 信任/开关 |
 
 ## 2. 安装前冲突审查
 
@@ -49,7 +40,7 @@ preflight 对「尚未接入」的缺项（C1/C2/C3）只报 `INFO`，不用于�
 | 用户规范指定唯一记忆系统 / 记忆文件 | B5 或人工阅读规则文件 | 人工裁决 | v2mem 只做 Level 2 检索库，或放弃安装；不要双写同一事实 |
 | 组织统一安装协议（如 qifuskills install.md） | 规则文件或组织文档 | 人工裁决 | 本协议不写 `.agents/skills`、不改仓库，通常不冲突；若组织要求登记/评审，先走组织流程 |
 | DB 路径不可写 / 在同步盘 | A4 | 阻止 | `~/.v2mem` 必须在本地可写目录；绝不放 iCloud / Dropbox / OneDrive / 坚果云等同步盘 |
-| 宿主要求面板确认 | S3 未确认 | 阻止（视为未完成） | TraeCode / CodeBuddy 打开 Hooks 总开关并选「本地自动运行」；WorkBuddy 新开会话即可 |
+| 宿主要求面板确认 | S3 未确认 | 阻止（视为未完成） | 按 §8 完成对应宿主的启用动作 |
 
 > B5 只是关键词启发式（`禁止/不要/禁用/不得` × `hook/MCP/记忆/mem`），命中后必须人工读原文，不能以脚本结论代替裁决。
 
@@ -130,22 +121,14 @@ mem init --harness <宿主>             # 合并写入，带 # v2mem 标记与 .
 完成判据（三段都满足）：
 
 1. 配置里出现 `# v2mem` 条目；`disableAllHooks` 不为 true。
-2. 完成该宿主的启用动作（细节与故障对照见 `setup.md` §3A）：
-
-| 宿主 | 写完配置后还必须做 |
-|:---|:---|
-| TraeCode | 设置 → Hooks → 全局：确认条目、打开总开关、运行方式选「本地自动运行」 |
-| TraeWork | 与 TraeCode 共用 `~/.trae-cn/hooks.json`；面板未暴露，新开会话后用审计确认 |
-| WorkBuddy | 新开会话（hooks 不需要面板） |
-| CodeBuddy | `/hooks` 面板审核并启用 |
-| Codex | `/hooks` 里 trust v2mem（改动后需重新 trust） |
-| Cursor | Hooks 面板确认 |
-| Qoder / Qoder CN | `/hooks` 查看；IDE 侧新开会话 |
-| QoderWork / QoderWork CN | 重启应用（不支持热加载） |
-
+2. 完成该宿主的启用动作（见 §8.1–§8.4）。
 3. **新开会话**后 `mem audit --tail 5` 出现对应宿主的 `session-start` / `prompt-submit`。
 
 > TraeCode 与 TraeWork 共用 `~/.trae-cn/hooks.json`，装一次即可，不要对两个名字重复 `mem init`。
+> Claude Code 与 TraeCode 也共用读取关系：给 claude 配 hooks 会顺带覆盖 TraeCode；两边都写会双份注入，二选一。
+
+补充：Codex 还需在 `~/.codex/config.toml` 确保 `[features] hooks = true`（默认开启），首次使用在 `/hooks` trust；
+Cursor 的 `hooks.json` 需要 `version: 1`、事件名 camelCase（`mem init` 已处理）。
 
 失败回退：`mem uninstall --harness <宿主>` 只摘 `# v2mem` 条目，不动用户自有配置。
 
@@ -153,26 +136,14 @@ mem init --harness <宿主>             # 合并写入，带 # v2mem 标记与 .
 
 **MCP 不是 `install.sh` 或 `mem init` 装的**：前者只放二进制，后者只写 hooks。
 MCP 必须两步都完成才算接入：宿主侧声明（文件或面板）+ 宿主侧信任/开关。
-只写 `mcp.json` 而没做第二列动作 = 未接入。
-
-| 宿主 | 注册动作 | 还必须做什么 |
-|:---|:---|:---|
-| WorkBuddy | 在 `~/.workbuddy/mcp.json` 写 `mcpServers.v2mem = { type: "stdio", command: "<mem 绝对路径>", args: ["mcp"] }` | 自定义连接器 → 添加 MCP → 保存 → 点「信任」，开关才会打开（`mcp-approvals.json` 出现 `*::v2mem`） |
-| Claude Code | `claude mcp add v2mem -- mem mcp`（或项目 `.mcp.json`） | 宿主首次信任该 server |
-| Codex | `~/.codex/config.toml` 的 `[mcp_servers.v2mem]`，`command = "<mem 绝对路径>"`、`args = ["mcp"]` | 首次信任 |
-| Cursor | `~/.cursor/mcp.json` 的 `mcpServers.v2mem` | 宿主 MCP 面板确认 |
-| TraeCode / TraeWork | 设置 → 插件市场 → 管理 → MCP → `+ 添加` → 手动配置，粘贴 `{"mcpServers":{"v2mem":{"command":"<mem 绝对路径>","args":["mcp"]}}}` → 确认（Trae 写入 `~/Library/Application Support/Trae CN/User/mcp.json`） | 面板内启用；工具列表出现 8 个 v2mem 工具 |
-| Qoder 系 | 宿主 MCP 面板新增 stdio server：命令 `<mem 绝对路径>`，参数 `mcp` | 面板内启用；脚本只能记 INFO |
+暴露 8 个工具：`search` / `add` / `ls` / `touch` / `recall_context` / `candidates_ls` / `accept` / `reject`。
+只写 `mcp.json` 而没做第二步 = 未接入。各宿主的声明位置与面板动作见 §8。
 
 完成判据：会话工具列表出现 `mcp__v2mem__search` 等工具；WorkBuddy 另有批准记录。
 失败回退：删除对应配置条目或关闭面板开关；不影响 hooks 注入。
 
-> GUI 宿主不继承 shell 的 PATH，`command` 建议直接写绝对路径（如 `~/.local/bin/mem`）；
-> 上表的 `mem` 只是简写。多个宿主同时拉起 `mem mcp` 时，首次连接可能短暂报 `SQLITE_BUSY`，
-> 在宿主面板点「重试」即可。
-
-> WorkBuddy 实测（5.11.3）：缺 `type: "stdio"` 时文件里虽有 v2mem，UI 不加载；
-> 补齐后需在「自定义连接器」里点「添加 MCP → 保存」，再点「信任」，开关才会变为开启。
+> GUI 宿主不继承 shell 的 PATH，`command` 建议直接写绝对路径（如 `~/.local/bin/mem`）。
+> 多个宿主同时拉起 `mem mcp` 时，首次连接可能短暂报 `SQLITE_BUSY`，在宿主面板点「重试」即可。
 
 ### S5 安装后校验
 
@@ -220,6 +191,7 @@ mem uninstall --all                  # 全部宿主
 
 - 配置回退：`mem uninstall` 没有 `--restore`；需要原样恢复时手工用同目录的
   `<配置>.v2mem.bak` 覆盖（仅在确认该备份是本工具产生时）。
+- `mem uninstall` 不会删除宿主目录；确认宿主已卸载后，残留目录需另行清理。
 - MCP：删除对应配置条目，或在宿主面板关闭 v2mem。
 - 二进制：按该机安装方式移除（发布版删 `~/.local/bin/mem`；软链删软链；`go install` 删 `$GOPATH/bin/mem`）。
 - 数据库：`~/.v2mem` 保留。确要删除时先 `mem export` 备份，再删目录；不要只删 `mem.db` 留下 WAL/SHM。
@@ -232,10 +204,114 @@ mem uninstall --all                  # 全部宿主
 |:---|:---|:---|:---|:---|:---|:---|:---|:---|
 | 示例：mini | macOS arm64 | 发布版 | v0.5.2 | workbuddy | 已批准 | `~/.v2mem/mem.db` | 2026-11-20 | 无 FAIL，1 WARN |
 
-## 7. 文档分工
+## 7. 附录 A：支持矩阵
 
-- 本文：端到端安装协议、冲突审查、A–D 判据、回滚、多机记录。
-- [`setup.md`](./setup.md)：各宿主配置落点、面板动作、故障对照；不重复安装协议。
-- [`ops-watch.md`](./ops-watch.md)：装好后的 I/R 稳态判据与巡检节奏；I1–I5 不在本文重算。
-- [`../README.md`](../README.md)：面向使用者的安装入口、命令一览、MCP 配置片段。
-- [`DEVELOPER.md`](./DEVELOPER.md)：构建、测试、覆盖率与合并门禁。
+v2mem 内置 12 个已知 harness：11 个 `native`（原生 hooks），`dsh` 为 `bridge`；另有 `instruction` 兜底通道。
+源码：`internal/harness/harness.go`（顺序即展示顺序）。
+
+> 这是**支持矩阵，不是本机安装清单**。`~/.qoder`、`~/.cursor` 等目录存在只说明曾配置过；
+> 接入前按 §3 S0.1 用 app/CLI/进程核实；残留目录不要执行 `mem init`。
+
+| Name | 别名 | Label（产品） | Tier | 配置位置 | 实测 |
+|:---|:---|:---|:---|:---|:---|
+| claude | claude-code, cc | Claude Code | native | `~/.claude/settings.json` | — |
+| traecode | trae, trae-cn, solo | TraeCode（Trae IDE/SOLO） | native | `~/.trae-cn/hooks.json` | ✅ 已验证生效 |
+| codebuddy | code-buddy, cb | CodeBuddy Code | native | `~/.codebuddy/settings.json` | 待面板审核 |
+| qoder | qoder-ide, qoder-cli | Qoder | native | `~/.qoder/settings.json` | — |
+| qoder-cn | qodercn, lingma | Qoder CN（通义灵码） | native | `~/.qoder-cn/settings.json` | — |
+| qoderwork | qoder-work, qw | QoderWork（桌面） | native | `~/.qoderwork/settings.json` | — |
+| qoderwork-cn | qoderworkcn | QoderWork CN | native | `~/.qoderworkcn/settings.json` | — |
+| codex | codex-cli | Codex CLI | native | `~/.codex/hooks.json` | — |
+| dsh | deepseek-harness | DeepSeek Harness | bridge | 复用 `~/.claude/settings.json` | — |
+| traework | trae-work, tw, trae-solo | TraeWork（原 TRAE SOLO） | native | `~/.trae-local` / `~/.trae-cn` / `~/.trae/hooks.json` | ⚠️ 面板未暴露 |
+| workbuddy | work-buddy, wb | WorkBuddy | native | `~/.workbuddy/settings.json` | ✅ 已验证生效（内置 CLI 实测） |
+| cursor | cursor-ide | Cursor | native | `~/.cursor/hooks.json` | 六个原生事件 |
+
+关键事实：
+
+- **traecode 已验证**：面板启用（本地自动运行）+ 提问后，审计出现 `prompt-submit | traecode`。
+- **traework 面板未暴露 hooks 选项**：应用包内有 `global_hooks_enabled` 等开关，但设置界面没有入口；新开会话后用审计确认。
+- **workbuddy ≠ codebuddy 的配置**：运行时同是内置 CodeBuddy CLI，但用户级配置读 `~/.workbuddy/settings.json`；写 `~/.codebuddy/settings.json` 永远不触发。
+- **traecode 会额外读 claude 的同份配置**：给 claude 配 hooks 会顺带覆盖 TraeCode；两边都写会双份注入。
+- **dsh**：原生不是 shell hook，本工具不产出插件代码；需装官方桥接包
+  `dsh plugin --profile add dsh-hooks-claude-code`（或 `dsh-hooks-codex`）。
+
+## 8. 附录 B：宿主接入细节
+
+### 8.1 TraeCode / TraeWork
+
+- 全局 hooks：`~/.trae-cn/hooks.json`；项目 hooks：`$PROJECT/.trae/hooks.json`。
+- 事件：SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / Stop / Notification；
+  stdout 纯文本注入仅适用于前两个。
+
+一次性接入清单（按序执行，缺一不可）：
+
+1. `mem init --harness traecode`：写入 `~/.trae-cn/hooks.json`，自动备份，条目带 `# v2mem`。
+2. 打开「设置 > Hooks > 全局」，确认条目在列，并打开 **已配置的 Hooks** 总开关。
+3. 运行方式选 **「本地自动运行」**；选 Sandbox 会出现「读得到、写不进」的半接入状态。
+4. 完全退出 Trae 或新建会话，发一句普通提问并结束该轮。
+5. 验收：`mem audit --tail 5` 应出现 `prompt-submit | traecode` 和 `stop | traecode`。
+
+| 现象 | 根因 | 处理 |
+|:---|:---|:---|
+| 日志 `ExecEnv: Sandbox`，报 `readonly database` 或 `operation not permitted` | 钩子跑在沙箱，`~/.v2mem` 禁写 | 改为「本地自动运行」，或给沙箱放行 `~/.v2mem` |
+| 配置存在但审计无 `traecode` | 总开关未开，或旧会话未重建 | 完成第 2、4 步 |
+| 审计只有 `workbuddy` / `codebuddy` | 写错了宿主文件 | Trae 只读 `~/.trae-cn/hooks.json` |
+
+MCP：设置 → 插件市场 → 管理 → **MCP** → 「MCP Servers 管理」右上角 **`+ 添加`** → **手动配置**，
+粘贴 `{"mcpServers":{"v2mem":{"command":"<mem 绝对路径>","args":["mcp"]}}}` → 确认。
+Trae 自己写入 `~/Library/Application Support/Trae CN/User/mcp.json`；启用后工具列表出现 8 个 v2mem 工具。
+首次连接若报 `SQLITE_BUSY`，在面板点「重试」即可。
+
+### 8.2 WorkBuddy（内置 CodeBuddy 运行时）
+
+- 用户级 hooks：`~/.workbuddy/settings.json` 的 `hooks` 段（**不是** `~/.codebuddy/settings.json`）。
+  判据是 `WORKBUDDY_CONFIG_DIR`：内置 CLI 读 `<该变量>/settings.json`，桌面端把它设成 `~/.workbuddy`。
+- **hooks 不需要面板确认**：内置 CLI 读到文件即执行。MCP 则必须开连接器开关。
+
+一次性接入清单（按序执行）：
+
+1. `mem init --harness workbuddy`：写入 4 个事件（SessionStart / UserPromptSubmit / Stop / SessionEnd），
+   条目带 `# v2mem`，首次备份为 `settings.json.v2mem.bak`。该文件约 43KB、含 IM 凭据的加密信封；
+   幂等性已实测：重复执行不重复、12 个顶层键完整保留。
+2. 检查没有 `"disableAllHooks": true`（它为真时全部钩子都不执行）。
+3. **新开会话**：每轮由新进程读取设置，已开的会话不生效。
+4. MCP：在 `~/.workbuddy/mcp.json` 加 `v2mem` 只是声明，不会激活。条目必须带 `"type": "stdio"`：
+   `{ "type": "stdio", "command": "<mem 绝对路径>", "args": ["mcp"] }`。
+   然后到「专家·技能·连接器 → 连接器页 → 右上角自定义连接器」，点「添加 MCP → 保存」，
+   再点该行「信任」，开关才会打开。开启后 `mcp-approvals.json` 出现 `<sha256>::v2mem`。
+5. 验收：`mem audit --tail 5` 应有 `session-start | workbuddy`、`prompt-submit | workbuddy`；
+   `scripts/watch-v2mem.sh --window 24h` 的 I1/I2 PASS、R1 ≥1。
+
+| 现象 | 根因 | 处理 |
+|:---|:---|:---|
+| 审计零 hook 事件，但配置语法正确 | 钩子写进了 `~/.codebuddy/settings.json` | 移到 `~/.workbuddy/settings.json`，再新开会话 |
+| 配置刚改完，当前会话仍无注入 | 会话进程建于改配置之前 | 新开会话；不要反复改配置 |
+| 连自带插件的钩子也不跑 | `"disableAllHooks": true` | 去掉该键 |
+| MCP 工具列表没有 v2mem | 只写了 `mcp.json`，未开连接器，或条目缺 `type: "stdio"` | 补齐 type → 添加 MCP → 保存 → 信任 |
+| hooks 有注入但 MCP 不可用（或反之） | 两条通道相互独立 | 分开排查 |
+
+> 判定「是否真的在跑」只看审计：`session-start` / `prompt-submit` 带 `harness=workbuddy`。
+
+### 8.3 其他支持 MCP 的宿主
+
+- Codex：`~/.codex/config.toml` 的 `[mcp_servers.v2mem]`，`command = "<mem 绝对路径>"`、`args = ["mcp"]`；
+  首次在 `/hooks` 或 MCP 面板 trust。
+- Cursor：`~/.cursor/mcp.json` 的 `mcpServers.v2mem`；在宿主 MCP 面板确认。
+- Claude Code：`claude mcp add v2mem -- mem mcp`（或项目 `.mcp.json`）；首次信任。
+- 其他宿主：产出 `.mcp.json`（或宿主等价配置），把 `mem mcp` 注册为 stdio server，并在宿主里信任/允许。
+
+### 8.4 无 hooks 时的手工兜底（不装 skill）
+
+没有 hook 时也不需要安装 skill：直接用 CLI，或按 §8.3 注册 MCP。
+仓库原有的三个 `skills/mem-*` 只服务旧路径，随原生 hooks 落地已退役。命令全表见 README「命令一览」，易错点：
+
+| 场景 | 要点 |
+|---|---|
+| 检索 | MCP `search` / `recall_context` 的 `query` 必填；`layer=observation` 才看得到近期痕迹 |
+| 写入 | MCP `add` 的 `content` 必填；一条只记一个原子事实；真正用上了再 `touch` |
+| 蒸馏 | `distill` 不在 MCP；走 CLI `mem distill --provider none --session <id>`，候选必须显式 `accept` / `reject` |
+
+P/D/X/T 类码见 [`VALUE.md`](./VALUE.md) §1.2；显式裁决见 [`design-write-governance.md`](./design-write-governance.md) §12。
+
+> `mem setup` 尚未实现，不要执行；实际按本文 S0–S5 走。

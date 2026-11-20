@@ -172,7 +172,7 @@ GUI 宿主不继承 shell 的 PATH，实际配置时建议把 `command` 写成�
 - **Trae / Qoder 系**：走宿主 MCP 面板，不靠手写文件；步骤见 [`docs/install.md`](./docs/install.md) S4
 
 MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval activity` 的评测样本。
-清单内宿主都走 hooks 通道（11 个 native + 1 个桥接，含 Cursor 的六个原生事件），不需要 skill 兜底；无 hook 的临时环境直接用 CLI 或 MCP，命令要点见 [`docs/setup.md`](./docs/setup.md) §3A.4。
+清单内宿主都走 hooks 通道（11 个 native + 1 个桥接，含 Cursor 的六个原生事件），不需要 skill 兜底；无 hook 的临时环境直接用 CLI 或 MCP，命令要点见 [`docs/install.md`](./docs/install.md) §8.4。
 
 ---
 
@@ -276,8 +276,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-speaker-attribution.md`](./docs/design-speaker-attribution.md) | 所有者 / 开发者 | **说话人归属**：用户请求与 AI 产出怎么进记忆；参照应用对照、分源提炼、`attributed_to`、反回声规则与验收数据 |
 | [`docs/design-write-governance.md`](./docs/design-write-governance.md) | 所有者 / 开发者 | **写侧治理**：三态（观测/候选/采纳）、写必由 LLM 决策、channel 与来源标记；§12 候选裁决自动化闭环（触发点、MCP 显式裁决、R8 分组、采纳率前提） |
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |
-| [`docs/install.md`](./docs/install.md) | 使用者 / 所有者 | **整体安装协议**：冲突审查、S0–S5 分步、A–D 校验、回滚与多机记录 |
-| [`docs/setup.md`](./docs/setup.md) | 使用者 | **安装/接入规范**：合规接入五守则、hooks/MCP 分层、各宿主标准流程、监听面板引导、卸载回退 |
+| [`docs/install.md`](./docs/install.md) | 使用者 / 所有者 | **安装与接入唯一文档**：五条原则、冲突审查、S0–S5、A–D 校验、宿主矩阵与细节、回滚、多机记录 |
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |
 | [`docs/exp-project-seed.md`](./docs/exp-project-seed.md) | 所有者 / 开发者 | **实验**：工程记忆覆盖度对注入的影响（0%→57%）、写入粒度与配额竞争的实测、已部署种子与回退方式 |
 | [`docs/design-ref-landscape.md`](./docs/design-ref-landscape.md) | 所有者 / 开发者 | **架构参考**：mem0 与 agentmemory 的全面对照，可借鉴/不借鉴/待评估三档，两边踩过的坑 |
