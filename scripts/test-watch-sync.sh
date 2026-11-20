@@ -98,6 +98,25 @@ printf '%s' "$(grep 'add R3 WARN' "$SCRIPT" || true)" | grep -q '副本对照' \
 printf '%s' "$r3_basis" | grep -q '库副本对照' \
   || fail "§3 R3 依据段缺库副本对照法与实测值"
 
+# ⑨b R3 的归因必须是「尚未定论」，不许把已否证的两个原因写回判据文案。
+# 实证：2026-11-20 对照实验——整目录副本挂一个常驻 `mem mcp` 6 次 11–13ms（中位 11.5ms）；
+# 带 4.2MB `-wal` 的副本 11.7ms，与只含主库文件的副本同值。故「常驻连接」与「WAL 常驻」
+# 单独都解释不了活库 150–205ms，写回文案会让下一轮照着错原因排障。
+r3_warn="$(grep 'add R3 WARN' "$SCRIPT" || true)"
+if printf '%s' "$r3_warn" | grep -q '常驻连接'; then
+  fail "脚本 R3 WARN 把「常驻连接」当已定原因（2026-11-20 已否证）"
+fi
+if printf '%s' "$r3_warn" | grep -q 'WAL 常驻'; then
+  fail "脚本 R3 WARN 把「WAL 常驻」当已定原因（2026-11-20 已否证）"
+fi
+# 正向断言：否证结论与 spool 旁证必须留在文案里，否则下一轮会重做同一实验。
+printf '%s' "$r3_warn" | grep -q '否证' \
+  || fail "脚本 R3 WARN 缺「mcp 数量 / WAL 大小已否证」的结论"
+printf '%s' "$r3_warn" | grep -q 'spool' \
+  || fail "脚本 R3 WARN 缺「本会话 spool 可作写失败旁证」的提示"
+printf '%s' "$r3_basis" | grep -q '已否证' \
+  || fail "§3 R3 依据段缺否证结论（会重复归因到 mcp/WAL）"
+
 # ⑩ R11 语义：帧数量的是 -wal **文件高水位**，不等于数据滞留。
 # 实证：2026-11-20 仅取主库文件（不含 -wal）的快照仍含 5249/5264 条观测，checkpoint 一直在推进，
 # 而 -wal 稳定 4.0MB；此前 detail 断言「被动 checkpoint 未跟上」，据此外推「WAL 拖慢读侧」缺依据。

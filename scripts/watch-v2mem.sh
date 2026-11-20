@@ -311,9 +311,9 @@ if [ "$A_MS" -gt 0 ]; then
   if [ "$A_MS" -lt 50 ]; then
     add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 端到端目标线；${R3_NOTE}"
   elif [ "$A_MS" -lt 200 ]; then
-    add R3 WARN "检索延迟 ${A_MS}ms" "端到端均值越 50ms：先做副本对照——同一二进制对「库副本」跑同一 prompt（实测中位 6–15ms，但尾部仍有 200–800ms），再比活库同 prompt 均值（11-20 实测 43–205ms）。差值指向运行态（常驻连接 / WAL 常驻 / 宿主 load），不是代码路径；纯检索热态仍 ~10ms。按日中位已 37→46→63→175ms 单调上行（11-17→11-20），不要当离群样本处理；${R3_NOTE}"
+    add R3 WARN "检索延迟 ${A_MS}ms" "端到端均值越 50ms：先做库副本对照——同一二进制对「库副本」跑同一 prompt（详见 docs/ops-watch.md §3 R3）；副本快而活库慢指向运行态，但「常驻 mcp 数量」与「WAL 大小」已由 2026-11-20 对照组否证（副本挂常驻 mcp、带 4.2MB -wal 仍 11–12ms），下一步查同秒并发 hook 与宿主 IO；纯检索热态仍 ~10ms。同一 2266 字符 prompt 的逐次耗时 40→205ms 单调上行（11-14→11-20），属真回归、不要当离群样本；再看本会话 spool/ 有无 seg-*.jsonl（有则同一时刻写路径也失败过）；${R3_NOTE}"
   else
-    add R3 FAIL "检索延迟 ${A_MS}ms" "端到端超 200ms：先看样本是否同秒并发，再查 WAL 帧数与写锁；${R3_NOTE}"
+    add R3 FAIL "检索延迟 ${A_MS}ms" "端到端超 200ms：先看样本是否同秒并发，再查本会话 spool 与宿主 IO（WAL 帧数只作参考，见 R11）；${R3_NOTE}"
   fi
 else
   add R3 INFO "无延迟样本" "窗口内没有带 ms 的读侧记录"
