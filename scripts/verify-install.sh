@@ -470,6 +470,7 @@ fi
 _mcp_found=""
 _mcp_bad=""
 _mcp_type_bad=""
+_mcp_disabled=""
 _scan_json_mcp() {
 	local f="$1" cmd _t
 	[ -f "$f" ] || return
@@ -484,6 +485,10 @@ _scan_json_mcp() {
 	if [ "$f" = "$WB_DIR/mcp.json" ]; then
 		_t="$(jq -r '.mcpServers.v2mem.type? // empty' "$f" 2>/dev/null || true)"
 		[ "$_t" != "stdio" ] && _mcp_type_bad="${_mcp_type_bad}${_mcp_type_bad:+, }$f(缺 type:stdio)"
+	fi
+	# 连接器页关掉开关后宿主写 disabled:true：声明仍在，工具却加载不出来。
+	if [ "$(jq -r '.mcpServers.v2mem.disabled? // false' "$f" 2>/dev/null || true)" = "true" ]; then
+		_mcp_disabled="${_mcp_disabled}${_mcp_disabled:+, }$f"
 	fi
 }
 _scan_toml_mcp() {
@@ -641,12 +646,14 @@ else
 fi
 
 if [ "$HAS_JQ" -eq 1 ]; then
-if [ -n "$_mcp_found" ] && [ -z "$_mcp_bad" ] && [ -z "$_mcp_type_bad" ]; then
-	add C3 PASS "MCP 已声明" "$_mcp_found"
-elif [ -n "$_mcp_bad" ]; then
+if [ -n "$_mcp_bad" ]; then
 	add C3 WARN "MCP 声明存在错配" "$_mcp_bad"
+elif [ -n "$_mcp_disabled" ]; then
+	add C3 WARN "MCP 已声明但被禁用" "${_mcp_disabled} 里 disabled=true；到宿主连接器页打开 v2mem 开关，或删掉该键"
 elif [ -n "$_mcp_type_bad" ]; then
 	add C3 WARN "WorkBuddy MCP 缺少 type: stdio" "${_mcp_type_bad}；补 type 后在连接器页添加并信任"
+elif [ -n "$_mcp_found" ]; then
+	add C3 PASS "MCP 已声明" "$_mcp_found"
 else
 	_gui=""
 	_file_host=""
