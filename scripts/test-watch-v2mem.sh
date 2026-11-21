@@ -486,4 +486,39 @@ assert_r14 r14_pass_under    "$R14_DIR"   PASS '未超 512MiB'
 ev_write b 200
 assert_r14 r14_warn_over     "$R14_DIR"   WARN '超过 512MiB'
 
+# R3 越线文案：判级只依赖读侧 ms 均值，但 detail 会直接引导排查方向，写错的结论比不写更贵。
+# 2026-11-22 更正：旧文案称「同一 2266 字符 prompt 的逐次耗时 40→205ms 单调上行，属真回归」，
+# 而 read_traces.elapsed_ms（进程内检索）同 11 次为 18→55ms、端到端 ms 在 11-21/11-22 已回落到
+# 54/54、191/49ms —— 非单调，且证明越线在进程启动与审计写入这一段。故用负向断言把错误结论钉死：
+# WARN detail 必须给出「进程内」这个可比口径，且不得再出现「单调上行」。
+# assert_r3 <名称> <prompt_ms> <want_level> <必须含> <必须不含>
+assert_r3() {
+  local name="$1" pms="$2" want="$3" needle="$4" banned="$5"
+  local out got detail
+  out="$(run_case "$name" none 0 no "$EMPTY" '' '' '' \
+    "$(printf '{"ts":%s,"event":"prompt-submit","ms":%s,"empty":false}\n' "$NOW" "$pms")")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R3") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R3") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL ${name}: R3 want=${want} got=${got}" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL ${name}: R3 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  if [ -n "$banned" ] && [[ "$detail" == *"$banned"* ]]; then
+    echo "FAIL ${name}: R3 detail 仍含过期结论 '${banned}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R3=%-4s\n' "$name" "$want"
+}
+
+# 单条 200ms → 均值 105ms → WARN；detail 必须指向进程内口径且不含「单调上行」。
+assert_r3 r3_warn_no_monotonic  200 WARN '进程内' '单调上行'
+# 12ms → PASS：低于目标线时不该带这套排查长文（本用例守住分支边界，防文案串档）。
+assert_r3 r3_pass_short          12 PASS '' '进程内'
+
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"
