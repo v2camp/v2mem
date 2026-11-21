@@ -324,7 +324,7 @@ if [ "$A_MS" -gt 0 ]; then
   if [ "$A_MS" -lt 50 ]; then
     add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 端到端目标线；${R3_NOTE}"
   elif [ "$A_MS" -lt 200 ]; then
-    add R3 WARN "检索延迟 ${A_MS}ms" "端到端均值越 50ms：先做库副本对照——同一二进制对「库副本」跑同一 prompt（详见 docs/ops-watch.md §3 R3）；副本快而活库慢指向运行态，但「常驻 mcp 数量」与「WAL 大小」已由 2026-11-20 对照组否证（副本挂常驻 mcp、带 4.2MB -wal 仍 11–12ms），下一步查同秒并发 hook 与宿主 IO；纯检索热态仍 ~10ms。同一 2266 字符 prompt 的逐次耗时 40→205ms 单调上行（11-14→11-20），属真回归、不要当离群样本；再看本会话 spool/ 有无 seg-*.jsonl（有则同一时刻写路径也失败过）；${R3_NOTE}"
+    add R3 WARN "检索延迟 ${A_MS}ms" "端到端均值越 50ms：先做库副本对照——同一二进制对「库副本」跑同一 prompt（详见 docs/ops-watch.md §3 R3）；副本快而活库慢指向运行态，但「常驻 mcp 数量」与「WAL 大小」已由 2026-11-20 对照组否证（副本挂常驻 mcp、带 4.2MB -wal 仍 11–12ms），下一步查同秒并发 hook 与宿主 IO；纯检索热态仍 ~10ms。同一 2266 字符 prompt 要分两个口径看：进程内检索耗时（read_traces.elapsed_ms）11 次为 18→55ms（11-16→11-22），端到端 ms 却是 205→54→191/49ms 来回抖、非单调，故越线成因在进程启动与审计写入这一段，不要按「检索退化」排因（docs/ops-watch.md §3 R3 ④）；再看本会话 spool/ 有无 seg-*.jsonl（有则同一时刻写路径也失败过）；${R3_NOTE}"
   else
     add R3 FAIL "检索延迟 ${A_MS}ms" "端到端超 200ms：先看样本是否同秒并发，再查本会话 spool 与宿主 IO（WAL 帧数只作参考，见 R11）；${R3_NOTE}"
   fi
