@@ -149,4 +149,25 @@ r11_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R11 ' || true)
 printf '%s' "$r11_action" | grep -q 'log == checkpointed' \
   || fail "§5 R11 处置未给「log == checkpointed 即无滞留」的判据"
 
+# ⑩ R7 计量对象：2026-11-22 前脚本只数 `*.jsonl`，漏掉 drain 认领后残留的
+# `*.jsonl.processing`——那种段明明还在盘上（重启后 DrainSpool 仍会读它），
+# 判据却数 0 报 PASS。文档与脚本必须同时覆盖两种后缀，且 detail 要能区分
+# 「下次会补写」与「重试已跑但没消化」。
+r7_row="$(grep -E '^\| \*\*R7\*\*' "$DOC" | head -1)"
+[ -n "$r7_row" ] || fail "§3 找不到 R7 行"
+printf '%s' "$r7_row" | grep -q 'jsonl.processing' \
+  || fail "§3 R7 未把 *.jsonl.processing 计入（口径与 isSpoolSegment 脱钩）"
+grep -q "SPOOL_STUCK=\$(find" "$SCRIPT" \
+  || fail "脚本 R7 未统计 *.jsonl.processing"
+grep -q 'SPOOL_TOTAL=\$(( ${SPOOL_FILES:-0} + ${SPOOL_STUCK:-0} ))' "$SCRIPT" \
+  || fail "脚本 R7 判级未按 jsonl + processing 合计"
+grep -q 'mode // "") == "spool-drain"' "$SCRIPT" \
+  || fail "脚本 R7 未读 spool-drain 审计（无法区分「会补写」与「补写在失败」）"
+# 文案在 R7_TAIL 里组装（add 行只拼接变量），所以按全文断言，不按某一行。
+grep -q '重试已跑但没消化' "$SCRIPT" \
+  || fail "脚本 R7 detail 缺「重试已跑但没消化」分支"
+r7_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R7 ' || true)"
+printf '%s' "$r7_action" | grep -q '重试本身在失败' \
+  || fail "§5 R7 处置未说明「同一文件跨会话存活即重试本身在失败」"
+
 echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"

@@ -195,6 +195,58 @@ assert_case r11_pass_boundary  100 1000 no "$EMPTY" PASS PASS PASS PASS
 assert_case r11_warn           100 1500 no "$EMPTY" PASS WARN PASS PASS
 assert_case r11_fail           100 2500 no "$EMPTY" PASS FAIL PASS PASS
 
+# R7 spool 积压：此前这一判据完全没有用例（判据表登记了，回归脚本里没有），
+# 于是「只数 *.jsonl」的漏计活到今天。两个口径都要守住：
+#   ① 计数含 *.jsonl.processing——drain 认领（rename）后崩溃/恢复失败留下的段，
+#      旧实现数 0 → 明明有积压却判 PASS；
+#   ② detail 要区分「下次会补写」与「重试已跑但没消化」，后者才需要人介入。
+# assert_r7 <名称> <jsonl 数> <processing 数> <额外审计体> <want_level> [detail 子串]
+assert_r7() {
+  local name="$1" n_jsonl="$2" n_proc="$3" extra="${4:-}" want="$5" needle="${6:-}"
+  local d="$TMP/$name" i out got detail
+  build_fixture "$d" 100 0 no "$extra"
+  for ((i = 0; i < n_jsonl; i++)); do
+    mkdir -p "$d/v2mem/spool/sess-$i"
+    : > "$d/v2mem/spool/sess-$i/seg-$i.jsonl"
+  done
+  for ((i = 0; i < n_proc; i++)); do
+    mkdir -p "$d/v2mem/spool/stuck-$i"
+    : > "$d/v2mem/spool/stuck-$i/seg-$i.jsonl.processing"
+  done
+  out="$(run_watch "$d")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R7") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R7") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R7 want=$want got=$got" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R7 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R7=%-4s\n' "$name" "$want"
+}
+
+# 边界：0 PASS / 1–3 WARN / >3 FAIL。
+assert_r7 r7_pass               0 0 '' PASS '写库链路正常'
+assert_r7 r7_warn_one           1 0 '' WARN '下次 SessionStart 会补写'
+assert_r7 r7_warn_three         3 0 '' WARN ''
+assert_r7 r7_fail_four          4 0 '' FAIL '写库持续失败'
+# 核心回归：只有已认领未完成的段时，旧实现数 *.jsonl 得 0 判 PASS。
+assert_r7 r7_processing_only    0 1 '' WARN '已认领未完成'
+assert_r7 r7_processing_counts  3 3 '' FAIL ''
+# 回放尝试过且失败：文案不得再承诺「下次会补写」。
+R7_FAILED_AUDIT="$(printf '{"ts":%s,"event":"obs-append","mode":"spool-drain","count":0,"failed":1}\n' "$NOW")"
+assert_r7 r7_retry_failed       1 0 "$R7_FAILED_AUDIT" WARN '重试已跑但没消化'
+# 同一条审计但 failed=0（补写成功过）→ 仍是「会补写」，不误报成失败。
+R7_OK_AUDIT="$(printf '{"ts":%s,"event":"obs-append","mode":"spool-drain","count":3,"failed":0}\n' "$NOW")"
+assert_r7 r7_retry_ok           1 0 "$R7_OK_AUDIT" WARN '下次 SessionStart 会补写'
+# 窗口外的失败记录不算（否则一次历史失败会永久改写文案）。
+R7_OLD_AUDIT="$(printf '{"ts":%s,"event":"obs-append","mode":"spool-drain","count":0,"failed":2}\n' "$((NOW - 172800))")"
+assert_r7 r7_retry_out_window   1 0 "$R7_OLD_AUDIT" WARN '下次 SessionStart 会补写'
+
 # R8 边界：单工程 ≤5 PASS / 6–15 WARN / >15 FAIL（阈值未改，只是单位变成「单个工程」）。
 assert_case r8_pass_5          100 0 no "$(cand_json A 5)"  PASS PASS PASS PASS
 assert_case r8_warn_6          100 0 no "$(cand_json A 6)"  PASS PASS WARN PASS
