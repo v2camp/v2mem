@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# 回归：R8 候选积压 / R9 载荷残留 / R10 写侧延迟 / R11 WAL 堆积 /
-# R12 写侧自动决策链路 / R13 注入体量 / R14 归档体量 的分级边界，逐格对应
-# docs/ops-watch.md §3 判据表。
+# 回归：R3 分段文案的变量边界 / R8 候选积压 / R9 载荷残留 / R10 写侧延迟 /
+# R11 WAL 堆积 / R12 写侧自动决策链路 / R13 注入体量 / R14 归档体量 的分级边界，
+# 逐格对应 docs/ops-watch.md §3 判据表。
 # 用临时 V2MEM_DIR + mem stub，不触碰生产库；只断言 --json 输出的级别。
 # 重点守住四条口径：R8 按工程分组取最大值（跨工程不相加）、R10 只取 stop
 # （不与 obs-append 双计）、无样本记 INFO 而非 PASS、R12 判级只依赖 audit
@@ -376,5 +376,21 @@ assert_r14 r14_pass_under    "$R14_DIR"   PASS '未超 512MiB'
 # 再 +200MiB → 约 600MiB → WARN；只判字节，文件数仍是 2 也要按体积判。
 ev_write b 200
 assert_r14 r14_warn_over     "$R14_DIR"   WARN '超过 512MiB'
+
+# R3 分段分支：默认夹具没有分段字段，走不到 R3 的展开分支。macOS bash 3.2 在
+# set -u 下会把 "$R3_NOTE；" 的全角分号首字节并进变量名，脚本在吐出 JSON 前就终止。
+# 这里用带 claim_ms 的窗口强制走该分支，断言 R3 完整产出且带分段文案。
+R3_SEG_DIR="$TMP/r3_seg"
+build_fixture "$R3_SEG_DIR" none 0 no "" \
+  "$(printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false,"claim_ms":3}\n' "$NOW")"
+r3_out="$(run_watch "$R3_SEG_DIR")"
+r3_detail="$(printf '%s' "$r3_out" | jq -r '.items[] | select(.id=="R3") | .detail' 2>/dev/null || true)"
+if [[ "$r3_detail" != *"分段均值"* ]]; then
+  echo "FAIL r3_seg_note: R3 detail 缺分段文案（脚本可能中途退出）: ${r3_detail}" >&2
+  printf '%s\n' "$r3_out" >&2
+  exit 1
+fi
+N=$((N+1))
+printf 'ok  %-26s R3=分段文案完整\n' "r3_seg_note"
 
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"
