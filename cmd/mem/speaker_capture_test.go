@@ -62,6 +62,52 @@ func TestPromptSubmitWritesUserPromptEvidence(t *testing.T) {
 	}
 }
 
+// 宿主不保证 UserPromptSubmit 的 prompt 是用户说的：后台任务完成通知会整段
+// 以 <task-notification> 形态送进来。归档必须保真，但这类消息既不是 full 正文，
+// 也不得进提案——否则 36 条/283 条的用户证据是宿主噪音，R9 准入会被撑开。
+func TestPromptSubmitHostNoticeIsNotUserSpeech(t *testing.T) {
+	db := testDB(t)
+	proj, _ := hookProjectDir(t, "demo-repo")
+	sid := "sess-host-notice"
+	in := hookJSON(t, map[string]any{
+		"hook_event_name": "UserPromptSubmit", "cwd": proj, "session_id": sid,
+		"prompt": "<task-notification><task-id>iKjIwS</task-id><tool-use-id>call_01</tool-use-id>" +
+			"<status>completed</status><summary>Background command done</summary></task-notification>",
+		"event_id": "evt-notice-1",
+	})
+	if _, err := withStdin(t, in, func() error {
+		return cmdHook([]string{"--db", db, "--harness", "workbuddy", "--audit", "-", "--dedup-window", "0"})
+	}); err != nil {
+		t.Fatalf("prompt-submit 通知: %v", err)
+	}
+
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	obs, err := st.ListObservations(sid, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 1 {
+		t.Fatalf("通知仍须归档一行证据，got %d 条", len(obs))
+	}
+	o := obs[0]
+	if !strings.Contains(o.MetaJSON, `"proposal_eligible":false`) ||
+		!strings.Contains(o.MetaJSON, `"fidelity":"none"`) {
+		t.Fatalf("宿主通知不得标 full/可提案，got %s", o.MetaJSON)
+	}
+	if o.ArchiveHash == "" || o.EventUID == "" {
+		t.Fatalf("归档仍须落盘（原文保真），got archive=%q uid=%q", o.ArchiveHash, o.EventUID)
+	}
+	// 摘要仍回退到归档原文（eventSummary 的设计：无 override 就用 Raw），
+	// 所以这里不要求 summary 为空；判「不是用户的话」只看 fidelity / eligible。
+	if o.Channel != store.ChannelUser {
+		t.Fatalf("通道仍是 user（宿主从 user 通道送来），got %q", o.Channel)
+	}
+}
+
 // 归档保真 vs 查询源清洗：Raw 仍含注入上下文，Summary 只留 <user_query>。
 func TestRecordEvidenceUserPromptSummaryOverride(t *testing.T) {
 	full := "<system-reminder data-role=\"user-context\">OS: darwin</system-reminder>\n" +
