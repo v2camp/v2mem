@@ -311,10 +311,12 @@ fi
 if [ "$A_MS" -gt 0 ]; then
   R3_NOTE="读侧样本 ${A_READ_N} 次"
   # 有分段字段的窗口才展开：旧记录没有这三段，硬算「其余」会把整段 ms 都算成空白
+  # 变量名一律用花括号收口：macOS 自带 bash 3.2 在 set -u 下会把紧邻的
+  # 全角分号首字节并进变量名（"$R3_NOTE；" → R3_NOTE\xEF unbound variable）。
   if [ "$A_SEG_HAS" -gt 0 ]; then
-    R3_NOTE="$R3_NOTE；分段均值 开库 ${A_SEG_OPEN} / 检索 ${A_SEG_SEARCH} / 去重 ${A_SEG_CLAIM} / 证据 ${A_SEG_EVID} / 维护 ${A_SEG_MAINT} / 其余 $((A_MS - A_SEG_OPEN - A_SEG_SEARCH - A_SEG_CLAIM - A_SEG_EVID - A_SEG_MAINT))（stdout+审计）"
+    R3_NOTE="${R3_NOTE}；分段均值 开库 ${A_SEG_OPEN} / 检索 ${A_SEG_SEARCH} / 去重 ${A_SEG_CLAIM} / 证据 ${A_SEG_EVID} / 维护 ${A_SEG_MAINT} / 其余 $((A_MS - A_SEG_OPEN - A_SEG_SEARCH - A_SEG_CLAIM - A_SEG_EVID - A_SEG_MAINT))（stdout+审计）"
   fi
-  R3_NOTE="$R3_NOTE；写侧 Stop ${A_WRITE_MS}ms 由 R10 单独判级，不计入本判据"
+  R3_NOTE="${R3_NOTE}；写侧 Stop ${A_WRITE_MS}ms 由 R10 单独判级，不计入本判据"
   if [ "$A_MS" -lt 50 ]; then
     add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 目标线；${R3_NOTE}"
   elif [ "$A_MS" -lt 200 ]; then
