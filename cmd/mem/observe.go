@@ -370,6 +370,15 @@ func appendUserPromptFailOpen(c common, harnessFlag, project string, in hookInpu
 	if uid == "" {
 		uid = synthPromptUID(source, raw)
 	}
+	// 宿主并不保证 prompt 是用户说的：后台任务完成通知（整段 <task-notification>）
+	// 与只含注入上下文的消息都会走 UserPromptSubmit。归档一律保真，但「是不是
+	// 用户原话」必须与 transcript 路径同一把尺子——查询源为空就说明没有用户的话，
+	// 此时不得标 full、不得进提案，否则 R9 的准入又会被宿主噪音撑开。
+	cleaned := transcript.UserQueryText(string(raw))
+	fidelity, eligible := evidence.FidelityFull, true
+	if strings.TrimSpace(cleaned) == "" {
+		fidelity, eligible = evidence.FidelityNone, false
+	}
 	ev := evidence.RawEvent{
 		SourceID:         source,
 		SessionID:        sid,
@@ -377,13 +386,12 @@ func appendUserPromptFailOpen(c common, harnessFlag, project string, in hookInpu
 		Harness:          hname,
 		EventType:        transcript.EventUserPrompt,
 		OccurredAtNS:     time.Now().UnixNano(),
-		ProposalEligible: true,
-		Fidelity:         evidence.FidelityFull,
+		ProposalEligible: eligible,
+		Fidelity:         fidelity,
 		EventUID:         uid,
 		Raw:              raw,
-		// hook 的 prompt 已是用户原话（不含注入上下文），无需清洗；
-		// 但走同一字段可让查询源与归档源口径一致。
-		SummaryOverride: truncateRunes(transcript.UserQueryText(string(raw)), 500),
+		// 查询源与归档源口径一致：Raw 保真，Summary 只留用户原话。
+		SummaryOverride: truncateRunes(cleaned, 500),
 	}
 
 	es, err := openEvidenceSession(c.db)

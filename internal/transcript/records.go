@@ -268,6 +268,9 @@ func parseNativeMessage(base Record, raw map[string]json.RawMessage, line []byte
 var (
 	userQueryRe      = regexp.MustCompile(`(?s)<user_query>(.*?)</user_query>`)
 	systemReminderRe = regexp.MustCompile(`(?s)<system-reminder\b[^>]*>.*?</system-reminder>`)
+	// 宿主的后台任务完成通知也走 user 通道：整段是 <task-notification>
+	// （task-id / tool-use-id / status / summary），没有一句用户的话。
+	hostNoticeRe = regexp.MustCompile(`(?s)<task-notification\b[^>]*>.*?</task-notification>`)
 )
 
 // UserQueryText 从宿主拼装的用户消息里取出「用户真正说的话」。
@@ -275,7 +278,7 @@ var (
 // WorkBuddy 的 input_text 把 system-reminder（user_info / 身份文件 / 连接器状态 /
 // 当前时间…）全部塞在同一条消息前面，真正的提问包在 <user_query> 里。若整段
 // 原样进提案，400 rune 的投影会全被注入上下文占满，用户请求反而看不到。
-// 优先取 <user_query>；没有该标签时只剥掉 system-reminder 块。
+// 优先取 <user_query>；没有该标签时剥掉 system-reminder 与 task-notification 块。
 // 只用于查询源（summary / 提案输入），归档 Raw 仍保留完整原文。
 func UserQueryText(s string) string {
 	if ms := userQueryRe.FindAllStringSubmatch(s, -1); len(ms) > 0 {
@@ -289,7 +292,7 @@ func UserQueryText(s string) string {
 			return strings.Join(parts, "\n")
 		}
 	}
-	return strings.TrimSpace(systemReminderRe.ReplaceAllString(s, ""))
+	return strings.TrimSpace(hostNoticeRe.ReplaceAllString(systemReminderRe.ReplaceAllString(s, ""), ""))
 }
 
 // unparsedRecord 把看不懂的行整行保留下来，交给调用方按原文归档。
