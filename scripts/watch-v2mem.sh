@@ -366,16 +366,56 @@ fi
 printf '{"ts":%s,"total":%s,"window":"%s"}\n' "$NOW" "$TOTAL" "$WINDOW" > "$STATE" 2>/dev/null
 
 # R7 spool 积压
+#
+# 计数口径必须与 internal/evidence.isSpoolSegment 一致：`.jsonl.processing` 是
+# DrainSpool 已认领、尚未读完的段（认领靠 rename，成功才删）。只数 `*.jsonl`
+# 会在「认领后进程被杀 / 恢复失败」时得到 0，把积压误报成 PASS。
+#
+# 第二个坑是文案：只要看到文件就说「下次 SessionStart 会补写」，可重试本身可能
+# 一直在失败（2026-11-22 实测：同一个 seg 从 02:58 活到 15:04，期间 SessionStart
+# 的 drain 记了 failed=1）。所以窗口内若有 spool-drain 记录的 failed>0，
+# 必须说「重试已跑但没消化」，否则读报告的人会以为它会自愈。
 SPOOL_FILES=0
+SPOOL_STUCK=0
 if [ -d "$V2MEM_DIR/spool" ]; then
   SPOOL_FILES=$(find "$V2MEM_DIR/spool" -name '*.jsonl' -type f 2>/dev/null | wc -l | tr -d ' ')
+  SPOOL_STUCK=$(find "$V2MEM_DIR/spool" -name '*.jsonl.processing' -type f 2>/dev/null | wc -l | tr -d ' ')
 fi
-if [ "$SPOOL_FILES" -eq 0 ]; then
+SPOOL_TOTAL=$(( ${SPOOL_FILES:-0} + ${SPOOL_STUCK:-0} ))
+
+# 窗口内 spool-drain 的三元组：尝试次数 / 已回放条数 / 未消化条数（取最大）。
+A_SPOOL_TRY=0; A_SPOOL_DRAINED=0; A_SPOOL_FAILED=0
+if [ -f "$AUDIT" ]; then
+  W7=$(jq -sr --argjson c "$CUTOFF" '
+    [ .[] | select(.ts >= $c and .event=="obs-append" and (.mode // "") == "spool-drain") ] as $d
+    | [ ($d | length),
+        ([$d[] | .count // 0]  | add // 0),
+        ([$d[] | .failed // 0] | max // 0) ]
+    | @tsv' "$AUDIT" 2>/dev/null)
+  if [ -n "${W7:-}" ]; then
+    IFS=$'\t' read -r A_SPOOL_TRY A_SPOOL_DRAINED A_SPOOL_FAILED <<< "$W7"
+  fi
+fi
+A_SPOOL_TRY=${A_SPOOL_TRY:-0}; A_SPOOL_DRAINED=${A_SPOOL_DRAINED:-0}
+A_SPOOL_FAILED=${A_SPOOL_FAILED:-0}
+
+if [ "$SPOOL_TOTAL" -eq 0 ]; then
   add R7 PASS "spool 无积压" "写库链路正常"
-elif [ "$SPOOL_FILES" -le 3 ]; then
-  add R7 WARN "spool 有 ${SPOOL_FILES} 个文件" "下次 SessionStart 会补写；若持续增长说明写库失败"
 else
-  add R7 FAIL "spool 积压 ${SPOOL_FILES} 个文件" "写库持续失败，检查库文件权限与磁盘"
+  STUCK_NOTE=""
+  if [ "$SPOOL_STUCK" -gt 0 ]; then
+    STUCK_NOTE="；其中 ${SPOOL_STUCK} 个是已认领未完成（*.jsonl.processing），不是写侧新失败"
+  fi
+  if [ "$A_SPOOL_FAILED" -gt 0 ]; then
+    R7_TAIL="窗口内回放尝试 ${A_SPOOL_TRY} 次、回放 ${A_SPOOL_DRAINED} 条、失败 ${A_SPOOL_FAILED} 条：重试已跑但没消化，别按「下次会补写」等；按 §5 R7 查锁竞争（busy_timeout）与库权限，先用库副本对照能否补上${STUCK_NOTE}"
+  else
+    R7_TAIL="窗口内无失败回放记录，下次 SessionStart 会补写；若持续增长说明写库失败${STUCK_NOTE}"
+  fi
+  if [ "$SPOOL_TOTAL" -le 3 ]; then
+    add R7 WARN "spool 有 ${SPOOL_TOTAL} 个文件" "$R7_TAIL"
+  else
+    add R7 FAIL "spool 积压 ${SPOOL_TOTAL} 个文件" "写库持续失败，检查库文件权限与磁盘${STUCK_NOTE}"
+  fi
 fi
 
 # R8 候选积压 / R9 载荷残留：统一从 candidates ls --json 采集，避免文本行数口径。
