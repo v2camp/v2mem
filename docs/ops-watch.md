@@ -3,7 +3,7 @@
 > **定位**：回答「装好之后，它有没有按设计在跑」。安装是否可用只在这里校验一次；
 > 之后关注的是**数据流是否通畅**，不是进程是否活着。
 > **真理源**：本文的判据表。`scripts/watch-v2mem.sh` 是它的可执行形态，**改判据必须同步改两处**。
-> 关联：[`VALUE.md`](./VALUE.md) 索引链、[`setup.md`](./setup.md) 接入规范、[`design-eval.md`](./design-eval.md) 评测口径。
+> 关联：[`VALUE.md`](./VALUE.md) 索引链、[`install.md`](./install.md) 安装与接入、[`design-eval.md`](./design-eval.md) 评测口径。
 
 ---
 
