@@ -173,6 +173,8 @@ mem setup --undo       # 回退到上一次写盘前
 想显式指定分支：`--mode cli`（必须探测成功，否则报错）、`--mode off`、`--mode api`。
 `--mode api` 只认 `model.json` 和当场输入，三步固定：
 
+`--mode api` 的流程：
+
 1. 检查 `~/.v2mem/model.json`，不存在就先创建（0600）；
 2. 文件里已有 `api_key` 就复用（掩码显示），否则提示从终端输入，输入不回显；**不读取 `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`**，不必 export；
 3. 拿该 key 真跑一次 judge dry-run，通过后才写盘；失败保留原文件不动。
@@ -180,7 +182,14 @@ mem setup --undo       # 回退到上一次写盘前
 可加 `--provider deepseek|openai` 指定供应商（缺省沿用文件里的 provider，仍为空则 deepseek）；
 `--dry-run` 走同样流程但不写盘。
 
-完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）及 `api_key` 掩码；真正的 `mem judge` 不再报「判定器不可用」。
+配好模型后**积压自动判定默认开启**：候选 ≥20 条时，在会话结束时由钩子后台拉起一次判定，
+默认影子（只记判定、不改记忆），有 24h 冷却。开关写在 `model.json` 的 `auto_spawn`，
+`mem setup --status` 能看到；关闭用 `mem setup --mode off`，临时关闭可设 `MEM_JUDGE_SPAWN=0`。
+不要依赖 `export MEM_JUDGE_SPAWN=1` 来开启——宿主钩子不继承交互 shell 的环境变量。
+详见 [`design-admission.md`](./design-admission.md) §3.1。
+
+完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）、`api_key` 掩码与
+`auto_spawn`（开 / 关）；真正的 `mem judge` 不再报「判定器不可用」。
 
 **已知不兼容**：`freebuff` 免费，但官方声明是 TUI-only、没有 headless / `-p` 输出模式，
 不能当非交互后端，因此不在上面的白名单里。本机装了它时 `mem setup` 会点名说明，而不是静默忽略；

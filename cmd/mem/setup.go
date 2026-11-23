@@ -31,9 +31,16 @@ const (
 func setupNotice(name, tag string) string {
 	return fmt.Sprintf(`已将判定器与蒸馏的模型来源设为 %s（%s）。
 judge 的候选正文与蒸馏的观测摘要会发往该 CLI 所连的远端模型；本机不另存副本。
-回退：mem setup --undo。
-自动触发仍默认关（MEM_JUDGE_SPAWN 未设 1）。
-`, name, tag)
+
+%s回退：mem setup --undo。
+`, name, tag, autoSpawnNotice())
+}
+
+// autoSpawnNotice 是配好模型后必须打印的自动触发告知：开着什么、边界在哪、怎么关。
+// 宿主钩子不继承 shell 环境，所以关闭方式以写进 model.json 的命令为主，环境变量为辅。
+func autoSpawnNotice() string {
+	return fmt.Sprintf("积压自动判定已开启：候选 ≥%d 条时在会话结束时后台跑一次判定，默认影子（只记判定，不改记忆）。\n"+
+		"关闭自动判定：mem setup --mode off；临时关闭可设 MEM_JUDGE_SPAWN=0。\n", judgeDefaultMinPending)
 }
 
 // noHeadlessHint 点名「本机装了、但已知不能当非交互后端」的 CLI。
@@ -109,6 +116,7 @@ func cmdSetup(args []string) error {
 	case "off":
 		next := cfg
 		next.Mode = "off"
+		next.AutoSpawn = false // 关掉模型来源就不能留着自动外发的开关
 		if *dryRun {
 			fmt.Printf("dry-run：将写入 mode=off（不写盘）\npath      %s\n", path)
 			return nil
@@ -116,7 +124,7 @@ func cmdSetup(args []string) error {
 		if err := distill.SaveModelConfig(path, next); err != nil {
 			return err
 		}
-		fmt.Printf("已关闭判定器与蒸馏的模型来源（mode=off）。\n回退：mem setup --undo。\n")
+		fmt.Printf("已关闭判定器与蒸馏的模型来源（mode=off），积压自动判定同时关闭。\n回退：mem setup --undo。\n")
 		return nil
 	case "api":
 		// 流程第 1 步：没有 model.json 就先建一个空壳（0600），后续只往这个文件里存密钥。
@@ -134,20 +142,21 @@ func cmdSetup(args []string) error {
 		if err != nil {
 			return err
 		}
+		next.AutoSpawn = true
 		// 第 3 步：真实调用一次 judge 端点；没通过就不把密钥落盘。
 		if err := apiDryRun(next); err != nil {
 			return fmt.Errorf("API dry-run 未通过，未写入 %s: %w", path, err)
 		}
 		if *dryRun {
-			fmt.Printf("dry-run 成功：provider=%s model=%s api_key=%s。未写盘。\npath      %s\n",
+			fmt.Printf("dry-run 成功：provider=%s model=%s api_key=%s auto_spawn=true。未写盘。\npath      %s\n",
 				next.Provider, next.Model, redactKey(next.APIKey), path)
 			return nil
 		}
 		if err := distill.SaveModelConfig(path, next); err != nil {
 			return err
 		}
-		fmt.Printf("已将模型来源切换为 API：%s / %s。\n密钥只写入 %s（0600），不经命令行参数或环境变量传入。\n回退：mem setup --undo。\n",
-			next.Provider, next.Model, path)
+		fmt.Printf("已将模型来源切换为 API：%s / %s。\n密钥只写入 %s（0600），不经命令行参数或环境变量传入。\n%s回退：mem setup --undo。\n",
+			next.Provider, next.Model, path, autoSpawnNotice())
 		return nil
 	}
 
@@ -194,9 +203,10 @@ func cmdSetup(args []string) error {
 	next.Mode = "cli"
 	next.CLI = name
 	next.ModelTag = tag
+	next.AutoSpawn = true
 
 	if *dryRun {
-		fmt.Printf("dry-run 通过：%s（%s）。未写盘。\npath      %s\n", name, tag, path)
+		fmt.Printf("dry-run 通过：%s（%s）。将写入 auto_spawn=true。未写盘。\npath      %s\n", name, tag, path)
 		return nil
 	}
 	if err := distill.SaveModelConfig(path, next); err != nil {
@@ -361,18 +371,26 @@ func printSetupStatus(path string) error {
 		mode = "未配置（无 model.json）"
 	}
 	fmt.Printf("path      %s\n", path)
-	fmt.Printf("mode      %s\n", mode)
-	fmt.Printf("cli       %s\n", setupOrDash(cfg.CLI))
-	fmt.Printf("model_tag %s\n", setupOrDash(cfg.ModelTag))
-	fmt.Printf("provider  %s\n", setupOrDash(cfg.Provider))
-	fmt.Printf("model     %s\n", setupOrDash(cfg.Model))
+	fmt.Printf("mode       %s\n", mode)
+	fmt.Printf("cli        %s\n", setupOrDash(cfg.CLI))
+	fmt.Printf("model_tag  %s\n", setupOrDash(cfg.ModelTag))
+	fmt.Printf("provider   %s\n", setupOrDash(cfg.Provider))
+	fmt.Printf("model      %s\n", setupOrDash(cfg.Model))
 	if cfg.APIKey == "" {
-		fmt.Printf("api_key   —\n")
+		fmt.Printf("api_key    —\n")
 	} else {
-		fmt.Printf("api_key   %s（来自 model.json）\n", redactKey(cfg.APIKey))
+		fmt.Printf("api_key    %s（来自 model.json）\n", redactKey(cfg.APIKey))
 	}
-	fmt.Printf("perm      %s\n", perm)
+	fmt.Printf("auto_spawn %s\n", setupOnOff(cfg.AutoSpawn))
+	fmt.Printf("perm       %s\n", perm)
 	return nil
+}
+
+func setupOnOff(on bool) string {
+	if on {
+		return "开"
+	}
+	return "关"
 }
 
 // undoSetupConfig 用备份内容覆盖 model.json 后删除备份。

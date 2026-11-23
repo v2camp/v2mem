@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/v2camp/v2mem/internal/distill"
 	"github.com/v2camp/v2mem/internal/harness"
 	"github.com/v2camp/v2mem/internal/store"
 )
@@ -20,7 +21,12 @@ import (
 //   - 钩子不等待：spawn 后立即返回，判定在子进程里跑完，失败只写 stderr。
 //   - 默认不落库：子进程默认影子（只写 verdict）；要真改状态得显式 MEM_JUDGE_APPLY=1。
 //
-// 默认不发（MEM_JUDGE_SPAWN 未设置即关）：它走网络、花钱，不该在升级后悄悄开始。
+// 自动触发的开关有两层：
+//   - model.json 的 auto_spawn：mem setup 配好模型后写入，是常态授权；
+//   - MEM_JUDGE_SPAWN：显式总闸。=1 强制开（脚本/CI），=0 强制关（GUI 宿主关不掉 export 时的退路）。
+//
+// 两层都不开就不发。老配置没有 auto_spawn，升级后不会突然开始烧 API。
+// MEM_JUDGE_APPLY 与这两层无关，仍默认关 —— auto_spawn 只开「跑」，不开「改库」。
 
 const (
 	judgeDefaultMinPending = 20 // 低于 R8 的 FAIL 线（>15）留一点余量，避免刚 WARN 就烧一次调用
@@ -46,10 +52,11 @@ func defaultStartJudge(db string, limit int, apply bool) error {
 
 // maybeSpawnJudge 在写侧事件末尾按阈值拉起判定。所有失败都静默（只写 stderr）。
 func maybeSpawnJudge(db string, event harness.Event) {
-	if strings.TrimSpace(os.Getenv("MEM_JUDGE_SPAWN")) != "1" {
+	// 事件判定必须最先：读路径连配置文件都不该读，守住「读路径零额外 I/O」。
+	if event != harness.EventStop && event != harness.EventSessionEnd {
 		return
 	}
-	if event != harness.EventStop && event != harness.EventSessionEnd {
+	if !judgeAutoSpawnEnabled() {
 		return
 	}
 	minPending := positiveEnvInt("MEM_JUDGE_MIN_PENDING")
@@ -86,6 +93,24 @@ func maybeSpawnJudge(db string, event harness.Event) {
 	if err := startJudgeProc(db, minPending, apply); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 judge 失败，已放过:", err)
 	}
+}
+
+// judgeAutoSpawnEnabled 决策开关：显式环境变量优先，未设时看 model.json 的授权。
+//
+// 只有 "1" / "0" 是有效覆盖；其它值（含空、拼写错）一律退回文件，不猜用户意图。
+// 配置读不出来时 fail-closed：宁可少跑一次，也不该在配置损坏时凭空开始外发。
+func judgeAutoSpawnEnabled() bool {
+	switch strings.TrimSpace(os.Getenv("MEM_JUDGE_SPAWN")) {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	cfg, err := distill.LoadModelConfig("")
+	if err != nil || cfg.Mode == "off" {
+		return false
+	}
+	return cfg.AutoSpawn
 }
 
 // shouldSpawnJudge 是触发判据本身，抽成纯函数才可测：
