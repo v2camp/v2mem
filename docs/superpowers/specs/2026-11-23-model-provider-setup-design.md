@@ -229,6 +229,11 @@ CLI 升级导致 tag 变化时不得合并统计。若复核认为不可接受�
 3. CLI 冷启动耗时是否超出 45s（distill）/ 90s（judge）默认超时。
 4. CLI 在无 TTY 的 detach 子进程里是否会弹权限或要求登录；dry-run 断言「stdin 关闭后不等待」能否稳定证伪。
 5. 蒸馏在 Stop 钩子被拉起时，`runCLI` 与现有 `distill_runs` 记账是否兼容。
+6. `freebuff` 是否已提供 headless 入口。**2026-11 已核实为不支持**：官方博客明写
+   「There is no headless mode. The CLI is a terminal UI with no non-interactive mode」，
+   README 只有交互式 `freebuff`，第三方集成实测管道接入仍渲染全屏 ANSI。
+   故它只进「已识别但不支持」表，供 `mem setup` 点名解释，不进白名单；不尝试 PTY 兜底。
+   若官方后续交付 `exec -p`，按 §5.1 重新实测后再纳入。
 
 以上任一项实测不符合契约，实现应回退到「该 CLI 模板不进入白名单」，**不得**放宽 §7 的验证条件。
 

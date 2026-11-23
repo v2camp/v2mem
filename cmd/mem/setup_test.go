@@ -416,3 +416,25 @@ func TestSetupModeAPIReusesStoredKey(t *testing.T) {
 		t.Errorf("权限应为 0600，got %v", st.Mode().Perm())
 	}
 }
+
+// 本机只装了 freebuff 时，用户最容易怀疑「为什么探测不到」。必须点名解释，
+// 而不是只丢一句「没有探测到可用的 CLI」。
+func TestSetupMentionsNoHeadlessCLI(t *testing.T) {
+	p := setupHome(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "freebuff"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	out, err := captureStdout(t, func() error { return cmdSetup(nil) })
+	if err != nil {
+		t.Fatalf("全不可用时默认流程不应返回错误，got %v", err)
+	}
+	if !strings.Contains(out, "freebuff") || !strings.Contains(out, "TUI-only") {
+		t.Errorf("应点名 freebuff 无 headless 的原因，got:\n%s", out)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("识别到不支持的 CLI 时不得写盘，got err=%v", err)
+	}
+}

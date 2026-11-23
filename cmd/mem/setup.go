@@ -35,6 +35,22 @@ judge 的候选正文与蒸馏的观测摘要会发往该 CLI 所连的远端模
 `, name, tag)
 }
 
+// noHeadlessHint 点名「本机装了、但已知不能当非交互后端」的 CLI。
+//
+// 静默跳过会让人以为探测坏了（例如装了免费的 freebuff 却查不到）；明确说出
+// 原因，用户才知道该换 API 还是换工具。它只影响文案，不影响探测与写盘。
+func noHeadlessHint() string {
+	items := distill.DetectNoHeadless()
+	if len(items) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, it := range items {
+		fmt.Fprintf(&b, "\n检测到 %s，但%s，不能作为判定器/蒸馏来源。", it.Name, it.Why)
+	}
+	return b.String()
+}
+
 func cmdSetup(args []string) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "只探测与验证，不写盘")
@@ -120,6 +136,7 @@ func cmdSetup(args []string) error {
 	candidates := distill.ProbeAll()
 	if len(candidates) == 0 {
 		msg := fmt.Sprintf("没有探测到可用的 CLI（白名单：%s）。判定器与蒸馏的模型来源未改变。", strings.Join(distill.CLIWhitelist(), " / "))
+		msg += noHeadlessHint()
 		if *mode == "cli" {
 			return errors.New(msg + "\n装了其中任一个后重跑 mem setup，或改用 mem setup --mode api / --mode off。")
 		}
@@ -141,10 +158,10 @@ func cmdSetup(args []string) error {
 	if name == "" {
 		// 全部候选失败：不写盘。默认流程不阻塞安装（退出 0），显式要求 cli 则报错。
 		if *mode == "cli" {
-			return fmt.Errorf("所有候选 CLI 验证均未通过，未写盘:\n  %s", strings.Join(reasons, "\n  "))
+			return fmt.Errorf("所有候选 CLI 验证均未通过，未写盘:\n  %s%s", strings.Join(reasons, "\n  "), noHeadlessHint())
 		}
-		fmt.Printf("未配置：%d 个候选 CLI 全部未通过验证，未写盘。\n  %s\n可改用 mem setup --mode api，或 mem setup --mode off。\n",
-			len(candidates), strings.Join(reasons, "\n  "))
+		fmt.Printf("未配置：%d 个候选 CLI 全部未通过验证，未写盘。\n  %s%s\n可改用 mem setup --mode api，或 mem setup --mode off。\n",
+			len(candidates), strings.Join(reasons, "\n  "), noHeadlessHint())
 		return nil
 	}
 

@@ -153,3 +153,32 @@ func TestVersionTagFirstToken(t *testing.T) {
 		t.Errorf("VersionTag 应只取版本首 token，got %q", got)
 	}
 }
+
+// freebuff 官方声明是 TUI-only、没有 headless 模式，因此不能当非交互后端。
+// 它必须只出现在「已识别但不支持」里，绝不能混进白名单被 ProbeAll 选中。
+func TestDetectNoHeadlessOnlyDiagnoses(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "freebuff"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	got := DetectNoHeadless()
+	if len(got) != 1 || got[0].Name != "freebuff" {
+		t.Fatalf("DetectNoHeadless = %+v，期望只命中 freebuff", got)
+	}
+	if got[0].Why == "" {
+		t.Error("Why 不能为空：文案要能解释为什么不能用")
+	}
+	for _, n := range CLIWhitelist() {
+		if n == "freebuff" {
+			t.Fatal("freebuff 不得进入 cliTemplates/白名单")
+		}
+	}
+	if _, ok := Probe(); ok {
+		t.Fatal("freebuff 不应被 Probe 选中")
+	}
+	if all := ProbeAll(); len(all) != 0 {
+		t.Errorf("ProbeAll 应为空，got %v", all)
+	}
+}

@@ -176,6 +176,10 @@ mem setup --undo       # 回退到上一次写盘前
 
 完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）；真正的 `mem judge` 不再报「判定器不可用」。
 
+**已知不兼容**：`freebuff` 免费，但官方声明是 TUI-only、没有 headless / `-p` 输出模式，
+不能当非交互后端，因此不在上面的白名单里。本机装了它时 `mem setup` 会点名说明，而不是静默忽略；
+想要零成本可改用本地 `ollama`（`mem judge --provider ollama --model <tag>`）。
+
 **数据边界**：judge 的候选正文与蒸馏的观测摘要会发往该 CLI 所连的模型端点；本机不另存副本。
 不配置只会让 judge / LLM 蒸馏不可用，不影响 hooks、MCP、检索与人工写入。
 
