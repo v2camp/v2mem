@@ -955,8 +955,16 @@ func TestStatsCountsKindsProjectsAndLive(t *testing.T) {
 	if st.Path != s.Path() {
 		t.Errorf("Stats.Path = %q，期望 %q", st.Path, s.Path())
 	}
-	if st.Total != 2 {
-		t.Errorf("Total = %d，期望 2", st.Total)
+	// Total 是全库口径（各数据表之和），记忆条数看 ByTable["memories"]。
+	if st.ByTable["memories"] != 2 {
+		t.Errorf("ByTable[memories] = %d，期望 2", st.ByTable["memories"])
+	}
+	sum := 0
+	for _, n := range st.ByTable {
+		sum += n
+	}
+	if st.Total != sum {
+		t.Errorf("Total = %d，期望等于各表之和 %d", st.Total, sum)
 	}
 	if st.Live != 2 || st.Superseded != 0 {
 		t.Errorf("Live/Superseded = %d/%d，期望 2/0", st.Live, st.Superseded)
