@@ -806,6 +806,48 @@ func TestSetupModeOffDisablesAutoSpawn(t *testing.T) {
 	}
 }
 
+// 存量配置（升级前写的、没有 auto_spawn 字段）默认流程必须逐字节不动 ——
+// 幂等契约不能被「升级补写」悄悄打破；要开启走显式 --mode。
+func TestSetupLeavesLegacyConfigUntouched(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := `{"mode":"cli","cli":"codebuddy","model_tag":"codebuddy@2.185.0+tpl2"}` + "\n"
+	if err := os.WriteFile(p, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir()) // 无 CLI 可探测，确保走幂等分支
+
+	if _, err := captureStdout(t, func() error { return cmdSetup(nil) }); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(p)
+	if err != nil || string(got) != original {
+		t.Errorf("幂等流程不得改动存量配置，got %q err=%v", got, err)
+	}
+}
+
+// 但用户显式 --mode cli 重写时，存量配置应拿到 auto_spawn=true。
+func TestSetupExplicitRewriteEnablesAutoSpawnOnLegacy(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"mode":"cli","cli":"codebuddy","model_tag":"codebuddy@2.185.0+tpl2"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", writeFakeCLI(t, setupCLIStub))
+
+	if _, err := captureStdout(t, func() error { return cmdSetup([]string{"--mode", "cli"}) }); err != nil {
+		t.Fatal(err)
+	}
+	c, err := distill.LoadModelConfig(p)
+	if err != nil || !c.AutoSpawn {
+		t.Fatalf("显式重写应补上 auto_spawn=true，got %+v err=%v", c, err)
+	}
+}
+
 // --status 要能看到自动触发状态，让用户不必打开 model.json 确认。
 func TestSetupStatusShowsAutoSpawn(t *testing.T) {
 	p := setupHome(t)
