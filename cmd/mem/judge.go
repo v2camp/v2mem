@@ -18,8 +18,9 @@ import (
 // 准入判定（docs/design-admission.md）。
 //
 // 定位：判定器只回答「这条要不要」，不回答「这条该怎么写」——后者是蒸馏的活。
-// 权限：默认影子，只写痕迹不改状态。理由见设计文档：模型判定是推测，
-// VALUE.md 的红线要求「未标定 + 不可回滚的推测不回写主库」，所以落库必须是显式动作。
+// 权限：只写痕迹，不改状态。VALUE.md 的红线要求「未标定 + 不可回滚的推测不回写主库」；
+// 回滚命令与 ≥95%/≥200 的标定门槛都还没落地，所以 --apply 入口一并撤掉，
+// 判定器目前没有任何改库路径。要恢复落库，必须先把这两件事同批交付。
 const (
 	judgePromptVersion = "judge-v2"
 	judgeDefaultBatch  = 20
@@ -70,7 +71,6 @@ func cmdJudge(args []string) error {
 	timeout := fs.Duration("timeout", 90*time.Second, "单次模型调用超时")
 	limit := fs.Int("limit", judgeDefaultBatch, "本批判定条数上限")
 	project := fs.String("project", "", "只判这个工程的候选（空=不过滤）")
-	apply := fs.Bool("apply", false, "按判定改状态（默认影子：只记判定，不改 status、不写库）")
 	stats := fs.Bool("stats", false, "只打印影子期统计，不调用模型")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
 	if err := fs.Parse(args); err != nil {
@@ -87,7 +87,9 @@ func cmdJudge(args []string) error {
 		return printJudgeStats(st, c.json)
 	}
 
-	list, err := st.ListCandidatesByProject("pending", "", *project, *limit)
+	// 只取 judge_verdict='' 的：影子不改 status，若按「最旧的 pending」取，
+	// 每轮都会把同一批重新发给付费端点，积压永远轮不到后面。
+	list, err := st.ListUnjudgedCandidates(*project, *limit)
 	if err != nil {
 		return err
 	}
@@ -131,35 +133,32 @@ func cmdJudge(args []string) error {
 	// 归因要能按模型分组：flag > 解析出的实际模型 > 只记 provider（cli 的版本分量在 providerName 里）。
 	modelTag := judgeModelTag(providerName, *model, opt.Model)
 
-	res, err := applyJudgments(st, list, verdicts, modelTag, *apply)
+	res, err := applyJudgments(st, list, verdicts, modelTag)
 	if err != nil {
 		return err
 	}
 
-	mode := "影子（未改状态）"
-	if *apply {
-		mode = "apply"
-	}
+	const mode = "影子（未改状态）"
 	if *auditFile != "-" {
-		_ = audit.Append(auditPath(*auditFile), audit.Record{
+		if err := audit.Append(auditPath(*auditFile), audit.Record{
 			TS: time.Now().Unix(), Event: "candidate-judge", Provider: providerName,
 			Count: len(verdicts), Mode: mode, Source: "judge",
-		})
+		}); err != nil {
+			// 审计写不进去不影响判定本身，但不能静默：否则「跑过」这件事没有留痕。
+			fmt.Fprintln(os.Stderr, "judge: 审计写入失败（判定结果已入库）:", err)
+		}
 	}
 	if c.json {
 		return printJSON(map[string]any{
 			"provider": providerName, "model": modelTag, "mode": mode,
 			"count": len(verdicts), "accept": res.Accept, "reject": res.Reject,
-			"unsure": res.Unsure, "downgraded": res.Downgraded, "applied": res.Applied,
+			"unsure": res.Unsure, "downgraded": res.Downgraded,
 		})
 	}
 	fmt.Printf("judge: %d 条 → accept %d / reject %d / unsure %d；模式=%s\n",
 		len(verdicts), res.Accept, res.Reject, res.Unsure, mode)
 	if res.Downgraded > 0 {
 		fmt.Printf("  其中 %d 条因 kind/scope 不允许自动采纳而降级 unsure\n", res.Downgraded)
-	}
-	if *apply {
-		fmt.Printf("  已改状态 %d 条（accept 走 CommitAccept，reject 走 CommitReject）\n", res.Applied)
 	}
 	return nil
 }
@@ -190,11 +189,11 @@ func judgeModelTag(providerName, flagModel, resolvedModel string) string {
 // judgeResult 是落库循环的计数。抽出来是为了让「影子不改状态」这件事可测 ——
 // 它不可能靠读代码相信，只能靠断言。
 type judgeResult struct {
-	Accept, Reject, Unsure, Downgraded, Applied int
+	Accept, Reject, Unsure, Downgraded int
 }
 
-// applyJudgments 把判定写进候选：影子期只写痕迹，apply 才改状态。
-func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVerdict, modelTag string, apply bool) (judgeResult, error) {
+// applyJudgments 把判定写进候选：只写痕迹，不动 status。
+func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVerdict, modelTag string) (judgeResult, error) {
 	var r judgeResult
 	for _, v := range verdicts {
 		cand := findByPrefix(list, v.ID)
@@ -226,25 +225,6 @@ func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVer
 		if err := st.MarkJudgeVerdict(cand.ID, verdict, modelTag, reason); err != nil {
 			return r, err
 		}
-		if !apply {
-			continue
-		}
-		// 真落库走与人工完全相同的那条路：审计、revision 冲突、唯一索引行为都一致。
-		switch verdict {
-		case "accept":
-			if _, err := st.CommitAccept(cand.ID, -1, "judge"); err != nil {
-				fmt.Fprintf(os.Stderr, "judge: 采纳 %s 失败: %v\n", cand.ID[:8], err)
-				continue
-			}
-		case "reject":
-			if _, err := st.CommitReject(cand.ID, -1, "judge", "judge:"+reason); err != nil {
-				fmt.Fprintf(os.Stderr, "judge: 否决 %s 失败: %v\n", cand.ID[:8], err)
-				continue
-			}
-		default:
-			continue
-		}
-		r.Applied++
 	}
 	return r, nil
 }
@@ -340,7 +320,7 @@ func printJudgeStats(st *store.Store, asJSON bool) error {
 	fmt.Println("verdict   总数  人工采纳  人工否决  判定器自裁  待定  一致率")
 	for _, s := range stats {
 		// 一致率只用人工样本做分母：accept 看「人工也采纳」，reject 看「人工也否决」。
-		// 判定器自己 --apply 的那些（SelfRun）不进分母，否则门槛会被自己的产出喂饱。
+		// 判定器自己落库的那些（SelfRun，历史数据）不进分母，否则门槛会被自己的产出喂饱。
 		decided := s.Accepted + s.Rejected
 		agree := "—"
 		if decided > 0 {

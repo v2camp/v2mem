@@ -18,15 +18,14 @@ import (
 //
 // 三条硬约束（都来自 VALUE.md §4）：
 //   - 不在读路径上：只挂 Stop / SessionEnd，绝不影响 PromptSubmit 的注入延迟。
-//   - 钩子不等待：spawn 后立即返回，判定在子进程里跑完，失败只写 stderr。
-//   - 默认不落库：子进程默认影子（只写 verdict）；要真改状态得显式 MEM_JUDGE_APPLY=1。
+//   - 钩子不等待：spawn 后立即返回，判定在子进程里跑完，失败只写 spawn 日志。
+//   - 不落库：子进程只写 verdict，没有任何改状态的参数——落库入口要等回滚与标定门槛一起交付。
 //
 // 自动触发的开关有两层：
 //   - model.json 的 auto_spawn：mem setup 配好模型后写入，是常态授权；
 //   - MEM_JUDGE_SPAWN：显式总闸。=1 强制开（脚本/CI），=0 强制关（GUI 宿主关不掉 export 时的退路）。
 //
 // 两层都不开就不发。老配置没有 auto_spawn，升级后不会突然开始烧 API。
-// MEM_JUDGE_APPLY 与这两层无关，仍默认关 —— auto_spawn 只开「跑」，不开「改库」。
 
 const (
 	judgeDefaultMinPending = 20 // 低于 R8 的 FAIL 线（>15）留一点余量，避免刚 WARN 就烧一次调用
@@ -42,12 +41,13 @@ type judgeState struct {
 
 var startJudgeProc = defaultStartJudge
 
-func defaultStartJudge(db string, limit int, apply bool) error {
-	args := []string{"judge", "--limit", strconv.Itoa(limit)}
-	if apply {
-		args = append(args, "--apply")
-	}
-	return startMemProc(db, args)
+func defaultStartJudge(db string, limit int) error {
+	return startMemProc(db, judgeArgs(limit))
+}
+
+// judgeArgs 抽成纯函数：自动拉起的参数里永远不能出现改库开关，这条要可断言。
+func judgeArgs(limit int) []string {
+	return []string{"judge", "--limit", strconv.Itoa(limit)}
 }
 
 // maybeSpawnJudge 在写侧事件末尾按阈值拉起判定。所有失败都静默（只写 stderr）。
@@ -90,7 +90,11 @@ func maybeSpawnJudge(db string, event harness.Event) {
 		return
 	}
 	apply := strings.TrimSpace(os.Getenv("MEM_JUDGE_APPLY")) == "1"
-	if err := startJudgeProc(db, minPending, apply); err != nil {
+	if apply {
+		// 旧环境变量残留时明确说一句：不报错（不能阻断写侧钩子），但不再有任何改库效果。
+		fmt.Fprintln(os.Stderr, "v2mem hook: MEM_JUDGE_APPLY 已废弃（--apply 入口已撤），本次仍按影子运行")
+	}
+	if err := startJudgeProc(db, minPending); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 judge 失败，已放过:", err)
 	}
 }

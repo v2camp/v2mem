@@ -43,8 +43,8 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
   mem import-transcript [选项]     从 Claude 会话 JSONL 回填观测（默认不写 memories）
   mem distill [选项]                从观测抽出候选（不写 memories）
-  mem judge [选项]                  准入判定：默认影子（只记 verdict，不改状态）
-                                    --stats 看影子期一致率；--apply 才真落库
+  mem judge [选项]                  准入判定：只记 verdict，不改状态（影子期）
+                                    --stats 看影子期一致率；落库入口待回滚命令落地后开放
   mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
   mem reject <id|前缀>             拒绝候选
   mem candidates ls [选项]         列出隔离区候选
@@ -863,7 +863,8 @@ func cmdGCCandidates(c common) error {
 	if c.json {
 		return printJSON(res)
 	}
-	fmt.Printf("候选过期 %d，删除已采纳行 %d（未改动 memories）\n", res.Expired, res.Deleted)
+	fmt.Printf("候选过期 %d，删除已采纳行 %d、过期行 %d（未改动 memories）\n",
+		res.Expired, res.Deleted, res.DeletedExpired)
 	return nil
 }
 

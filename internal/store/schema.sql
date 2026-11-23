@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   schema_version INTEGER NOT NULL DEFAULT 0,
   -- 事实的原始来源（非写候选的人）：user|assistant|空串（旧行）
   attributed_to TEXT NOT NULL DEFAULT '',
-  -- 准入判定的痕迹（docs/design-admission.md）：verdict 只记判定，改 status 要 --apply。
+  -- 准入判定的痕迹（docs/design-admission.md）：verdict 只记判定，改 status 只能走人工裁决。
   -- judge_model 带 prompt 版本（ollama:qwen2.5@judge-v1），判定标准一改，历史才能分段看。
   judge_verdict TEXT NOT NULL DEFAULT '',
   judge_model   TEXT NOT NULL DEFAULT ''

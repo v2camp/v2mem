@@ -4,8 +4,10 @@ package main
 // 所以两条判据（阈值、冷却）都单独测，且默认必须是关的。
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,7 +77,7 @@ func TestMaybeSpawnJudgeOffByDefault(t *testing.T) {
 	st.Close()
 
 	called := 0
-	startJudgeProc = func(string, int, bool) error { called++; return nil }
+	startJudgeProc = func(string, int) error { called++; return nil }
 	t.Cleanup(func() { startJudgeProc = defaultStartJudge })
 
 	maybeSpawnJudge(db, harness.EventStop)
@@ -84,7 +86,7 @@ func TestMaybeSpawnJudgeOffByDefault(t *testing.T) {
 	}
 }
 
-// 开了之后：够阈值发一次，冷却内不发第二次，且默认不 --apply。
+// 开了之后：够阈值发一次，冷却内不发第二次；拉起参数里不得有任何改库开关。
 func TestMaybeSpawnJudgeFiresOncePerCooldown(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MEM_JUDGE_SPAWN", "1")
@@ -99,10 +101,9 @@ func TestMaybeSpawnJudgeFiresOncePerCooldown(t *testing.T) {
 
 	var calls int
 	var gotLimit int
-	var gotApply bool
-	startJudgeProc = func(_ string, limit int, apply bool) error {
+	startJudgeProc = func(_ string, limit int) error {
 		calls++
-		gotLimit, gotApply = limit, apply
+		gotLimit = limit
 		return nil
 	}
 	t.Cleanup(func() { startJudgeProc = defaultStartJudge })
@@ -112,8 +113,8 @@ func TestMaybeSpawnJudgeFiresOncePerCooldown(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("冷却内应只发一次，calls=%d", calls)
 	}
-	if gotLimit != 20 || gotApply {
-		t.Errorf("应以阈值条数、影子模式拉起，got limit=%d apply=%v", gotLimit, gotApply)
+	if gotLimit != 20 {
+		t.Errorf("应以阈值条数拉起，got limit=%d", gotLimit)
 	}
 }
 
@@ -130,7 +131,7 @@ func TestMaybeSpawnJudgeSkipsReadEvents(t *testing.T) {
 	st.Close()
 
 	called := 0
-	startJudgeProc = func(string, int, bool) error { called++; return nil }
+	startJudgeProc = func(string, int) error { called++; return nil }
 	t.Cleanup(func() { startJudgeProc = defaultStartJudge })
 
 	maybeSpawnJudge(db, harness.EventPromptSubmit)
@@ -163,7 +164,7 @@ func seedPendingAndSpy(t *testing.T) (*int, string) {
 	st.Close()
 
 	called := new(int)
-	startJudgeProc = func(string, int, bool) error { *called++; return nil }
+	startJudgeProc = func(string, int) error { *called++; return nil }
 	t.Cleanup(func() { startJudgeProc = defaultStartJudge })
 	return called, db
 }
@@ -223,29 +224,41 @@ func TestMaybeSpawnJudgeConfigDoesNotTouchReadPath(t *testing.T) {
 	}
 }
 
-// 钩子拉起时仍必须是影子模式：auto_spawn 只开「跑」，不开「改库」。
-func TestAutoSpawnKeepsShadowDefault(t *testing.T) {
+// 自动拉起的参数里永远不能出现改库开关：落库入口已撤，这条要可断言。
+func TestJudgeArgsNeverCarryApply(t *testing.T) {
+	if got := strings.Join(judgeArgs(20), " "); got != "judge --limit 20" {
+		t.Fatalf("自动拉起参数异常: %q", got)
+	}
+}
+
+// 旧的 MEM_JUDGE_APPLY 残留只警告、不生效：用户不能以为它还在自动改库。
+func TestMaybeSpawnJudgeWarnsDeprecatedApply(t *testing.T) {
 	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
 	t.Setenv("MEM_JUDGE_SPAWN", "")
-	t.Setenv("MEM_JUDGE_APPLY", "")
-	db := filepath.Join(t.TempDir(), "mem.db")
-	st, err := store.Open(db)
+	t.Setenv("MEM_JUDGE_APPLY", "1")
+	called, db := seedPendingAndSpy(t)
+
+	stderr := captureStderr(t, func() { maybeSpawnJudge(db, harness.EventStop) })
+	if *called != 1 {
+		t.Fatalf("应照常拉起一次，called=%d", *called)
+	}
+	if !strings.Contains(stderr, "已废弃") {
+		t.Fatalf("旧环境变量应给出废弃警告，got %q", stderr)
+	}
+}
+
+// captureStderr 截获一次调用写到标准错误的内容。
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	seedPending(t, st, 25)
-	st.Close()
-
-	var called int
-	var gotApply bool
-	startJudgeProc = func(_ string, _ int, apply bool) error { called++; gotApply = apply; return nil }
-	t.Cleanup(func() { startJudgeProc = defaultStartJudge })
-
-	maybeSpawnJudge(db, harness.EventStop)
-	if called != 1 {
-		t.Fatalf("应拉起一次，called=%d", called)
-	}
-	if gotApply {
-		t.Error("auto_spawn 只开「跑」，不开「改库」：apply 必须保持 false")
-	}
+	old := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+	fn()
+	w.Close()
+	b, _ := io.ReadAll(r)
+	return string(b)
 }

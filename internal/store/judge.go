@@ -17,13 +17,16 @@ func (s *Store) MarkJudgeVerdict(id, verdict, model, reason string) error {
 	return err
 }
 
-// CountPending 统计全库 pending 候选数，供积压触发判定用。
+// CountPending 统计全库「还没被判定」的 pending 候选数，供积压触发判定用。
 //
+// 必须排除 judge_verdict!=”：影子期不改 status，已判的行仍然是 pending；
+// 若照旧全数统计，积压会永远 ≥ 阈值，自动触发每 24h 空跑一次。
 // 用全库而不是按工程：judge 一次处理的就是全库最老的一批，触发条件与它处理的
 // 范围保持一致，否则「某工程 30 条却永不触发」取决于别的工程有没有先到阈值。
 func (s *Store) CountPending() (int, error) {
 	var n int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM candidates WHERE status = 'pending'`).Scan(&n)
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM candidates WHERE status = 'pending' AND judge_verdict = ''`).Scan(&n)
 	return n, err
 }
 
@@ -36,7 +39,7 @@ type JudgeStat struct {
 	Total    int    `json:"total"`
 	Accepted int    `json:"accepted"` // 人工采纳
 	Rejected int    `json:"rejected"` // 人工否决
-	SelfRun  int    `json:"self_run"` // 判定器自己 --apply 落下的：不能算人工一致率
+	SelfRun  int    `json:"self_run"` // 判定器自己落库的（历史数据）：不能算人工一致率
 	Pending  int    `json:"pending"`
 }
 
@@ -44,7 +47,7 @@ type JudgeStat struct {
 // 候选表量级在千条以内，不为它加索引。
 func (s *Store) JudgeStats() ([]JudgeStat, error) {
 	// 只把 actor != 'judge' 的裁决算作人工样本。
-	// 否则 --apply 之后判定器自己的决定变成分母，一致率恒为 100%——
+	// 否则判定器自己的决定变成分母，一致率恒为 100%——
 	// 影子期「≥95% 才转正」这条门槛会被自己的产出喂饱，等于没有门槛。
 	rows, err := s.db.Query(`SELECT c.judge_verdict, COUNT(*),
 		SUM(CASE WHEN c.status = 'accepted' AND d.actor != 'judge' THEN 1 ELSE 0 END),

@@ -32,7 +32,8 @@ func setupNotice(name, tag string) string {
 	return fmt.Sprintf(`已将判定器与蒸馏的模型来源设为 %s（%s）。
 judge 的候选正文与蒸馏的观测摘要会发往该 CLI 所连的远端模型；本机不另存副本。
 
-%s回退：mem setup --undo。
+%s下一步：mem judge --stats 查看影子期一致率（判定只记 verdict，不改记忆）。
+回退：mem setup --undo。
 `, name, tag, autoSpawnNotice())
 }
 
@@ -155,7 +156,7 @@ func cmdSetup(args []string) error {
 		if err := distill.SaveModelConfig(path, next); err != nil {
 			return err
 		}
-		fmt.Printf("已将模型来源切换为 API：%s / %s。\n密钥只写入 %s（0600），不经命令行参数或环境变量传入。\n%s回退：mem setup --undo。\n",
+		fmt.Printf("已将模型来源切换为 API：%s / %s。\n密钥只写入 %s（0600），不经命令行参数或环境变量传入。\n%s下一步：mem judge --stats 查看影子期一致率（判定只记 verdict，不改记忆）。\n回退：mem setup --undo。\n",
 			next.Provider, next.Model, path, autoSpawnNotice())
 		return nil
 	}
@@ -174,7 +175,7 @@ func cmdSetup(args []string) error {
 		if *mode == "cli" {
 			return errors.New(msg + "\n装了其中任一个后重跑 mem setup，或改用 mem setup --mode api / --mode off。")
 		}
-		fmt.Printf("%s\n可改用 mem setup --mode api（读 DEEPSEEK_API_KEY / OPENAI_API_KEY），或 mem setup --mode off 关闭。\n", msg)
+		fmt.Printf("%s\n可改用 mem setup --mode api（在终端输入 api key，dry-run 通过才写盘），或 mem setup --mode off 关闭。\n", msg)
 		return nil
 	}
 
@@ -383,6 +384,11 @@ func printSetupStatus(path string) error {
 	}
 	fmt.Printf("auto_spawn %s\n", setupOnOff(cfg.AutoSpawn))
 	fmt.Printf("perm       %s\n", perm)
+	if cfg.Mode == "" || cfg.Mode == "off" {
+		fmt.Println("下一步：mem setup 配置模型来源（--dry-run 只验证不写盘）。")
+	} else {
+		fmt.Println("下一步：mem judge --stats 查看影子期一致率；mem judge 立即判一批（只记 verdict，不改记忆）。")
+	}
 	return nil
 }
 
