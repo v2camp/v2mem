@@ -48,6 +48,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
   mem reject <id|前缀>             拒绝候选
   mem batch  [选项]                批量裁决：按方案文件一次 accept/reject（--dry-run 只校验，--rollback 撤销）
+                                    --reject-judged 批量否决影子判定为 reject 的候选（只否决、不采纳）
   mem candidates ls [选项]         列出隔离区候选
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）

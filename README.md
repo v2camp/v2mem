@@ -203,7 +203,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 **Level 1 文件运维**：`mem ingest <文件.md...>`（把既有 md 机械化搬进库，幂等；写侧治理含 `--source harness-summary` 锚定"任务收尾汇总"双路径写）
 · `mem budget --file <文件> [--max-chars N]`（检查注入文件是否超预算，超限非零退出）
 · `mem notes`（先输出类码表 P/D/X/T，再输出硬规则小字条：`kind=rule`/全局高优先，一行一条、幂等；正文由 SessionStart 注入承载，每轮检索侧再去重，`MEM_NO_NOTES=1` 让检索侧也回退到原始注入）
-· `mem distill --provider none`（从观测抽候选，**不**写永久记忆）· `mem candidates ls [--project P]`（按工程就近查看）· `mem accept` / `mem reject`（顶层命令，MCP 里是 `accept` / `reject` 工具）· `mem batch --plan <file> [--dry-run]`（按 AI 产出的方案一次裁决，归档可 `--rollback`）
+· `mem distill --provider none`（从观测抽候选，**不**写永久记忆）· `mem candidates ls [--project P]`（按工程就近查看）· `mem accept` / `mem reject`（顶层命令，MCP 里是 `accept` / `reject` 工具）· `mem batch --plan <file> [--dry-run]`（按 AI 产出的方案一次裁决，归档可 `--rollback`）· `mem batch --reject-judged`（把影子判定为 reject 的候选批量否决，只否决不采纳）
 · `mem import-transcript --file <claude.jsonl>`（默认只写观测；`--into both` 再跑规则蒸馏，仍须 accept）
 · `mem gc --candidates`（pending 14 天过期，已采纳行 90 天后删除，不动记忆）
 

@@ -184,3 +184,65 @@ func TestJudgeStatsSeparatesSelfRunFromHuman(t *testing.T) {
 		t.Errorf("未裁决的应落在 pending，got %+v", uns)
 	}
 }
+
+// ListJudgeRejects 只出「已判 reject、仍 pending」的行：
+// accept 的候选一条都不能进来——批量清退只允许否决，不允许授予。
+func TestListJudgeRejectsOnlyPendingRejects(t *testing.T) {
+	s := newTestStore(t)
+	insert := func(project, kind, content string) string {
+		t.Helper()
+		res, err := s.InsertCandidate(CandidateInput{
+			SessionID: "s", Project: project, Kind: kind, Content: content, Source: "distill",
+		})
+		if err != nil {
+			t.Fatalf("InsertCandidate: %v", err)
+		}
+		return res.Candidate.ID
+	}
+	first := insert("p1", "fact", "巡检完成，报告已输出")
+	accept := insert("p1", "fact", "MCP 与 hook 注入相互独立")
+	decided := insert("p1", "fact", "已经被人采纳的候选")
+	other := insert("p2", "pitfall", "另一个工程的过程叙述候选")
+
+	if err := s.MarkJudgeVerdict(first, "reject", "m@v1", "process_narrative"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkJudgeVerdict(accept, "accept", "m@v1", "durable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkJudgeVerdict(decided, "reject", "m@v1", "process_narrative"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkJudgeVerdict(other, "reject", "m@v1", "transient_state"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CommitAccept(decided, -1, "human"); err != nil {
+		t.Fatalf("CommitAccept: %v", err)
+	}
+
+	got, err := s.ListJudgeRejects("", 10)
+	if err != nil {
+		t.Fatalf("ListJudgeRejects: %v", err)
+	}
+	// created_at 只到秒，同一秒内的先后由 id 决定；这里只断言集合，不断言次序。
+	ids := map[string]bool{}
+	for _, r := range got {
+		ids[r.ID] = true
+	}
+	if len(got) != 2 || !ids[first] || !ids[other] {
+		t.Fatalf("应只出两条未裁决的 reject，got %+v", got)
+	}
+	for _, r := range got {
+		if r.ID == first && (r.Rationale != "process_narrative" || r.Kind != "fact") {
+			t.Errorf("理由码与 kind 应带出来，got %+v", r)
+		}
+	}
+
+	filtered, err := s.ListJudgeRejects("p1", 10)
+	if err != nil {
+		t.Fatalf("ListJudgeRejects(project): %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].ID != first {
+		t.Fatalf("工程过滤应生效，got %+v", filtered)
+	}
+}
