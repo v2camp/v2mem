@@ -42,6 +42,36 @@ var cliTemplates = []cliTemplate{
 	{Name: "traecli", Args: []string{"exec", "--sandbox", "read-only", "--ask-for-approval", "never", "--skip-git-repo-check", "--ephemeral"}, VersionArgs: []string{"--version"}, Ver: "1"},
 }
 
+// NoHeadlessCLI 描述一个本机可能已装、但厂商明确没有非交互输出契约的 CLI。
+//
+// 它们故意不进 cliTemplates：runCLI 的契约是「prompt 进、纯文本 stdout 出」，
+// 而 TUI-only 的 CLI 会渲染全屏 alternate buffer，stdout 里是 ANSI 控制序列，
+// 既无法可靠判断一次回答何时结束，也无法提取 JSON。硬塞进白名单只会让
+// mem setup 的 dry-run 永远失败，或把 TUI 噪声当 verdict 解析。
+type NoHeadlessCLI struct {
+	Name string
+	Why  string
+}
+
+// Why 只写厂商可查证的事实（README / 官方博客 / 官方 issue），不写推测。
+var knownNoHeadless = []NoHeadlessCLI{
+	{Name: "freebuff", Why: "官方声明是 TUI-only、没有 headless / -p 输出模式（stdin 被管道接入时仍渲染全屏）"},
+}
+
+// DetectNoHeadless 返回本机存在、但已知不能用于非交互调用的 CLI。
+//
+// 只用于 mem setup 的诊断文案：绝不参与 ProbeAll 与 runCLI。
+// 目的不是支持它们，而是避免「我装了 freebuff 却没被探测到」被当成 bug。
+func DetectNoHeadless() []NoHeadlessCLI {
+	var found []NoHeadlessCLI
+	for _, c := range knownNoHeadless {
+		if _, err := exec.LookPath(c.Name); err == nil {
+			found = append(found, c)
+		}
+	}
+	return found
+}
+
 // CLIWhitelist 返回白名单顺序的名字，供 mem setup 的错误文案复用，避免第二出处。
 func CLIWhitelist() []string {
 	names := make([]string, len(cliTemplates))
