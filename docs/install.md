@@ -169,11 +169,12 @@ mem setup --undo       # 回退到上一次写盘前
 ```
 
 `mem setup` 按白名单（`claude` → `codex`）逐个验证 judge 与 distill 两条真实路径，首个通过者胜出；
-全都不可用时退出 0、不写盘，安装流程不因此中断。想显式指定分支：`--mode api`（读环境变量里的密钥）、
-`--mode cli`（必须探测成功，否则报错）、`--mode off`；`--dry-run` 只验证不写盘。
+验证时各跑一次真实调用，可能消耗额度与时间。全都不可用时退出 0、不写盘，安装流程不因此中断。
+想显式指定分支：`--mode api`（把 API 来源写入 `model.json`，密钥取 setup 时环境里的
+`DEEPSEEK_API_KEY` / `OPENAI_API_KEY`，需先 export）、`--mode cli`（必须探测成功，否则报错）、
+`--mode off`；`--dry-run` 只验证不写盘。
 
-完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）；`mem judge --stats` 有输出，
-首次 `mem judge` 不再报「判定器不可用」。
+完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）；真正的 `mem judge` 不再报「判定器不可用」。
 
 **数据边界**：judge 的候选正文与蒸馏的观测摘要会发往该 CLI 所连的模型端点；本机不另存副本。
 不配置只会让 judge / LLM 蒸馏不可用，不影响 hooks、MCP、检索与人工写入。

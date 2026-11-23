@@ -52,7 +52,7 @@ v2mem 有两条安装路径，二选一即可；模型配置是可选项，装�
 |:---|:---|:---|:---|
 | **远程发布版**（推荐给使用者） | 稳定、随版本走 | `curl -fsSL …/install.sh \| bash` → `~/.local/bin/mem` | 重跑同一行脚本 |
 | **本地开发软链**（推荐给开发者） | 跟着代码走，改完即生效 | `make build` → `bin/mem`，软链到 PATH | 重新 `make build`，软链自动跟随 |
-| **模型配置**（可选） | judge / LLM 蒸馏 | `mem setup` | `mem setup --undo` |
+| **模型配置**（可选） | judge / LLM 蒸馏 | `mem setup` | 重跑 `mem setup`（回退用 `--undo`） |
 
 ```bash
 # 远程发布版（推荐）—— 下载预编译二进制；失败则浅克隆到临时目录再构建
