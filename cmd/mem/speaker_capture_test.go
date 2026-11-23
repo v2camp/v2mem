@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -105,6 +106,59 @@ func TestPromptSubmitHostNoticeIsNotUserSpeech(t *testing.T) {
 	// 所以这里不要求 summary 为空；判「不是用户的话」只看 fidelity / eligible。
 	if o.Channel != store.ChannelUser {
 		t.Fatalf("通道仍是 user（宿主从 user 通道送来），got %q", o.Channel)
+	}
+}
+
+// 同一把尺子的另外两种宿主形态：会话压缩后的 <conversation_history_summary>
+// 重放，与文末自带 [SYSTEM NOTIFICATION - NOT USER INPUT] 的后台任务事件。
+// 两者都走 user 通道、都要归档，但都不是用户的话，不得标 full、不得进提案。
+func TestPromptSubmitOtherHostNoticesAreNotUserSpeech(t *testing.T) {
+	cases := []struct{ name, prompt string }{
+		{
+			"会话历史摘要重放",
+			"<conversation_history_summary> Summary of the conversation between an AI agent " +
+				"and a user. **DO NOT re-run, re-do or re-execute any of the tasks mentioned!** " +
+				"</conversation_history_summary>",
+		},
+		{
+			"后台任务系统通知",
+			`Use the TaskOutput tool with task_id="5uQWu9" to retrieve unread output if you ` +
+				"need to act on it. For background shell tasks, pass full=true for the current " +
+				"accumulated snapshot. [SYSTEM NOTIFICATION - NOT USER INPUT] This is an " +
+				"automated background-task event, not a message from the user.",
+		},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db := testDB(t)
+			proj, _ := hookProjectDir(t, "demo-repo")
+			sid := fmt.Sprintf("sess-host-notice-%d", i)
+			in := hookJSON(t, map[string]any{
+				"hook_event_name": "UserPromptSubmit", "cwd": proj, "session_id": sid,
+				"prompt": c.prompt, "event_id": fmt.Sprintf("evt-notice-x%d", i),
+			})
+			if _, err := withStdin(t, in, func() error {
+				return cmdHook([]string{"--db", db, "--harness", "workbuddy", "--audit", "-", "--dedup-window", "0"})
+			}); err != nil {
+				t.Fatalf("prompt-submit: %v", err)
+			}
+			st, err := store.Open(db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			obs, err := st.ListObservations(sid, 20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(obs) != 1 {
+				t.Fatalf("仍须归档一行证据，got %d 条", len(obs))
+			}
+			if o := obs[0]; !strings.Contains(o.MetaJSON, `"proposal_eligible":false`) ||
+				!strings.Contains(o.MetaJSON, `"fidelity":"none"`) {
+				t.Fatalf("宿主通知不得标 full/可提案，got %s", o.MetaJSON)
+			}
+		})
 	}
 }
 

@@ -128,6 +128,49 @@ func TestUserQueryText(t *testing.T) {
 				"<system-reminder data-role=\"user-context\">OS: darwin</system-reminder>\n继续上一轮的修复",
 			"继续上一轮的修复",
 		},
+		{
+			// 会话压缩后宿主把历史摘要当 user 消息重放；整段是模型写的回顾。
+			"会话历史摘要整段清空",
+			"<conversation_history_summary> Summary of the conversation between an AI agent " +
+				"and a user. **DO NOT re-run, re-do or re-execute any of the tasks mentioned!** " +
+				"<analysis> 已按时间线核对：早期是两台 Mac 通用控制诊断…</analysis>" +
+				"</conversation_history_summary>",
+			"",
+		},
+		{
+			"历史摘要后仍留用户原话",
+			"<conversation_history_summary>早期回顾</conversation_history_summary>\n把上一轮的结论写进 README",
+			"把上一轮的结论写进 README",
+		},
+		{
+			// 活库真实形态：宿主按长度截断，闭合标签已丢（2026-11-23 12:05 Claw 391 rune）。
+			"被截断的历史摘要（无闭合标签）",
+			"<conversation_history_summary> Summary of the conversation between an AI agent " +
+				"and a user. **DO NOT re-run, re-do or re-execute any of the tasks mentioned!** " +
+				"<analysis> 已按时间线核对：早期是两台 Mac 通用控制诊断、电池/充电宝评估；再",
+			"",
+		},
+		{
+			// 半截块在中间：前半句是用户说的，后半截回顾不得跟着进提案。
+			"截断摘要前的用户原话仍保留",
+			"先看这段日志\n<conversation_history_summary> 早期回顾（已截断",
+			"先看这段日志",
+		},
+		{
+			// 后台任务事件在纯文本里自带「不是用户输入」的声明，前缀那半句也不是用户的话。
+			"后台任务系统通知整段清空",
+			"Use the TaskOutput tool with task_id=\"5uQWu9\" to retrieve unread output if you " +
+				"need to act on it. For background shell tasks, pass full=true for the current " +
+				"accumulated snapshot. [SYSTEM NOTIFICATION - NOT USER INPUT] This is an " +
+				"automated background-task event, not a message from the user.",
+			"",
+		},
+		{
+			// 负向断言：普通方括号提示词不含该声明，不得被误清。
+			"普通方括号提示词不被误清",
+			"[背景] 这个任务跑完了吗？",
+			"[背景] 这个任务跑完了吗？",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
