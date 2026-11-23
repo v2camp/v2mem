@@ -38,7 +38,7 @@ var cliTemplates = []cliTemplate{
 	{Name: "gemini", Args: []string{"--output-format", "text", "--approval-mode", "plan", "--extensions", "none", "--skip-trust"}, VersionArgs: []string{"--version"}, Ver: "1"},
 	{Name: "copilot", Args: []string{"-s", "--no-ask-user", "--trust-folder", "--available-tools=", "--deny-tool=shell,write,read,url,memory"}, VersionArgs: []string{"--version"}, Ver: "1"},
 	{Name: "qoder", Args: []string{"-p", "--output-format", "text", "--max-turns", "1"}, VersionArgs: []string{"--version"}, Ver: "1"},
-	{Name: "codebuddy", Args: []string{"-y", "-p", promptPlaceholder, "--output-format", "text", "--tools", "", "--append-system-prompt", "Only output the JSON array requested; no prose."}, PromptArg: true, VersionArgs: []string{"--version"}, Ver: "1"},
+	{Name: "codebuddy", Args: []string{"-y", "-p", promptPlaceholder, "--output-format", "text", "--tools", "", "--append-system-prompt", "Output only the JSON requested: one JSON object per line (JSONL), or a single JSON array when asked for an array. No prose."}, PromptArg: true, VersionArgs: []string{"--version"}, Ver: "2"},
 	{Name: "traecli", Args: []string{"exec", "--sandbox", "read-only", "--ask-for-approval", "never", "--skip-git-repo-check", "--ephemeral"}, VersionArgs: []string{"--version"}, Ver: "1"},
 }
 

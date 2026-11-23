@@ -200,17 +200,34 @@ func verifySetupCLI(name, tag string) error {
 		return fmt.Errorf("judge dry-run 调用失败: %w", err)
 	}
 	if _, err := parseJudgeVerdicts(raw); err != nil {
-		return fmt.Errorf("judge dry-run 输出不可解析: %w", err)
+		return fmt.Errorf("judge dry-run 输出不可解析: %w；原始响应: %s", err, setupRawSnippet(raw))
 	}
 
+	// 观测要足够明确：模型面对「偏好：默认使用短句。」这类弱信号时可能回一段
+	// 散文式说明而不是空行或 JSON，于是合法的 dry-run 也会报 ErrBadResponse。
 	out := distill.Run([]distill.Observation{
-		{ID: "setup", Event: "user-prompt", Summary: "偏好：默认使用短句。"},
+		{ID: "setup", Event: "user-prompt", Summary: "我偏好所有回复都用短句，不要长段落；每次代码改动后都要跑测试。"},
 	}, distill.Options{CLI: name, ModelTag: tag, Timeout: setupDryRunTimeout})
 	// empty 是合法 0 条，只有 fail（模型没起来 / 响应坏）才算验证失败。
 	if out.Failed() {
-		return fmt.Errorf("distill dry-run 失败: %s", out.Error)
+		msg := fmt.Sprintf("distill dry-run 失败: %s", out.Error)
+		if raw := setupRawSnippet(out.Raw); raw != "" {
+			msg += "；原始响应: " + raw
+		}
+		return errors.New(msg)
 	}
 	return nil
+}
+
+// setupRawSnippet 把模型原始响应截到可诊断的长度。没有原文时「响应不可解析」
+// 分不清是 CLI 未登录、被限流，还是模型输出了散文（2026-11-23 的真实卡点）。
+func setupRawSnippet(raw string) string {
+	s := strings.TrimSpace(raw)
+	r := []rune(s)
+	if len(r) > 300 {
+		return string(r[:300]) + "…（已截断）"
+	}
+	return s
 }
 
 // apiConfigFromEnv 优先用环境变量构造 API 配置：不读 stdin，避免密钥回显与依赖终端。

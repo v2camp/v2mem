@@ -182,3 +182,31 @@ func TestDetectNoHeadlessOnlyDiagnoses(t *testing.T) {
 		t.Errorf("ProbeAll 应为空，got %v", all)
 	}
 }
+
+// codebuddy 的 system prompt 曾写死 "Only output the JSON array"，与蒸馏的 JSONL
+// 要求冲突（judge 要数组、distill 要一行一个 JSON）。改 argv 必须同时升 Ver，
+// 让历史 judge_model 自动分段。
+func TestCodebuddySystemPromptAllowsJSONL(t *testing.T) {
+	var tpl *cliTemplate
+	for i := range cliTemplates {
+		if cliTemplates[i].Name == "codebuddy" {
+			tpl = &cliTemplates[i]
+			break
+		}
+	}
+	if tpl == nil {
+		t.Fatal("找不到 codebuddy 模板")
+	}
+	sp := ""
+	for i, a := range tpl.Args {
+		if a == "--append-system-prompt" && i+1 < len(tpl.Args) {
+			sp = tpl.Args[i+1]
+		}
+	}
+	if !strings.Contains(sp, "per line") || !strings.Contains(sp, "array") {
+		t.Errorf("system prompt 应同时允许 JSONL 与数组，got %q", sp)
+	}
+	if tpl.Ver != "2" {
+		t.Errorf("改了 argv 必须升 Ver 以隔离 judge_model，got %q", tpl.Ver)
+	}
+}

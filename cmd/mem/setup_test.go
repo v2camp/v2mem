@@ -438,3 +438,77 @@ func TestSetupMentionsNoHeadlessCLI(t *testing.T) {
 		t.Errorf("识别到不支持的 CLI 时不得写盘，got err=%v", err)
 	}
 }
+
+// dry-run 失败只报「响应不可解析」无法区分「CLI 未登录」和「模型输出格式错」
+// （2026-11-23 codebuddy setup 失败正卡在这里）。失败信息必须带原始响应片段。
+func TestSetupDryRunFailureShowsRawResponse(t *testing.T) {
+	setupHome(t)
+	dir := t.TempDir()
+	// judge 返回合法数组；distill 返回一段典型的「模型说话了但不是 JSON」的散文。
+	script := `#!/bin/sh
+case "$1" in --version) echo "1.2.3"; exit 0 ;; esac
+in=$(/bin/cat)
+case "$in" in
+  *"候选"*) echo '[{"id":"aaaaaaaa","verdict":"reject","reason":"process_narrative"}]' ;;
+  *) echo "Authentication required. Please use /login command to sign in to your account" ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	out, err := captureStdout(t, func() error { return cmdSetup(nil) })
+	if err != nil {
+		t.Fatalf("默认流程全失败不应返回错误: %v", err)
+	}
+	if !strings.Contains(out, "Authentication required") {
+		t.Errorf("失败信息应包含模型原始响应，got:\n%s", out)
+	}
+}
+
+// 显式 --mode cli 失败时报错也要带原始响应，否则用户在终端同样无从排查。
+func TestSetupModeCLIFailureShowsRawResponse(t *testing.T) {
+	setupHome(t)
+	dir := writeFakeCLI(t, `#!/bin/sh
+case "$1" in --version) echo "1.2.3"; exit 0 ;; esac
+echo "Authentication required. Please use /login command to sign in to your account"
+`)
+	t.Setenv("PATH", dir)
+
+	err := cmdSetup([]string{"--mode", "cli"})
+	if err == nil {
+		t.Fatal("显式 --mode cli 验证失败时应报错")
+	}
+	if !strings.Contains(err.Error(), "Authentication required") {
+		t.Errorf("错误信息应包含模型原始响应，got: %v", err)
+	}
+}
+
+// dry-run 的观测必须明确到模型有事实可抽；过弱的观测会让正常模型也回散文。
+func TestSetupDryRunUsesInformativeObservation(t *testing.T) {
+	p := setupHome(t)
+	dir := t.TempDir()
+	// 只有 prompt 里出现「跑测试」才回合法事实，否则回散文 —— 直接验证 dry-run 观测内容。
+	script := `#!/bin/sh
+case "$1" in --version) echo "1.2.3"; exit 0 ;; esac
+in=$(/bin/cat)
+case "$in" in
+  *"候选"*) echo '[{"id":"aaaaaaaa","verdict":"reject","reason":"process_narrative"}]' ;;
+  *"跑测试"*) echo '{"kind":"preference","content":"偏好短句","salience":0.6,"obs_ids":["setup"]}' ;;
+  *) echo "这条观测没有可抽取的事实。" ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	if _, err := captureStdout(t, func() error { return cmdSetup(nil) }); err != nil {
+		t.Fatalf("cmdSetup: %v", err)
+	}
+	c, err := distill.LoadModelConfig(p)
+	if err != nil || c.Mode != "cli" {
+		t.Fatalf("dry-run 观测应可产出事实并写盘，got %+v err=%v", c, err)
+	}
+}
