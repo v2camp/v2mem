@@ -227,3 +227,21 @@ func TestResolveDeepSeekBaseOverride(t *testing.T) {
 		t.Error("模型名不应为空")
 	}
 }
+
+// ResolveOptions 要把 deepseek 的默认模型补进 Options.Model：judgeModelTag 只看得到
+// Options.Model，留空会让 judge_model 丢掉模型分量、历史判定无法按模型分组。
+func TestResolveOptionsDeepSeekDefaultModel(t *testing.T) {
+	if opt := ResolveOptions(ModelConfig{Mode: "api", Provider: "deepseek"}, "", ""); opt.Model != "deepseek-flash" {
+		t.Errorf("api 分支 deepseek 应补默认模型，got %q", opt.Model)
+	}
+	if opt := ResolveOptions(ModelConfig{Provider: "openai"}, "deepseek", ""); opt.Model != "deepseek-flash" {
+		t.Errorf("显式 --provider deepseek 应补默认模型，got %q", opt.Model)
+	}
+	// 显式模型不能被默认值覆盖。
+	if opt := ResolveOptions(ModelConfig{Mode: "api", Provider: "deepseek", Model: "m1"}, "", ""); opt.Model != "m1" {
+		t.Errorf("显式模型应保留，got %q", opt.Model)
+	}
+	if opt := ResolveOptions(ModelConfig{Mode: "api", Provider: "ollama"}, "", ""); opt.Model != "" {
+		t.Errorf("非 deepseek 不该被补模型，got %q", opt.Model)
+	}
+}

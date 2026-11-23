@@ -232,8 +232,10 @@ func TestJudgeModelTag(t *testing.T) {
 		provider, flagModel, resolved, want string
 	}{
 		{"cli:claude@1+tpl1", "", "", "cli:claude@1+tpl1@judge-v2"},
+		{"cli:m1@1+tpl1", "m1", "", "cli:m1@1+tpl1@judge-v2"}, // 模型已在 cli: 前缀里，不能再拼一次
 		{"deepseek", "", "deepseek-flash", "deepseek:deepseek-flash@judge-v2"},
 		{"deepseek", "m1", "", "deepseek:m1@judge-v2"},
+		{"ollama", "", "", "ollama@judge-v2"}, // ollama 的默认模型是运行期兜底，不写进归因
 	}
 	for _, tc := range cases {
 		if got := judgeModelTag(tc.provider, tc.flagModel, tc.resolved); got != tc.want {

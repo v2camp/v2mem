@@ -139,6 +139,7 @@ func ResolveOptions(cfg ModelConfig, flagProvider, flagModel string) Options {
 		if model == "" {
 			model = cfg.Model
 		}
+		model = defaultModelFor(flagProvider, model)
 		return Options{Provider: flagProvider, Model: model, APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}
 	}
 	switch cfg.Mode {
@@ -156,6 +157,23 @@ func ResolveOptions(cfg ModelConfig, flagProvider, flagModel string) Options {
 		if flagModel != "" {
 			model = flagModel
 		}
+		model = defaultModelFor(cfg.Provider, model)
 		return Options{Provider: cfg.Provider, Model: model, APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}
 	}
+}
+
+// defaultModelFor 把「provider 自带的默认模型」提前落到 Options.Model 上。
+//
+// resolve() 里也会兜一次（没有它，直接调 Run/PromptCompleter 的旧调用方就没默认模型），
+// 但调用方（judge 的归因标签、distill 的 job.Model 回填）只能看到 Options，
+// 不在这里填就会以为「没配模型」。只补 deepseek：ollama/openai 的默认值是
+// qwen2.5:7b，属于"最后兜底"而不是"这个 provider 的默认模型"，不该写进归因。
+func defaultModelFor(provider, model string) string {
+	if strings.TrimSpace(model) != "" {
+		return model
+	}
+	if strings.EqualFold(strings.TrimSpace(provider), "deepseek") {
+		return DefaultDeepSeekModel
+	}
+	return model
 }

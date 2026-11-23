@@ -164,8 +164,14 @@ func cmdJudge(args []string) error {
 // 为什么要分 flagModel 与 resolvedModel：flag 显式给了 --model 时它是权威；
 // 否则要写 ResolveOptions 解析出的实际模型（model.json 的 model，或 resolve() 给
 // deepseek 补的默认名）——只认 flag 会让 model.json 配的模型从归因里消失，
-// 历史判定无法按模型分组。cli 模式下 resolvedModel 为空（版本分量已在 provider 里）。
+// 历史判定无法按模型分组。
+//
+// cli 的 providerName 形如 cli:<model_tag>：model_tag 里已经含模型（或模板）分量，
+// 再拼 :<model> 会得到 cli:m1:m1@judge-v2，所以以 cli: 开头时直接返回。
 func judgeModelTag(providerName, flagModel, resolvedModel string) string {
+	if strings.HasPrefix(providerName, "cli:") {
+		return providerName + "@" + judgePromptVersion
+	}
 	m := flagModel
 	if m == "" {
 		m = resolvedModel
