@@ -45,13 +45,14 @@ AI 工具的"长期记忆"通常是一个每轮都注入的 Markdown 文件（`A
 完整的分步安装（含冲突审查、MCP 注册与安装后校验）见 [`docs/install.md`](./docs/install.md)。
 
 ```
-v2mem 有两条安装路径，二选一即可：
+v2mem 有两条安装路径，二选一即可；模型配置是可选项，装完再配也不迟。
 ```
 
 | 路径 | 适用 | 安装 | 更新 |
 |:---|:---|:---|:---|
 | **远程发布版**（推荐给使用者） | 稳定、随版本走 | `curl -fsSL …/install.sh \| bash` → `~/.local/bin/mem` | 重跑同一行脚本 |
 | **本地开发软链**（推荐给开发者） | 跟着代码走，改完即生效 | `make build` → `bin/mem`，软链到 PATH | 重新 `make build`，软链自动跟随 |
+| **模型配置**（可选） | judge / LLM 蒸馏 | `mem setup` | `mem setup --undo` |
 
 ```bash
 # 远程发布版（推荐）—— 下载预编译二进制；失败则浅克隆到临时目录再构建
@@ -277,7 +278,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-write-governance.md`](./docs/design-write-governance.md) | 所有者 / 开发者 | **写侧治理**：三态（观测/候选/采纳）、写必由 LLM 决策、channel 与来源标记；§12 候选裁决自动化闭环（触发点、MCP 显式裁决、R8 分组、采纳率前提） |
 | [`docs/design-admission.md`](./docs/design-admission.md) | 所有者 / 开发者 | **准入判定**：模型只判「要不要」、权限不得宽于 commit 矩阵、影子期与转正门槛、理由码作为规则沉淀语料 |
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |
-| [`docs/install.md`](./docs/install.md) | 使用者 / 所有者 | **安装与接入唯一文档**：五条原则、冲突审查、S0–S5、A–D 校验、宿主矩阵与细节、回滚、多机记录 |
+| [`docs/install.md`](./docs/install.md) | 使用者 / 所有者 | **安装与接入唯一文档**：六条原则、冲突审查、S0–S6、A–D 校验、宿主矩阵与细节、回滚、多机记录 |
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |
 | [`docs/exp-project-seed.md`](./docs/exp-project-seed.md) | 所有者 / 开发者 | **实验**：工程记忆覆盖度对注入的影响（0%→57%）、写入粒度与配额竞争的实测、已部署种子与回退方式 |
 | [`docs/design-ref-landscape.md`](./docs/design-ref-landscape.md) | 所有者 / 开发者 | **架构参考**：mem0 与 agentmemory 的全面对照，可借鉴/不借鉴/待评估三档，两边踩过的坑 |

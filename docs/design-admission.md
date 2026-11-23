@@ -92,6 +92,15 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
 - 候选正文会发往该端点，这是 `VALUE.md` §4 例外的边界——所以 `provider` 必须显式配，
   不允许「没配就随便挑一个远端」。
 
+**CLI 路径（`mode=cli`）**：`mem setup` 探测本机已登录的 CLI 后写 `{"mode":"cli","cli":"claude","model_tag":"…"}`。
+优先级上，显式 `--provider` 仍最高；否则 `mode=cli` 压过后面的环境变量与 `auto`。
+`cli` 字段只存白名单名（`claude` / `codex`），不存命令串、不拼参数——模板内置在二进制里，
+避免 `model.json` 变成任意命令执行入口。`judge_model` 记 `cli:<name>@<version>+tpl<ver>@judge-v2`
+（如 `cli:claude@2.0.1+tpl1@judge-v2`）：版本取 CLI `--version` 首行，探测不到记 `unknown`，不编造。
+
+这是 `VALUE.md` §4 例外 (a) 的**降级**：隔离维度从「模型版本」变成「CLI + 模板版本」，同一个 CLI 升级后可能静默换模型。
+所以影子期一致率必须按该 tag **分段复核**——tag 变了就重新累计 ≥95%，不能拿旧 tag 的样本给新 tag 背书。
+
 ## 6. 数据与观测
 
 | 项 | 位置 |
