@@ -317,10 +317,11 @@ func printJudgeStats(st *store.Store, asJSON bool) error {
 		fmt.Println("judge: 还没有任何判定记录")
 		return nil
 	}
-	fmt.Println("verdict   总数  人工采纳  人工否决  判定器自裁  待定  一致率")
+	fmt.Println("verdict   总数  人工采纳  人工否决      非人工  待定  一致率")
 	for _, s := range stats {
 		// 一致率只用人工样本做分母：accept 看「人工也采纳」，reject 看「人工也否决」。
-		// 判定器自己落库的那些（SelfRun，历史数据）不进分母，否则门槛会被自己的产出喂饱。
+		// 非人工（SelfRun）= 判定器自裁的历史数据 + mem batch 落库（人批准 AI 方案），
+		// 都是模型的回声，不进分母，否则门槛会被自己的产出喂饱。
 		decided := s.Accepted + s.Rejected
 		agree := "—"
 		if decided > 0 {
@@ -334,7 +335,7 @@ func printJudgeStats(st *store.Store, asJSON bool) error {
 			s.Verdict, s.Total, s.Accepted, s.Rejected, s.SelfRun, s.Pending, agree)
 	}
 	if noHuman(stats) {
-		fmt.Println("（本批没有任何人工裁决样本，一致率无意义——影子期要的是人怎么判，不是判定器自己怎么判）")
+		fmt.Println("（本批没有任何人工裁决样本，一致率无意义——影子期要的是人怎么判，不是模型或批量落库怎么判）")
 	}
 	return nil
 }

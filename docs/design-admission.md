@@ -38,7 +38,8 @@ mem judge --stats         # 人工一致率：verdict=accept 看人工也采纳�
 - 影子期数据落 `candidates.judge_verdict` / `judge_model`（含 prompt 版本），`rationale` 记理由码。
 - 一致率的**分母是人工裁决**；判定器本身没有任何改库入口（`--apply` 已撤），分母不会被自己的产出污染。
 - 转正门槛：`accept` 一致率 ≥95%，且样本 ≥200 条。未达标不放开，不因着急下调。
-- **落库入口暂不开放**：恢复 `--apply` 必须与 `mem judge --rollback <judge_model>` 同批交付（§4 例外条款 (c)）。
+- **`--apply` 仍不开放**：恢复它必须与 `mem judge --rollback <judge_model>` 同批交付（§4 例外条款 (c)）。
+  批量清积压走 §3.2 的 `mem batch`——它由人授权、有回滚凭证，与「模型自裁」是两回事。
 - 每轮只取 `judge_verdict=''` 的 pending：影子不改 status，按「最旧的 pending」取会永远重判同一批。
 
 ## 3.1 积压触发（配好模型后自动开，可一键关）
@@ -66,6 +67,44 @@ mem judge --stats         # 人工一致率：verdict=accept 看人工也采纳�
   也不要因写状态失败而反复重跑。
 - 判定条数取阈值本身（`--limit = MEM_JUDGE_MIN_PENDING`）：一次只清一批，
   不清空积压，避免单次调用把上下文撑爆。
+
+## 3.2 批量准出：AI 出方案，人给授权
+
+积压的成因常常是「没人点按钮」而不是「判断不了」。让 AI 读候选没问题，问题在它**不能同时拥有写库权限**：
+`cmdAccept` 把 actor 写死成 `human`，模型批量调它会被算成人工样本，一致率恒 100%，§3 的门槛直接失效。
+所以批量走三段，缺一段就退化成「提示词直接改库」：
+
+```
+mem candidates ls --status pending --policy --json > /tmp/pending.json   # 1. 只读导出
+# 2. AI 读 pending.json，写 /tmp/plan.jsonl（数据文件，不入库）
+mem batch --plan /tmp/plan.jsonl --dry-run                              # 3. 人过目
+mem batch --plan /tmp/plan.jsonl                                        #    执行一次
+mem batch --rollback <归档路径>                                          #    判错了原路退回
+```
+
+方案文件是 JSONL，字段只有三个，未知字段直接报错（防止模型把 `verdict` 当 `action` 混进来）：
+
+```json
+{"id":"e3d08eb4","action":"accept"}
+{"id":"f0971547","action":"reject","reason":"process_narrative"}
+```
+
+给 AI 的提示词可以就这几行：
+
+> 读 `/tmp/pending.json`，为每条候选给裁决：`action=human_accept` 且内容是可复用知识 → `accept`；
+> `action=defer` 或明显是过程叙述、一次性回执、纯代码/日志清单 → `reject`，`reason` 从闭集里选；
+> 拿不准的**不写进方案**，留给人。只输出 JSONL，每行 `{"id","action","reason"}`，不要解释。
+
+三条硬约束：
+
+| 约束 | 实现 | 为什么 |
+|:---|:---|:---|
+| 记账诚实 | actor 记 `human-reviewed-llm`，`JudgeStats` 只把 `actor='human'` 算人工样本 | 人批准 AI 方案是模型的回声，不能当作标定数据 |
+| 看着执行 | 任一行不可执行（非 pending、理由码非法）就整体拒绝，不半跑 | 人看到的方案与实际写库必须是同一份 |
+| 可回滚 | 执行结果归档到 `<db 目录>/plans/<时间>-*.jsonl`，内含 `memory_id` / `created_memory`；回滚只删本次新建的记忆，并带 revision 校验 | 批量越大，判错一笔的代价越大；归档之后又被裁决过的候选不按旧档撤 |
+
+注意：`mem batch` 不会让 `--apply` 的标定门槛更快达标——它省的是「逐条敲命令」，不是「证明模型判得准」。
+一致率仍要靠人独立裁决的样本来攒。
 
 ## 4. 理由码是语料，不是日志
 
@@ -123,17 +162,19 @@ mem judge --stats         # 人工一致率：verdict=accept 看人工也采纳�
 |:---|:---|
 | 判定结果 | `candidates.judge_verdict` / `judge_model` / `rationale` |
 | 落库记忆 | 走 `CommitAccept`，来源仍是 `distill-accept`（可 JOIN `judge_model` 归因） |
-| 审计 | `event=candidate-judge`：`provider` / `count` / `mode`（固定影子） |
-| 巡检 | 影子期 `--stats` 的输出；pending 只随人工裁决或 GC 下降，判定器不改 status |
+| 批量落库 | `commit_decisions.actor='human-reviewed-llm'`；归档在 `<db 目录>/plans/*.jsonl`，`reopen` 记撤销 |
+| 审计 | `event=candidate-judge`：`provider` / `count` / `mode`（固定影子）；批量走 `event=accept|reject`，`source=batch-plan` |
+| 巡检 | 影子期 `--stats` 的输出；pending 只随人工裁决、`mem batch` 或 GC 下降，判定器不改 status |
 
-**R8 的口径不变**：pending 下降要么是人工裁决，要么是 GC 过期；判定只写痕迹，不应被当成「问题解决」。
+**R8 的口径不变**：pending 下降要么是人或批量裁决，要么是 GC 过期；判定只写痕迹，不应被当成「问题解决」。
 
 ## 7. 未做（按顺序，且都有前置条件）
 
 1. **规则沉淀**：需要 ≥50 条带理由码的裁决。现在 0 条，先攒语料。产出形态拟为
    `~/.v2mem/admission.jsonl` + dry-run 计数，转正看误杀率（分母来自抽样复核，不是 dry-run 自己）。
-2. **回滚命令**：影子期不落库，故当前无不可逆风险。`--apply` 入口已撤；恢复它**必须**与
-   `mem judge --rollback <judge_model>` 同批交付——按 §4 例外条款 (c)，单独放行 `--apply` 视为违约。
+2. **判定器级回滚**：`mem batch --rollback` 已能给「人授权的批量落库」兜底；仍缺
+   `mem judge --rollback <judge_model>`（按模型版本整体撤销）。后者是恢复 `--apply` 的前置——
+   按 §4 例外条款 (c)，单独放行 `--apply` 视为违约。
 3. **R8 增列**：影子准确率进 detail，需同步改 `docs/ops-watch.md` 与脚本两处。
 
 ## 8. 已知限制

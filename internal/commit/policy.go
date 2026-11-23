@@ -84,6 +84,14 @@ const (
 const (
 	ActorAuto  = "auto"
 	ActorHuman = "human"
+	// ActorHumanReviewedLLM 是「人批准了 AI 给的方案」这一档。
+	//
+	// 它必须与 ActorHuman 分开：一致率门槛要的是人独立判断的样本，
+	// 人不看就批量点是同一模型的回声，算进去门槛就恒为 100%。
+	// 审计也因此能回答「这条是 AI 提的、人点过，还是人自己看出来的」。
+	ActorHumanReviewedLLM = "human-reviewed-llm"
+	// ActorJudge 是判定器自己落库（历史数据）。转正前不该再产生这种样本。
+	ActorJudge = "judge"
 )
 
 // taskStates 是 task 类候选允许的明确状态。
