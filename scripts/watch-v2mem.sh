@@ -175,6 +175,7 @@ if [ -f "$AUDIT" ]; then
       "A_SEG_HAS=\([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and (.claim_ms != null or .evidence_ms != null or .maint_ms != null))] | length)",
       "A_SEG_OPEN=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .open_ms != null) | .open_ms] | if length>0 then (add/length|floor) else 0 end))",
       "A_SEG_SEARCH=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .search_ms != null) | .search_ms] | if length>0 then (add/length|floor) else 0 end))",
+      "A_SEG_SEARCH_N=\([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .search_ms != null)] | length)",
       "A_SEG_CLAIM=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .claim_ms != null) | .claim_ms] | if length>0 then (add/length|floor) else 0 end))",
       "A_SEG_EVID=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .evidence_ms != null) | .evidence_ms] | if length>0 then (add/length|floor) else 0 end))",
       "A_SEG_MAINT=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .maint_ms != null) | .maint_ms] | if length>0 then (add/length|floor) else 0 end))"
@@ -185,6 +186,7 @@ A_SS=${A_SS:-0}; A_OBS=${A_OBS:-0}; A_ADD=${A_ADD:-0}; A_MS=${A_MS:-0}
 A_READ_N=${A_READ_N:-0}; A_WRITE_MS=${A_WRITE_MS:-0}; A_WRITE_N=${A_WRITE_N:-0}
 A_SEG_HAS=${A_SEG_HAS:-0}; A_SEG_OPEN=${A_SEG_OPEN:-0}; A_SEG_SEARCH=${A_SEG_SEARCH:-0}
 A_SEG_CLAIM=${A_SEG_CLAIM:-0}; A_SEG_EVID=${A_SEG_EVID:-0}; A_SEG_MAINT=${A_SEG_MAINT:-0}
+A_SEG_SEARCH_N=${A_SEG_SEARCH_N:-0}
 
 # R12 写侧事件单独采集：不复用上面的 eval 字符串插值 —— 插值内部再嵌字符串字面量
 # 会触发 jq INVALID_CHARACTER。这里输出 TSV 后由 read 拆列，表达式里没有插值。
@@ -307,23 +309,28 @@ else
   add R2 INFO "窗口内无提问" "窗口内没有 prompt-submit 事件，无法评估命中率"
 fi
 
-# R3 检索延迟：只取读侧 hook，写侧 Stop 单独展示但不判级
-if [ "$A_MS" -gt 0 ]; then
-  R3_NOTE="读侧样本 ${A_READ_N} 次"
+# R3 检索延迟：判 search_ms（检索+渲染），写侧 Stop 单独展示但不判级。
+# 总 ms 含进程启动、开库、去重事务、证据落盘、维护，与「检索」不同名不同事——
+# 用它判级会把宿主负载与 fsync 算成检索退化（旧口径的 FAIL 均由此产生），
+# 故只作 detail 观察。没有 search_ms 的旧记录按无样本记 INFO，不当 0 判 PASS。
+if [ "$A_SEG_SEARCH_N" -gt 0 ]; then
+  R3_NOTE="带 search_ms 的读侧样本 ${A_SEG_SEARCH_N}/${A_READ_N} 次；总耗时均值 ${A_MS}ms（含启动/开库/证据/维护，不判级）"
   # 有分段字段的窗口才展开：旧记录没有这三段，硬算「其余」会把整段 ms 都算成空白
   # 变量名一律用花括号收口：macOS 自带 bash 3.2 在 set -u 下会把紧邻的
   # 全角分号首字节并进变量名（"$R3_NOTE；" → R3_NOTE\xEF unbound variable）。
   if [ "$A_SEG_HAS" -gt 0 ]; then
-    R3_NOTE="${R3_NOTE}；分段均值 开库 ${A_SEG_OPEN} / 检索 ${A_SEG_SEARCH} / 去重 ${A_SEG_CLAIM} / 证据 ${A_SEG_EVID} / 维护 ${A_SEG_MAINT} / 其余 $((A_MS - A_SEG_OPEN - A_SEG_SEARCH - A_SEG_CLAIM - A_SEG_EVID - A_SEG_MAINT))（stdout+审计）"
+    R3_NOTE="${R3_NOTE}；其余分段均值 开库 ${A_SEG_OPEN} / 去重 ${A_SEG_CLAIM} / 证据 ${A_SEG_EVID} / 维护 ${A_SEG_MAINT} / 未归类 $((A_MS - A_SEG_OPEN - A_SEG_SEARCH - A_SEG_CLAIM - A_SEG_EVID - A_SEG_MAINT))（启动+stdout+审计）"
   fi
   R3_NOTE="${R3_NOTE}；写侧 Stop ${A_WRITE_MS}ms 由 R10 单独判级，不计入本判据"
-  if [ "$A_MS" -lt 50 ]; then
-    add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 目标线；${R3_NOTE}"
-  elif [ "$A_MS" -lt 200 ]; then
-    add R3 WARN "检索延迟 ${A_MS}ms" "高于典型值 ~9ms，观察是否库膨胀或锁竞争；${R3_NOTE}"
+  if [ "$A_SEG_SEARCH" -lt 50 ]; then
+    add R3 PASS "检索延迟 ${A_SEG_SEARCH}ms" "低于 50ms 目标线；${R3_NOTE}"
+  elif [ "$A_SEG_SEARCH" -lt 200 ]; then
+    add R3 WARN "检索延迟 ${A_SEG_SEARCH}ms" "高于典型值 ~9ms，观察是否库膨胀或锁竞争；${R3_NOTE}"
   else
-    add R3 FAIL "检索延迟 ${A_MS}ms" "超过 200ms，检查 WAL 大小与并发写入；${R3_NOTE}"
+    add R3 FAIL "检索延迟 ${A_SEG_SEARCH}ms" "超过 200ms，检查库膨胀与 WAL 写锁竞争；${R3_NOTE}"
   fi
+elif [ "$A_MS" -gt 0 ]; then
+  add R3 INFO "无分段样本" "读侧 ${A_READ_N} 次都没有 search_ms 字段（二进制早于分段埋点，需 make build）；总耗时均值 ${A_MS}ms 仅作观察"
 else
   add R3 INFO "无延迟样本" "窗口内没有带 ms 的读侧记录"
 fi

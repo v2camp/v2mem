@@ -81,7 +81,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **I5** | Trae 钩子执行环境 | `agent-hooks.log` 中 traecode 块的 `ExecEnv` | `Host` | `Sandbox`（读得到、写不进） | 未匹配到 traecode 块时 `INFO` |
 | **R1** | 钩子被真实触发 | 窗口内审计事件数 | ≥1 | — | 0 |
 | **R2** | 检索命中率 | **按 `project` 分组**：仅统计「该工程库内 ≥20 条」的 `prompt-submit`，`1 - empty 占比`；库内 <20 条的工程样本单列为冷启动剔除 | ≥30% | 10–30% | <10% |
-| **R3** | 检索延迟 | 窗口内 `prompt-submit` / `session-start` 的 `ms` 均值（写侧不计入，见下） | <50ms | 50–200ms | >200ms |
+| **R3** | 检索延迟 | 窗口内 `prompt-submit` / `session-start` 的 **`search_ms`** 均值（检索+渲染；总 `ms` 只作 detail，见下） | <50ms | 50–200ms | >200ms |
 | **R4** | 写侧活动 | 窗口内 `manual-add` 数 | ≥1 | 0（库≥20 条时） | — |
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
 | **R6** | 库规模 | `mem stats` 总条数 vs 上次快照 | 未下降 | 下降 | — |
@@ -98,10 +98,16 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 - **R3 的 50ms**：README 声明 200 条库检索平均 ~9ms，实测量级 9–15ms。50ms 是 5 倍冗余，
   越过说明库膨胀或 WAL 写锁竞争。
-  **采集口径**：只取 `prompt-submit` / `session-start`（读侧注入）。`stop` 与 `obs-append`
-  共用同一个 Stop hook 计时器，其 `ms` 是整个捕获/归档流程耗时，不是检索耗时；
-  早期脚本对所有带 `ms` 的事件取均值，把 500ms 级写侧耗时混进来，产生稳定误报。
-  脚本另在 R3 detail 展示写侧 Stop 均值供观察，**不对写侧判级**。
+  **采集口径**：只取 `prompt-submit` / `session-start`（读侧注入），**且判级用 `search_ms`**。
+  总 `ms` 是一个 hook 进程的生命周期，含进程启动、开库、去重事务、证据归档 fsync、
+  session-start 的 spool 排空与内联蒸馏——这些都不是检索，其中证据 fsync 与内联蒸馏
+  （200ms 上限）单次就能顶到 FAIL 线。`stop` 与 `obs-append` 共用同一个 Stop hook 计时器，
+  其 `ms` 是整个捕获/归档流程耗时，不是检索耗时；早期脚本对所有带 `ms` 的事件取均值，
+  把 500ms 级写侧耗时混进来，产生稳定误报。
+  脚本在 R3 detail 展示总 `ms` 与各分段均值供观察，**只有 `search_ms` 参与判级**。
+  **判级字段切换（2026-11-23）**：此前判总 `ms`，在库内 0 条、注入体量恒定、宿主 load 34/12 核时
+  判出 202ms FAIL，而同一时刻 `mem search -no-audit` 与 `mem stats` 空启动同为 0.04–0.05s——
+  测的是宿主排队而非检索。旧记录没有 `search_ms` 字段时判 `INFO`（无样本），**不当 0 判 PASS**。
   **均值对并发敏感（2026-11-17 实证）**：某窗口 8 个读侧样本全部落在 45 秒内、分两批同秒触发
   （3 个 hook 并发时 1737–1873ms，4 个并发时 158–368ms），均值 809ms 判 FAIL，而同一时刻
   纯读路径实测 10–20ms、库仅 29MB、WAL 663 帧。故 R3 越线时**先看样本时间分布与宿主 load**，
@@ -262,7 +268,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 |:---|:---|:---|
 | R1 = 0（钩子零事件） | 配置写错文件 | 查 `WORKBUDDY_CONFIG_DIR`，确认钩子在 `~/.workbuddy/settings.json` 而**非** `~/.codebuddy/settings.json` |
 | R2 低但 R1 正常 | 库稀疏 / 同义词未覆盖 / **找到了但供给弃答** | 先分因，再对症：① `mem eval activity --since 12h` 列出空命中 query；② 手工复跑 `mem search "<query>"`，**也空** → 检索侧（补记忆或 `mem lexicon init`）；**有结果** → 供给侧弃答，直接查结局分布：`sqlite3 -readonly ~/.v2mem/mem.db "SELECT outcome, COUNT(*) FROM read_traces WHERE created_at > strftime('%s','now')-43200 GROUP BY outcome;"`。`abstained_no_hit` 是检索侧没找到，`abstained_low_quality` 是**找到了但被判无支持**（典型：只有 broad 单路支持），`skipped_gate` 是客套跳过（正常）。第三种（低质量弃答）的机制证据与复现见 [`design-eval.md`](./design-eval.md) §17.1 与 `make eval-hook-ab`——**不要**靠调低质量门阈值来让 R2 变好看 |
-| R3 检索延迟越线 | 读侧被写侧事务或并发 hook 拖慢；库膨胀 / WAL 写锁竞争 | 先分因，**不要先动阈值**：① 看 detail 里读侧样本数与时间分布——若样本集中在同几秒（多个 hook 同秒触发）或宿主 load 高，均值会被单批离群样本抬高，属采样构成问题；② 复测纯读路径 `mem search -no-audit -scope current "<query>"` 跑 3–5 次取中位数，健康值 10–20ms；③ 复测仍高，再查库膨胀（`mem stats` 条数与体积）与 `-wal` 帧数（R11）；④ 高负载时不用单窗口均值下结论，等窗口滑过再复评。**不要**为让读数回落而删观测行或改阈值 |
+| R3 检索延迟越线 | 库膨胀 / WAL 写锁竞争拖慢检索（总 `ms` 高而 `search_ms` 正常则属启动或写侧，已不判 R3） | 先分因，**不要先动阈值**：① 看 detail 里 `search_ms` 与总 `ms` 的差——差得远说明慢在启动/证据/维护，不是检索；② 复测纯读路径 `mem search -no-audit -scope current "<query>"` 跑 3–5 次取中位数，健康值 10–20ms（含进程启动约 40ms）；③ 复测仍高，再查库膨胀（`mem stats` 条数与体积）与 `-wal` 帧数（R11）；④ 高负载时不用单窗口均值下结论，等窗口滑过再复评。判 `INFO`「无分段样本」说明二进制早于分段埋点，先 `make build` 再评。**不要**为让读数回落而删观测行或改阈值 |
 | R7 持续增长 | 写库失败 | 查 `~/.v2mem` 权限与磁盘；spool 会在下次 SessionStart 重试 |
 | R6 下降 | 非预期删除 | 查 `mem gc` / `mem consolidate` 是否自动跑过；库被外部删除后重建也走这条 |
 | I2 掉到 1–3 | 宿主升级覆盖配置 | 重跑 `mem init --harness workbuddy`（幂等、带备份） |

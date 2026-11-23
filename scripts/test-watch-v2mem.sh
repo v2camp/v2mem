@@ -61,11 +61,12 @@ STUB
 SETTINGS
 
   {
-    printf '{"ts":%s,"event":"session-start","ms":10,"empty":false}\n' "$NOW"
+    # 读侧恒带 search_ms：R3 判这一段，不带就是旧格式记录（按无样本 INFO）。
+    printf '{"ts":%s,"event":"session-start","ms":10,"empty":false,"search_ms":3,"open_ms":5}\n' "$NOW"
     if [ -n "$prompts" ]; then
       printf '%s' "$prompts"
     else
-      printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false}\n' "$NOW"
+      printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false,"search_ms":4,"open_ms":5}\n' "$NOW"
     fi
     if [ "$stop_ms" != "none" ]; then
       printf '{"ts":%s,"event":"stop","ms":%s}\n' "$NOW" "$stop_ms"
@@ -377,12 +378,12 @@ assert_r14 r14_pass_under    "$R14_DIR"   PASS '未超 512MiB'
 ev_write b 200
 assert_r14 r14_warn_over     "$R14_DIR"   WARN '超过 512MiB'
 
-# R3 分段分支：默认夹具没有分段字段，走不到 R3 的展开分支。macOS bash 3.2 在
+# R3 分段分支：默认夹具没有 claim/evidence/maint，走不到 R3 的展开分支。macOS bash 3.2 在
 # set -u 下会把 "$R3_NOTE；" 的全角分号首字节并进变量名，脚本在吐出 JSON 前就终止。
 # 这里用带 claim_ms 的窗口强制走该分支，断言 R3 完整产出且带分段文案。
 R3_SEG_DIR="$TMP/r3_seg"
 build_fixture "$R3_SEG_DIR" none 0 no "" \
-  "$(printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false,"claim_ms":3}\n' "$NOW")"
+  "$(printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false,"search_ms":4,"claim_ms":3}\n' "$NOW")"
 r3_out="$(run_watch "$R3_SEG_DIR")"
 r3_detail="$(printf '%s' "$r3_out" | jq -r '.items[] | select(.id=="R3") | .detail' 2>/dev/null || true)"
 if [[ "$r3_detail" != *"分段均值"* ]]; then
@@ -392,5 +393,24 @@ if [[ "$r3_detail" != *"分段均值"* ]]; then
 fi
 N=$((N+1))
 printf 'ok  %-26s R3=分段文案完整\n' "r3_seg_note"
+
+# R3 判级字段是 search_ms，不是总 ms：总耗时 900ms 而 search_ms 5 必须 PASS
+# （旧口径会判 FAIL，正是本机误报的形态）。旧记录没有 search_ms → INFO，不当 0 判 PASS。
+assert_r3() {
+  local name="$1" lines="$2" want="$3" d got
+  d="$TMP/$name"
+  build_fixture "$d" none 0 no "" "$lines"
+  got="$(run_watch "$d" | jq -r '.items[] | select(.id=="R3") | .level')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL ${name}: R3 want=$want got=$got" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R3=%-4s\n' "$name" "$want"
+}
+assert_r3 r3_search_pass "$(printf '{"ts":%s,"event":"prompt-submit","ms":900,"empty":false,"search_ms":5,"open_ms":40,"evidence_ms":800}\n' "$NOW")" PASS
+assert_r3 r3_search_warn "$(printf '{"ts":%s,"event":"prompt-submit","ms":120,"empty":false,"search_ms":60}\n' "$NOW")" WARN
+assert_r3 r3_search_fail "$(printf '{"ts":%s,"event":"prompt-submit","ms":300,"empty":false,"search_ms":250}\n' "$NOW")" FAIL
+assert_r3 r3_no_seg_info "$(printf '{"ts":%s,"event":"prompt-submit","ms":300,"empty":false}\n' "$NOW")" INFO
 
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"
