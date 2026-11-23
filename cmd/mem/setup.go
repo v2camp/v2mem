@@ -59,6 +59,11 @@ func cmdSetup(args []string) error {
 	if (*status || *undo) && *mode != "" {
 		return errors.New("--status / --undo 与 --mode 互斥：查看或回退时不要改配置")
 	}
+	// --undo 会写回配置并删除备份，不可逆；不能让它披着 --dry-run 的外衣真的执行。
+	// --status 是只读的，与 --dry-run 并存无害，保持允许。
+	if *undo && *dryRun {
+		return errors.New("--undo 与 --dry-run 不可同时使用：--undo 会写回配置并删除备份")
+	}
 
 	path := distill.DefaultModelConfigPath()
 	if *status {

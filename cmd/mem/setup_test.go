@@ -224,6 +224,46 @@ func TestSetupUndoWithoutBackupErrors(t *testing.T) {
 	}
 }
 
+// --undo 是真实且不可逆的写操作（写回配置并删除备份），不能被 --dry-run 当成预览执行。
+func TestSetupUndoDryRunRejected(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	current := `{"mode":"off"}` + "\n"
+	backup := `{"provider":"deepseek","model":"m","api_key":"sk-old"}` + "\n"
+	if err := os.WriteFile(p, []byte(current), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bak := p + ".v2mem.bak"
+	if err := os.WriteFile(bak, []byte(backup), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := cmdSetup([]string{"--undo", "--dry-run"})
+	if err == nil {
+		t.Fatal("--undo 与 --dry-run 同时使用应报错")
+	}
+	if !strings.Contains(err.Error(), "--undo") || !strings.Contains(err.Error(), "--dry-run") {
+		t.Errorf("错误应点名两个 flag，got: %v", err)
+	}
+
+	got, rerr := os.ReadFile(p)
+	if rerr != nil {
+		t.Fatalf("ReadFile: %v", rerr)
+	}
+	if string(got) != current {
+		t.Errorf("被拒绝的组合不得改动配置\nwant: %s\ngot:  %s", current, got)
+	}
+	gotBak, rerr := os.ReadFile(bak)
+	if rerr != nil {
+		t.Fatalf("备份不应被删除: %v", rerr)
+	}
+	if string(gotBak) != backup {
+		t.Errorf("备份内容不得改动\nwant: %s\ngot:  %s", backup, gotBak)
+	}
+}
+
 func TestSetupModeAPIUsesEnv(t *testing.T) {
 	p := setupHome(t)
 	t.Setenv("OPENAI_API_KEY", "")
