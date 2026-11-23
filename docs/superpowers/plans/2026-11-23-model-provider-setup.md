@@ -325,17 +325,23 @@ complete, providerName, err := distill.PromptCompleter(opt)
 localOpt := distill.Options{Provider: "ollama", Model: model, Timeout: timeout}
 byokOpt := distill.Options{Provider: "openai", Model: model, Timeout: timeout}
 if cfg.Mode == "cli" {
-	localOpt = distill.ResolveOptions(cfg, "", model)
+	localOpt = distill.ResolveOptions(cfg, "", "")
 	localOpt.Timeout = timeout
 	byokOpt = localOpt
 }
 ```
 
+**不要把 `config.toml` 的 `model` 传给 `flagModel`**：它不是显式 `--model` flag，传进去会把
+`model_tag` 覆盖成 `cli:qwen2.5:7b`，破坏按 CLI 版本 + 模板版本归因。
+
 line 446（在 `distillOne` 内）的 `Run` 改为：
 
 ```go
 cfg, _ := distill.LoadModelConfig("")
-opt := distill.ResolveOptions(cfg, job.Provider, job.Model)
+opt := distill.ResolveOptions(cfg, job.Provider, "")
+if opt.CLI == "" && opt.Model == "" {
+	opt.Model = job.Model
+}
 opt.Timeout = job.Timeout
 out := distill.Run(in, opt)
 ```
