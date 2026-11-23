@@ -97,6 +97,8 @@ gc 选项:
   --obs                 只回收 observations（不删 memories）
   --max-age <dur>       与 --obs 合用：观测保留时长（默认 720h）
   --candidates          只回收候选：pending 超 14 天标过期，accepted 超 90 天删除（不删 memories）
+  --evidence            回收无观测引用的证据归档段与磁盘文件（可与 --obs 合用，先观测后归档）
+  --evidence-grace <dur> 与 --evidence 合用：写入保护期（默认 1h，刚写入的段不回收）
 
 consolidate 选项:
   --threshold <f>       相似度阈值 0..1（默认 0.7）
@@ -792,6 +794,8 @@ func cmdGC(args []string) error {
 	backupDir := fs.String("backup-dir", "", "备份目录（默认 <库目录>/backup）")
 	obsOnly := fs.Bool("obs", false, "只回收 observations，不删除 memories")
 	candOnly := fs.Bool("candidates", false, "只回收候选，不删除 memories")
+	evOnly := fs.Bool("evidence", false, "回收无观测引用的证据归档（可与 --obs 合用）")
+	evGrace := fs.Duration("evidence-grace", time.Hour, "证据归档写入保护期（配合 --evidence）")
 	maxAge := fs.Duration("max-age", 720*time.Hour, "observations 保留时长（配合 --obs）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -800,11 +804,23 @@ func cmdGC(args []string) error {
 	if *obsOnly && *candOnly {
 		return errors.New("--obs 与 --candidates 不能同时使用")
 	}
-	if *obsOnly {
-		return cmdGCObservations(c, *maxAge)
-	}
-	if *candOnly {
-		return cmdGCCandidates(c)
+	// --obs 与 --evidence 允许合并且顺序固定：先回收观测，被删观测对应的归档段
+	// 这一轮才成为孤儿。反过来跑，归档要等下一次才清得掉。
+	if *obsOnly || *candOnly || *evOnly {
+		if *obsOnly {
+			if err := cmdGCObservations(c, *maxAge); err != nil {
+				return err
+			}
+		}
+		if *candOnly {
+			if err := cmdGCCandidates(c); err != nil {
+				return err
+			}
+		}
+		if *evOnly {
+			return cmdGCEvidence(c, *evGrace)
+		}
+		return nil
 	}
 
 	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
@@ -847,6 +863,33 @@ func cmdGCObservations(c common, maxAge time.Duration) error {
 		return printJSON(res)
 	}
 	fmt.Printf("已回收观测 %d 条，保留 %d（未改动 memories）\n", res.Deleted, res.Kept)
+	return nil
+}
+
+// cmdGCEvidence 回收「已经没有任何观测指向」的证据归档：账本行 + 磁盘文件。
+//
+// 破坏性（删磁盘字节）且不进 --obs 的默认路径：必须显式 --evidence。
+// 写入保护期默认 1h，避免把「已落文件、还没写账」的段当成孤儿删掉。
+func cmdGCEvidence(c common, grace time.Duration) error {
+	es, err := openEvidenceSession(c.db)
+	if err != nil {
+		return err
+	}
+	defer es.Close()
+
+	res, err := es.engine.GCEvidence(time.Now().Add(-grace).Unix())
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(res)
+	}
+	fmt.Printf("已回收归档段 %d（%d 条原始事件，释放 %.1f MB），账本外残文件 %d，临时文件 %d，空转证据源 %d\n",
+		res.Segments, res.RawEvents, float64(res.Bytes)/1024/1024,
+		res.Untracked, res.TempFiles, res.Sources)
+	if res.Failed > 0 {
+		fmt.Printf("%d 段删文件失败，已留在账本里等下轮重试\n", res.Failed)
+	}
 	return nil
 }
 

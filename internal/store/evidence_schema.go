@@ -75,6 +75,10 @@ func ensureEvidenceSchema(db *sql.DB) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS ux_obs_source_seq
 			ON observations(source_id, source_generation, source_seq)
 			WHERE source_id <> '' AND source_seq > 0`,
+		// 证据归档准出（mem gc --evidence）按 archive_hash 反查「还有没有观测引用这段」。
+		// 没有它，NOT EXISTS 会对每条归档全表扫 observations，退化成 O(N²)。
+		// 必须建在这里而不是 schema.sql：存量库在补列之前还没有 archive_hash。
+		`CREATE INDEX IF NOT EXISTS ix_obs_archive ON observations(archive_hash)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("建 Evidence 索引: %w", err)

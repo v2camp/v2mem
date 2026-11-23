@@ -121,6 +121,9 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS ix_obs_session ON observations(session_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_obs_project ON observations(project, created_at);
+-- ix_obs_archive（证据归档准出按 archive_hash 反查）不能写在这里：存量库还没有
+-- archive_hash 列，CREATE INDEX 会先于 ensureColumn 执行而失败。它由
+-- ensureEvidenceSchema 在补列之后建。
 
 CREATE TABLE IF NOT EXISTS candidates (
   id            TEXT PRIMARY KEY,
