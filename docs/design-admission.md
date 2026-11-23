@@ -106,6 +106,18 @@ mem batch --rollback <归档路径>                                          #  
 注意：`mem batch` 不会让 `--apply` 的标定门槛更快达标——它省的是「逐条敲命令」，不是「证明模型判得准」。
 一致率仍要靠人独立裁决的样本来攒。
 
+清积压还有一条**不用方案文件**的近路，只覆盖否决：
+
+```bash
+mem batch --reject-judged --dry-run     # 列出「影子判 reject、仍 pending」的候选
+mem batch --reject-judged               # 执行：逐条 CommitReject，同样归档可回滚
+```
+
+它刻意不接受 accept：**模型可以自动否决，不能自动授予**。判 reject 的行本来就该出隔离区，
+移出去不影响主库，判错能原路退回；判 accept 的行要进主库，必须由人给的方案决定。
+同理 `--project P` 只能收窄范围，不能改变这条不对称。理由码沿用模型的 `rationale`
+（不在闭集内则记 `judge_rejected`），actor 仍是 `human-reviewed-llm`，不进人工标定样本。
+
 ## 4. 理由码是语料，不是日志
 
 `reason` 是闭集（`durable` / `process_narrative` / `transient_state` / `payload_residue` /
@@ -163,7 +175,7 @@ mem batch --rollback <归档路径>                                          #  
 | 判定结果 | `candidates.judge_verdict` / `judge_model` / `rationale` |
 | 落库记忆 | 走 `CommitAccept`，来源仍是 `distill-accept`（可 JOIN `judge_model` 归因） |
 | 批量落库 | `commit_decisions.actor='human-reviewed-llm'`；归档在 `<db 目录>/plans/*.jsonl`，`reopen` 记撤销 |
-| 审计 | `event=candidate-judge`：`provider` / `count` / `mode`（固定影子）；批量走 `event=accept|reject`，`source=batch-plan` |
+| 审计 | `event=candidate-judge`：`provider` / `count` / `mode`（固定影子）；批量走 `event=accept|reject`，`source=batch-plan` / `batch-judged` |
 | 巡检 | 影子期 `--stats` 的输出；pending 只随人工裁决、`mem batch` 或 GC 下降，判定器不改 status |
 
 **R8 的口径不变**：pending 下降要么是人或批量裁决，要么是 GC 过期；判定只写痕迹，不应被当成「问题解决」。

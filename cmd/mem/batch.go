@@ -25,10 +25,17 @@ import (
 //
 // plan 同时是回滚凭证：执行时把 memory_id / created_memory 回填进归档，
 // mem batch --rollback 照着归档原路退回。没有归档，批量落库就是不可逆写库。
+//
+// --reject-judged 是只覆盖否决的近路：不读方案文件，直接把影子判定 reject 的 pending
+// 候选判掉。它不出 accept——采纳要人给的方案，这条边界不能拿「省事」换。
 const (
 	batchActor        = commit.ActorHumanReviewedLLM
 	batchMaxItems     = 1000
 	batchContentRunes = 60
+
+	// 归档只记结果，审计要能分辨这批是「AI 方案」还是「照影子判定批量否决」。
+	batchSourcePlan   = "batch-plan"
+	batchSourceJudged = "batch-judged"
 )
 
 // batchPlanItem 是方案文件的一行。字段刻意只有三个：
@@ -73,16 +80,27 @@ func cmdBatch(args []string) error {
 	c.register(fs)
 	planPath := fs.String("plan", "", "方案文件（JSONL，每行 {id,action,reason}）")
 	rollback := fs.String("rollback", "", "按一次执行的归档撤回（退回 pending）")
+	rejectJudged := fs.Bool("reject-judged", false, "批量否决影子判定为 reject 的 pending 候选（只否决、不采纳，无需方案文件）")
+	project := fs.String("project", "", "只处理这个工程（配合 --reject-judged）")
 	dryRun := fs.Bool("dry-run", false, "只校验并打印，不写库")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if (*planPath == "") == (*rollback == "") {
-		return errors.New("用法: mem batch --plan <file> [--dry-run]，或 mem batch --rollback <archive>")
+	modes := 0
+	for _, on := range []bool{*planPath != "", *rollback != "", *rejectJudged} {
+		if on {
+			modes++
+		}
+	}
+	if modes != 1 {
+		return errors.New("用法: mem batch --plan <file> [--dry-run] | --reject-judged [--project P] [--dry-run] | --rollback <archive>")
 	}
 	if *dryRun && *rollback != "" {
-		return errors.New("--dry-run 只用于 --plan，回滚不做预演")
+		return errors.New("--dry-run 只用于 --plan / --reject-judged，回滚不做预演")
+	}
+	if *project != "" && !*rejectJudged {
+		return errors.New("--project 只配合 --reject-judged 使用")
 	}
 
 	st, err := store.Open(c.db)
@@ -95,13 +113,30 @@ func cmdBatch(args []string) error {
 		return rollbackBatch(st, *rollback, c.json)
 	}
 
-	items, err := readBatchPlan(*planPath)
-	if err != nil {
-		return err
+	var items []batchPlanItem
+	source := batchSourcePlan
+	if *rejectJudged {
+		items, err = planFromJudged(st, *project)
+		if err != nil {
+			return err
+		}
+		if len(items) == 0 {
+			if c.json {
+				return printJSON(map[string]any{"source": batchSourceJudged, "planned": 0})
+			}
+			fmt.Println("没有「影子判定 reject 且仍 pending」的候选，无需清退。")
+			return nil
+		}
+		source = batchSourceJudged
+	} else {
+		items, err = readBatchPlan(*planPath)
+		if err != nil {
+			return err
+		}
 	}
 	previews := previewBatch(st, items)
 	if *dryRun {
-		return printBatchPreview(previews, c.json)
+		return printBatchPreview(previews, source, c.json)
 	}
 	// 预演里有不可执行的项就整体拒绝：批量落库最忌讳「一半执行一半跳过」，
 	// 人看到的方案与实际写库的方案必须是同一份。
@@ -110,7 +145,32 @@ func cmdBatch(args []string) error {
 			return fmt.Errorf("方案未通过校验（%s: %s），先用 --dry-run 修好再执行", shortID(p.ID), p.Error)
 		}
 	}
-	return runBatch(st, items, previews, dbPath(c.db), *auditFile, c.json)
+	return runBatch(st, items, previews, dbPath(c.db), *auditFile, source, c.json)
+}
+
+// planFromJudged 把「影子判定 reject」当场翻成方案，省掉一个中转文件。
+//
+// 只收 reject：采纳是授予权限，必须由人给的方案决定；否决只是把明显不该入库的
+// 候选移出待裁决区，判错还能 --rollback 退回。这条不对称是 design-admission §3.2 的边界。
+func planFromJudged(st *store.Store, project string) ([]batchPlanItem, error) {
+	rows, err := st.ListJudgeRejects(project, batchMaxItems)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]batchPlanItem, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, batchPlanItem{ID: r.ID, Action: "reject", Reason: derivedRejectReason(r.Rationale)})
+	}
+	return out, nil
+}
+
+// derivedRejectReason 沿用模型给的理由码；不是闭集里的码（老数据、模型自由发挥）
+// 就统一记 judge_rejected —— 别把自由文本伪装成理由码写进裁决。
+func derivedRejectReason(rationale string) string {
+	if r := strings.TrimSpace(rationale); judgeReasons[r] {
+		return r
+	}
+	return "judge_rejected"
 }
 
 // readBatchPlan 解析并做静态校验。逐行 Decode 而不是整体 Unmarshal：
@@ -196,7 +256,7 @@ func previewBatch(st *store.Store, items []batchPlanItem) []batchPreview {
 	return out
 }
 
-func printBatchPreview(previews []batchPreview, asJSON bool) error {
+func printBatchPreview(previews []batchPreview, source string, asJSON bool) error {
 	accept, reject := countBatchActions(previews)
 	bad := 0
 	for _, p := range previews {
@@ -207,10 +267,13 @@ func printBatchPreview(previews []batchPreview, asJSON bool) error {
 	var err error
 	if asJSON {
 		err = printJSON(map[string]any{
-			"dry_run": true, "planned": len(previews),
+			"dry_run": true, "source": source, "planned": len(previews),
 			"accept": accept, "reject": reject, "items": previews,
 		})
 	} else {
+		if source == batchSourceJudged {
+			fmt.Printf("来源：影子判定 reject 的 pending 候选 %d 条（只否决，不采纳）\n", len(previews))
+		}
 		fmt.Printf("方案 %d 条（accept %d / reject %d）：\n", len(previews), accept, reject)
 		for _, p := range previews {
 			mark := "ok  "
@@ -235,7 +298,7 @@ func printBatchPreview(previews []batchPreview, asJSON bool) error {
 	return nil
 }
 
-func runBatch(st *store.Store, items []batchPlanItem, previews []batchPreview, dbPath, auditFile string, asJSON bool) error {
+func runBatch(st *store.Store, items []batchPlanItem, previews []batchPreview, dbPath, auditFile, source string, asJSON bool) error {
 	recs := make([]batchRunRecord, 0, len(items))
 	accepted, rejected, failed := 0, 0, 0
 	for i, it := range items {
@@ -266,10 +329,10 @@ func runBatch(st *store.Store, items []batchPlanItem, previews []batchPreview, d
 			fmt.Fprintf(os.Stderr, "batch: %s %s 失败: %s\n", shortID(rec.ID), rec.Action, rec.Error)
 		case rec.Action == "accept":
 			accepted++
-			appendBatchAudit(auditFile, "accept", previews[i].Project, previews[i].ID, rec.MemoryID)
+			appendBatchAudit(auditFile, "accept", previews[i].Project, previews[i].ID, rec.MemoryID, source)
 		default:
 			rejected++
-			appendBatchAudit(auditFile, "reject", previews[i].Project, previews[i].ID, "")
+			appendBatchAudit(auditFile, "reject", previews[i].Project, previews[i].ID, "", source)
 		}
 		recs = append(recs, rec)
 	}
@@ -282,7 +345,8 @@ func runBatch(st *store.Store, items []batchPlanItem, previews []batchPreview, d
 
 	if asJSON {
 		out := map[string]any{
-			"planned": len(items), "accepted": accepted, "rejected": rejected,
+			"source": source, "planned": len(items),
+			"accepted": accepted, "rejected": rejected,
 			"failed": failed, "records": recs,
 		}
 		if archive != "" {
@@ -403,13 +467,13 @@ func writeBatchArchive(dbPath string, recs []batchRunRecord) (string, error) {
 
 // appendBatchAudit 逐条留痕，事件名与人工 accept/reject 保持一致：
 // 另起一套事件名会让 audit --stats 与看板漏掉批量这条路。
-func appendBatchAudit(path, event, project, candidateID, memoryID string) {
+func appendBatchAudit(path, event, project, candidateID, memoryID, source string) {
 	if path == "-" {
 		return
 	}
 	_ = audit.Append(auditPath(path), audit.Record{
 		TS: time.Now().Unix(), Event: event, Project: project,
-		Source: "batch-plan", Mode: "batch", Count: 1,
+		Source: source, Mode: "batch", Count: 1,
 		Hashes: []string{memoryID}, Kinds: nil,
 	})
 }

@@ -30,6 +30,50 @@ func (s *Store) CountPending() (int, error) {
 	return n, err
 }
 
+// JudgedReject 是「模型判了否决、但还没人裁决」的候选，供批量清积压用。
+type JudgedReject struct {
+	ID        string `json:"id"`
+	Project   string `json:"project"`
+	Kind      string `json:"kind"`
+	Content   string `json:"content"`
+	Rationale string `json:"rationale"`
+}
+
+// ListJudgeRejects 取出影子判定为 reject 且仍 pending 的候选（最老的在前）。
+//
+// 只出 reject，不出 accept：模型可以自动否决，不能自动授予。采纳仍必须走
+// 人给的方案（design-admission §3.2）——否则「批量准出」就成了换名的 --apply。
+// 判定痕迹不清空：退回 pending 的行不会被再判一遍（judge 只取 judge_verdict=”）。
+func (s *Store) ListJudgeRejects(project string, limit int) ([]JudgedReject, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	q := `SELECT id, COALESCE(project, ''), kind, content, COALESCE(rationale, '')
+		FROM candidates WHERE status = 'pending' AND judge_verdict = 'reject'`
+	args := []any{}
+	if project != "" {
+		q += ` AND project = ?`
+		args = append(args, project)
+	}
+	q += ` ORDER BY created_at ASC, id ASC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []JudgedReject
+	for rows.Next() {
+		var r JudgedReject
+		if err := rows.Scan(&r.ID, &r.Project, &r.Kind, &r.Content, &r.Rationale); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // JudgeStat 是按判定结果分组的影子期统计。
 //
 // Accepted / Rejected 数的是「判定之后被裁决成什么」：影子期两个数都由人工产生，

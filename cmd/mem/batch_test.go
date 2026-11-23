@@ -300,7 +300,117 @@ func TestBatchFlagUsage(t *testing.T) {
 	if err := cmdBatch([]string{"--plan", "a", "--rollback", "b"}); err == nil {
 		t.Fatal("--plan 与 --rollback 互斥")
 	}
+	if err := cmdBatch([]string{"--plan", "a", "--reject-judged"}); err == nil {
+		t.Fatal("--plan 与 --reject-judged 互斥")
+	}
+	if err := cmdBatch([]string{"--project", "p"}); err == nil {
+		t.Fatal("--project 只配合 --reject-judged")
+	}
 	if err := cmdBatch([]string{"--rollback", "b", "--dry-run"}); err == nil {
 		t.Fatal("--dry-run 只用于 --plan")
+	}
+}
+
+// --reject-judged 是「不用方案文件」的清积压通道：只清影子判定为 reject 的，
+// 判 accept 的一条都不能动——采纳是授予权限，必须由人给的方案决定。
+func TestBatchRejectJudgedOnlyRejects(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st := newJudgeStore(t)
+	db := st.Path()
+	drop := seedCandidate(t, st, "pitfall", "巡检完成，报告已输出")
+	keep := seedCandidate(t, st, "fact", "v2mem 的 MCP 通道与 hook 注入相互独立")
+	already := seedCandidate(t, st, "fact", "已经被人裁决过的候选")
+	for _, c := range []string{drop.ID, already.ID} {
+		if err := st.MarkJudgeVerdict(c, "reject", "fake@judge-v2", "process_narrative"); err != nil {
+			t.Fatalf("MarkJudgeVerdict: %v", err)
+		}
+	}
+	if err := st.MarkJudgeVerdict(keep.ID, "accept", "fake@judge-v2", "durable"); err != nil {
+		t.Fatalf("MarkJudgeVerdict: %v", err)
+	}
+	if _, err := st.CommitAccept(already.ID, -1, commit.ActorHuman); err != nil {
+		t.Fatalf("CommitAccept: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdBatch([]string{"--reject-judged", "--db", db, "--dry-run"})
+	})
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "来源：影子判定 reject") || !strings.Contains(out, "方案 1 条（accept 0 / reject 1）") {
+		t.Errorf("应只列一条 reject 并标明来源，got:\n%s", out)
+	}
+	if c, err := st.ResolveCandidate(drop.ID); err != nil || c.Status != "pending" {
+		t.Errorf("dry-run 不得改状态，got %+v %v", c, err)
+	}
+	if files, _ := filepath.Glob(filepath.Join(filepath.Dir(db), "plans", "*.jsonl")); len(files) != 0 {
+		t.Errorf("dry-run 不得写归档，got %v", files)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return cmdBatch([]string{"--reject-judged", "--db", db})
+	})
+	if err != nil {
+		t.Fatalf("batch --reject-judged: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "已采纳 0 条 / 已拒绝 1 条") {
+		t.Errorf("应拒绝 1 条、不采纳任何条，got:\n%s", out)
+	}
+	if c, err := st.ResolveCandidate(drop.ID); err != nil || c.Status != "rejected" {
+		t.Errorf("reject 判定应落库，got %+v %v", c, err)
+	}
+	if c, err := st.ResolveCandidate(keep.ID); err != nil || c.Status != "pending" {
+		t.Errorf("判 accept 的候选不得被批量通道改动，got %+v %v", c, err)
+	}
+	dec, err := st.CommitDecisions(drop.ID)
+	if err != nil {
+		t.Fatalf("CommitDecisions: %v", err)
+	}
+	if last := dec[len(dec)-1]; last.Actor != commit.ActorHumanReviewedLLM {
+		t.Errorf("actor 应为 %q，got %q", commit.ActorHumanReviewedLLM, last.Actor)
+	}
+	recs, err := readBatchArchive(batchArchivePath(t, db))
+	if err != nil {
+		t.Fatalf("readBatchArchive: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Action != "reject" {
+		t.Fatalf("归档应只有这一条 reject，got %+v", recs)
+	}
+}
+
+// 没有可清退的行不是错误：定时脚本会天天跑，这里报错只会训练人忽略报错。
+func TestBatchRejectJudgedNothingToDo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	st := newJudgeStore(t)
+	keep := seedCandidate(t, st, "fact", "MCP 与 hook 注入相互独立")
+	if err := st.MarkJudgeVerdict(keep.ID, "accept", "fake@judge-v2", "durable"); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdBatch([]string{"--reject-judged", "--db", st.Path()})
+	})
+	if err != nil {
+		t.Fatalf("无可清退项应正常返回: %v", err)
+	}
+	if !strings.Contains(out, "无需清退") {
+		t.Errorf("应说明没有可清退项，got:\n%s", out)
+	}
+	if files, _ := filepath.Glob(filepath.Join(filepath.Dir(st.Path()), "plans", "*.jsonl")); len(files) != 0 {
+		t.Errorf("空执行不该留归档，got %v", files)
+	}
+}
+
+// 理由码来自模型；不在闭集里的（老数据、模型自由发挥）要标成 judge_rejected，
+// 不能把自由文本伪装成理由码。
+func TestDerivedRejectReason(t *testing.T) {
+	if got := derivedRejectReason("process_narrative"); got != "process_narrative" {
+		t.Errorf("闭集内的理由码应原样保留，got %q", got)
+	}
+	for _, raw := range []string{"", "  ", "looks_like_noise"} {
+		if got := derivedRejectReason(raw); got != "judge_rejected" {
+			t.Errorf("非闭集理由 %q 应归一为 judge_rejected，got %q", raw, got)
+		}
 	}
 }
