@@ -81,8 +81,9 @@ type AcceptResult struct {
 
 // CandGCResult 是候选回收的结果。不触及 memories。
 type CandGCResult struct {
-	Expired int `json:"expired"`
-	Deleted int `json:"deleted"`
+	Expired        int `json:"expired"`
+	Deleted        int `json:"deleted"`
+	DeletedExpired int `json:"deleted_expired"`
 }
 
 // DistillRun 是一次蒸馏的审计行。
@@ -251,6 +252,29 @@ func (s *Store) ListCandidates(status, session string, limit int) ([]Candidate, 
 	return s.ListCandidatesByProject(status, session, "", limit)
 }
 
+// candidateSelect 是候选行列表的统一读法，避免两处查询的列顺序漂移。
+const candidateSelect = `SELECT id, session_id, project, kind, content, content_hash,
+	status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id,
+	attributed_to, scope
+	FROM candidates`
+
+func (s *Store) queryCandidates(q string, args ...any) ([]Candidate, error) {
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Candidate
+	for rows.Next() {
+		c, err := scanCandidate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *c)
+	}
+	return out, rows.Err()
+}
+
 // ListCandidatesByProject 在 ListCandidates 之上加工程过滤。
 // project 为空表示**不过滤**（与 status / session 的空值语义一致）；
 // 想只取全局候选请显式传 project="" 并配合 status，不要依赖空值。
@@ -258,10 +282,7 @@ func (s *Store) ListCandidatesByProject(status, session, project string, limit i
 	if limit <= 0 {
 		limit = 50
 	}
-	q := `SELECT id, session_id, project, kind, content, content_hash,
-		status, source, channel, salience, obs_ids_json, 		created_at, decided_at, memory_id,
-		attributed_to, scope
-		FROM candidates WHERE 1=1`
+	q := candidateSelect + ` WHERE 1=1`
 	var args []any
 	if status != "" {
 		q += ` AND status = ?`
@@ -277,20 +298,26 @@ func (s *Store) ListCandidatesByProject(status, session, project string, limit i
 	}
 	q += ` ORDER BY created_at ASC, id ASC LIMIT ?`
 	args = append(args, limit)
-	rows, err := s.db.Query(q, args...)
-	if err != nil {
-		return nil, err
+	return s.queryCandidates(q, args...)
+}
+
+// ListUnjudgedCandidates 取「判定器还没看过」的 pending 候选，供 judge 批量判定。
+//
+// 影子期不改 status，所以不能按「最旧的 pending」取：那会每轮重判同一批，
+// 既重复付费，也让后面的候选永远轮不到。judge_verdict=” 是唯一的游标。
+func (s *Store) ListUnjudgedCandidates(project string, limit int) ([]Candidate, error) {
+	if limit <= 0 {
+		limit = 50
 	}
-	defer rows.Close()
-	var out []Candidate
-	for rows.Next() {
-		c, err := scanCandidate(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *c)
+	q := candidateSelect + ` WHERE status = 'pending' AND judge_verdict = ''`
+	var args []any
+	if project != "" {
+		q += ` AND project = ?`
+		args = append(args, project)
 	}
-	return out, rows.Err()
+	q += ` ORDER BY created_at ASC, id ASC LIMIT ?`
+	args = append(args, limit)
+	return s.queryCandidates(q, args...)
 }
 
 // CountPendingByProject 统计指定工程仍在 pending 的候选数，供 SessionStart
@@ -410,7 +437,22 @@ func (s *Store) GCCandidates(pendingAge, acceptedAge time.Duration) (*CandGCResu
 	if err != nil {
 		return nil, err
 	}
-	return &CandGCResult{Expired: int(expired), Deleted: int(deleted)}, nil
+	// 过期行也要有出口：它们从未被判过，不参与一致率，留着只会让候选表只增不减。
+	// 与 accepted 用同一个保留期，避免两套「多久算老」的口径。
+	res, err = s.db.Exec(
+		`DELETE FROM candidates
+		  WHERE status='expired' AND decided_at IS NOT NULL AND decided_at < ?`,
+		now.Add(-acceptedAge).Unix())
+	if err != nil {
+		return nil, err
+	}
+	deletedExpired, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	return &CandGCResult{
+		Expired: int(expired), Deleted: int(deleted), DeletedExpired: int(deletedExpired),
+	}, nil
 }
 
 // DistillWindowDone 报告这个会话的观测窗口是否已经成功蒸馏过。

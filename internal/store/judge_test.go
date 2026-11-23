@@ -67,16 +67,59 @@ func TestCountPendingIgnoresDecided(t *testing.T) {
 	if _, err := s.CommitReject(rejected, -1, "human", "过程叙述"); err != nil {
 		t.Fatalf("CommitReject: %v", err)
 	}
+	// 已判定但仍是 pending 的行不能再计入积压：影子期不改 status，
+	// 若把它算进去，自动触发会永远 ≥ 阈值、每 24h 空跑一次。
+	judged := insert("fact", "判定器看过的候选仍在 pending")
+	if err := s.MarkJudgeVerdict(judged, "reject", "ollama@judge-v2", "process_narrative"); err != nil {
+		t.Fatalf("MarkJudgeVerdict: %v", err)
+	}
 	n, err := s.CountPending()
 	if err != nil {
 		t.Fatalf("CountPending: %v", err)
 	}
 	if n != 1 {
-		t.Fatalf("只应数 pending，got %d", n)
+		t.Fatalf("只应数未判定的 pending，got %d", n)
 	}
 }
 
-// JudgeStats 的分母只含人工样本：判定器自己 --apply 落下的不算一致率，
+// 影子期不改 status：判定过的行必须从下一批里消失，否则每轮重判同一批、后面的永远轮不到。
+func TestListUnjudgedCandidatesSkipsJudged(t *testing.T) {
+	s := newTestStore(t)
+	insert := func(content string) string {
+		t.Helper()
+		res, err := s.InsertCandidate(CandidateInput{
+			SessionID: "s", Project: "p", Kind: "fact", Content: content, Source: "distill",
+		})
+		if err != nil {
+			t.Fatalf("InsertCandidate: %v", err)
+		}
+		return res.Candidate.ID
+	}
+	first := insert("第一条未判定候选")
+	middle := insert("第二条已判定候选")
+	last := insert("第三条未判定候选")
+	if err := s.MarkJudgeVerdict(middle, "reject", "ollama@judge-v2", "process_narrative"); err != nil {
+		t.Fatalf("MarkJudgeVerdict: %v", err)
+	}
+
+	got, err := s.ListUnjudgedCandidates("", 10)
+	if err != nil {
+		t.Fatalf("ListUnjudgedCandidates: %v", err)
+	}
+	// 同一秒插入时 created_at 相同、按 id 兜底排序，所以只比集合不比顺序。
+	ids := map[string]bool{}
+	for _, c := range got {
+		ids[c.ID] = true
+	}
+	if len(got) != 2 || !ids[first] || !ids[last] || ids[middle] {
+		t.Fatalf("应跳过已判定的中间行，got %+v", got)
+	}
+	if got, err := s.ListUnjudgedCandidates("other", 10); err != nil || len(got) != 0 {
+		t.Fatalf("工程过滤应生效，got %+v %v", got, err)
+	}
+}
+
+// JudgeStats 的分母只含人工样本：判定器自己落库的（历史 --apply 数据）不算一致率，
 // 否则「≥95% 才转正」会被自己的产出喂饱，等于没有门槛。
 func TestJudgeStatsSeparatesSelfRunFromHuman(t *testing.T) {
 	s := newTestStore(t)
@@ -103,7 +146,7 @@ func TestJudgeStatsSeparatesSelfRunFromHuman(t *testing.T) {
 			t.Fatalf("MarkJudgeVerdict: %v", err)
 		}
 	}
-	// 人工采纳一条；另一条由判定器自己 --apply 否决。
+	// 人工采纳一条；另一条由判定器自己落库否决（历史 --apply 数据）。
 	if _, err := s.CommitAccept(human, -1, "human"); err != nil {
 		t.Fatalf("CommitAccept: %v", err)
 	}

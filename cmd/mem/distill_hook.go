@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,6 +30,9 @@ func defaultStartDistill(db, session, harness string) error {
 
 // startMemProc 拉起一个短命 mem 子进程，不等待它结束。
 // 冷启动与常规蒸馏共用这一条出口，避免两处各自实现 .test 守卫与参数拼接。
+//
+// stderr 追加到 ~/.v2mem/spawn.log：这些子进程 detach 后没有终端，坏 key、
+// 端点不可达、落库失败在界面上都表现为「什么都没发生」，没有日志就只能翻库猜。
 func startMemProc(db string, args []string) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -41,8 +45,25 @@ func startMemProc(db string, args []string) error {
 	cmd := exec.Command(exe, args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
-	cmd.Stderr = nil
+	if f, err := openSpawnLog(); err == nil {
+		defer f.Close() // 子进程已继承 fd，父进程这份可以立刻关
+		cmd.Stderr = f
+	}
 	return cmd.Start()
+}
+
+// openSpawnLog 打开 ~/.v2mem/spawn.log（追加，0644）。
+// 打不开就算了：日志是观测手段，不能因为它失败而让钩子拉不起子进程。
+func openSpawnLog() (*os.File, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(home, ".v2mem")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(filepath.Join(dir, "spawn.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 }
 
 // normalizeHarness 把宿主名（规范名或别名）经注册表归一化到 h.Name；

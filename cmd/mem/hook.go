@@ -676,7 +676,8 @@ func pendingCandidatesLine(st *store.Store, project string) string {
 		return ""
 	}
 	return fmt.Sprintf("[待裁决] 本工程 %d 条 pending 候选（隔离区，不进检索）："+
-		"用 MCP candidates_ls 查看，逐条 accept / reject 裁决；或跑 mem candidates ls。\n", n)
+		"用 MCP candidates_ls 查看，逐条 accept / reject 裁决；或跑 mem candidates ls。"+
+		"影子判定进度：mem judge --stats。\n", n)
 }
 
 // hintBlock 是「钩子」本体：告诉模型还有 Level 2 可查，并给出可直接执行的命令。

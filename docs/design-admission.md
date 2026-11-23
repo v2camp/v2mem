@@ -33,12 +33,13 @@
 ```
 mem judge                 # 只写 verdict，status 不动，memories 零写入
 mem judge --stats         # 人工一致率：verdict=accept 看人工也采纳的比例，reject 看人工也否决的比例
-mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 CommitReject
 ```
 
 - 影子期数据落 `candidates.judge_verdict` / `judge_model`（含 prompt 版本），`rationale` 记理由码。
-- 一致率的**分母是人工裁决**，所以影子期内不能用 `--apply`，否则分母被判定器自己污染。
+- 一致率的**分母是人工裁决**；判定器本身没有任何改库入口（`--apply` 已撤），分母不会被自己的产出污染。
 - 转正门槛：`accept` 一致率 ≥95%，且样本 ≥200 条。未达标不放开，不因着急下调。
+- **落库入口暂不开放**：恢复 `--apply` 必须与 `mem judge --rollback <judge_model>` 同批交付（§4 例外条款 (c)）。
+- 每轮只取 `judge_verdict=''` 的 pending：影子不改 status，按「最旧的 pending」取会永远重判同一批。
 
 ## 3.1 积压触发（配好模型后自动开，可一键关）
 
@@ -50,19 +51,17 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
 |:---|:---|:---|
 | `model.json` 的 `auto_spawn` | 关 | `mem setup` / `--mode api` 配好模型后写入 `true`；`--mode off` 写回 `false`。钩子由宿主进程启动、不继承 shell 环境，所以授权必须落在文件上 |
 | `MEM_JUDGE_SPAWN` | 未设 | 显式总闸：`1` 强制开（脚本/CI），`0` 强制关（一键关闭，GUI 宿主无法 export 时的退路）。其它值退回文件判断 |
-| `MEM_JUDGE_MIN_PENDING` | 20 | 全库 pending ≥ 该值才触发。取值略高于 R8 的 FAIL 线（>15），避免刚 WARN 就烧一次调用 |
+| `MEM_JUDGE_MIN_PENDING` | 20 | 全库**未判定**的 pending ≥ 该值才触发。取值略高于 R8 的 FAIL 线（>15），避免刚 WARN 就烧一次调用 |
 | `MEM_JUDGE_COOLDOWN_H` | 24 | 冷却小时数。一个会话能 Stop 几十次，没有冷却等于每轮都跑 |
-| `MEM_JUDGE_APPLY` | 关 | 子进程是否带 `--apply`。默认影子，转正前必须保持关 |
 
 为什么从「默认关」改为「配好模型就开」：用户**主动执行** `mem setup` 已构成显式授权，
 关着却只提示 `export MEM_JUDGE_SPAWN=1` 是死路——宿主钩子读不到交互 shell 的变量。
 升级后的老用户不受影响：老 `model.json` 没有 `auto_spawn` 字段，读出来就是 `false`。
-`auto_spawn` 只开「跑判定」，**不开「改库」**——`MEM_JUDGE_APPLY` 仍是独立的默认关闸门，
-影子期的红线不动。
+`auto_spawn` 只开「跑判定」，**不开「改库」**——判定器本身没有改状态入口，影子期的红线不动。
 
 - 只挂 `Stop` / `SessionEnd`。**读路径（PromptSubmit / SessionStart）永不触发**——判定要走网络，
   进了注入链路就直接违约。
-- 拉起后不等：`startMemProc` 是 detach 的子进程，钩子立即返回；失败只写 stderr。
+- 拉起后不等：`startMemProc` 是 detach 的子进程，钩子立即返回；失败写 `~/.v2mem/spawn.log`。
 - 先写 `~/.v2mem/judge-state.json`（上次拉起时间）再 spawn：宁可少跑一次，
   也不要因写状态失败而反复重跑。
 - 判定条数取阈值本身（`--limit = MEM_JUDGE_MIN_PENDING`）：一次只清一批，
@@ -124,17 +123,16 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
 |:---|:---|
 | 判定结果 | `candidates.judge_verdict` / `judge_model` / `rationale` |
 | 落库记忆 | 走 `CommitAccept`，来源仍是 `distill-accept`（可 JOIN `judge_model` 归因） |
-| 审计 | `event=candidate-judge`：`provider` / `count` / `mode`（影子/apply） |
-| 巡检 | 影子期 `--stats` 的输出；R8 的 pending 计数在 `--apply` 后才下降 |
+| 审计 | `event=candidate-judge`：`provider` / `count` / `mode`（固定影子） |
+| 巡检 | 影子期 `--stats` 的输出；pending 只随人工裁决或 GC 下降，判定器不改 status |
 
-**R8 的口径不变**：`--apply` 后 pending 会降，但知识只是从候选区移到主库，由 R6（库规模）承接。
-不把 R8 变好当成「问题解决」。
+**R8 的口径不变**：pending 下降要么是人工裁决，要么是 GC 过期；判定只写痕迹，不应被当成「问题解决」。
 
 ## 7. 未做（按顺序，且都有前置条件）
 
 1. **规则沉淀**：需要 ≥50 条带理由码的裁决。现在 0 条，先攒语料。产出形态拟为
    `~/.v2mem/admission.jsonl` + dry-run 计数，转正看误杀率（分母来自抽样复核，不是 dry-run 自己）。
-2. **回滚命令**：影子期不落库，故当前无不可逆风险。`--apply` 转正**必须**与
+2. **回滚命令**：影子期不落库，故当前无不可逆风险。`--apply` 入口已撤；恢复它**必须**与
    `mem judge --rollback <judge_model>` 同批交付——按 §4 例外条款 (c)，单独放行 `--apply` 视为违约。
 3. **R8 增列**：影子准确率进 detail，需同步改 `docs/ops-watch.md` 与脚本两处。
 

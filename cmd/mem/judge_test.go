@@ -40,12 +40,12 @@ func TestJudgeShadowKeepsStateUntouched(t *testing.T) {
 
 	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
 		{ID: c.ID[:8], Verdict: "reject", Reason: "process_narrative"},
-	}, "ollama@judge-v1", false)
+	}, "ollama@judge-v1")
 	if err != nil {
 		t.Fatalf("applyJudgments: %v", err)
 	}
-	if r.Reject != 1 || r.Applied != 0 {
-		t.Fatalf("影子期应只记判定不改状态，got %+v", r)
+	if r.Reject != 1 {
+		t.Fatalf("影子期应记下判定，got %+v", r)
 	}
 	got, err := st.ResolveCandidate(c.ID)
 	if err != nil {
@@ -63,7 +63,7 @@ func TestJudgeDowngradesKindsMatrixKeepsForHumans(t *testing.T) {
 
 	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
 		{ID: c.ID[:8], Verdict: "accept", Reason: "durable"},
-	}, "ollama@judge-v1", false)
+	}, "ollama@judge-v1")
 	if err != nil {
 		t.Fatalf("applyJudgments: %v", err)
 	}
@@ -72,26 +72,10 @@ func TestJudgeDowngradesKindsMatrixKeepsForHumans(t *testing.T) {
 	}
 }
 
-// apply 才改状态，且理由码进 rationale —— 没有理由码，规则沉淀永远没有语料。
-func TestJudgeApplyRejectRecordsReason(t *testing.T) {
-	st := newJudgeStore(t)
-	c := seedCandidate(t, st, "fact", "巡检已完成，报告已输出并追加到自动化记忆")
-
-	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
-		{ID: c.ID[:8], Verdict: "reject", Reason: "process_narrative"},
-	}, "ollama@judge-v1", true)
-	if err != nil {
-		t.Fatalf("applyJudgments: %v", err)
-	}
-	if r.Applied != 1 {
-		t.Fatalf("apply 应改一条状态，got %+v", r)
-	}
-	got, err := st.ResolveCandidate(c.ID)
-	if err != nil {
-		t.Fatalf("ResolveCandidate: %v", err)
-	}
-	if got.Status != "rejected" {
-		t.Errorf("apply 后状态应为 rejected，got %q", got.Status)
+// 落库入口必须是真的不存在：--apply 若被静默接受，等于绕开了回滚与标定门槛。
+func TestJudgeApplyFlagRemoved(t *testing.T) {
+	if err := cmdJudge([]string{"--apply"}); err == nil {
+		t.Fatal("--apply 已撤，不应被接受")
 	}
 }
 
@@ -180,8 +164,8 @@ func TestJudgeCandidatesJSONTruncates(t *testing.T) {
 	}
 }
 
-// 判定器自己 --apply 的裁决不能算人工样本：否则 once 转正后一致率恒 100%，
-// 「≥95% 才放行」这条门槛会被自己的产出喂饱。
+// 判定器自己落库的裁决（历史 --apply 数据）不能算人工样本：否则 once 转正后
+// 一致率恒 100%，「≥95% 才放行」这条门槛会被自己的产出喂饱。
 func TestJudgeStatsExcludesSelfRun(t *testing.T) {
 	st := newJudgeStore(t)
 	c := seedCandidate(t, st, "fact", "判定器自裁的样本")

@@ -134,7 +134,7 @@ func TestGCCandidatesLeavesMemories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Expired != 1 || got.Deleted != 1 {
+	if got.Expired != 1 || got.Deleted != 1 || got.DeletedExpired != 0 {
 		t.Fatalf("gc: %+v", got)
 	}
 	var n int
@@ -147,6 +147,37 @@ func TestGCCandidatesLeavesMemories(t *testing.T) {
 	listed, err := s.ListCandidates("expired", "s", 10)
 	if err != nil || len(listed) != 1 {
 		t.Fatalf("过期行应留下，got %+v %v", listed, err)
+	}
+}
+
+// 过期行也要有出口：从未判过的老候选不参与一致率，留着只会让候选表只增不减。
+func TestGCCandidatesDeletesOldExpired(t *testing.T) {
+	s := newTestStore(t)
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Kind: "task", Content: "很久没人裁决的候选", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-100 * 24 * time.Hour).Unix()
+	if _, err := s.db.Exec(
+		`UPDATE candidates SET status='expired', created_at=?, decided_at=? WHERE id=?`,
+		old, old, res.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GCCandidates(14*24*time.Hour, 90*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DeletedExpired != 1 {
+		t.Fatalf("超期 expired 行应删除，got %+v", got)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM candidates WHERE id=?`, res.Candidate.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("超期 expired 行应已删除")
 	}
 }
 
