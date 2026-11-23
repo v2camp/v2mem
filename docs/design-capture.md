@@ -464,6 +464,12 @@ Trae 一次任务跨多个 Stop 是常态，不能把第 N 个 Stop 当收工。
   归档、`mem search --layer observation` 的可读性不受影响，只是不再作为提案种子。
 - 旧实现按工具名判定（`isPipelineTool` + `memoryToolNames`）只挡流水线工具，挡不住 bash / read 这类普通载荷，
   §8.5.1 实测 50% 残留即由此而来；该判定已被事件类型规则取代并删除。
+- **宿主原生行按语义归类，不再一律落 `unparsed`（2026-11-23）**：`function_call` / `function_call_result`
+  翻成与 Claude `tool_use` / `tool_result` 同形的 `tool-use` / `tool-result`（工具名 + 实参进正文，
+  `tool_use:<callId>` 作身份），**仍不可提案**；`reasoning`（模型中间态）与 `session-meta` / `ai-title`
+  （宿主元数据）按 `thinking` 块同等处理，可解释地跳过。活库实测：393 条 `unparsed` 里 250 条是工具事件、
+  85 条是 `reasoning`、23 条是宿主元数据；改后 6 份真实 transcript（907 条事件）解析零残留。
+  `unparsed` 因此重新只是「真的解析不了」的信号，而不是垃圾桶。
 
 代价与非目标：只靠 `PostToolUse` 而无对话正文的畸形宿主会产出 0 候选——按定义它此前产出的也只是工具 JSON。
 存量 pending 污染候选不会自动消失，需 `mem reject` 或等窗口过期。

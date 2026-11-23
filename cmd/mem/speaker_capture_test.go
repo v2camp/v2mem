@@ -243,16 +243,29 @@ func TestObserveStopCapturesNativeWorkBuddyTranscript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unparsed := 0
+	// 工具行不再落 unparsed（那样只是把原文塞进「看不懂」的桶里），
+	// 但**仍然不可提案**：工具载荷不是事实陈述。两条必须一起断言，
+	// 否则「解析成功」会被误读成「可以进记忆」。
+	tools := 0
 	for _, o := range obs {
-		if o.Event == "unparsed" {
-			unparsed++
-			if !strings.Contains(o.Summary, "function_call") {
-				t.Fatalf("工具行仍须按原文归档，got %q", o.Summary)
+		switch o.Event {
+		case "tool-use":
+			tools++
+			if !strings.Contains(o.Summary, "tool:Bash") {
+				t.Fatalf("工具观测应带工具名，got %q", o.Summary)
 			}
+		case "unparsed":
+			t.Fatalf("原生工具行不该再落 unparsed，got %q", o.Summary)
 		}
 	}
-	if unparsed != 1 {
-		t.Fatalf("未识别的工具行应恰好 1 条（原文保真），got %d", unparsed)
+	if tools != 1 {
+		t.Fatalf("工具行应恰好 1 条 tool-use，got %d", tools)
+	}
+	tool, ok, err := st.LookupEvidence("tx:tool_use:c1", src, 0, 0)
+	if err != nil || !ok {
+		t.Fatalf("工具证据缺失: ok=%v err=%v", ok, err)
+	}
+	if tool.EventType != "tool-use" || tool.ProposalEligible {
+		t.Fatalf("工具载荷必须归档且不可提案，got %+v", tool)
 	}
 }

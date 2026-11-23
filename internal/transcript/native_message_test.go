@@ -56,7 +56,11 @@ func TestParseNativeMessageUserAndAssistant(t *testing.T) {
 	}
 }
 
-func TestParseNativeToolLineKeepsRawAsUnparsed(t *testing.T) {
+// 工具行过去落 unparsed：整行原文虽然保住了，但语义没解析出来，
+// 于是「工具载荷」被记成了「看不懂的行」，unparsed 也就失去了信号价值。
+// 现在按 Claude 的 tool_use 同形解析：正文里保住工具名与实参。
+// 不可提案这条安全属性不变，由 cmd 层按 EventType 拦（observe.go recordEvidence）。
+func TestParseNativeToolLineBecomesToolUse(t *testing.T) {
 	recs, err := NewReader(strings.NewReader(nativeToolLine + "\n")).ReadAll()
 	if err != nil {
 		t.Fatal(err)
@@ -65,10 +69,35 @@ func TestParseNativeToolLineKeepsRawAsUnparsed(t *testing.T) {
 		t.Fatalf("工具行应归档成 1 条，got %d", len(recs))
 	}
 	r := recs[0]
-	if r.EventType != EventUnparsed || !r.Unparsed || r.EventType == EventUserPrompt {
-		t.Fatalf("未识别的工具行必须保留原文且不可提案，got %+v", r)
+	if r.EventType != EventToolUse || r.Unparsed {
+		t.Fatalf("原生工具行应解析为 tool-use，got %+v", r)
 	}
-	if !strings.Contains(r.Text, "function_call") || !strings.Contains(r.Text, "callId") {
+	if r.EventType == EventUserPrompt || r.EventType == EventAssistantText {
+		t.Fatalf("工具载荷绝不能当成用户/助手原话: %q", r.EventType)
+	}
+	if r.ToolName != "Bash" || r.ToolID != "c1" || r.HostUID != "tool_use:c1" {
+		t.Fatalf("工具身份错: %+v", r)
+	}
+	if !strings.Contains(r.Text, "tool:Bash") || !strings.Contains(r.Text, "{}") {
+		t.Fatalf("正文应含工具名与实参: %q", r.Text)
+	}
+}
+
+// 真正的未知行仍必须整行保住原文——修上面的 bug 不能把「看不懂就丢」引回来。
+func TestParseUnknownLineKeepsRawAsUnparsed(t *testing.T) {
+	line := `{"type":"brand-new-host-event","payload":{"k":"v"}}`
+	recs, err := NewReader(strings.NewReader(line + "\n")).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("未知行应归档成 1 条，got %d", len(recs))
+	}
+	r := recs[0]
+	if r.EventType != EventUnparsed || !r.Unparsed {
+		t.Fatalf("未知行必须保留原文，got %+v", r)
+	}
+	if !strings.Contains(r.Text, "brand-new-host-event") || !strings.Contains(r.Text, `"k":"v"`) {
 		t.Fatalf("原文必须整行保住: %q", r.Text)
 	}
 }
