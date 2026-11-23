@@ -166,7 +166,7 @@ func TestProbeOrderAndTemplate(t *testing.T) {
 func TestRunCLIStdinStdoutAndError(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "claude")
-	body := "#!/bin/sh\ncat\nexit 0\n"
+	body := "#!/bin/sh\n/bin/cat\nexit 0\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestRunCLIStdinStdoutAndError(t *testing.T) {
 
 func TestRunCLITimeout(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\nsleep 5\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\n/bin/sleep 5\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
@@ -263,7 +263,7 @@ func TestResolveCLIWins(t *testing.T) {
 
 func TestCompleteLLMCLI(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\ncat\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\n/bin/cat\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
@@ -385,7 +385,7 @@ func TestSetupWritesCLIAndNotice(t *testing.T) {
 	t.Setenv("HOME", home)
 	dir := t.TempDir()
 	script := `#!/bin/sh
-in=$(cat)
+in=$(/bin/cat)
 case "$in" in
   *"候选"*) echo '[{"id":"aaaaaaaa","verdict":"reject","reason":"process_narrative"}]' ;;
   *) echo '{"kind":"preference","content":"默认短句","salience":0.6,"obs_ids":["setup"]}' ;;
