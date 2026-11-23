@@ -139,7 +139,7 @@ git commit -m "feat(distill): model.json 增加 mode/cli/model_tag 与 ResolveOp
 - Modify: `internal/distill/llm.go`（只加 `case "cli"`，留到 Task 3 也可；本任务先建执行器）
 
 **Interfaces:**
-- Produces: `Probe() (name string, ok bool)`；`VersionTag(name string) string`；`runCLI(ctx context.Context, name, prompt string) (string, error)`；模板表 `cliTemplates`（含 `Name/Args/VersionArgs/Ver`）。
+- Produces: `Probe() (name string, ok bool)`；`ProbeAll() []string`；`VersionTag(name string) string`；`runCLI(ctx context.Context, name, prompt string) (string, error)`；模板表 `cliTemplates`（含 `Name/Args/VersionArgs/Ver`）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -214,7 +214,7 @@ var cliTemplates = []cliTemplate{
 ```
 
 在表头写一行注释：`// argv 未在本机实测；dry-run 失败时该模板不得写盘，换 flag 必须同时升 Ver。`
-`Probe` 用 `exec.LookPath` 按顺序取第一个命中。
+`ProbeAll` 用 `exec.LookPath` 按顺序收集全部命中；`Probe` 返回第一个。
 `VersionTag` 用 `context.WithTimeout(3s)` 跑 `VersionArgs`，取 stdout 首行；失败返回 `<name>@unknown+tpl<Ver>`。
 `runCLI`：查表；`exec.CommandContext`；`cmd.Stdin = strings.NewReader(prompt)`；stdout / stderr 各 `bytes.Buffer`；非零退出返回 `fmt.Errorf("%w: %s: %s", ErrLLMUnavailable, name, firstLine(stderr))`；成功返回 stdout。
 `firstLine` 截首行、限 200 字节。
@@ -372,7 +372,7 @@ git commit -m "feat(distill): judge 与蒸馏共用 CLI 执行路径"
 - Test: `cmd/mem/main_test.go`（护栏会断言已知子命令清单）
 
 **Interfaces:**
-- Consumes: `distill.Probe`、`distill.VersionTag`、`distill.LoadModelConfig`、`distill.SaveModelConfig`、`distill.DefaultModelConfigPath`、`distill.ResolveOptions`、`distill.Run`；本包 `parseJudgeVerdicts`、`judgePrompt`。
+- Consumes: `distill.ProbeAll`、`distill.VersionTag`、`distill.LoadModelConfig`、`distill.SaveModelConfig`、`distill.DefaultModelConfigPath`、`distill.ResolveOptions`、`distill.Run`；本包 `parseJudgeVerdicts`、`judgePrompt`。
 - Produces: `cmdSetup(args []string) error`；`setupNotice(name, tag string) string`；`apiConfigFromEnv(cfg ModelConfig) (ModelConfig, error)`。
 
 - [ ] **Step 1: 写失败测试**
@@ -425,7 +425,7 @@ Expected: FAIL（`cmdSetup` 未定义）。
 - [ ] **Step 3: 实现 `setup.go`**
 
 flag：`--dry-run`、`--status`、`--mode api|cli|off`、`--undo`。
-流程按 spec §7：读现状 → 已有配置且无显式 mode 时打印 status 返回 → `Probe()` → 逐候选 dry-run（judge prompt + `distill.Run` 一条合成观测）→ 全失败不写盘、退出 0 → 通过则 `SaveModelConfig` → 打印 `setupNotice`。
+流程按 spec §7：读现状 → 已有配置且无显式 mode 时打印 status 返回 → `ProbeAll()` 遍历候选 → 逐候选 dry-run（judge prompt + `distill.Run` 一条合成观测）→ 全失败不写盘、退出 0 → 首个通过则 `SaveModelConfig` → 打印 `setupNotice`。
 `--mode api` 只从环境变量取 key（`DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`），都没有则报错并提示两种 export；不读 stdin（避免回显与依赖）。
 `--undo`：无 `model.json.v2mem.bak` 报错；有则读备份、写回 `model.json`（0600）、删除备份。
 跨平台不用 `os.Rename` 覆盖目标（Windows 会失败）。
