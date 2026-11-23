@@ -151,6 +151,8 @@ mem setup --undo          # 恢复最近一次写盘前的备份；无备份则�
 
 默认流程（有序，不可跳步）：
 1. 读现状。已有配置**默认不覆盖**（幂等），打印现状并返回；要改必须显式 `--mode`。
+   存量 `model.json` 缺 `auto_spawn` 时钩子按 `false` 处理（升级后不会突然外发）；
+   要开启用 `mem setup --mode cli / --mode api` 显式重写，或手工在文件里加该字段。
 2. `Probe()` 按白名单顺序探测本机 CLI；取第一个 `LookPath` 命中的候选。
 3. dry-run 各跑一次：judge 合成候选 prompt、蒸馏真实 prompt。验证四点：
    退出码 0、`parseJudgeVerdicts` 可解析、`ParseFacts` 可解析、**stdin 关闭后不等待输入**（证明非交互、不弹权限）。
