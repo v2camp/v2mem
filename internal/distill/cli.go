@@ -56,7 +56,8 @@ func VersionTag(name string) string {
 		if t.Name != name {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// 10s：并行包测试/冷启动下 3s 会偶发超时，版本探测不是热路径。
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		out, err := exec.CommandContext(ctx, t.Name, t.VersionArgs...).Output()
 		if err != nil {

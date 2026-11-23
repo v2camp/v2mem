@@ -22,8 +22,9 @@ func TestProbeOrderAndTemplate(t *testing.T) {
 	if name, ok := Probe(); !ok || name != "claude" {
 		t.Fatalf("应按白名单顺序取 claude，got %q ok=%v", name, ok)
 	}
-	if !strings.Contains(VersionTag("claude"), "claude@claude-v1+tpl") {
-		t.Errorf("VersionTag 不对: %q", VersionTag("claude"))
+	tag := VersionTag("claude")
+	if !strings.Contains(tag, "claude@claude-v1+tpl") {
+		t.Errorf("VersionTag 不对: %q", tag)
 	}
 }
 
