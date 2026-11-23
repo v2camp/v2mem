@@ -47,6 +47,28 @@ func TestRunCLIStdinStdoutAndError(t *testing.T) {
 	}
 }
 
+func TestResolveCLIWins(t *testing.T) {
+	name, spec, err := resolve(Options{CLI: "claude", ModelTag: "claude@1+tpl1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "cli:claude@1+tpl1" || spec.Kind != "cli" || spec.Name != "claude" {
+		t.Fatalf("got %q %+v", name, spec)
+	}
+}
+
+func TestCompleteLLMCLI(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\n/bin/cat\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := completeLLM(context.Background(), ModelSpec{Kind: "cli", Name: "claude"}, "[]")
+	if err != nil || out != "[]" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
 func TestRunCLITimeout(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\n/bin/sleep 5\n"), 0o755); err != nil {

@@ -96,29 +96,17 @@ func cmdJudge(args []string) error {
 		return nil
 	}
 
-	// 优先级：flag > model.json > 环境变量 > none。配置文件在中间，
-	// 因为定时任务不继承交互 shell 的环境，而 flag 只适合临时试一次。
+	// 优先级：flag > model.json > 环境变量 > auto|none，统一由 ResolveOptions 实现。
+	// 这里不再手工补 cfg.Provider / cfg.Model / deepseek-flash：手工补出来的值
+	// 会变成「已显式指定」的 flag，把 model.json 的 mode=cli 永久压掉。
 	cfg, err := distill.LoadModelConfig(*cfgPath)
 	if err != nil {
 		return fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
 	}
-	if strings.TrimSpace(*provider) == "" {
-		*provider = cfg.Provider
-	}
-	if strings.TrimSpace(*provider) == "" {
-		*provider = "auto"
-	}
-	if strings.TrimSpace(*model) == "" {
-		*model = cfg.Model
-	}
-	if strings.TrimSpace(*model) == "" && strings.EqualFold(*provider, "deepseek") {
-		*model = "deepseek-flash"
-	}
 
-	complete, providerName, err := distill.PromptCompleter(distill.Options{
-		Provider: *provider, Model: *model, Timeout: *timeout,
-		APIKey: cfg.APIKey, BaseURL: cfg.BaseURL,
-	})
+	opt := distill.ResolveOptions(cfg, *provider, *model)
+	opt.Timeout = *timeout
+	complete, providerName, err := distill.PromptCompleter(opt)
 	if err != nil {
 		// 明确告诉用户「模型没起来」而不是「判定为 0 条」——后者会被当成「候选都干净」。
 		return fmt.Errorf("判定器不可用（%w）。在 ~/.v2mem/model.json 配 provider/model/api_key，或用 --provider deepseek 加 DEEPSEEK_API_KEY；候选正文会发往该端点", err)
@@ -135,9 +123,11 @@ func cmdJudge(args []string) error {
 		return fmt.Errorf("模型输出无法解析: %w（原文前 200 字节：%s）", err, truncateRunes(raw, 200))
 	}
 
+	// 拼接逻辑不变，只是改用 ResolveOptions 解析出的实际模型：cli 模式下 Model 为空，
+	// providerName 已带 <cli>@<ver>+tpl<ver>，tag 自然落在 §5.1 的分段上。
 	modelTag := providerName + "@" + judgePromptVersion
-	if *model != "" {
-		modelTag = providerName + ":" + *model + "@" + judgePromptVersion
+	if opt.Model != "" {
+		modelTag = providerName + ":" + opt.Model + "@" + judgePromptVersion
 	}
 
 	res, err := applyJudgments(st, list, verdicts, modelTag, *apply)

@@ -141,7 +141,7 @@ type ModelSpec struct {
 	Name    string
 	BaseURL string
 	APIKey  string
-	Kind    string // ollama | openai
+	Kind    string // ollama | openai | cli
 }
 
 var kindRes = []struct {
@@ -243,6 +243,15 @@ func attributeFacts(facts []Fact, obs []Observation) []Fact {
 }
 
 func resolve(opt Options) (string, ModelSpec, error) {
+	// CLI 必须先于 provider 解析：mode=cli 时 Provider 是空的，落到 auto
+	// 会去探测 ollama/env，既不必要，也会把 CLI 配置静默降级成别的来源。
+	if strings.TrimSpace(opt.CLI) != "" {
+		name := "cli:" + strings.TrimSpace(opt.ModelTag)
+		if strings.TrimSpace(opt.ModelTag) == "" {
+			name = "cli:" + strings.TrimSpace(opt.CLI)
+		}
+		return name, ModelSpec{Name: opt.CLI, Kind: "cli"}, nil
+	}
 	p := strings.ToLower(strings.TrimSpace(opt.Provider))
 	if p == "" {
 		p = "auto"

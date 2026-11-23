@@ -63,6 +63,16 @@ func TestPromptCompleterWiresModel(t *testing.T) {
 	}
 }
 
+func TestPromptCompleterCLI(t *testing.T) {
+	fn, name, err := PromptCompleter(Options{CLI: "claude", ModelTag: "claude@1+tpl1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "cli:claude@1+tpl1" || fn == nil {
+		t.Fatalf("name=%q fn=%v", name, fn != nil)
+	}
+}
+
 func TestPromptCompleterLocalOllama(t *testing.T) {
 	fn, name, err := PromptCompleter(Options{
 		Provider: "ollama", Model: "qwen",
