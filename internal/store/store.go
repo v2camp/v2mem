@@ -1218,6 +1218,7 @@ type Stats struct {
 	ByKind      map[string]int `json:"by_kind"`
 	ByProject   map[string]int `json:"by_project"`
 	ExpiredLive int            `json:"expired_pending_gc"`
+	ByTable     map[string]int `json:"by_table"`
 }
 
 // ClaimHookEvent 原子地声明「本次钩子事件归我处理」。
@@ -1409,14 +1410,37 @@ func (s *Store) List(q ListQuery) ([]Hit, error) {
 	return out, rows.Err()
 }
 
+// statsOperationalTables 是不计入「数据条数」的表：它们是索引、去重痕迹、
+// 版本戳等运维副产物，随主表行数变化，计进去会把 Total 放大成重复计数。
+// 用白名单而非黑名单枚举数据表，避免以后加影子表时又被算进来。
+var statsDataTables = []string{
+	"memories", "observations", "candidates", "distill_runs",
+	"read_traces", "read_trace_items", "tags", "edges", "mem_sigs",
+	"evidence_sources", "evidence_archives", "evidence_bundles", "evidence_bundle_items",
+	"candidate_evidence", "commit_decisions", "memory_evidence",
+}
+
 func (s *Store) Stats() (*Stats, error) {
-	st := &Stats{Path: s.path, ByKind: map[string]int{}, ByProject: map[string]int{}}
+	st := &Stats{
+		Path: s.path, ByKind: map[string]int{}, ByProject: map[string]int{},
+		ByTable: map[string]int{},
+	}
 
 	if fi, err := os.Stat(s.path); err == nil {
 		st.SizeBytes = fi.Size()
 	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&st.Total); err != nil {
-		return nil, err
+	// Total 是全库口径：各数据表行数之和。旧版只数 memories，导致有观测/候选
+	// 却显示「总条数 0」，与 8MB 的库体积自相矛盾。memories 的检索可见性
+	// （Live/Superseded/ByKind/ByProject/ExpiredLive）保留独立字段，供检索侧使用。
+	for _, table := range statsDataTables {
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+			return nil, err
+		}
+		if n > 0 {
+			st.ByTable[table] = n
+			st.Total += n
+		}
 	}
 	// Live 与 Superseded 是检索可见性的口径：只有 superseded_by IS NULL
 	// 且未过期的条目会出现在 search 结果里。

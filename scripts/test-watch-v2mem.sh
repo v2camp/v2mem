@@ -73,11 +73,12 @@ STUB
 SETTINGS
 
   {
-    printf '{"ts":%s,"event":"session-start","ms":10,"empty":false}\n' "$NOW"
+    # 读侧恒带 search_ms：R3 判这一段，不带就是旧格式记录（按无样本 INFO）。
+    printf '{"ts":%s,"event":"session-start","ms":10,"empty":false,"search_ms":3,"open_ms":5}\n' "$NOW"
     if [ -n "$prompts" ]; then
       printf '%s' "$prompts"
     else
-      printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false}\n' "$NOW"
+      printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false,"search_ms":4,"open_ms":5}\n' "$NOW"
     fi
     if [ "$stop_ms" != "none" ]; then
       printf '{"ts":%s,"event":"stop","ms":%s}\n' "$NOW" "$stop_ms"
@@ -538,47 +539,12 @@ assert_r14 r14_pass_under    "$R14_DIR"   PASS '未超 512MiB'
 ev_write b 200
 assert_r14 r14_warn_over     "$R14_DIR"   WARN '超过 512MiB'
 
-# R3 越线文案：判级只依赖读侧 ms 均值，但 detail 会直接引导排查方向，写错的结论比不写更贵。
-# 2026-11-22 更正：旧文案称「同一 2266 字符 prompt 的逐次耗时 40→205ms 单调上行，属真回归」，
-# 而 read_traces.elapsed_ms（进程内检索）同 11 次为 18→55ms、端到端 ms 在 11-21/11-22 已回落到
-# 54/54、191/49ms —— 非单调，且证明越线在进程启动与审计写入这一段。故用负向断言把错误结论钉死：
-# WARN detail 必须给出「进程内」这个可比口径，且不得再出现「单调上行」。
-# assert_r3 <名称> <prompt_ms> <want_level> <必须含> <必须不含>
-assert_r3() {
-  local name="$1" pms="$2" want="$3" needle="$4" banned="$5"
-  local out got detail
-  out="$(run_case "$name" none 0 no "$EMPTY" '' '' '' \
-    "$(printf '{"ts":%s,"event":"prompt-submit","ms":%s,"empty":false}\n' "$NOW" "$pms")")"
-  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R3") | .level')"
-  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R3") | .detail')"
-  if [ "$got" != "$want" ]; then
-    echo "FAIL ${name}: R3 want=${want} got=${got}" >&2
-    printf '%s\n' "$out" >&2
-    exit 1
-  fi
-  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
-    echo "FAIL ${name}: R3 detail 缺 '${needle}'，got: ${detail}" >&2
-    exit 1
-  fi
-  if [ -n "$banned" ] && [[ "$detail" == *"$banned"* ]]; then
-    echo "FAIL ${name}: R3 detail 仍含过期结论 '${banned}'，got: ${detail}" >&2
-    exit 1
-  fi
-  N=$((N+1))
-  printf 'ok  %-26s R3=%-4s\n' "$name" "$want"
-}
-
-# 单条 200ms → 均值 105ms → WARN；detail 必须指向进程内口径且不含「单调上行」。
-assert_r3 r3_warn_no_monotonic  200 WARN '进程内' '单调上行'
-# 12ms → PASS：低于目标线时不该带这套排查长文（本用例守住分支边界，防文案串档）。
-assert_r3 r3_pass_short          12 PASS '' '进程内'
-
 # R3 分段分支：默认夹具没有分段字段，走不到 R3 的展开分支。macOS bash 3.2 在
 # set -u 下会把 "$R3_NOTE；" 的全角分号首字节并进变量名，脚本在吐出 JSON 前就终止。
 # 这里用带 claim_ms 的窗口强制走该分支，断言 R3 完整产出且带分段文案。
 R3_SEG_DIR="$TMP/r3_seg"
 build_fixture "$R3_SEG_DIR" none 0 no "" \
-  "$(printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false,"claim_ms":3}\n' "$NOW")"
+  "$(printf '{"ts":%s,"event":"prompt-submit","ms":12,"empty":false,"search_ms":4,"claim_ms":3}\n' "$NOW")"
 r3_out="$(run_watch "$R3_SEG_DIR")"
 r3_detail="$(printf '%s' "$r3_out" | jq -r '.items[] | select(.id=="R3") | .detail' 2>/dev/null || true)"
 if [[ "$r3_detail" != *"分段均值"* ]]; then
@@ -588,5 +554,34 @@ if [[ "$r3_detail" != *"分段均值"* ]]; then
 fi
 N=$((N+1))
 printf 'ok  %-26s R3=分段文案完整\n' "r3_seg_note"
+
+# R3 判级字段是 search_ms，不是总 ms：总耗时 900ms 而 search_ms 5 必须 PASS
+# （旧口径会判 FAIL，正是本机误报的形态）。旧记录没有 search_ms → INFO，不当 0 判 PASS。
+# 文案侧同样要钉住过期结论（2026-11-22 更正）：旧说「同一 2266 字符 prompt 逐次耗时 40→205ms
+# 单调上行、属真回归」，而进程内检索同 11 次为 18→55ms、端到端 ms 在 11-21/11-22 回落
+# 54/54、191/49ms——非单调，漂移在进程启动与审计写入。故 detail 不得再出现「单调上行」。
+# assert_r3 <名称> <审计体> <want_level> [必须不含]
+assert_r3() {
+  local name="$1" lines="$2" want="$3" banned="${4:-}" d out got detail
+  d="$TMP/$name"
+  build_fixture "$d" none 0 no "" "$lines"
+  out="$(run_watch "$d")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R3") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R3") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL ${name}: R3 want=$want got=$got" >&2
+    exit 1
+  fi
+  if [ -n "$banned" ] && [[ "$detail" == *"$banned"* ]]; then
+    echo "FAIL ${name}: R3 detail 仍含过期结论 '${banned}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R3=%-4s\n' "$name" "$want"
+}
+assert_r3 r3_search_pass "$(printf '{"ts":%s,"event":"prompt-submit","ms":900,"empty":false,"search_ms":5,"open_ms":40,"evidence_ms":800}\n' "$NOW")" PASS '单调上行'
+assert_r3 r3_search_warn "$(printf '{"ts":%s,"event":"prompt-submit","ms":120,"empty":false,"search_ms":60}\n' "$NOW")" WARN '单调上行'
+assert_r3 r3_search_fail "$(printf '{"ts":%s,"event":"prompt-submit","ms":300,"empty":false,"search_ms":250}\n' "$NOW")" FAIL
+assert_r3 r3_no_seg_info "$(printf '{"ts":%s,"event":"prompt-submit","ms":300,"empty":false}\n' "$NOW")" INFO
 
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"

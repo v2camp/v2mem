@@ -1,6 +1,6 @@
 # 整体安装与接入（v2mem）
 
-本文是 v2mem **唯一的安装/接入文档**：装二进制 → 接 hooks → 注册 MCP → 安装后校验 → 回滚。
+本文是 v2mem **唯一的安装/接入文档**：装二进制 → 接 hooks → 注册 MCP → 安装后校验 →（可选）配模型来源 → 回滚。
 它不自动写宿主配置；写动作由 `install.sh`、`mem init`、宿主面板或手工 MCP 配置完成。
 
 - 装好之后的稳态判据（I/R 组）：见 [`ops-watch.md`](./ops-watch.md)。
@@ -16,6 +16,8 @@
 > 3. **引导而非静默**：安装后必须给出「到哪个面板做什么」的可操作清单，不假设外部生效。
 > 4. **只读护栏**：hooks / MCP 的读侧被触发时，绝不往 memories 写内容。
 > 5. **可回退**：每次写入前备份；卸载只摘本工具的 `# v2mem` 条目，不碰用户自有配置。
+> 6. **零填写但需告知**：模型来源可以零填写（探测本机已登录的 CLI），但发出去的是什么必须写清楚；
+>    不配也能装完用起来，只是判定器与 LLM 蒸馏不可用。
 
 v2mem 有两条互补通道，不能互相替代：
 
@@ -155,6 +157,31 @@ bash scripts/verify-install.sh --harness <宿主> --runtime --window 12h   # 追
 
 完成判据：无 `FAIL`。`WARN` 按条目处理：MCP 未批准去开面板，多份 mem 收敛来源，
 事件数不足重跑 `mem init`。`INFO` 只表示当前不构成判据。
+
+### S6 可选：配置模型来源（判定器 / 蒸馏）
+
+不配也能用 hooks 与 MCP；只是 `mem judge` 会报「判定器不可用」、`mem distill` 不能走 LLM。
+
+```bash
+mem setup              # 探测本机 CLI，dry-run 通过才写 ~/.v2mem/model.json（0600，带备份）
+mem setup --status     # 查看当前来源（不联网、不调用 CLI）
+mem setup --undo       # 回退到上一次写盘前
+```
+
+`mem setup` 按白名单（`claude` → `codex` → `cursor-agent` → `gemini` → `copilot` → `qoder` → `codebuddy` → `traecli`）逐个验证 judge 与 distill 两条真实路径，首个通过者胜出；
+验证时各跑一次真实调用，可能消耗额度与时间。全都不可用时退出 0、不写盘，安装流程不因此中断。
+想显式指定分支：`--mode api`（把 API 来源写入 `model.json`，密钥取 setup 时环境里的
+`DEEPSEEK_API_KEY` / `OPENAI_API_KEY`，需先 export）、`--mode cli`（必须探测成功，否则报错）、
+`--mode off`；`--dry-run` 只验证不写盘。
+
+完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）；真正的 `mem judge` 不再报「判定器不可用」。
+
+**已知不兼容**：`freebuff` 免费，但官方声明是 TUI-only、没有 headless / `-p` 输出模式，
+不能当非交互后端，因此不在上面的白名单里。本机装了它时 `mem setup` 会点名说明，而不是静默忽略；
+想要零成本可改用本地 `ollama`（`mem judge --provider ollama --model <tag>`）。
+
+**数据边界**：judge 的候选正文与蒸馏的观测摘要会发往该 CLI 所连的模型端点；本机不另存副本。
+不配置只会让 judge / LLM 蒸馏不可用，不影响 hooks、MCP、检索与人工写入。
 
 ## 4. 校验判据 A–D
 
@@ -315,5 +342,3 @@ Trae 自己写入 `~/Library/Application Support/Trae CN/User/mcp.json`；启用
 | 蒸馏 | `distill` 不在 MCP；走 CLI `mem distill --provider none --session <id>`，候选必须显式 `accept` / `reject` |
 
 P/D/X/T 类码见 [`VALUE.md`](./VALUE.md) §1.2；显式裁决见 [`design-write-governance.md`](./design-write-governance.md) §12。
-
-> `mem setup` 尚未实现，不要执行；实际按本文 S0–S5 走。

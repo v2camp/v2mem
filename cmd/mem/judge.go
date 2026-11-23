@@ -96,32 +96,25 @@ func cmdJudge(args []string) error {
 		return nil
 	}
 
-	// 优先级：flag > model.json > 环境变量 > none。配置文件在中间，
-	// 因为定时任务不继承交互 shell 的环境，而 flag 只适合临时试一次。
+	// 优先级：flag > model.json > 环境变量 > auto|none，统一由 ResolveOptions 实现。
+	// 这里不再手工补 cfg.Provider / cfg.Model / deepseek-flash：手工补出来的值
+	// 会变成「已显式指定」的 flag，把 model.json 的 mode=cli 永久压掉。
 	cfg, err := distill.LoadModelConfig(*cfgPath)
 	if err != nil {
-		return fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
-	}
-	if strings.TrimSpace(*provider) == "" {
-		*provider = cfg.Provider
-	}
-	if strings.TrimSpace(*provider) == "" {
-		*provider = "auto"
-	}
-	if strings.TrimSpace(*model) == "" {
-		*model = cfg.Model
-	}
-	if strings.TrimSpace(*model) == "" && strings.EqualFold(*provider, "deepseek") {
-		*model = "deepseek-flash"
+		// 报用户实际用的那个路径：--config 给过却报默认路径，会让人去改错文件。
+		path := *cfgPath
+		if strings.TrimSpace(path) == "" {
+			path = distill.DefaultModelConfigPath()
+		}
+		return fmt.Errorf("读取模型配置失败（%s）: %w", path, err)
 	}
 
-	complete, providerName, err := distill.PromptCompleter(distill.Options{
-		Provider: *provider, Model: *model, Timeout: *timeout,
-		APIKey: cfg.APIKey, BaseURL: cfg.BaseURL,
-	})
+	opt := distill.ResolveOptions(cfg, *provider, *model)
+	opt.Timeout = *timeout
+	complete, providerName, err := distill.PromptCompleter(opt)
 	if err != nil {
 		// 明确告诉用户「模型没起来」而不是「判定为 0 条」——后者会被当成「候选都干净」。
-		return fmt.Errorf("判定器不可用（%w）。在 ~/.v2mem/model.json 配 provider/model/api_key，或用 --provider deepseek 加 DEEPSEEK_API_KEY；候选正文会发往该端点", err)
+		return fmt.Errorf("判定器不可用（%w）。运行 mem setup（或 mem setup --status 查看当前来源）配置 provider/model/api_key，也可用 --provider deepseek 加 DEEPSEEK_API_KEY；候选正文会发往该端点", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -135,10 +128,8 @@ func cmdJudge(args []string) error {
 		return fmt.Errorf("模型输出无法解析: %w（原文前 200 字节：%s）", err, truncateRunes(raw, 200))
 	}
 
-	modelTag := providerName + "@" + judgePromptVersion
-	if *model != "" {
-		modelTag = providerName + ":" + *model + "@" + judgePromptVersion
-	}
+	// 归因要能按模型分组：flag > 解析出的实际模型 > 只记 provider（cli 的版本分量在 providerName 里）。
+	modelTag := judgeModelTag(providerName, *model, opt.Model)
 
 	res, err := applyJudgments(st, list, verdicts, modelTag, *apply)
 	if err != nil {
@@ -171,6 +162,29 @@ func cmdJudge(args []string) error {
 		fmt.Printf("  已改状态 %d 条（accept 走 CommitAccept，reject 走 CommitReject）\n", res.Applied)
 	}
 	return nil
+}
+
+// judgeModelTag 拼 judge_model：<provider>[:<model>]@<prompt 版本>。
+//
+// 为什么要分 flagModel 与 resolvedModel：flag 显式给了 --model 时它是权威；
+// 否则要写 ResolveOptions 解析出的实际模型（model.json 的 model，或 resolve() 给
+// deepseek 补的默认名）——只认 flag 会让 model.json 配的模型从归因里消失，
+// 历史判定无法按模型分组。
+//
+// cli 的 providerName 形如 cli:<model_tag>：model_tag 里已经含模型（或模板）分量，
+// 再拼 :<model> 会得到 cli:m1:m1@judge-v2，所以以 cli: 开头时直接返回。
+func judgeModelTag(providerName, flagModel, resolvedModel string) string {
+	if strings.HasPrefix(providerName, "cli:") {
+		return providerName + "@" + judgePromptVersion
+	}
+	m := flagModel
+	if m == "" {
+		m = resolvedModel
+	}
+	if m == "" {
+		return providerName + "@" + judgePromptVersion
+	}
+	return providerName + ":" + m + "@" + judgePromptVersion
 }
 
 // judgeResult 是落库循环的计数。抽出来是为了让「影子不改状态」这件事可测 ——

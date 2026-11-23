@@ -224,6 +224,27 @@ func TestPrintJudgeStatsText(t *testing.T) {
 	}
 }
 
+// judge_model 的分段决定历史判定能不能按模型分组：flag 显式给了就写 flag，
+// 否则写 ResolveOptions 解析出的实际模型（model.json 或 deepseek 默认）。
+// cli 的版本分量已经在 provider 里，Model 为空，不能再拼一段。
+func TestJudgeModelTag(t *testing.T) {
+	cases := []struct {
+		provider, flagModel, resolved, want string
+	}{
+		{"cli:claude@1+tpl1", "", "", "cli:claude@1+tpl1@judge-v2"},
+		{"cli:m1@1+tpl1", "m1", "", "cli:m1@1+tpl1@judge-v2"}, // 模型已在 cli: 前缀里，不能再拼一次
+		{"deepseek", "", "deepseek-flash", "deepseek:deepseek-flash@judge-v2"},
+		{"deepseek", "m1", "", "deepseek:m1@judge-v2"},
+		{"ollama", "", "", "ollama@judge-v2"}, // ollama 的默认模型是运行期兜底，不写进归因
+	}
+	for _, tc := range cases {
+		if got := judgeModelTag(tc.provider, tc.flagModel, tc.resolved); got != tc.want {
+			t.Errorf("judgeModelTag(%q,%q,%q)=%q，要 %q",
+				tc.provider, tc.flagModel, tc.resolved, got, tc.want)
+		}
+	}
+}
+
 // ---------- CLI 入口的三个早退分支 ----------
 //
 // 这三种「什么都没判」必须各自说话：没有候选 ≠ 模型不可用 ≠ 判定失败。
@@ -268,7 +289,8 @@ func TestCmdJudgeStatsJSONNeedsNoModel(t *testing.T) {
 	}
 }
 
-// 有候选但模型起不来：必须报「判定器不可用」，且提示出路（配 model.json / 加 API key）。
+// 有候选但模型起不来：必须报「判定器不可用」，且提示出路（mem setup / 加 API key）。
+// 出路文案随模型来源配置改版：旧版指向手写 model.json，现由 mem setup 统一落配置。
 func TestCmdJudgeUnavailableModelIsExplicit(t *testing.T) {
 	db := testDB(t)
 	st, err := store.Open(db)
@@ -284,7 +306,7 @@ func TestCmdJudgeUnavailableModelIsExplicit(t *testing.T) {
 	if err == nil {
 		t.Fatal("模型不可用时应返回错误，而不是静默判 0 条")
 	}
-	for _, want := range []string{"判定器不可用", "model.json"} {
+	for _, want := range []string{"判定器不可用", "mem setup"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("错误信息应含 %q，got %v", want, err)
 		}

@@ -1,0 +1,212 @@
+package distill
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestProbeOrderAndTemplate(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"codex", "claude"} {
+		p := filepath.Join(dir, n)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\necho "+n+"-v1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	if name, ok := Probe(); !ok || name != "claude" {
+		t.Fatalf("应按白名单顺序取 claude，got %q ok=%v", name, ok)
+	}
+	tag := VersionTag("claude")
+	if !strings.Contains(tag, "claude@claude-v1+tpl") {
+		t.Errorf("VersionTag 不对: %q", tag)
+	}
+}
+
+func TestProbeAllOrder(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"codex", "claude"} {
+		p := filepath.Join(dir, n)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\necho "+n+"-v1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	got := ProbeAll()
+	want := []string{"claude", "codex"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("ProbeAll 应按白名单顺序返回全部可用 CLI，want %v got %v", want, got)
+	}
+	// Probe 必须仍是 ProbeAll 的首个元素，老调用方语义不变。
+	if name, ok := Probe(); !ok || name != got[0] {
+		t.Fatalf("Probe 应返回 ProbeAll 首项，got %q ok=%v", name, ok)
+	}
+}
+
+func TestRunCLIStdinStdoutAndError(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "claude")
+	body := "#!/bin/sh\n/bin/cat\nexit 0\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := runCLI(context.Background(), "claude", "hello")
+	if err != nil || out != "hello" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho boom >&2\nexit 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runCLI(context.Background(), "claude", "x"); err == nil || !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("非零退出应归 ErrLLMUnavailable，got %v", err)
+	}
+}
+
+func TestResolveCLIWins(t *testing.T) {
+	name, spec, err := resolve(Options{CLI: "claude", ModelTag: "claude@1+tpl1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "cli:claude@1+tpl1" || spec.Kind != "cli" || spec.Name != "claude" {
+		t.Fatalf("got %q %+v", name, spec)
+	}
+}
+
+func TestCompleteLLMCLI(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\n/bin/cat\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := completeLLM(context.Background(), ModelSpec{Kind: "cli", Name: "claude"}, "[]")
+	if err != nil || out != "[]" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+func TestRunCLITimeout(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\n/bin/sleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := runCLI(ctx, "claude", "x"); err == nil {
+		t.Fatal("超时应报错")
+	}
+}
+
+func TestCLIWhitelistOrder(t *testing.T) {
+	want := []string{"claude", "codex", "cursor-agent", "gemini", "copilot", "qoder", "codebuddy", "traecli"}
+	got := CLIWhitelist()
+	if len(got) != len(want) {
+		t.Fatalf("whitelist=%v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("whitelist[%d]=%q，want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRunCLIArgMode(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '%s' \"$last\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "cursor-agent"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := runCLI(context.Background(), "cursor-agent", "hello")
+	if err != nil || out != "hello" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+func TestRunCLIArgPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codebuddy"), []byte("#!/bin/sh\nprintf '%s' \"$3\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := runCLI(context.Background(), "codebuddy", "hello")
+	if err != nil || out != "hello" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+// claude --version 可能打印 "2.1.34 (Claude Code)"：整行进标签会带空格与括号，
+// judge_model 按版本分组的键就不稳定，只取第一个 token。
+func TestVersionTagFirstToken(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\necho \"2.1.34 (Claude Code)\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if got := VersionTag("claude"); got != "claude@2.1.34+tpl1" {
+		t.Errorf("VersionTag 应只取版本首 token，got %q", got)
+	}
+}
+
+// freebuff 官方声明是 TUI-only、没有 headless 模式，因此不能当非交互后端。
+// 它必须只出现在「已识别但不支持」里，绝不能混进白名单被 ProbeAll 选中。
+func TestDetectNoHeadlessOnlyDiagnoses(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "freebuff"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	got := DetectNoHeadless()
+	if len(got) != 1 || got[0].Name != "freebuff" {
+		t.Fatalf("DetectNoHeadless = %+v，期望只命中 freebuff", got)
+	}
+	if got[0].Why == "" {
+		t.Error("Why 不能为空：文案要能解释为什么不能用")
+	}
+	for _, n := range CLIWhitelist() {
+		if n == "freebuff" {
+			t.Fatal("freebuff 不得进入 cliTemplates/白名单")
+		}
+	}
+	if _, ok := Probe(); ok {
+		t.Fatal("freebuff 不应被 Probe 选中")
+	}
+	if all := ProbeAll(); len(all) != 0 {
+		t.Errorf("ProbeAll 应为空，got %v", all)
+	}
+}
+
+// codebuddy 的 system prompt 曾写死 "Only output the JSON array"，与蒸馏的 JSONL
+// 要求冲突（judge 要数组、distill 要一行一个 JSON）。改 argv 必须同时升 Ver，
+// 让历史 judge_model 自动分段。
+func TestCodebuddySystemPromptAllowsJSONL(t *testing.T) {
+	var tpl *cliTemplate
+	for i := range cliTemplates {
+		if cliTemplates[i].Name == "codebuddy" {
+			tpl = &cliTemplates[i]
+			break
+		}
+	}
+	if tpl == nil {
+		t.Fatal("找不到 codebuddy 模板")
+	}
+	sp := ""
+	for i, a := range tpl.Args {
+		if a == "--append-system-prompt" && i+1 < len(tpl.Args) {
+			sp = tpl.Args[i+1]
+		}
+	}
+	if !strings.Contains(sp, "per line") || !strings.Contains(sp, "array") {
+		t.Errorf("system prompt 应同时允许 JSONL 与数组，got %q", sp)
+	}
+	if tpl.Ver != "2" {
+		t.Errorf("改了 argv 必须升 Ver 以隔离 judge_model，got %q", tpl.Ver)
+	}
+}

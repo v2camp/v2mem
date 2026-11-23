@@ -51,6 +51,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
   mem harness [--json]              列出各工具的接入方式与检测结果
+  mem setup  [选项]                配置判定器与蒸馏的模型来源：探测本机 CLI 并写入 ~/.v2mem/model.json（--status 看现状，--undo 回退）
   mem init   --harness <名字>       把钩子写入该工具的配置（幂等、合并、带备份）
   mem uninstall --harness <名字>    反向操作：移除该工具里的 v2mem 钩子（--all 全部）
   mem ingest <文件.md>              把既有 md 文件里的条目机械化搬进记忆库
@@ -132,7 +133,7 @@ var knownSubcommands = []string{
 	"add", "search", "asset", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
 	"gc", "consolidate", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
-	"distill", "accept", "reject", "candidates", "judge",
+	"distill", "accept", "reject", "candidates", "judge", "setup",
 }
 
 func main() {
@@ -191,6 +192,8 @@ func main() {
 		err = cmdHook(os.Args[2:])
 	case "harness":
 		err = cmdHarness(os.Args[2:])
+	case "setup":
+		err = cmdSetup(os.Args[2:])
 	case "init":
 		err = cmdInit(os.Args[2:])
 	case "uninstall":
@@ -1040,8 +1043,20 @@ func cmdStats(args []string) error {
 
 	fmt.Printf("库路径   %s\n", s.Path)
 	fmt.Printf("大小     %.1f KB\n", float64(s.SizeBytes)/1024)
-	fmt.Printf("总条数   %d\n", s.Total)
-	fmt.Printf("检索可见 %d（未被取代；已过期的另计）\n", s.Live)
+	fmt.Printf("总条数   %d（全库各数据表之和）\n", s.Total)
+	if len(s.ByTable) > 0 {
+		keys := make([]string, 0, len(s.ByTable))
+		for k := range s.ByTable {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%d", k, s.ByTable[k]))
+		}
+		fmt.Printf("按表     %s\n", strings.Join(parts, " "))
+	}
+	fmt.Printf("检索可见 %d（记忆层；未被取代；已过期的另计）\n", s.Live)
 	if s.Superseded > 0 {
 		fmt.Printf("已归并   %d（被相似归并取代，保留可追溯）\n", s.Superseded)
 	}

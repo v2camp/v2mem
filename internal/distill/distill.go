@@ -30,6 +30,10 @@ const (
 	DefaultModel   = "qwen2.5:7b"
 	DefaultTimeout = 45 * time.Second
 
+	// DefaultDeepSeekModel 是 deepseek provider 没显式配模型时的默认名。
+	// 它必须与 DefaultModel 分开：qwen2.5:7b 是 ollama 的模型，发给 DeepSeek 端点会 404。
+	DefaultDeepSeekModel = "deepseek-flash"
+
 	// RulesMaxFacts 是单次规则蒸馏产出的候选上限。
 	// 上限不是质量阀，是**供需阀**：一次会话实测能产 6–7 条，而人工裁决
 	// 速率是每窗口 0–2 条，不限流时候选积压只增不减（docs/ops-watch.md §3 R8）。
@@ -108,7 +112,13 @@ type Outcome struct {
 	Error    string
 	Err      error
 	Facts    []Fact
+	// Raw 是模型原始响应的截断片段（<=rawSnippetRunes），只在解析失败时有值。
+	// 没有它，调用方只能看到「响应不可解析」，分不清未登录、限流还是模型说散文。
+	Raw string
 }
+
+// rawSnippetRunes 是诊断片段的长度上限：够看出错误形态，又不把整段噪声灌进终端。
+const rawSnippetRunes = 300
 
 // Failed 报告这次蒸馏是否真的失败。empty 是成功的一种，不算失败。
 func (o Outcome) Failed() bool { return o.Status == StatusFail }
@@ -131,6 +141,10 @@ type Options struct {
 	// 而这正是「换个模型要改一堆环境」的来源。
 	APIKey  string
 	BaseURL string
+	// CLI / ModelTag 是 mode=cli 时的来源：CLI 是内置白名单里的名字（不是命令串），
+	// ModelTag 形如 cli@<ver>+tpl<ver>，供 judge_model 按版本归因。由 ResolveOptions 填。
+	CLI      string
+	ModelTag string
 }
 
 // ModelSpec 是一次本地或兼容 OpenAI 的调用参数。
@@ -138,7 +152,7 @@ type ModelSpec struct {
 	Name    string
 	BaseURL string
 	APIKey  string
-	Kind    string // ollama | openai
+	Kind    string // ollama | openai | cli
 }
 
 var kindRes = []struct {
@@ -299,9 +313,6 @@ func Run(obs []Observation, opt Options) Outcome {
 	if opt.Timeout <= 0 {
 		opt.Timeout = DefaultTimeout
 	}
-	if opt.Model == "" {
-		opt.Model = DefaultModel
-	}
 	name, spec, err := resolve(opt)
 	if err != nil {
 		// 解析不出 provider = 模型不可用。这不是「抽到 0 条」。
@@ -326,12 +337,15 @@ func Run(obs []Observation, opt Options) Outcome {
 		// 超时、连不上、HTTP 非 2xx：一律归为「模型不可用」，与「响应坏」分开。
 		return failOutcome(name, fmt.Errorf("%w: %w", ErrLLMUnavailable, err))
 	}
+	rawSnippet := truncate(raw, rawSnippetRunes)
 	facts, err := ParseFacts(raw)
 	if err != nil {
 		if errors.Is(err, ErrNoFacts) {
-			return Outcome{Provider: name, Status: StatusEmpty}
+			return Outcome{Provider: name, Status: StatusEmpty, Raw: rawSnippet}
 		}
-		return failOutcome(name, err)
+		out := failOutcome(name, err)
+		out.Raw = rawSnippet
+		return out
 	}
 	return Outcome{Provider: name, Status: StatusOK, Facts: attributeFacts(facts, obs)}
 }
@@ -369,9 +383,24 @@ func attributeFacts(facts []Fact, obs []Observation) []Fact {
 }
 
 func resolve(opt Options) (string, ModelSpec, error) {
+	// CLI 必须先于 provider 解析：mode=cli 时 Provider 是空的，落到 auto
+	// 会去探测 ollama/env，既不必要，也会把 CLI 配置静默降级成别的来源。
+	if strings.TrimSpace(opt.CLI) != "" {
+		name := "cli:" + strings.TrimSpace(opt.ModelTag)
+		if strings.TrimSpace(opt.ModelTag) == "" {
+			name = "cli:" + strings.TrimSpace(opt.CLI)
+		}
+		return name, ModelSpec{Name: opt.CLI, Kind: "cli"}, nil
+	}
 	p := strings.ToLower(strings.TrimSpace(opt.Provider))
 	if p == "" {
 		p = "auto"
+	}
+	// 默认模型在 resolve 里按 provider 补，调用方不要预填：预填会让 deepseek 拿到
+	// ollama 的 qwen2.5:7b，也让 judge 的归因标签拿不到实际生效的模型名。
+	model := opt.Model
+	if strings.TrimSpace(model) == "" {
+		model = DefaultModel
 	}
 	switch p {
 	case "none":
@@ -380,7 +409,7 @@ func resolve(opt Options) (string, ModelSpec, error) {
 		if _, err := opt.LookPath("ollama"); err != nil {
 			return "ollama", ModelSpec{}, fmt.Errorf("找不到 ollama: %w", err)
 		}
-		return "ollama", ModelSpec{Name: opt.Model, Kind: "ollama"}, nil
+		return "ollama", ModelSpec{Name: model, Kind: "ollama"}, nil
 	case "openai":
 		key := strings.TrimSpace(opt.APIKey)
 		if key == "" {
@@ -396,7 +425,7 @@ func resolve(opt Options) (string, ModelSpec, error) {
 		if base == "" {
 			base = "https://api.openai.com/v1"
 		}
-		return "openai", ModelSpec{Name: opt.Model, BaseURL: base, APIKey: key, Kind: "openai"}, nil
+		return "openai", ModelSpec{Name: model, BaseURL: base, APIKey: key, Kind: "openai"}, nil
 	case "deepseek":
 		// DeepSeek 是 OpenAI 兼容协议：同一套 chat/completions，只换 base 与 model 名。
 		key := strings.TrimSpace(opt.APIKey)
@@ -415,19 +444,19 @@ func resolve(opt Options) (string, ModelSpec, error) {
 		}
 		name := opt.Model
 		if strings.TrimSpace(name) == "" {
-			name = "deepseek-flash"
+			name = DefaultDeepSeekModel
 		}
 		return "deepseek", ModelSpec{Name: name, BaseURL: base, APIKey: key, Kind: "openai"}, nil
 	case "auto":
 		if _, err := opt.LookPath("ollama"); err == nil && ollamaAlive(opt.Timeout) {
-			return "ollama", ModelSpec{Name: opt.Model, Kind: "ollama"}, nil
+			return "ollama", ModelSpec{Name: model, Kind: "ollama"}, nil
 		}
 		if key := strings.TrimSpace(opt.Getenv("OPENAI_API_KEY")); key != "" {
 			base := strings.TrimSpace(opt.Getenv("OPENAI_BASE_URL"))
 			if base == "" {
 				base = "https://api.openai.com/v1"
 			}
-			return "openai", ModelSpec{Name: opt.Model, BaseURL: base, APIKey: key, Kind: "openai"}, nil
+			return "openai", ModelSpec{Name: model, BaseURL: base, APIKey: key, Kind: "openai"}, nil
 		}
 		return "none", ModelSpec{}, nil
 	default:
