@@ -112,7 +112,13 @@ type Outcome struct {
 	Error    string
 	Err      error
 	Facts    []Fact
+	// Raw 是模型原始响应的截断片段（<=rawSnippetRunes），只在解析失败时有值。
+	// 没有它，调用方只能看到「响应不可解析」，分不清未登录、限流还是模型说散文。
+	Raw string
 }
+
+// rawSnippetRunes 是诊断片段的长度上限：够看出错误形态，又不把整段噪声灌进终端。
+const rawSnippetRunes = 300
 
 // Failed 报告这次蒸馏是否真的失败。empty 是成功的一种，不算失败。
 func (o Outcome) Failed() bool { return o.Status == StatusFail }
@@ -331,12 +337,15 @@ func Run(obs []Observation, opt Options) Outcome {
 		// 超时、连不上、HTTP 非 2xx：一律归为「模型不可用」，与「响应坏」分开。
 		return failOutcome(name, fmt.Errorf("%w: %w", ErrLLMUnavailable, err))
 	}
+	rawSnippet := truncate(raw, rawSnippetRunes)
 	facts, err := ParseFacts(raw)
 	if err != nil {
 		if errors.Is(err, ErrNoFacts) {
-			return Outcome{Provider: name, Status: StatusEmpty}
+			return Outcome{Provider: name, Status: StatusEmpty, Raw: rawSnippet}
 		}
-		return failOutcome(name, err)
+		out := failOutcome(name, err)
+		out.Raw = rawSnippet
+		return out
 	}
 	return Outcome{Provider: name, Status: StatusOK, Facts: attributeFacts(facts, obs)}
 }
