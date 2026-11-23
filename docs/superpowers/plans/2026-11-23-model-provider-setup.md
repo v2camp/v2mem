@@ -412,7 +412,7 @@ esac
 
 再补五个用例（同文件）：
 - `TestSetupNoticeMentionsScope`：`setupNotice("claude", "claude@1+tpl1")` 的返回串必须包含「会发往」与回退命令。
-- `TestSetupAllCandidatesFailLeavesNoConfig`：桩 `exit 1`，断言 `model.json` 不存在、err 为 nil。
+- `TestSetupAllCandidatesFailLeavesNoConfig`：桩 `exit 1`，断言 `model.json` 不存在、err 为 nil；同文件覆盖 `--dry-run` 不写盘、`--status` 不联网。
 - `TestSetupDoesNotOverwriteExisting`：先写 api 配置，跑 `cmdSetup(nil)`，断言内容不变。
 - `TestSetupUndoRestoresBackup`：先写旧配置，跑 `cmdSetup([]string{"--mode","off"})`，再 `cmdSetup([]string{"--undo"})`，断言恢复旧内容。
 - `TestSetupModeAPIUsesEnv`：`t.Setenv("DEEPSEEK_API_KEY","sk-test")`，`cmdSetup([]string{"--mode","api"})`，断言 `Provider=="deepseek"`、`APIKey=="sk-test"`、0600。
