@@ -140,10 +140,14 @@ func (s *Store) CommitCandidate(idOrPrefix string) (*CommitCandidate, error) {
 }
 
 // CommitDecisions 返回某候选的裁决历史（按时间正序），供审计与排障。
+//
+// 排序用 revision 做同一秒内的次序：created_at 只到秒，批量落库与回滚常常落在
+// 同一秒里，只按 created_at + 随机 id 排会让「最后一次裁决」变成随机结果。
+// revision 单调递增（每次裁决 +1），才是这里真正的时间轴。
 func (s *Store) CommitDecisions(candidateID string) ([]commit.Decision, error) {
 	rows, err := s.db.Query(`SELECT candidate_id, revision, evidence_hash, action, actor,
 			reason_codes_json, memory_id, idempotency_key, created_at
-		FROM commit_decisions WHERE candidate_id = ? ORDER BY created_at ASC, id ASC`, candidateID)
+		FROM commit_decisions WHERE candidate_id = ? ORDER BY created_at ASC, revision ASC, id ASC`, candidateID)
 	if err != nil {
 		return nil, err
 	}
@@ -717,6 +721,75 @@ func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, rea
 		out = &CommitResult{Action: commit.ActionReject, Actor: actor,
 			EvidenceHash: evidenceHash, EvidenceCount: len(rows),
 			ReasonCodes: reasons, Committed: true}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	updated, err := s.candidateByID(view.ID)
+	if err != nil {
+		return nil, err
+	}
+	out.Candidate = *updated
+	return out, nil
+}
+
+// RollbackCandidate 撤销一次已生效的裁决：把候选退回 pending（可重新裁决），
+// deleteMemory 为真时连同它落库时新建的记忆一起删除。
+//
+// 为什么需要它：批量准出（mem batch）把「人批准 AI 方案」变成了可批量执行的动作，
+// 批量越大，判错一笔的代价越大。plan 归档记下了 memory_id 与 created_memory，
+// 回滚就是照着归档原路退回——没有这一步，批量落库就是不可逆写库，违反 VALUE.md §4(c)。
+//
+// deleteMemory 必须由调用方按 created_memory 传，不能在这里自己猜：
+// 命中「相同知识覆盖」的重放（Already）指向的可能是别人的记忆，删了就是误伤。
+func (s *Store) RollbackCandidate(idOrPrefix, actor string, deleteMemory bool, expectedRevision int) (*CommitResult, error) {
+	view, err := s.CommitCandidate(idOrPrefix)
+	if err != nil {
+		return nil, err
+	}
+	if actor == "" {
+		actor = commit.ActorHumanReviewedLLM
+	}
+	var out *CommitResult
+	err = s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
+		cur, err := s.commitCandidateByID(ctx, q, view.ID)
+		if err != nil {
+			return err
+		}
+		if cur.Status != "accepted" && cur.Status != "rejected" {
+			return fmt.Errorf("%w: 候选 %s 状态为 %s，无法回滚", ErrCandidateClosed, cur.ID, cur.Status)
+		}
+		// 归档只在落库那一刻有效：之后又被裁决过（revision 变了）就不再撤，
+		// 否则回滚一份旧 plan 会把人后来的决定一起抹掉。
+		if expectedRevision >= 0 && cur.Revision != expectedRevision {
+			return fmt.Errorf("%w: 候选 %s 当前 revision=%d, 归档期望 %d",
+				ErrRevisionConflict, cur.ID, cur.Revision, expectedRevision)
+		}
+		if deleteMemory && cur.MemoryID != "" {
+			if _, err := q.ExecContext(ctx, `DELETE FROM memories WHERE id = ?`, cur.MemoryID); err != nil {
+				return err
+			}
+		}
+		res, err := q.ExecContext(ctx, `UPDATE candidates
+			SET status = 'pending', decided_at = NULL, memory_id = NULL, revision = revision + 1
+			WHERE id = ? AND revision = ? AND status = ?`, cur.ID, cur.Revision, cur.Status)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return err
+		} else if n == 0 {
+			return fmt.Errorf("%w: 候选 %s", ErrRevisionConflict, cur.ID)
+		}
+		// 记一笔 reopen：否则裁决历史里最后一次动作还是 accept/reject，
+		// 事后无法解释「为什么这条又回到 pending 了」。
+		if err := recordDecision(ctx, q, cur.ID, cur.Revision, "",
+			commit.ActionReopen, actor, []string{"rollback"}, cur.MemoryID); err != nil {
+			return err
+		}
+		out = &CommitResult{Action: commit.ActionReopen, Actor: actor,
+			MemoryID: cur.MemoryID, Committed: true}
 		return nil
 	})
 	if err != nil {

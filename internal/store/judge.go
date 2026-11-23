@@ -39,20 +39,23 @@ type JudgeStat struct {
 	Total    int    `json:"total"`
 	Accepted int    `json:"accepted"` // 人工采纳
 	Rejected int    `json:"rejected"` // 人工否决
-	SelfRun  int    `json:"self_run"` // 判定器自己落库的（历史数据）：不能算人工一致率
+	SelfRun  int    `json:"self_run"` // 非人工样本（判定器自裁、或人批准 AI 方案）：不算一致率
 	Pending  int    `json:"pending"`
 }
 
 // JudgeStats 汇总所有已判定的候选。只读单次聚合，命中 ix_cand_status 之外的顺序扫描——
 // 候选表量级在千条以内，不为它加索引。
 func (s *Store) JudgeStats() ([]JudgeStat, error) {
-	// 只把 actor != 'judge' 的裁决算作人工样本。
-	// 否则判定器自己的决定变成分母，一致率恒为 100%——
-	// 影子期「≥95% 才转正」这条门槛会被自己的产出喂饱，等于没有门槛。
+	// 只把 actor = 'human' 的裁决算作人工样本。
+	//
+	// 白名单而不是黑名单（旧写法是 actor != 'judge'）：每新增一种 actor
+	// （例如 mem batch 的 human-reviewed-llm），黑名单都会把它误算成人工，
+	// 一致率被自己喂到 100%，「≥95% 才转正」这道门槛就白设了。
+	// 新 actor 默认不进标定，要进必须显式改这一行并说明理由。
 	rows, err := s.db.Query(`SELECT c.judge_verdict, COUNT(*),
-		SUM(CASE WHEN c.status = 'accepted' AND d.actor != 'judge' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN c.status = 'rejected' AND d.actor != 'judge' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN (c.status = 'accepted' OR c.status = 'rejected') AND d.actor = 'judge' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN c.status = 'accepted' AND d.actor = 'human' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN c.status = 'rejected' AND d.actor = 'human' THEN 1 ELSE 0 END),
+		SUM(CASE WHEN (c.status = 'accepted' OR c.status = 'rejected') AND d.actor != 'human' THEN 1 ELSE 0 END),
 		SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END)
 		FROM candidates c
 		LEFT JOIN commit_decisions d

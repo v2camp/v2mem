@@ -13,7 +13,7 @@
 
 | 项 | 现状 |
 |:---|:---|
-| 写库路径 | 现状 5 条：CLI `mem add`（`cmd/mem/main.go:300`）、MCP `add` 工具、`mem ingest`（`cmd/mem/level1.go:94`）、`mem accept` 与 MCP `accept`（后两者走隔离区升格，均为**显式**裁决，非自动） |
+| 写库路径 | 现状 6 条：CLI `mem add`（`cmd/mem/main.go:300`）、MCP `add` 工具、`mem ingest`（`cmd/mem/level1.go:94`）、`mem accept` 与 MCP `accept`（走隔离区升格，**显式**裁决）、`mem batch`（按方案批量裁决，`--dry-run` 过目后执行，带归档与 `--rollback`） |
 | 钩子写永久库吗 | **否**。钩子仍不 `store.Add`。观测缓冲写入同库另表 `observations`（`source=hook-observe`）。默认 `mem search` 不看它；`layer=observation` 或 `both` 才查痕迹 |
 | 去重键 | `(content_hash, project)`，跨工程同句各自独立 —— 设计文档明示的既定语义，**不是 bug**（见 `design-dedup-merge` e2e） |
 | 那 208 条是谁 | 脚本紧凑循环调 `mem add` 灌入（对应 ~200 条检索基准）。**既非 hooks 自动灌，也非 LLM 逐条决策**——是第三类：无来源标记的批量写入 |
@@ -51,7 +51,7 @@
 |:---|:---|:---|:---|
 | 观测 | hooks（失败则 spool） | `observations` | 默认否；`--layer observation` 或 `both` 可搜 |
 | 蒸馏 | `mem distill`（规则或可选本地模型） | `candidates`，`status=pending`，`source=distill` | 否 |
-| 采纳 | `mem accept` | `memories`，`source=distill-accept`，并写 `edges.rel=derived_from`（dst 是候选 id） | 是 |
+| 采纳 | `mem accept` / `mem batch --plan` | `memories`，`source=distill-accept`，并写 `edges.rel=derived_from`（dst 是候选 id）；批量落的 `actor=human-reviewed-llm` | 是 |
 
 - `mem distill` / `mem reject` / `import-transcript` **禁止** `INSERT memories`。LLM 超时或 JSON 不合规：写 `distill_runs` 失败行，不写候选，默认退出码 0；`--strict` 才非零。
 - 同一会话的同一批观测只蒸馏一次（`distill_runs.window_key`）。Stop 每轮都触发时不会放大噪声。

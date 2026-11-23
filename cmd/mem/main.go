@@ -47,6 +47,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
                                     --stats 看影子期一致率；落库入口待回滚命令落地后开放
   mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
   mem reject <id|前缀>             拒绝候选
+  mem batch  [选项]                批量裁决：按方案文件一次 accept/reject（--dry-run 只校验，--rollback 撤销）
   mem candidates ls [选项]         列出隔离区候选
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
@@ -137,7 +138,7 @@ var knownSubcommands = []string{
 	"add", "search", "asset", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
 	"gc", "consolidate", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
-	"distill", "accept", "reject", "candidates", "judge", "setup",
+	"distill", "accept", "reject", "batch", "candidates", "judge", "setup",
 }
 
 func main() {
@@ -188,6 +189,8 @@ func main() {
 		err = cmdAccept(os.Args[2:])
 	case "reject":
 		err = cmdReject(os.Args[2:])
+	case "batch":
+		err = cmdBatch(os.Args[2:])
 	case "candidates":
 		err = cmdCandidates(os.Args[2:])
 	case "sync":

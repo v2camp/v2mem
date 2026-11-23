@@ -48,6 +48,9 @@ const (
 	ActionConflict    Action = "conflict"
 	ActionBacklog     Action = "backlog"
 	ActionDefer       Action = "defer"
+	// ActionReopen 是把已裁决候选退回 pending 的撤销动作（mem batch --rollback）。
+	// 单独一个值而不是复用 human_accept：否则裁决历史看起来像又采纳了一次。
+	ActionReopen Action = "reopen"
 )
 
 // Link 是一条记忆到原始证据的关联。
