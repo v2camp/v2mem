@@ -90,7 +90,8 @@ C 扩 `provider`（污染 `ModelSpec` 与 `--provider` 枚举）、纯静默零�
 |:---|:---|
 | `internal/distill/modelconfig.go` | `ModelConfig` 加 `Mode` / `CLI` / `ModelTag`；`LoadModelConfig` 归一化老文件与校验；新增 `SaveModelConfig`（0600、写前备份、原子替换）与 `ResolveOptions()`（§4 优先级单一实现点） |
 | `internal/distill/cli.go`（**新文件，同包**） | 内置模板表（含 `tplVer`）、`Probe()`、`runCLI()`、`VersionTag()` |
-| `internal/distill/distill.go` | `Options` 加 `CLI` / `ModelTag`；`ModelSpec.Kind` 增加 `"cli"`；`resolve()` 入口分派；`completeLLM` 按 Kind 走 `runCLI` |
+| `internal/distill/distill.go` | `Options` 加 `CLI` / `ModelTag`；`ModelSpec.Kind` 增加 `"cli"`；`resolve()` 入口分派 |
+| `internal/distill/llm.go` | `completeLLM` 按 `spec.Kind` 走 `runCLI`（原按 Kind 分派 ollama / openai） |
 | `internal/distill/completer.go` | 无需改动（自动继承 `resolve()`） |
 | `cmd/mem/judge.go` | 构造 `Options` 改走 `distill.ResolveOptions`；`mode=off` 保持现有「判定器不可用」报错 |
 | `cmd/mem/distill.go` | 4 处 `Options` 构造全部改走 `distill.ResolveOptions`；`config.toml` 仍只提供 model / timeout |
@@ -124,7 +125,7 @@ C 扩 `provider`（污染 `ModelSpec` 与 `--provider` 枚举）、纯静默零�
 mem setup  → Probe() → dry-run(judge prompt + 蒸馏真实 prompt) → 通过才写 model.json(0600)
                                                             ↘ 打印外发告知 + 回退命令
 
-mem judge  → LoadModelConfig → Options{CLI,ModelTag} → resolve() → runCLI
+mem judge  → LoadModelConfig → ResolveOptions() → resolve() → runCLI
            → parseJudgeVerdicts → 影子期（默认，只写 verdict）→ --apply 才落库
 mem distill→ LoadModelConfig → ResolveOptions() → resolve() → runCLI → ParseFacts → candidates
 Stop/SessionEnd → startDistillProc（detach） / maybeSpawnJudge（MEM_JUDGE_SPAWN 仍默认关）
@@ -193,6 +194,13 @@ dry-run 通过的 CLI，不是「没配就随便挑一个远端」；有告知�
 
 CLI 拿不到真实模型名（能否从输出取：**未测**）。`judge_model` 记
 `cli:<name>@<cli-version>+tpl<ver>@judge-v2`——按 **CLI 版本 + 模板版本**隔离，而非模型版本。
+
+映射链必须显式实现，不能靠字符串巧合：`VersionTag()` 把 `cli@<ver>+tpl<ver>` 写进
+配置的 `model_tag` → `ResolveOptions` 填进 `Options.ModelTag` → `resolve()` 的 cli 分支
+返回的 provider name 取 `cli:` + `ModelTag` → `cmd/mem/judge.go` 现有拼接
+`providerName + "@" + judgePromptVersion` 原样不动，得到最终 `judge_model`。
+因此 **不修改 `judge_model` 的拼接逻辑**，只让它拿到的 name 带上版本分量。
+
 这是 `VALUE.md` §4 例外 (a)「按模型版本隔离」的降级，必须在 `design-admission.md` 明写：
 影子期 `--stats` 的一致率按该 tag 分段；转正标定前须人工复核同一 tag 下样本是否同质；
 CLI 升级导致 tag 变化时不得合并统计。若复核认为不可接受，则 CLI 路径不进入 `--apply` 转正范围。
