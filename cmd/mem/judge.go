@@ -123,12 +123,8 @@ func cmdJudge(args []string) error {
 		return fmt.Errorf("模型输出无法解析: %w（原文前 200 字节：%s）", err, truncateRunes(raw, 200))
 	}
 
-	// 拼接逻辑不变，只是改用 ResolveOptions 解析出的实际模型：cli 模式下 Model 为空，
-	// providerName 已带 <cli>@<ver>+tpl<ver>，tag 自然落在 §5.1 的分段上。
-	modelTag := providerName + "@" + judgePromptVersion
-	if opt.Model != "" {
-		modelTag = providerName + ":" + opt.Model + "@" + judgePromptVersion
-	}
+	// 归因要能按模型分组：flag > 解析出的实际模型 > 只记 provider（cli 的版本分量在 providerName 里）。
+	modelTag := judgeModelTag(providerName, *model, opt.Model)
 
 	res, err := applyJudgments(st, list, verdicts, modelTag, *apply)
 	if err != nil {
@@ -161,6 +157,23 @@ func cmdJudge(args []string) error {
 		fmt.Printf("  已改状态 %d 条（accept 走 CommitAccept，reject 走 CommitReject）\n", res.Applied)
 	}
 	return nil
+}
+
+// judgeModelTag 拼 judge_model：<provider>[:<model>]@<prompt 版本>。
+//
+// 为什么要分 flagModel 与 resolvedModel：flag 显式给了 --model 时它是权威；
+// 否则要写 ResolveOptions 解析出的实际模型（model.json 的 model，或 resolve() 给
+// deepseek 补的默认名）——只认 flag 会让 model.json 配的模型从归因里消失，
+// 历史判定无法按模型分组。cli 模式下 resolvedModel 为空（版本分量已在 provider 里）。
+func judgeModelTag(providerName, flagModel, resolvedModel string) string {
+	m := flagModel
+	if m == "" {
+		m = resolvedModel
+	}
+	if m == "" {
+		return providerName + "@" + judgePromptVersion
+	}
+	return providerName + ":" + m + "@" + judgePromptVersion
 }
 
 // judgeResult 是落库循环的计数。抽出来是为了让「影子不改状态」这件事可测 ——

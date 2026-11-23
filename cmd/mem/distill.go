@@ -46,7 +46,11 @@ func cmdDistill(args []string) error {
 	model, timeout := distill.LoadConfig(distill.ConfigPath())
 	// model.json 的 mode=cli 要同时接管 proposal 的 local/byok 两条来源，
 	// 否则 `mem distill --proposal` 还会去连 ollama/openai，与配置说的不符。
-	cfg, _ := distill.LoadModelConfig("")
+	// 读不出来必须 fail-closed：把非法配置当「没配」会让用户选的 CLI 静默变成外发。
+	cfg, err := distill.LoadModelConfig("")
+	if err != nil {
+		return fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
+	}
 	st, err := store.Open(c.db)
 	if err != nil {
 		return err
@@ -404,6 +408,13 @@ func distillObservationEligible(metaJSON, event string) bool {
 func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 	started := time.Now()
 	report := &distillReport{Session: job.Session, Status: distill.StatusSkipped}
+	// 先读配置再干活：非法 model.json 当「没配」处理会退回 auto 外发，
+	// 所以这里 fail-closed，且放在读库之前，避免白跑一遍观测查询。
+	cfg, err := distill.LoadModelConfig("")
+	if err != nil {
+		err = fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
+		return failReport(report, err), err
+	}
 	var sinceUnix int64
 	if job.Since > 0 {
 		sinceUnix = time.Now().Add(-job.Since).Unix()
@@ -453,7 +464,6 @@ func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 	}
 	// 优先级统一走 ResolveOptions；job.Model（config.toml 的 [distill] model）只在
 	// api 路径上当兜底，绝不作为 flagModel 传入 —— 它不是显式 --model。
-	cfg, _ := distill.LoadModelConfig("")
 	opt := distill.ResolveOptions(cfg, job.Provider, "")
 	if opt.CLI == "" && opt.Model == "" {
 		opt.Model = job.Model
