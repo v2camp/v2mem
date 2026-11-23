@@ -102,3 +102,16 @@ func TestRunCLITimeout(t *testing.T) {
 		t.Fatal("超时应报错")
 	}
 }
+
+// claude --version 可能打印 "2.1.34 (Claude Code)"：整行进标签会带空格与括号，
+// judge_model 按版本分组的键就不稳定，只取第一个 token。
+func TestVersionTagFirstToken(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte("#!/bin/sh\necho \"2.1.34 (Claude Code)\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if got := VersionTag("claude"); got != "claude@2.1.34+tpl1" {
+		t.Errorf("VersionTag 应只取版本首 token，got %q", got)
+	}
+}

@@ -105,7 +105,7 @@ func cmdSetup(args []string) error {
 		if err := distill.SaveModelConfig(path, next); err != nil {
 			return err
 		}
-		fmt.Printf("已将模型来源切换为 API：%s / %s。\n密钥已写入 %s（0600），不会进 shell history。\n回退：mem setup --undo。\n",
+		fmt.Printf("已将模型来源切换为 API：%s / %s。\n密钥只写入 %s（0600），不经命令行参数传入。\n回退：mem setup --undo。\n",
 			next.Provider, next.Model, path)
 		return nil
 	}
@@ -196,8 +196,9 @@ func verifySetupCLI(name, tag string) error {
 	return nil
 }
 
-// apiConfigFromEnv 只用环境变量构造 API 配置：不读 stdin，避免密钥回显与依赖终端。
-// 已有配置的其它字段（cli/model_tag）保留不删，方便再切回 cli。
+// apiConfigFromEnv 优先用环境变量构造 API 配置：不读 stdin，避免密钥回显与依赖终端。
+// 没有环境变量时沿用 model.json 里已有的 api_key —— spec §4 说 mode=cli 时这四个字段
+// 保留不删，正是为了让 --mode api 不再要求用户重新 export 一遍。
 func apiConfigFromEnv(cfg distill.ModelConfig) (distill.ModelConfig, error) {
 	next := cfg
 	next.Mode = "api"
@@ -215,8 +216,16 @@ func apiConfigFromEnv(cfg distill.ModelConfig) (distill.ModelConfig, error) {
 		next.APIKey = key
 		return next, nil
 	}
+	// 文件里的 key 可以直接复用，但没有 provider 就不知道往哪发；这时不能猜，只能报错。
+	if strings.TrimSpace(cfg.APIKey) != "" {
+		if strings.TrimSpace(cfg.Provider) == "" {
+			return distill.ModelConfig{}, errors.New(
+				"--mode api 复用了 model.json 里已有的 api_key，但缺少 provider；请设置 DEEPSEEK_API_KEY 或 OPENAI_API_KEY 后重跑，或在 model.json 里补 provider")
+		}
+		return next, nil
+	}
 	return distill.ModelConfig{}, errors.New(
-		"--mode api 需要环境变量 DEEPSEEK_API_KEY 或 OPENAI_API_KEY；请先 export 其中之一后重跑 mem setup --mode api（不读 stdin，密钥不回显）")
+		"--mode api 需要环境变量 DEEPSEEK_API_KEY 或 OPENAI_API_KEY，或 model.json 里已有的 api_key；请先 export 其中之一后重跑 mem setup --mode api（不读 stdin，密钥不回显）")
 }
 
 // printSetupStatus 只读本地文件：不探测 PATH、不调用 CLI、不出网。
@@ -262,10 +271,20 @@ func undoSetupConfig(path string) error {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return err
 	}
+	// 恢复后回读一次：cli→api 切换后 --undo 回到 cli，用户要能立刻看到当前来源。
+	// 先回读再删备份：内容解析不了时还留着可重试的那份。
+	restored, err := distill.LoadModelConfig(path)
+	if err != nil {
+		return fmt.Errorf("已恢复 %s，但内容无法解析（可用 mem setup --status 查看）: %w", path, err)
+	}
 	if err := os.Remove(bak); err != nil {
 		return err
 	}
-	fmt.Printf("已从备份恢复 %s\n", path)
+	if restored.Mode == "cli" {
+		fmt.Printf("已从备份恢复 %s（mode=cli，cli=%s）\n", path, restored.CLI)
+	} else {
+		fmt.Printf("已从备份恢复 %s（mode=%s）\n", path, restored.Mode)
+	}
 	return nil
 }
 

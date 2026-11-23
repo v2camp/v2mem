@@ -21,6 +21,22 @@ import (
 // 蒸馏只写 candidates 与 distill_runs。本文件没有 store.Add。
 // 采纳在 cmdAccept，那是唯一把候选升格进 memories 的入口。
 
+// proposalOptions 把 model.json 的 mode 语义带进 proposal 的 local/byok 两条来源。
+//
+// cli 与 off 都必须走 ResolveOptions：只判断 cli 会让 mode=off 落回硬编码的
+// ollama/openai，`mem distill --proposal` 就还会外发，与配置说的「关闭」不符。
+// api 保持原行为：local 试 ollama、byok 试 openai，模型取 config.toml 的 model。
+func proposalOptions(cfg distill.ModelConfig, provider, model string, timeout time.Duration) distill.Options {
+	if cfg.Mode == "cli" || cfg.Mode == "off" {
+		// 只读 model.json 的 cli/model_tag：config.toml 的 model 不是显式 --model，
+		// 传进去会把归因标签覆盖成 cli:<config.toml 的模型名>。
+		opt := distill.ResolveOptions(cfg, "", "")
+		opt.Timeout = timeout
+		return opt
+	}
+	return distill.Options{Provider: provider, Model: model, Timeout: timeout}
+}
+
 func cmdDistill(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("distill", flag.ContinueOnError)
@@ -71,15 +87,8 @@ func cmdDistill(args []string) error {
 		unavailable := func(label string, cause error) proposal.Generator {
 			return proposal.UnavailableGenerator(label, cause)
 		}
-		localOpt := distill.Options{Provider: "ollama", Model: model, Timeout: timeout}
-		byokOpt := distill.Options{Provider: "openai", Model: model, Timeout: timeout}
-		if cfg.Mode == "cli" {
-			// 只读 model.json 的 cli/model_tag：config.toml 的 model 不是显式 --model，
-			// 传进去会把归因标签覆盖成 cli:<config.toml 的模型名>。
-			localOpt = distill.ResolveOptions(cfg, "", "")
-			localOpt.Timeout = timeout
-			byokOpt = localOpt
-		}
+		localOpt := proposalOptions(cfg, "ollama", model, timeout)
+		byokOpt := proposalOptions(cfg, "openai", model, timeout)
 		local := func() proposal.Generator {
 			fn, name, cerr := distill.PromptCompleter(localOpt)
 			if cerr != nil {

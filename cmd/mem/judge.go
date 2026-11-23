@@ -101,7 +101,12 @@ func cmdJudge(args []string) error {
 	// 会变成「已显式指定」的 flag，把 model.json 的 mode=cli 永久压掉。
 	cfg, err := distill.LoadModelConfig(*cfgPath)
 	if err != nil {
-		return fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
+		// 报用户实际用的那个路径：--config 给过却报默认路径，会让人去改错文件。
+		path := *cfgPath
+		if strings.TrimSpace(path) == "" {
+			path = distill.DefaultModelConfigPath()
+		}
+		return fmt.Errorf("读取模型配置失败（%s）: %w", path, err)
 	}
 
 	opt := distill.ResolveOptions(cfg, *provider, *model)
@@ -109,7 +114,7 @@ func cmdJudge(args []string) error {
 	complete, providerName, err := distill.PromptCompleter(opt)
 	if err != nil {
 		// 明确告诉用户「模型没起来」而不是「判定为 0 条」——后者会被当成「候选都干净」。
-		return fmt.Errorf("判定器不可用（%w）。在 ~/.v2mem/model.json 配 provider/model/api_key，或用 --provider deepseek 加 DEEPSEEK_API_KEY；候选正文会发往该端点", err)
+		return fmt.Errorf("判定器不可用（%w）。运行 mem setup（或 mem setup --status 查看当前来源）配置 provider/model/api_key，也可用 --provider deepseek 加 DEEPSEEK_API_KEY；候选正文会发往该端点", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)

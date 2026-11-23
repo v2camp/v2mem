@@ -245,3 +245,31 @@ func TestResolveOptionsDeepSeekDefaultModel(t *testing.T) {
 		t.Errorf("非 deepseek 不该被补模型，got %q", opt.Model)
 	}
 }
+
+// --undo 的语义是「回到最近一次写盘前」，所以备份必须跟着每次写盘前进；
+// 只在首次写盘时留备份会让 cli→api→cli 之后的回退落到很久以前的状态。
+func TestSaveModelConfigBackupTracksLatest(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "model.json")
+	a := ModelConfig{Mode: "api", Provider: "deepseek", Model: "a", APIKey: "sk-a"}
+	b := ModelConfig{Mode: "api", Provider: "deepseek", Model: "b", APIKey: "sk-b"}
+	c := ModelConfig{Mode: "off"}
+	for _, step := range []ModelConfig{a, b, c} {
+		if err := SaveModelConfig(p, step); err != nil {
+			t.Fatalf("SaveModelConfig(%+v): %v", step, err)
+		}
+	}
+	bak, err := os.ReadFile(p + ".v2mem.bak")
+	if err != nil {
+		t.Fatalf("读备份失败: %v", err)
+	}
+	if !strings.Contains(string(bak), `"model": "b"`) {
+		t.Errorf("备份应是最新一轮写盘前的 B，got %q", bak)
+	}
+	if strings.Contains(string(bak), `"model": "a"`) {
+		t.Errorf("备份不应停留在最早写入的 A，got %q", bak)
+	}
+	got, err := LoadModelConfig(p)
+	if err != nil || got.Mode != "off" {
+		t.Errorf("当前配置应是 C（mode=off），got %+v err=%v", got, err)
+	}
+}

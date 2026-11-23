@@ -80,8 +80,8 @@ func normalizeModelConfig(c ModelConfig) (ModelConfig, error) {
 }
 
 // SaveModelConfig 原子写入配置：同目录临时文件 + rename，权限固定 0600。
-// 写前留一份 <path>.v2mem.bak，供 mem setup --undo 回退；已有备份不覆盖，
-// 这样连续多次写盘后 --undo 仍能回到最初的状态。
+// 写前把原内容留一份到 <path>.v2mem.bak，供 mem setup --undo 回退；每次写盘都覆盖，
+// 让 --undo 的语义与帮助文本一致 ——「回到最近一次写盘前」。
 func SaveModelConfig(path string, c ModelConfig) error {
 	if path == "" {
 		path = DefaultModelConfigPath()
@@ -96,15 +96,10 @@ func SaveModelConfig(path string, c ModelConfig) error {
 			return err
 		}
 	} else {
-		bak := path + ".v2mem.bak"
-		// 已有备份不覆盖：保留最早的状态，--undo 才能一直回到最初。
-		if _, statErr := os.Stat(bak); errors.Is(statErr, fs.ErrNotExist) {
-			if err := os.WriteFile(bak, old, 0o600); err != nil {
-				return err
-			}
-		} else if statErr != nil {
-			// 备份状态不可判定就别写：不能让用户丢配置又没得回退。
-			return statErr
+		// 已有备份也要覆盖：保留最早的状态会让连续切换（cli→api→cli）后的
+		// --undo 退到很久以前，和「最近一次写盘前」的承诺不符。
+		if err := os.WriteFile(path+".v2mem.bak", old, 0o600); err != nil {
+			return err
 		}
 	}
 	b, err := json.MarshalIndent(c, "", "  ")

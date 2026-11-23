@@ -384,3 +384,35 @@ func TestSetupRejectsModeWithStatusOrUndo(t *testing.T) {
 		t.Error("未知 --mode 应报错")
 	}
 }
+
+// spec §4：mode=cli 时 api 字段保留不删，--mode api 切回时没有环境变量也应沿用文件里的 key。
+func TestSetupModeAPIReusesStoredKey(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"provider":"deepseek","model":"deepseek-flash","api_key":"sk-stored","base_url":"https://api.deepseek.com/v1"}` + "\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+
+	if _, err := captureStdout(t, func() error { return cmdSetup([]string{"--mode", "api"}) }); err != nil {
+		t.Fatalf("cmdSetup --mode api: %v", err)
+	}
+	c, err := distill.LoadModelConfig(p)
+	if err != nil {
+		t.Fatalf("LoadModelConfig: %v", err)
+	}
+	if c.Mode != "api" || c.APIKey != "sk-stored" || c.Provider != "deepseek" {
+		t.Errorf("应沿用 model.json 里已有的 api_key 与 provider，got %+v", c)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("权限应为 0600，got %v", st.Mode().Perm())
+	}
+}

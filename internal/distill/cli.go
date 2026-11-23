@@ -49,7 +49,7 @@ func Probe() (name string, ok bool) {
 	return "", false
 }
 
-// VersionTag 返回形如 claude@<版本首行>+tpl<Ver> 的归因标签。
+// VersionTag 返回形如 claude@<版本首 token>+tpl<Ver> 的归因标签。
 // 探测失败返回 <name>@unknown+tpl<Ver>：宁可标注未知，也不要编造版本。
 func VersionTag(name string) string {
 	for _, t := range cliTemplates {
@@ -63,11 +63,16 @@ func VersionTag(name string) string {
 		if err != nil {
 			return name + "@unknown+tpl" + t.Ver
 		}
-		line := firstLine(string(out))
-		if line == "" {
+		// 只取第一个空白分隔的 token：claude --version 可能打印
+		// "2.1.34 (Claude Code)"，整行进标签会让 judge_model 带空格和括号，难按版本分段。
+		ver := ""
+		if f := strings.Fields(firstLine(string(out))); len(f) > 0 {
+			ver = f[0]
+		}
+		if ver == "" {
 			return name + "@unknown+tpl" + t.Ver
 		}
-		return name + "@" + line + "+tpl" + t.Ver
+		return name + "@" + ver + "+tpl" + t.Ver
 	}
 	return name + "@unknown"
 }

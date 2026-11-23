@@ -664,3 +664,18 @@ func TestCmdDistillRejectsBadModelConfig(t *testing.T) {
 		t.Errorf("应在打开数据库前失败，db 却被创建了: %v", statErr)
 	}
 }
+
+// proposalOptions 必须把 model.json 的 mode 语义带进 proposal 的 local/byok 两条来源：
+// mode=off 走规则路径（provider=none），否则 `mem distill --proposal` 仍会去连 ollama/openai。
+func TestProposalOptionsOffIsNone(t *testing.T) {
+	if got := proposalOptions(distill.ModelConfig{Mode: "off"}, "ollama", "m", time.Second); got.Provider != "none" {
+		t.Errorf("mode=off 应映射 provider=none，got %+v", got)
+	}
+	cli := distill.ModelConfig{Mode: "cli", CLI: "claude", ModelTag: "claude@1+tpl1"}
+	if got := proposalOptions(cli, "ollama", "m", time.Second); got.CLI != "claude" || got.Timeout != time.Second {
+		t.Errorf("mode=cli 应填 CLI 与 timeout，got %+v", got)
+	}
+	if got := proposalOptions(distill.ModelConfig{Mode: "api", Provider: "deepseek"}, "ollama", "m", time.Second); got.Provider != "ollama" || got.Model != "m" {
+		t.Errorf("mode=api 应保持原来的 local 硬编码 provider，got %+v", got)
+	}
+}
