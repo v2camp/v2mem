@@ -168,7 +168,7 @@ mem setup --status     # 查看当前来源（不联网、不调用 CLI）
 mem setup --undo       # 回退到上一次写盘前
 ```
 
-`mem setup` 按白名单（`claude` → `codex`）逐个验证 judge 与 distill 两条真实路径，首个通过者胜出；
+`mem setup` 按白名单（`claude` → `codex` → `cursor-agent` → `gemini` → `copilot` → `qoder` → `codebuddy` → `traecli`）逐个验证 judge 与 distill 两条真实路径，首个通过者胜出；
 验证时各跑一次真实调用，可能消耗额度与时间。全都不可用时退出 0、不写盘，安装流程不因此中断。
 想显式指定分支：`--mode api`（把 API 来源写入 `model.json`，密钥取 setup 时环境里的
 `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`，需先 export）、`--mode cli`（必须探测成功，否则报错）、

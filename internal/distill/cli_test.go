@@ -103,6 +103,44 @@ func TestRunCLITimeout(t *testing.T) {
 	}
 }
 
+func TestCLIWhitelistOrder(t *testing.T) {
+	want := []string{"claude", "codex", "cursor-agent", "gemini", "copilot", "qoder", "codebuddy", "traecli"}
+	got := CLIWhitelist()
+	if len(got) != len(want) {
+		t.Fatalf("whitelist=%v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("whitelist[%d]=%q，want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRunCLIArgMode(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\nlast=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '%s' \"$last\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "cursor-agent"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := runCLI(context.Background(), "cursor-agent", "hello")
+	if err != nil || out != "hello" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+func TestRunCLIArgPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "codebuddy"), []byte("#!/bin/sh\nprintf '%s' \"$3\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := runCLI(context.Background(), "codebuddy", "hello")
+	if err != nil || out != "hello" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
 // claude --version 可能打印 "2.1.34 (Claude Code)"：整行进标签会带空格与括号，
 // judge_model 按版本分组的键就不稳定，只取第一个 token。
 func TestVersionTagFirstToken(t *testing.T) {

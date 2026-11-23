@@ -94,9 +94,12 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
 
 - **CLI 路径（`mode=cli`）**：`mem setup` 探测本机已登录的 CLI 后写 `{"mode":"cli","cli":"claude","model_tag":"…"}`。
   优先级上，显式 `--provider` 仍最高；否则 `mode=cli` 压过表中的环境变量与 `auto`（优先级 3/4）。
-  `cli` 字段只存白名单名（`claude` / `codex`），不存命令串、不拼参数——模板内置在二进制里，
+  `cli` 字段只存白名单名（`claude` / `codex` / `cursor-agent` / `gemini` / `copilot` / `qoder` / `codebuddy` / `traecli`），不存命令串、不拼参数——模板内置在二进制里，
   避免 `model.json` 变成任意命令执行入口。`judge_model` 记 `cli:<name>@<version>+tpl<ver>@judge-v2`
   （如 `cli:claude@2.0.1+tpl1@judge-v2`）：版本取 CLI `--version` 首行，探测不到记 `unknown`，不编造。
+- **CLI 工具边界**：claude/codebuddy 用 `--tools ""` 全禁，copilot 用空 `--available-tools`，codex/trae 用只读沙箱，
+  gemini 用 plan 只读，qoder 用非交互默认拒绝 + `--max-turns 1`；cursor 官方没有硬禁工具开关，
+  `--mode ask` + `--sandbox enabled` 只是只读倾向，标为受限支持。
 - **CLI 路径是 `VALUE.md` §4 例外 (a) 的降级**：隔离维度从「模型版本」变成「CLI + 模板版本」，
   同一个 CLI 升级后可能静默换模型。所以影子期一致率必须按该 tag **分段复核**——
   tag 变了就重新累计 ≥95%，不能拿旧 tag 的样本给新 tag 背书。

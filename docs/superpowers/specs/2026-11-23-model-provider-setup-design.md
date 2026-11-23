@@ -104,9 +104,10 @@ C 扩 `provider`（污染 `ModelSpec` 与 `--provider` 枚举）、纯静默零�
 
 ### 5.1 CLI 执行契约
 
-- 模板表内置于代码，白名单仅含本机常见 harness CLI（`claude` / `codex`，按固定顺序探测）。
-  每条模板含：argv、禁工具 flag、stdin 传 prompt、stdout 出纯文本、`tplVer`。
-- `runCLI`：`exec.CommandContext`，stdin 写完整 prompt、stdout 收集、stderr 截断；
+- 模板表内置于代码，白名单含本机常见 harness CLI（`claude` / `codex` / `cursor-agent` / `gemini` / `copilot` / `qoder` / `codebuddy` / `traecli`，按固定顺序探测）。
+  工具策略：claude/codebuddy 用 `--tools ""` 全禁；copilot 用空 `--available-tools`；codex/trae 用只读沙箱；gemini 用 plan 只读；qoder 用非交互默认拒绝 + `--max-turns 1`；cursor 官方无硬禁工具开关，`--mode ask` + `--sandbox enabled` 只是只读倾向，标为受限支持。
+  每条模板含：argv、禁工具 flag、prompt 传输方式（stdin，或官方示例要求的 argv 占位位置）、stdout 出纯文本、`tplVer`。
+- `runCLI`：`exec.CommandContext`，prompt 按模板走 stdin 或替换 argv 占位；stdout 收集、stderr 截断；
   超时复用 `opt.Timeout`（judge 默认 90s，distill 默认 45s）；非零退出归 `ErrLLMUnavailable`。
 - 输出**不新增解析器**：仍交给 `parseJudgeVerdicts`（截首个 `[` 到末个 `]`）与 `ParseFacts`。
   dry-run 的职责就是证明模板输出落在现有解析器容差内。
@@ -223,7 +224,7 @@ CLI 升级导致 tag 变化时不得合并统计。若复核认为不可接受�
 
 ## 12. 未测项（实现期本机实测，不得据常识补写）
 
-1. `claude` / `codex` 的非交互 flag 具体名称、输出格式、是否等 stdin、能否取 model 字段。
+1. 白名单各 CLI 的非交互 flag 具体名称、输出格式、是否等 stdin、能否取 model 字段；除 `codebuddy` 外均未在本机实测。
 2. `cli --version` 输出格式，以及取不到版本时 `VersionTag()` 的兜底串。
 3. CLI 冷启动耗时是否超出 45s（distill）/ 90s（judge）默认超时。
 4. CLI 在无 TTY 的 detach 子进程里是否会弹权限或要求登录；dry-run 断言「stdin 关闭后不等待」能否稳定证伪。
