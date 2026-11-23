@@ -271,14 +271,38 @@ var (
 	// 宿主的后台任务完成通知也走 user 通道：整段是 <task-notification>
 	// （task-id / tool-use-id / status / summary），没有一句用户的话。
 	hostNoticeRe = regexp.MustCompile(`(?s)<task-notification\b[^>]*>.*?</task-notification>`)
+	// 会话被压缩后，宿主把「历史摘要」当成一条 user 消息重放（整段
+	// <conversation_history_summary>）：里面是模型自己写的回顾与
+	// 「不要重跑这些任务」的自我叮嘱，同样没有一句用户的话。
+	historySummaryRe = regexp.MustCompile(`(?s)<conversation_history_summary\b[^>]*>.*?</conversation_history_summary>`)
+	// 后台任务事件还有纯文本形态（`Use the TaskOutput tool with task_id="…"`），
+	// 宿主在文末自带 [SYSTEM NOTIFICATION - NOT USER INPUT] 声明。
+	// 该声明只在「这条不是用户输入」时出现，故命中即整条判非用户；
+	// 万一用户真去逐字复述这句话，代价也只是这一条不进提案，不会污染记忆。
+	sysNoticeRe = regexp.MustCompile(`\[SYSTEM NOTIFICATION - NOT USER INPUT\]`)
+	// 宿主会把上面两个块按长度截断后送进来（活库 2026-11-23 12:05 的历史摘要
+	// 就只有 391 rune、没有闭合标签）。成对剥离之后再兜一层：残留的开标签一律
+	// 剥到文末，否则半截回顾照样会被当成用户原话写进提案。
+	unterminatedHostRe = regexp.MustCompile(`(?s)<(?:task-notification|conversation_history_summary)\b[^>]*>.*`)
 )
+
+// stripHostBlocks 剥掉宿主注入的整块文本，返回剥完的结果（可能为空串）。
+// 先剥成对的块，再处理「闭合标签已被截掉」的半截块。
+func stripHostBlocks(s string) string {
+	s = systemReminderRe.ReplaceAllString(s, "")
+	s = hostNoticeRe.ReplaceAllString(s, "")
+	s = historySummaryRe.ReplaceAllString(s, "")
+	return unterminatedHostRe.ReplaceAllString(s, "")
+}
 
 // UserQueryText 从宿主拼装的用户消息里取出「用户真正说的话」。
 //
 // WorkBuddy 的 input_text 把 system-reminder（user_info / 身份文件 / 连接器状态 /
 // 当前时间…）全部塞在同一条消息前面，真正的提问包在 <user_query> 里。若整段
 // 原样进提案，400 rune 的投影会全被注入上下文占满，用户请求反而看不到。
-// 优先取 <user_query>；没有该标签时剥掉 system-reminder 与 task-notification 块。
+// 优先取 <user_query>；没有该标签时剥掉 system-reminder、task-notification、
+// conversation_history_summary 三个块，命中 [SYSTEM NOTIFICATION - NOT USER INPUT]
+// 的整条判非用户。
 // 只用于查询源（summary / 提案输入），归档 Raw 仍保留完整原文。
 func UserQueryText(s string) string {
 	if ms := userQueryRe.FindAllStringSubmatch(s, -1); len(ms) > 0 {
@@ -292,7 +316,12 @@ func UserQueryText(s string) string {
 			return strings.Join(parts, "\n")
 		}
 	}
-	return strings.TrimSpace(hostNoticeRe.ReplaceAllString(systemReminderRe.ReplaceAllString(s, ""), ""))
+	// 后台任务事件的纯文本形态：宿主自己声明了「不是用户输入」，
+	// 整条都不该当成用户的话（哪怕是 `Use the … tool with task_id="…"` 那半句前缀）。
+	if sysNoticeRe.MatchString(s) {
+		return ""
+	}
+	return strings.TrimSpace(stripHostBlocks(s))
 }
 
 // unparsedRecord 把看不懂的行整行保留下来，交给调用方按原文归档。

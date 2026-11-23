@@ -29,3 +29,4 @@
 # 编辑器 / 系统
 .DS_Store
 *.swp
+.e1/sessions

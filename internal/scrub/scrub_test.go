@@ -19,6 +19,19 @@ func TestApplyMatrix(t *testing.T) {
 		{"token assign", "token=abcd1234", "[redacted]", "abcd1234", ""},
 		{"password spaces", "password = hunter2", "[redacted]", "hunter2", ""},
 		{"authorization", "authorization: letmein", "[redacted]", "letmein", ""},
+		{
+			// 活库真实形态：OAuth 授权码是 URL 查询参数，名字里没有 token/secret。
+			"oauth auth_code 查询参数",
+			"Open this URL to log in: https://freebuff.com/login?auth_code=TMSyZDiwOkxdTA3Rz6gNTw&cli_flow=979360df",
+			"[redacted]", "TMSyZDiwOkxdTA3Rz6gNTw", "https://freebuff.com/login",
+		},
+		{"client_secret", "client_secret=shhh12345 tail", "[redacted]", "shhh12345", "tail"},
+		{
+			// 负向断言：只提概念、没有赋值时不动，别把正常讨论打成 [redacted]。
+			"auth code 无赋值不打码",
+			"讨论 auth code 的有效期与 code 字段含义",
+			"讨论 auth code 的有效期与 code 字段含义", "", "auth code 的有效期",
+		},
 		{"sk", "key sk-12345678 end", "[redacted]", "sk-12345678", "key"},
 		{"akia", "AKIAIOSFODNN7EXAMPLE", "[redacted]", "AKIAIOSFODNN7EXAMPLE", ""},
 		{"bearer", "Bearer abcdefghij", "[redacted]", "abcdefghij", ""},

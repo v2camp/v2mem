@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,6 +147,27 @@ func TestSetupStatusDoesNotProbe(t *testing.T) {
 	}
 }
 
+// --status 要能回答「检查 model.json」这一步：密钥只露掩码，不能回显全量。
+func TestSetupStatusShowsRedactedKey(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"mode":"api","provider":"deepseek","model":"deepseek-flash","api_key":"sk-secret-value"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(t, func() error { return cmdSetup([]string{"--status"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "sk-…lue") || !strings.Contains(out, "来自 model.json") {
+		t.Errorf("应显示密钥掩码与来源，got:\n%s", out)
+	}
+	if strings.Contains(out, "sk-secret-value") {
+		t.Errorf("不得回显完整密钥，got:\n%s", out)
+	}
+}
+
 func TestSetupStatusReportsMissingConfig(t *testing.T) {
 	p := setupHome(t)
 	out, err := captureStdout(t, func() error { return cmdSetup([]string{"--status"}) })
@@ -264,23 +288,58 @@ func TestSetupUndoDryRunRejected(t *testing.T) {
 	}
 }
 
-func TestSetupModeAPIUsesEnv(t *testing.T) {
-	p := setupHome(t)
-	t.Setenv("OPENAI_API_KEY", "")
-	t.Setenv("DEEPSEEK_API_KEY", "sk-test")
+// 测试替身：不碰真实终端，也不发真实 HTTP。
+func stubAPIKeyPrompt(t *testing.T, key string, calls *int) {
+	t.Helper()
+	old := readAPIKey
+	readAPIKey = func(in *os.File, out io.Writer, prompt string) (string, error) {
+		if calls != nil {
+			*calls++
+		}
+		return key, nil
+	}
+	t.Cleanup(func() { readAPIKey = old })
+}
 
-	if err := cmdSetup([]string{"--mode", "api"}); err != nil {
+func stubAPIDryRun(t *testing.T, fn func(distill.ModelConfig) error) {
+	t.Helper()
+	old := apiDryRun
+	apiDryRun = fn
+	t.Cleanup(func() { apiDryRun = old })
+}
+
+// --mode api 只从 model.json 和用户当场输入取密钥；即使环境里导出了 key 也不许用。
+func TestSetupModeAPIPromptsAndIgnoresEnv(t *testing.T) {
+	p := setupHome(t)
+	t.Setenv("DEEPSEEK_API_KEY", "sk-from-env")
+	t.Setenv("OPENAI_API_KEY", "sk-from-env-openai")
+	calls := 0
+	stubAPIKeyPrompt(t, "sk-from-prompt", &calls)
+	var seen distill.ModelConfig
+	stubAPIDryRun(t, func(cfg distill.ModelConfig) error { seen = cfg; return nil })
+
+	out, err := captureStdout(t, func() error { return cmdSetup([]string{"--mode", "api"}) })
+	if err != nil {
 		t.Fatalf("cmdSetup --mode api: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("文件无 key 时应且只应提示一次，got %d", calls)
 	}
 	c, err := distill.LoadModelConfig(p)
 	if err != nil {
 		t.Fatalf("LoadModelConfig: %v", err)
 	}
-	if c.Mode != "api" || c.Provider != "deepseek" || c.APIKey != "sk-test" {
-		t.Errorf("应从环境变量构造 deepseek 配置，got %+v", c)
+	if c.Mode != "api" || c.Provider != "deepseek" || c.APIKey != "sk-from-prompt" {
+		t.Errorf("应写入用户输入的密钥，got %+v", c)
 	}
-	if c.Model != distill.DefaultDeepSeekModel {
-		t.Errorf("deepseek 默认模型应为 %q，got %q", distill.DefaultDeepSeekModel, c.Model)
+	if c.Model != distill.DefaultDeepSeekModel || c.BaseURL != "https://api.deepseek.com/v1" {
+		t.Errorf("应补 deepseek 默认值，got %+v", c)
+	}
+	if seen.APIKey != "sk-from-prompt" {
+		t.Errorf("dry-run 应使用输入的密钥，got %+v", seen)
+	}
+	if strings.Contains(out, "sk-from-env") || strings.Contains(out, "sk-from-prompt") {
+		t.Errorf("密钥不得回显，got:\n%s", out)
 	}
 	st, err := os.Stat(p)
 	if err != nil {
@@ -291,19 +350,180 @@ func TestSetupModeAPIUsesEnv(t *testing.T) {
 	}
 }
 
-func TestSetupModeAPIWithoutKeyErrors(t *testing.T) {
+// 流程第 1 步：文件不存在时先创建，再进入取 key / dry-run。
+func TestSetupModeAPICreatesMissingModelJSON(t *testing.T) {
 	p := setupHome(t)
-	t.Setenv("DEEPSEEK_API_KEY", "")
-	t.Setenv("OPENAI_API_KEY", "")
-	err := cmdSetup([]string{"--mode", "api"})
-	if err == nil {
-		t.Fatal("没有环境变量密钥时应报错")
+	stubAPIKeyPrompt(t, "sk-new", nil)
+	stubAPIDryRun(t, func(distill.ModelConfig) error { return nil })
+
+	if _, err := captureStdout(t, func() error { return cmdSetup([]string{"--mode", "api"}) }); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "DEEPSEEK_API_KEY") || !strings.Contains(err.Error(), "OPENAI_API_KEY") {
-		t.Errorf("错误应提示两种 export，got: %v", err)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("应创建 model.json: %v", err)
+	}
+	if !strings.Contains(string(b), `"api_key": "sk-new"`) {
+		t.Errorf("文件应含密钥，got %q", b)
+	}
+}
+
+func TestSetupModeAPIEmptyKeyErrors(t *testing.T) {
+	p := setupHome(t)
+	stubAPIKeyPrompt(t, "   ", nil)
+	stubAPIDryRun(t, func(distill.ModelConfig) error {
+		t.Error("空密钥不应进入 dry-run")
+		return nil
+	})
+
+	err := cmdSetup([]string{"--mode", "api"})
+	if err == nil || !strings.Contains(err.Error(), "不能为空") {
+		t.Fatalf("空密钥应报错，got %v", err)
+	}
+	st, statErr := os.Stat(p)
+	if statErr == nil && strings.Contains(string(mustRead(t, p)), "api_key") {
+		t.Errorf("空密钥不得写入 config，got %v", st)
+	}
+}
+
+func TestSetupModeAPIDryRunFailureDoesNotWriteKey(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := `{"mode":"off"}` + "\n"
+	if err := os.WriteFile(p, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stubAPIKeyPrompt(t, "sk-bad", nil)
+	stubAPIDryRun(t, func(distill.ModelConfig) error { return fmt.Errorf("openai http 401") })
+
+	err := cmdSetup([]string{"--mode", "api"})
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("dry-run 失败应报出原因，got %v", err)
+	}
+	if got := string(mustRead(t, p)); got != original {
+		t.Errorf("dry-run 失败不得写盘\nwant: %s\ngot:  %s", original, got)
+	}
+}
+
+func TestSetupModeAPIDryRunFlagDoesNotWrite(t *testing.T) {
+	p := setupHome(t)
+	stubAPIKeyPrompt(t, "sk-dry", nil)
+	stubAPIDryRun(t, func(distill.ModelConfig) error { return nil })
+
+	out, err := captureStdout(t, func() error {
+		return cmdSetup([]string{"--mode", "api", "--dry-run"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "dry-run 成功") {
+		t.Errorf("应报告 dry-run 成功，got:\n%s", out)
 	}
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
-		t.Errorf("报错时不得写盘，got err=%v", err)
+		t.Errorf("--dry-run 不得写盘，got err=%v", err)
+	}
+}
+
+func TestSetupModeAPIKeepsCustomModelAndBaseURL(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"mode":"api","provider":"deepseek","model":"my-model","base_url":"https://gw.internal/v1"}` + "\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stubAPIKeyPrompt(t, "sk-gw", nil)
+	var seen distill.ModelConfig
+	stubAPIDryRun(t, func(cfg distill.ModelConfig) error { seen = cfg; return nil })
+
+	if err := cmdSetup([]string{"--mode", "api"}); err != nil {
+		t.Fatal(err)
+	}
+	if seen.Model != "my-model" || seen.BaseURL != "https://gw.internal/v1" {
+		t.Errorf("自建网关配置不得被默认值覆盖，got %+v", seen)
+	}
+}
+
+func TestSetupModeAPIProviderFlag(t *testing.T) {
+	setupHome(t)
+	stubAPIKeyPrompt(t, "sk-openai", nil)
+	var seen distill.ModelConfig
+	stubAPIDryRun(t, func(cfg distill.ModelConfig) error { seen = cfg; return nil })
+
+	if err := cmdSetup([]string{"--mode", "api", "--provider", "openai"}); err != nil {
+		t.Fatal(err)
+	}
+	if seen.Provider != "openai" || seen.Model != "gpt-4o-mini" || !strings.HasPrefix(seen.BaseURL, "https://api.openai.com") {
+		t.Errorf("--provider openai 应走默认端点，got %+v", seen)
+	}
+}
+
+func mustRead(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", p, err)
+	}
+	return string(b)
+}
+
+// 真实 dry-run 必须带着文件里的 key 打到 base_url，且能解析 judge 输出。
+func TestDryRunAPIConfigUsesStoredKey(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/chat/completions" {
+			t.Errorf("路径不对: %s", r.URL.Path)
+		}
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"[{\"id\":\"aaaaaaaa\",\"verdict\":\"reject\",\"reason\":\"process_narrative\"}]"}}]}`)
+	}))
+	defer srv.Close()
+
+	cfg := distill.ModelConfig{Provider: "deepseek", Model: "deepseek-flash", BaseURL: srv.URL, APIKey: "sk-live"}
+	t.Setenv("DEEPSEEK_API_KEY", "sk-env-should-not-win")
+	if err := dryRunAPIConfig(cfg); err != nil {
+		t.Fatalf("dryRunAPIConfig: %v", err)
+	}
+	if gotAuth != "Bearer sk-live" {
+		t.Errorf("应显式使用配置的 key，got %q", gotAuth)
+	}
+}
+
+func TestDryRunAPIConfigRejectsBadResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"模型坏掉了"}}]}`)
+	}))
+	defer srv.Close()
+	cfg := distill.ModelConfig{Provider: "deepseek", Model: "deepseek-flash", BaseURL: srv.URL, APIKey: "sk-live"}
+	if err := dryRunAPIConfig(cfg); err == nil {
+		t.Fatal("输出不可解析时应报错")
+	}
+}
+
+// 非 TTY（管道 / 测试）时逐行读；真实终端的无回显由 term.ReadPassword 负责。
+func TestReadSecretLineFromPipe(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := io.WriteString(w, "sk-pipe\n"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	var out strings.Builder
+	key, err := promptSecretLine(r, &out, "输入密钥:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "sk-pipe" {
+		t.Errorf("got %q", key)
+	}
+	if !strings.Contains(out.String(), "输入密钥:") {
+		t.Errorf("应先打印提示，got %q", out.String())
 	}
 }
 
@@ -385,7 +605,7 @@ func TestSetupRejectsModeWithStatusOrUndo(t *testing.T) {
 	}
 }
 
-// spec §4：mode=cli 时 api 字段保留不删，--mode api 切回时没有环境变量也应沿用文件里的 key。
+// spec §4：mode=cli 时 api 字段保留不删，--mode api 切回时直接沿用文件里的 key，不提示、不看环境。
 func TestSetupModeAPIReusesStoredKey(t *testing.T) {
 	p := setupHome(t)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -395,11 +615,18 @@ func TestSetupModeAPIReusesStoredKey(t *testing.T) {
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("DEEPSEEK_API_KEY", "")
-	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("DEEPSEEK_API_KEY", "sk-env-decoy")
+	t.Setenv("OPENAI_API_KEY", "sk-env-decoy-2")
+	calls := 0
+	stubAPIKeyPrompt(t, "sk-should-not-be-used", &calls)
+	var seen distill.ModelConfig
+	stubAPIDryRun(t, func(cfg distill.ModelConfig) error { seen = cfg; return nil })
 
 	if _, err := captureStdout(t, func() error { return cmdSetup([]string{"--mode", "api"}) }); err != nil {
 		t.Fatalf("cmdSetup --mode api: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("文件已有 key 时不得再提示，got %d", calls)
 	}
 	c, err := distill.LoadModelConfig(p)
 	if err != nil {
@@ -407,6 +634,9 @@ func TestSetupModeAPIReusesStoredKey(t *testing.T) {
 	}
 	if c.Mode != "api" || c.APIKey != "sk-stored" || c.Provider != "deepseek" {
 		t.Errorf("应沿用 model.json 里已有的 api_key 与 provider，got %+v", c)
+	}
+	if seen.APIKey != "sk-stored" {
+		t.Errorf("dry-run 应看到文件里的 key，got %+v", seen)
 	}
 	st, err := os.Stat(p)
 	if err != nil {
@@ -538,10 +768,17 @@ func TestSetupEnablesAutoSpawnAndExplainsIt(t *testing.T) {
 }
 
 // --mode api 同样配好了模型来源，也应默认开启自动触发。
+// 新版 API 流程不读环境变量：先在 model.json 里存好 key，再走 dry-run。
 func TestSetupModeAPIEnablesAutoSpawn(t *testing.T) {
 	p := setupHome(t)
-	t.Setenv("DEEPSEEK_API_KEY", "sk-test")
-	t.Setenv("OPENAI_API_KEY", "")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"mode":"api","provider":"deepseek","model":"deepseek-flash","api_key":"sk-stored"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stubAPIDryRun(t, func(distill.ModelConfig) error { return nil })
+
 	if err := cmdSetup([]string{"--mode", "api"}); err != nil {
 		t.Fatal(err)
 	}

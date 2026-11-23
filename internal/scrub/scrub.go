@@ -14,7 +14,10 @@ var patterns = []struct {
 	repl string
 }{
 	{regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`), "[redacted]"},
-	{regexp.MustCompile(`(?i)(api[_-]?key|token|secret|password|authorization|passwd)\s*[:=]\s*\S+`), "[redacted]"},
+	// 赋值形态：覆盖 API key / token / 密码等常见名，外加 OAuth 授权码与客户端密钥。
+	// OAuth 的 auth_code 不带 token 字样，2026-11-23 巡检里 `freebuff login` 的
+	// 授权码就是从这个缺口原样进了永久归档（观测与候选各一条）。
+	{regexp.MustCompile(`(?i)(api[_-]?key|token|secret|password|authorization|passwd|auth[_-]?code|client[_-]?secret)\s*[:=]\s*\S+`), "[redacted]"},
 	{regexp.MustCompile(`\bsk-[A-Za-z0-9_\-]{8,}\b`), "[redacted]"},
 	{regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`), "[redacted]"},
 	{regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._\-]{8,}`), "[redacted]"},
