@@ -385,6 +385,7 @@ func TestSetupWritesCLIAndNotice(t *testing.T) {
 	t.Setenv("HOME", home)
 	dir := t.TempDir()
 	script := `#!/bin/sh
+case "$1" in --version) echo "1.2.3"; exit 0 ;; esac
 in=$(/bin/cat)
 case "$in" in
   *"候选"*) echo '[{"id":"aaaaaaaa","verdict":"reject","reason":"process_narrative"}]' ;;
@@ -416,7 +417,6 @@ esac
 - `TestSetupDoesNotOverwriteExisting`：先写 api 配置，跑 `cmdSetup(nil)`，断言内容不变。
 - `TestSetupUndoRestoresBackup`：先写旧配置，跑 `cmdSetup([]string{"--mode","off"})`，再 `cmdSetup([]string{"--undo"})`，断言恢复旧内容。
 - `TestSetupModeAPIUsesEnv`：`t.Setenv("DEEPSEEK_API_KEY","sk-test")`，`cmdSetup([]string{"--mode","api"})`，断言 `Provider=="deepseek"`、`APIKey=="sk-test"`、0600。
-
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `go test ./cmd/mem -run 'TestSetup' -v`
