@@ -190,10 +190,12 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 
 **生命周期**：`mem gc [--max-idle DUR] [--min-salience F] [--no-backup]`（回收：TTL 到期 + 久未命中**且**低重要性）
 · `mem gc --obs [--max-age DUR]`（只删观测行）· `mem gc --evidence [--evidence-grace DUR]`（删**已无观测引用**的归档段与磁盘文件；可与 `--obs` 合跑，顺序固定为观测在前）
+· `mem gc --audit [--audit-age DUR]`（只删审计账本：超期 `distill_runs` / `read_traces`，默认 720h；**每个会话留一条蒸馏游标**，活跃会话的轨迹不动）
 · `mem consolidate [--threshold F] [--no-backup]`（相似知识归并，留 1 条、其余置 `superseded_by`）
 · `mem forget <id\|前缀>`（删除一条）
 `gc` / `consolidate` 是破坏性操作，执行前**自动备份库快照**到 `<库目录>/backup/`；空库或加 `--no-backup` 则跳过。
 证据归档**按引用准出**：观测还在、段就必须留（否则记忆会显示「有证据」却打不开），所以 `--evidence` 单跑在观测未回收时释放 0 字节，属预期。
+审计账本**按会话结束准出**：`read_traces` 是注入去重依据（按 session 无时间窗读），`distill_runs` 是蒸馏游标（每会话 `MAX(finished_at)`），两者都不能按年龄一刀切。
 
 **跨设备**：`mem export [文件.jsonl]` / `mem import <文件.jsonl>`（按 `(content_hash, project)` 归并，**幂等**）· `mem sync <remote>`（git 拉→三方合并→推，`content_hash+updated_at` 最近者胜、冲突并存打标记，`--abort` 复原；写前自动备份）。
 ⚠️ **绝不要同步 `mem.db` 本体** —— 写入中途的同步会损坏 SQLite；`export/import` 与 `sync` 都只走导出的 JSONL。

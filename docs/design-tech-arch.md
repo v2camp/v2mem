@@ -122,7 +122,7 @@ make build-onnx  # M5 可选分支：-tags local_onnx，需 CGO + libonnxruntime
 - `mem touch <id|前缀>`：命中反馈，刷新 `last_seen_at` + 累加 `access_count`；支持 8 位短 ID 前缀，**歧义前缀报错**而非静默选第一条
 - `mem forget <id|前缀>`：显式删除，`tags` 经外键 `ON DELETE CASCADE` 级联清理
 - `mem gc [--max-idle 720h] [--min-salience 0.2]`：回收两类——TTL 到期（`expired`）、久未命中且低重要性（`decayed`）
-- `mem gc --obs` / `--candidates` / `--evidence`：分层准出。观测按保留期删行；候选 pending→expired、已采纳行超期删；证据归档**按引用准出**——只删已无观测引用的段与磁盘文件（`--evidence` 有 1h 写入保护期，且只在观测回收后才释放字节）
+- `mem gc --obs` / `--candidates` / `--evidence` / `--audit`：分层准出。观测按保留期删行；候选 pending→expired、已采纳行超期删；证据归档**按引用准出**——只删已无观测引用的段与磁盘文件（`--evidence` 有 1h 写入保护期，且只在观测回收后才释放字节）；审计账本**按会话结束准出**——`read_traces`（注入去重依据）只在所属会话无新观测时按年龄删，`distill_runs`（蒸馏游标）每会话必留最新一条 `ok`/`empty`
 
 **淘汰判据**：`last_seen_at < now - maxIdle AND salience < minSalience`。
 关键取舍：**高 salience 的记忆即使久未命中也保留**——重要性应当能抵御遗忘，否则重要但不常用的知识会被误删。
