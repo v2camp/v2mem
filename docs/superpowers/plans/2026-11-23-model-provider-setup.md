@@ -416,7 +416,7 @@ esac
 - `TestSetupAllCandidatesFailLeavesNoConfig`：桩 `exit 1`，断言 `model.json` 不存在、err 为 nil；同文件覆盖 `--dry-run` 不写盘、`--status` 不联网。
 - `TestSetupDoesNotOverwriteExisting`：先写 api 配置，跑 `cmdSetup(nil)`，断言内容不变。
 - `TestSetupUndoRestoresBackup`：先写旧配置，跑 `cmdSetup([]string{"--mode","off"})`，再 `cmdSetup([]string{"--undo"})`，断言恢复旧内容。
-- `TestSetupModeAPIUsesEnv`：`t.Setenv("DEEPSEEK_API_KEY","sk-test")`，`cmdSetup([]string{"--mode","api"})`，断言 `Provider=="deepseek"`、`APIKey=="sk-test"`、0600。
+- `TestSetupModeAPIPromptsAndIgnoresEnv`：环境里预置诱饵 key，`cmdSetup([]string{"--mode","api"})` 断言只取输入 key、`Provider=="deepseek"`、0600、输出不回显；`TestSetupModeAPIReusesStoredKey` 断言文件有 key 时不提示。
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `go test ./cmd/mem -run 'TestSetup' -v`
@@ -426,7 +426,7 @@ Expected: FAIL（`cmdSetup` 未定义）。
 
 flag：`--dry-run`、`--status`、`--mode api|cli|off`、`--undo`。
 流程按 spec §7：读现状 → 已有配置且无显式 mode 时打印 status 返回 → `ProbeAll()` 遍历候选 → 逐候选 dry-run（judge prompt + `distill.Run` 一条合成观测）→ 全失败不写盘、退出 0 → 首个通过则 `SaveModelConfig` → 打印 `setupNotice`。
-`--mode api` 只从环境变量取 key（`DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`），都没有则报错并提示两种 export；不读 stdin（避免回显与依赖）。
+`--mode api` 只从 model.json 取 key：文件不存在先创建（0600）；文件已有 key 就复用并掩码显示，否则终端无回显提示输入（D9，不读环境变量）；随后用真实 judge prompt 跑 dry-run，通过才写盘，失败保留原文件；`--provider deepseek|openai` 可指定供应商。
 `--undo`：无 `model.json.v2mem.bak` 报错；有则读备份、写回 `model.json`（0600）、删除备份。
 跨平台不用 `os.Rename` 覆盖目标（Windows 会失败）。
 `--status`：只打印 `mode/cli/model_tag/path/perm`，不联网。

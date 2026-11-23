@@ -29,6 +29,7 @@
 | D6 | 零选择 × 红线 | **零填写 ≠ 零告知**：主动执行 `mem setup` 即显式授权，但必须打印数据外发告知、dry-run、回退命令 |
 | D7 | model_tag | 记为 `cli:<name>@<cli-version>+tpl<ver>@judge-v2`，并在设计文档标注为 §4(a) 的**降级** |
 | D8 | CLI flag | 具体 flag / 输出格式 / 能否取 model 字段**全部标「未测」**，实现期本机实测 |
+| D9 | `--mode api` 取 key | **只从 model.json 或终端无回显输入取，不读环境变量**；固定「查/建文件 → 复用或提示 key → 真实 dry-run 通过后写盘」三步（2026-11-23 用户更正 D4 的 env 设想） |
 
 被否决的方案：B 双文件（两份配置 + 优先级规则扩散，「零选择」下状态更多）、
 C 扩 `provider`（污染 `ModelSpec` 与 `--provider` 枚举）、纯静默零选择（违反 §5「provider 必须显式配」）。
@@ -141,7 +142,7 @@ CLI 只在写侧 detach 子进程里被调用，**绝不进 PromptSubmit / Sessi
 mem setup                 # 默认：全自动探测、零选择
 mem setup --dry-run       # 只探测 + 验证，不落盘
 mem setup --status        # 显示 mode / cli / model_tag / 路径 / 权限 / 来源，不联网
-mem setup --mode api      # 显式切回 API；key 从 stdin 不回显读入，或沿用已探测到的环境变量
+mem setup --mode api      # 显式切回 API；只认 model.json 里已有的 key 或终端无回显输入，不读环境变量
 mem setup --mode cli      # 显式指定 CLI 路径
 mem setup --mode off      # 显式关闭
 mem setup --undo          # 恢复最近一次写盘前的备份；无备份则报错并提示 --mode off
