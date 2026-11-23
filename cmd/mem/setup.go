@@ -119,7 +119,7 @@ func cmdSetup(args []string) error {
 	// （argv 未实测），此时换下一个，而不是让用户手工排查。
 	candidates := distill.ProbeAll()
 	if len(candidates) == 0 {
-		msg := "没有探测到可用的 CLI（白名单：claude / codex）。判定器与蒸馏的模型来源未改变。"
+		msg := fmt.Sprintf("没有探测到可用的 CLI（白名单：%s）。判定器与蒸馏的模型来源未改变。", strings.Join(distill.CLIWhitelist(), " / "))
 		if *mode == "cli" {
 			return errors.New(msg + "\n装了其中任一个后重跑 mem setup，或改用 mem setup --mode api / --mode off。")
 		}
