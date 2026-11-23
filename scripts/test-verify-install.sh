@@ -286,6 +286,16 @@ jq -n --arg c "$H/bin/mem" '{mcpServers: {v2mem: {command: $c, args: ["mcp"]}}}'
 OUT="$(run --harness workbuddy)"
 expect_has "T22 C3 缺 type WARN" 'WARN C3.*type' "$OUT"
 
+# ---------- T24 WorkBuddy 连接器关闭（disabled: true）----------
+new_home wbdisabled
+write_hooks 4
+jq -n --arg c "$H/bin/mem" '{mcpServers: {v2mem: {type: "stdio", command: $c, args: ["mcp"], disabled: true}}}' >"$H/.workbuddy/mcp.json"
+printf '{"abc::v2mem":{}}' >"$H/.workbuddy/mcp-approvals.json"
+OUT="$(run --harness workbuddy)"
+expect_has "T24 C3 禁用 WARN" 'WARN C3.*禁用' "$OUT"
+OUT="$(run --harness workbuddy --preflight)"
+expect_has "T24 preflight 也报禁用" 'WARN C3.*禁用' "$OUT"
+
 # ---------- T23 Trae 的 User/mcp.json 可被读取 ----------
 new_home traemcp
 write_trae_hooks

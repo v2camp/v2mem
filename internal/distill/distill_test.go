@@ -46,6 +46,180 @@ func TestExtractRulesFromSyntheticObs(t *testing.T) {
 	}
 }
 
+// TestMatchKindSkipsNegatedMatch 覆盖 C（否定语境前置判断）。
+// 用例取自本机实测的 18 条噪音候选原句：它们都是「一切正常」的表述，
+// 只因含「失败 / FAIL」被 kindRes 判成踩坑。
+func TestMatchKindSkipsNegatedMatch(t *testing.T) {
+	cases := []struct {
+		name    string
+		summary string
+		want    string
+	}{
+		{"日志无FAIL", "日志无 `FAIL`/`ERROR`，进程正常退出", ""},
+		{"一次也没有失败", "完整性校验：一次也没有**失败**", ""},
+		{"失败计数零", "校验结果 失败：0 个", ""},
+		{"管道表零", "FAIL | 0（一次也没有失败）", ""},
+		{"均为零", "润色产物 与 原始 差异 FAIL 均为 0", ""},
+		{"长枚举里否定向后传递", "无 timeout/error/panic/exception 失败", ""},
+		{"真踩坑", "报错：fts 把整句汉字当成一个词", "pitfall"},
+		{"否定后回落下一个kind", "日志无 FAIL，决策是继续跑下一批", "decision"},
+		{"日期不是计数零", "2026-11-10 报错：内存溢出", "pitfall"},
+		{"十六进制错误码不是计数零", "报错 0x8007 权限不足", "pitfall"},
+		{"十次不是零次", "失败了 10 次才定位到", "pitfall"},
+		{"无实义词不否定", "报错无法复现，先加日志", "pitfall"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := matchKind(c.summary); got != c.want {
+				t.Errorf("matchKind(%q) = %q, want %q", c.summary, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExtractRulesAssistantSourceGate 覆盖 A（分源准入）：
+// assistant 的进度汇报默认不产候选，可复用结论仍放行，user 来源不受过程性过滤影响。
+func TestExtractRulesAssistantSourceGate(t *testing.T) {
+	cases := []struct {
+		name    string
+		event   string
+		summary string
+		want    int
+	}{
+		{
+			name: "助手进度汇报挡掉", event: "stop",
+			summary: "## Qwen3-ASR 全量重跑进度 **已完成：52 / 65（80%）**",
+			want:    0,
+		},
+		{
+			name: "助手完成汇报挡掉", event: "stop",
+			summary: "全量重跑已完成。**进度**：已完成 65/65 场，日志末尾出现 `DONE`",
+			want:    0,
+		},
+		{
+			name: "助手巡检报告自身不再自我喂养", event: "stop",
+			summary: "巡检已完成，全程只读。健康度：无 P0，采集链路正常",
+			want:    0,
+		},
+		{
+			name: "助手可复用结论保留", event: "stop",
+			summary: "报错根因是 fts5 把整句汉字当一个词，必须显式建 unicode61 分词器",
+			want:    1,
+		},
+		{
+			name: "结论与过程混在一起也挡掉", event: "stop",
+			summary: "根因是分词器没建，已修复并合并",
+			want:    0,
+		},
+		{
+			name: "结构化声明保留", event: "stop",
+			summary: "决策：记忆库放在用户目录，不放代码目录",
+			want:    1,
+		},
+		{
+			name: "口语化的决定不算声明", event: "stop",
+			summary: "决定先跑一遍测试，再合入",
+			want:    0,
+		},
+		{
+			name: "用户原话不看过程性标记", event: "user-prompt",
+			summary: "进度 52/65，报错了 3 次，先别再重跑",
+			want:    1,
+		},
+		{
+			name: "工具载荷不产事实", event: "post-tool-use",
+			summary: "Grep {\"pattern\":\"失败\"}",
+			want:    0,
+		},
+		{
+			// 真实漏网（obs ev_2b5a1 → cand 23ef4adc，2026-11-17 13:08 蒸馏：
+			// 该轮唯一一条 assistant 候选，是「讨论判据的句子」本身被当成判据的产物。
+			name: "助手复述判据原文挡掉", event: "stop",
+			summary: "这个失败用例暴露了一处真实取舍：`决策：…` 这类结构化声明本身就可复用，" +
+				"不该依赖「必须/不要」等词。我加了一条结构化声明判据。",
+			want: 0,
+		},
+		{
+			// 判据的判定对象是引号外的叙述；引号内的词是「被引用的字面」，
+			// 不该反过来把结论判成过程叙述。
+			name: "引号内的过程词不阻断结论", event: "stop",
+			summary: "决策：候选必须带 `已完成` 字样才算数",
+			want:    1,
+		},
+		{
+			// 真实漏网（obs ev_7be27 → cand 1ec0a682，2026-11-18 17:41 蒸馏）：
+			// 「根因是既有的测试范围问题」在 300 字处，落库时被截到 240 rune，
+			// 存下来的整段只剩「测试已执行 / 通过 / 失败」，裁决时无从判断可复用性。
+			// 判定必须看将要存储的那一段，否则门槛形同虚设。
+			name: "结论在截断窗口外不算数", event: "stop",
+			summary: "全量 Java 测试已执行（聚合入口，`-fae` 跑完所有模块）： ```bash mvn -f projects/pom.xml test -fae ``` " +
+				"结果： - **通过**：`agent-shared-core`、5-8（含 basic）、9-12（含 basic）、13-16 basic、17-18 basic、17-20 " +
+				"- **17-20 全量**：483 条测试，0 失败、0 错误、1 跳过，`BUILD SUCCESS` " +
+				"- **失败**：`lesson13-16-shop` 的 2 个护栏测试，共 5 条 - `MetricFormulaGuardTest`：3 条 " +
+				"- `WhitelistSchemaDriftTest`：2 条 根因是既有的测试范围问题，必须按模块重划边界。",
+			want: 0,
+		},
+		{
+			name: "结论在窗口内、进度在窗口外仍保留", event: "stop",
+			summary: "决策：图表题采用两层契约，LLM 只产出 ChartIntent，代码查库回填 ChartData，渲染器只吃 ChartData。" +
+				"这样模型不接触数字，渲染库可以整体替换，也不需要在 prompt 里塞任何表结构。" +
+				"落地时先把 intent 的字段命名收敛到五个维度，再让查询层按维度拼 SQL，最后统一在渲染层做单位换算。" +
+				"字段命名沿用数据字典里已有的中文标签，避免前端再维护一套映射表；单位换算只用整数，避免浮点误差。" +
+				"渲染库的替换成本因此压到只改一个适配器文件，测试也只需覆盖适配器边界。" +
+				"本轮进度：已完成 52/65 场，日志末尾 DONE。",
+			want: 1,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			facts := ExtractRules([]Observation{{ID: "x", Event: c.event, Summary: c.summary}})
+			if len(facts) != c.want {
+				t.Fatalf("len(facts) = %d, want %d (%+v)", len(facts), c.want, facts)
+			}
+		})
+	}
+}
+
+// TestUnquotedStripsQuotedSpans 覆盖引号剥除本身：只剥成对定界符，半个引号不吞句。
+func TestUnquotedStripsQuotedSpans(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"行内代码", "必须带 `已完成` 字样", "必须带   字样"},
+		{"围栏代码块", "看这段：\n```\nrm -rf /\n```\n以后别这么干", "看这段：\n \n以后别这么干"},
+		{"中文直角引号", "不该依赖「必须/不要」等词", "不该依赖 等词"},
+		{"英文双引号", `日志里说 "no error" 但进程挂了`, "日志里说   但进程挂了"},
+		{"半个反引号不吞句", "这个 ` 后面还有结论要说", "这个 ` 后面还有结论要说"},
+		{"没有引号原样返回", "根因是分词器没建", "根因是分词器没建"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := unquoted(c.in); got != c.want {
+				t.Fatalf("unquoted(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+func TestNegatedHelpers(t *testing.T) {
+	if negatedAfter("：0 个失败") != true {
+		t.Error("「：0」应判为否定")
+	}
+	if negatedAfter("：2 次") {
+		t.Error("「：2 次」不是否定")
+	}
+	if negatedBefore("日志无 ") != true {
+		t.Error("「无」应判为否定")
+	}
+	if negatedBefore("2026-11-10 ") {
+		t.Error("日期末尾的 0 不是计数零")
+	}
+}
+
+// TestExtractRulesKeepsEarlierKindsWithinCap：截断只砍超出上限的部分，
+// 靠前的 task/decision 不能被上限吃掉（与上一条的「套话不占位」互补）。
 func TestExtractRulesKeepsEarlierKindsWithinCap(t *testing.T) {
 	// 截断只砍超出上限的部分：靠前的 task/decision 不能被上限吃掉。
 	got := map[string]string{}
@@ -374,5 +548,71 @@ func TestParseFactsErrorKinds(t *testing.T) {
 	facts, err := ParseFacts("前言\n" + `{"kind":"task","content":"还剩一步"}` + "\n{坏的}")
 	if err != nil || len(facts) != 1 {
 		t.Fatalf("混排应留下好行，got %+v %v", facts, err)
+	}
+}
+
+// Reviewable 是 R8 的读侧口径：对已落库的候选重算「现行准入判据是否放行」。
+// 它必须与写侧规则同源，否则 R8 的绿/红就与产出端的实际行为脱钩。
+func TestReviewableMatchesAdmission(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		attrib  string
+		kind    string
+		want    bool
+	}{
+		{
+			name:    "用户原话一律可裁决",
+			content: "以后提交前必须跑 cover-gate",
+			attrib:  "user", kind: "preference",
+			want: true,
+		},
+		{
+			name:    "用户提问也算可裁决（宁可留噪不误删）",
+			content: "认真看下这个问题：种子绕过了候选裁决吗",
+			attrib:  "user", kind: "decision",
+			want: true,
+		},
+		{
+			name:    "助手进度汇报不可裁决",
+			content: "## Qwen3-ASR 全量重跑进度 已完成 52/65，进程存活",
+			attrib:  "assistant", kind: "pitfall",
+			want: false,
+		},
+		{
+			name:    "助手巡检报告不可裁决",
+			content: "巡检已完成，全程只读。健康度：无 P0",
+			attrib:  "assistant", kind: "decision",
+			want: false,
+		},
+		{
+			name:    "助手可复用结论可裁决",
+			content: "报错根因是 fts5 把整句汉字当一个词，必须显式建 unicode61 分词器",
+			attrib:  "assistant", kind: "pitfall",
+			want: true,
+		},
+		{
+			name:    "助手不产偏好：preference 不可裁决",
+			content: "根因是偏好被助手代填，必须只从用户原话取",
+			attrib:  "assistant", kind: "preference",
+			want: false,
+		},
+		{
+			name:    "来源未知的旧行不替人下结论",
+			content: "已完成 65/65，进程正常退出",
+			attrib:  "", kind: "pitfall",
+			want: true,
+		},
+		{
+			name:    "引用片段里的可复用标记不算断言",
+			content: "这条候选只是复述判据：`根因/必须/不要` 这些词本身不构成结论",
+			attrib:  "assistant", kind: "decision",
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		if got := Reviewable(c.content, c.attrib, c.kind); got != c.want {
+			t.Errorf("%s: Reviewable=%v want=%v（content=%q）", c.name, got, c.want, c.content)
+		}
 	}
 }

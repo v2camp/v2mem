@@ -9,8 +9,11 @@
 #   scripts/watch-v2mem.sh --window 24h
 #   scripts/watch-v2mem.sh --json          # 机器可读
 #   scripts/watch-v2mem.sh --quiet         # 只输出非 PASS 项
+#   scripts/watch-v2mem.sh --no-gc         # 不执行 R15 的候选过期，只判级
 #
 # 只读：不写库、不改配置。唯一的写入是 ~/.v2mem/watch-state.json 的基线快照。
+# 唯一例外是 R15：候选超期时执行 `mem gc --candidates` 做 pending → expired 的状态迁移
+# （行仍在库、不删 memories）；存在待删的已采纳行时转人工，不执行。`--no-gc` 可关掉。
 # R3 只统计读侧 hook（prompt-submit / session-start）的 ms；写侧 stop / obs-append
 # 共用同一个 Stop 计时器，计入会污染「检索延迟」，详见 docs/ops-watch.md §3。
 # R10 给这部分写侧耗时独立判级（只取 stop，避免与 obs-append 双计）；R11 只读
@@ -20,6 +23,7 @@
 # 有硬上限，越线会整块换占位且仍报成功，R2 的命中率看不出来。
 # R14 只量 evidence 归档目录的落盘量（文件数 + 字节），不折算成观测条数：gc 之后
 # 行数会降而文件数不降，两者本就会脱钩；归档是只写事实源，无自动回收路径。
+# R15 在候选超期时执行 pending → expired 的状态迁移（行仍在库，不删行）；--no-gc 可关。
 # 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
@@ -31,13 +35,15 @@ WB_DIR="${WORKBUDDY_CONFIG_DIR:-$HOME/.workbuddy}"
 WINDOW="12h"
 JSON_OUT=0
 QUIET=0
+GC_DISABLED=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --window) WINDOW="${2:-12h}"; shift 2 ;;
     --json)   JSON_OUT=1; shift ;;
     --quiet)  QUIET=1; shift ;;
-    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-gc)  GC_DISABLED=1; shift ;;
+    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -260,6 +266,9 @@ fi
 # 旧实现用全局 EMPTY/A_PROMPT 算，只要窗口内提问集中在「库内 0 条」的工程上，
 # 就会得到稳定但无意义的 FAIL——空注入是冷启动的设计预期，不是检索失效。
 # 这里把「该工程库内 <20 条」的样本单列为冷启动剔除，只在有料工程上判级。
+# 剔除不等于注入为空：规则段与观测注入不看 memories 条数，所以冷启动 INFO 会把
+# 实际的注入次数一并报出（见下方 R2_COLD_INJ），否则「确实注入了」会被读成
+# 「没有可注入内容」，把检索失效藏在 INFO 背后。
 PROMPT_BY_PROJ=""
 if [ -f "$AUDIT" ]; then
   PROMPT_BY_PROJ=$(jq -sr --argjson c "$CUTOFF" '
@@ -270,7 +279,7 @@ if [ -f "$AUDIT" ]; then
 fi
 
 if [ "$A_PROMPT" -gt 0 ]; then
-  R2_N=0; R2_EMPTY=0; R2_COLD=0; R2_COLD_PROJ=""
+  R2_N=0; R2_EMPTY=0; R2_COLD=0; R2_COLD_INJ=0; R2_COLD_PROJ=""
   if [ -n "$PROMPT_BY_PROJ" ]; then
     while IFS=$'\t' read -r pj tot emp; do
       case "${tot:-}${emp:-}" in ''|*[!0-9]*) continue ;; esac
@@ -278,6 +287,9 @@ if [ "$A_PROMPT" -gt 0 ]; then
       if [ -z "$pj" ]; then pc=$TOTAL; else pc=$(proj_total "$pj"); fi
       if [ "$pc" -lt 20 ]; then
         R2_COLD=$((R2_COLD + tot))
+        # 冷启动样本仍可能注入（规则段与观测不依赖 memories 条数），
+        # 只报「空注入属设计预期」会把「确实注入了」读成「没有可注入内容」。
+        R2_COLD_INJ=$((R2_COLD_INJ + tot - emp))
         R2_COLD_PROJ="$R2_COLD_PROJ${R2_COLD_PROJ:+, }${pj:-(未标注)}"
         continue
       fi
@@ -289,8 +301,15 @@ if [ "$A_PROMPT" -gt 0 ]; then
   fi
 
   if [ "$R2_N" -eq 0 ]; then
+    # 冷启动样本的注入次数要如实报出：库内 <20 条只说明「不按 30% 判级」，
+    # 不说明「一定注入为空」。规则段 / 观测注入不受 memories 条数约束。
+    if [ "$R2_COLD_INJ" -gt 0 ]; then
+      R2_COLD_TAIL="其中 ${R2_COLD_INJ} 次仍注入（来自规则段/观测，非记忆库命中）、$((R2_COLD - R2_COLD_INJ)) 次为空；样本同源，不计命中率"
+    else
+      R2_COLD_TAIL="空注入属设计预期，不计命中率"
+    fi
     add R2 INFO "窗口内提问全部来自冷启动工程" \
-      "prompt-submit ${A_PROMPT} 次全落在库内 <20 条的工程（${R2_COLD_PROJ:-未标注}），空注入属设计预期，不计命中率"
+      "prompt-submit ${A_PROMPT} 次全落在库内 <20 条的工程（${R2_COLD_PROJ:-未标注}），${R2_COLD_TAIL}"
   else
     HIT_RATE=$(( (R2_N - R2_EMPTY) * 100 / R2_N ))
     COLD_NOTE=""
@@ -325,9 +344,9 @@ if [ "$A_SEG_SEARCH_N" -gt 0 ]; then
   if [ "$A_SEG_SEARCH" -lt 50 ]; then
     add R3 PASS "检索延迟 ${A_SEG_SEARCH}ms" "低于 50ms 目标线；${R3_NOTE}"
   elif [ "$A_SEG_SEARCH" -lt 200 ]; then
-    add R3 WARN "检索延迟 ${A_SEG_SEARCH}ms" "高于典型值 ~9ms，观察是否库膨胀或锁竞争；${R3_NOTE}"
+    add R3 WARN "检索延迟 ${A_SEG_SEARCH}ms" "高于典型值 ~9ms，观察是否库膨胀或锁竞争（分因见 docs/ops-watch.md §5 R3）；${R3_NOTE}"
   else
-    add R3 FAIL "检索延迟 ${A_SEG_SEARCH}ms" "超过 200ms，检查库膨胀与 WAL 写锁竞争；${R3_NOTE}"
+    add R3 FAIL "检索延迟 ${A_SEG_SEARCH}ms" "超过 200ms，检查库膨胀与 WAL 写锁竞争（分因见 docs/ops-watch.md §5 R3）；${R3_NOTE}"
   fi
 elif [ "$A_MS" -gt 0 ]; then
   add R3 INFO "无分段样本" "读侧 ${A_READ_N} 次都没有 search_ms 字段（二进制早于分段埋点，需 make build）；总耗时均值 ${A_MS}ms 仅作观察"
@@ -369,23 +388,82 @@ fi
 printf '{"ts":%s,"total":%s,"window":"%s"}\n' "$NOW" "$TOTAL" "$WINDOW" > "$STATE" 2>/dev/null
 
 # R7 spool 积压
+#
+# 计数口径必须与 internal/evidence.isSpoolSegment 一致：`.jsonl.processing` 是
+# DrainSpool 已认领、尚未读完的段（认领靠 rename，成功才删）。只数 `*.jsonl`
+# 会在「认领后进程被杀 / 恢复失败」时得到 0，把积压误报成 PASS。
+#
+# 第二个坑是文案：只要看到文件就说「下次 SessionStart 会补写」，可重试本身可能
+# 一直在失败（2026-11-22 实测：同一个 seg 从 02:58 活到 15:04，期间 SessionStart
+# 的 drain 记了 failed=1）。所以窗口内若有 spool-drain 记录的 failed>0，
+# 必须说「重试已跑但没消化」，否则读报告的人会以为它会自愈。
 SPOOL_FILES=0
+SPOOL_STUCK=0
 if [ -d "$V2MEM_DIR/spool" ]; then
   SPOOL_FILES=$(find "$V2MEM_DIR/spool" -name '*.jsonl' -type f 2>/dev/null | wc -l | tr -d ' ')
+  SPOOL_STUCK=$(find "$V2MEM_DIR/spool" -name '*.jsonl.processing' -type f 2>/dev/null | wc -l | tr -d ' ')
 fi
-if [ "$SPOOL_FILES" -eq 0 ]; then
+SPOOL_TOTAL=$(( ${SPOOL_FILES:-0} + ${SPOOL_STUCK:-0} ))
+
+# 窗口内 spool-drain 的三元组：尝试次数 / 已回放条数 / 未消化条数（取最大）。
+A_SPOOL_TRY=0; A_SPOOL_DRAINED=0; A_SPOOL_FAILED=0
+if [ -f "$AUDIT" ]; then
+  W7=$(jq -sr --argjson c "$CUTOFF" '
+    [ .[] | select(.ts >= $c and .event=="obs-append" and (.mode // "") == "spool-drain") ] as $d
+    | [ ($d | length),
+        ([$d[] | .count // 0]  | add // 0),
+        ([$d[] | .failed // 0] | max // 0) ]
+    | @tsv' "$AUDIT" 2>/dev/null)
+  if [ -n "${W7:-}" ]; then
+    IFS=$'\t' read -r A_SPOOL_TRY A_SPOOL_DRAINED A_SPOOL_FAILED <<< "$W7"
+  fi
+fi
+A_SPOOL_TRY=${A_SPOOL_TRY:-0}; A_SPOOL_DRAINED=${A_SPOOL_DRAINED:-0}
+A_SPOOL_FAILED=${A_SPOOL_FAILED:-0}
+
+if [ "$SPOOL_TOTAL" -eq 0 ]; then
   add R7 PASS "spool 无积压" "写库链路正常"
-elif [ "$SPOOL_FILES" -le 3 ]; then
-  add R7 WARN "spool 有 ${SPOOL_FILES} 个文件" "下次 SessionStart 会补写；若持续增长说明写库失败"
 else
-  add R7 FAIL "spool 积压 ${SPOOL_FILES} 个文件" "写库持续失败，检查库文件权限与磁盘"
+  STUCK_NOTE=""
+  if [ "$SPOOL_STUCK" -gt 0 ]; then
+    STUCK_NOTE="；其中 ${SPOOL_STUCK} 个是已认领未完成（*.jsonl.processing），不是写侧新失败"
+  fi
+  if [ "$A_SPOOL_FAILED" -gt 0 ]; then
+    R7_TAIL="窗口内回放尝试 ${A_SPOOL_TRY} 次、回放 ${A_SPOOL_DRAINED} 条、失败 ${A_SPOOL_FAILED} 条：重试已跑但没消化，别按「下次会补写」等；按 §5 R7 查锁竞争（busy_timeout）与库权限，先用库副本对照能否补上${STUCK_NOTE}"
+  else
+    R7_TAIL="窗口内无失败回放记录，下次 SessionStart 会补写；若持续增长说明写库失败${STUCK_NOTE}"
+  fi
+  if [ "$SPOOL_TOTAL" -le 3 ]; then
+    add R7 WARN "spool 有 ${SPOOL_TOTAL} 个文件" "$R7_TAIL"
+  else
+    add R7 FAIL "spool 积压 ${SPOOL_TOTAL} 个文件" "写库持续失败，检查库文件权限与磁盘${STUCK_NOTE}"
+  fi
 fi
 
 # R8 候选积压 / R9 载荷残留：统一从 candidates ls --json 采集，避免文本行数口径。
 # 按 project 分组，窗口值取各工程计数的**最大值**（阈值 5/15 不变）：
 # 跨工程候选不相加——别的项目候选留给它们自己的会话就近裁决，
 # 全局累加会把合法产物误诊成脏数据。见 docs/ops-watch.md §3 R8 / design-write-governance.md §12。
-CAND_JSON=$( "$MEM_BIN" candidates ls --json --limit 100000 2>/dev/null )
+#
+# 口径（2026-11-20 起）：R8 数的是「**现行准入判据下仍可裁决**的待处理数」，
+# 不是 pending 行数。原因：助手准入判据 2026-11-17 才落到写侧，此前入库的行按定义
+# 都没过这道门，于是 pending 里混着大量过程叙述（一台 cron 的进度汇报就有 17 条）。
+# 把这批算进「待办」，R8 会长期 FAIL 且处置不可执行——它不是没人裁决，是不可裁决。
+# 判据只约束新行、不能追认旧行，所以在读侧重算一遍：--triage 由 internal/distill.Reviewable
+# 统一给每条打 reviewable（与写侧同一套规则，不在脚本里另写正则）。
+# 旧行不删不改，`mem candidates ls --triage` 照常可见，并按 R15 的 TTL 自然过期；
+# 不可裁决的条数单独在 detail 里报出来，不做静默丢弃。
+CAND_JSON=$( "$MEM_BIN" candidates ls --json --triage --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null )
+# 脚本可能先于二进制更新（钩子跑的是装好的 ~/.local/bin/mem）。老二进制不认 --triage，
+# 此时退回纯 pending 口径并在 detail 说明，而不是把 R8 判成「候选读取失败」——
+# 后者会让人去查库权限，把版本错配误诊成故障。
+CAND_TRIAGE=1
+if ! printf '%s' "$CAND_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  if CAND_JSON=$( "$MEM_BIN" candidates ls --json --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null ) \
+     && printf '%s' "$CAND_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    CAND_TRIAGE=0
+  fi
+fi
 if printf '%s' "$CAND_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
   CAND_READ_FAIL=0
 else
@@ -395,16 +473,31 @@ fi
 CAND_PENDING=$(printf '%s' "$CAND_JSON" | jq -c '[.[] | select(.status == "pending")]' 2>/dev/null || echo '[]')
 CAND=$(printf '%s' "$CAND_PENDING" | jq -r 'length' 2>/dev/null || echo 0)
 CAND=${CAND:-0}
-CAND_MAX=$(printf '%s' "$CAND_PENDING" | jq -r '[group_by(.project)[] | length] | max // 0' 2>/dev/null || echo 0)
+# 缺 reviewable 键（旧二进制 / 测试夹具）按「可裁决」处理：不可裁决统计以 false 为唯一依据。
+CAND_REVIEWABLE=$(printf '%s' "$CAND_PENDING" | jq -c '[.[] | select(.reviewable != false)]' 2>/dev/null || echo '[]')
+CAND_REV=$(printf '%s' "$CAND_REVIEWABLE" | jq -r 'length' 2>/dev/null || echo 0)
+CAND_REV=${CAND_REV:-0}
+CAND_EXHAUST=$(( CAND - CAND_REV ))
+[ "$CAND_EXHAUST" -lt 0 ] && CAND_EXHAUST=0
+CAND_MAX=$(printf '%s' "$CAND_REVIEWABLE" | jq -r '[group_by(.project)[] | length] | max // 0' 2>/dev/null || echo 0)
 CAND_MAX=${CAND_MAX:-0}
 # detail 以 | 分隔 RESULTS，且会被拼进 JSON：项目名里的 | 与 " 一律替换掉。
-CAND_GROUPS=$(printf '%s' "$CAND_PENDING" | jq -r '
+CAND_GROUPS=$(printf '%s' "$CAND_REVIEWABLE" | jq -r '
   group_by(.project) | map({p:(.[0].project // ""), n:length}) | sort_by(-.n)
   | map((if .p == "" then "(全局)" else .p end) + "=" + (.n|tostring))
   | join(", ") | gsub("[\"|]"; "/")' 2>/dev/null || echo '')
+# 不可裁决的按工程报数，避免「总量降了但不知降在哪」。
+CAND_EXHAUST_TXT=""
+if [ "$CAND_EXHAUST" -gt 0 ]; then
+  CAND_EXHAUST_TXT="；另有 ${CAND_EXHAUST} 条按现行准入判据不可裁决（过程叙述/助手偏好，不计入积压，随 R15 TTL 过期）"
+fi
+if [ "${CAND_TRIAGE:-1}" -eq 0 ]; then
+  CAND_EXHAUST_TXT="；二进制不支持 --triage，本窗口按 pending 行数计（重建 mem 后恢复可裁决口径）"
+fi
 # 越线时直接给出「最积压工程的前 3 条」，省掉裁决前的一次 candidates ls。
 # 只给 id 前半段 + 正文前 40 字：够认出是哪件事，又不把 detail 撑长。
-CAND_TODO=$(printf '%s' "$CAND_PENDING" | jq -r '
+# 取数集与积压计数同源（CAND_REVIEWABLE）：不可裁决的行列进来只会误导裁决。
+CAND_TODO=$(printf '%s' "$CAND_REVIEWABLE" | jq -r '
   (group_by(.project) | max_by(length) // [])[0:3]
   | map(((.id // "")[0:8]) + ":" + (((.content // "")[0:40]) | gsub("[\\n\"|*#]"; "/")))
   | join(" / ")' 2>/dev/null || echo '')
@@ -412,11 +505,11 @@ CAND_TODO=$(printf '%s' "$CAND_PENDING" | jq -r '
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
   add R8 WARN "候选读取失败" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
 elif [ "$CAND_MAX" -le 5 ]; then
-  add R8 PASS "候选待处理 ${CAND_MAX}" "隔离区未积压；按工程：${CAND_GROUPS:-无}"
+  add R8 PASS "候选待处理 ${CAND_MAX}" "隔离区未积压；按工程：${CAND_GROUPS:-无}${CAND_EXHAUST_TXT}"
 elif [ "$CAND_MAX" -le 15 ]; then
-  add R8 WARN "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决${CAND_TODO:+；可先裁决：$CAND_TODO}"
+  add R8 WARN "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
 else
-  add R8 FAIL "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响${CAND_TODO:+；可先裁决：$CAND_TODO}"
+  add R8 FAIL "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
 fi
 
 # R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤。
@@ -485,7 +578,14 @@ else
   add R10 INFO "无写侧样本" "窗口内没有带 ms 的 stop 事件，无法评估写侧延迟"
 fi
 
-# R11 WAL 堆积：只读文件大小，绝不修改或删除 -wal。
+# R11 WAL 高水位：只读文件大小，绝不修改或删除 -wal。
+#
+# 帧数由文件大小折算，量的是**文件高水位**，不是积压量：SQLite 只在
+# wal_checkpoint(TRUNCATE) 或最后一个连接关闭时才收缩 -wal 文件，被动 checkpoint
+# 只把页回写主库、文件本身不缩。故「帧数 > 1000」只说明历史写过这么多，不等于
+# 数据滞留。2026-11-20 实证：仅取主库文件（不含 -wal）的快照含 5249/5264 条观测
+# （99.7%，最新到 11-19 20:29），checkpoint 实际一直在推进；同期 -wal 稳定 4.0MB。
+# 判「是否真滞留」看 §5 的 (busy,log,checkpointed) 三元组，不要据此推断读侧延迟。
 WAL_FILE="$V2MEM_DIR/mem.db-wal"
 WAL_BYTES=0
 if [ -f "$WAL_FILE" ]; then
@@ -494,11 +594,11 @@ fi
 WAL_BYTES=${WAL_BYTES:-0}
 WAL_FRAMES=$(( WAL_BYTES / 4096 ))
 if [ "$WAL_FRAMES" -le 1000 ]; then
-  add R11 PASS "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，未超 wal_autocheckpoint=1000"
+  add R11 PASS "WAL 高水位 ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，未超 wal_autocheckpoint=1000"
 elif [ "$WAL_FRAMES" -le 2000 ]; then
-  add R11 WARN "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，被动 checkpoint 未跟上；按 §5 执行 wal_checkpoint(TRUNCATE) 并记录返回三元组"
+  add R11 WARN "WAL 高水位 ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，超过 autocheckpoint 水位。帧数取自文件大小，不代表数据滞留（SQLite 只在 TRUNCATE 或最后一个连接关闭时收缩 -wal）；先按 §5 取 (busy,log,checkpointed) 三元组，log 与 checkpointed 相等即无滞留，确有滞留再 TRUNCATE"
 else
-  add R11 FAIL "WAL ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，超过阈值 2 倍；按 §5 执行 wal_checkpoint(TRUNCATE)，不要手工删 -wal"
+  add R11 FAIL "WAL 高水位 ${WAL_FRAMES} 帧" "${WAL_BYTES} 字节，超过阈值 2 倍。先按 §5 取三元组判滞留，确需回收再 wal_checkpoint(TRUNCATE)，不要手工删 -wal"
 fi
 
 # R12 写侧自动决策链路：观测 → 蒸馏 → 候选 → 显式裁决。
@@ -560,6 +660,48 @@ elif [ "$EV_BYTES" -le 536870912 ]; then
   add R14 PASS "归档 ${EV_MIB}MiB" "${EV_FILES} 个归档 / ${EV_MIB}MiB（主库 ${DB_MIB}MiB），未超 512MiB 水位"
 else
   add R14 WARN "归档 ${EV_MIB}MiB" "${EV_FILES} 个归档 / ${EV_MIB}MiB（主库 ${DB_MIB}MiB），超过 512MiB 水位；归档只增不减，按 §5 R14 裁决保留策略，勿删目录"
+fi
+
+# R15 候选 TTL 执行：pending 超过 14 天仍未转 expired，说明过期机制从来没被跑过。
+# 为什么需要单独一条判据：GCCandidates 在代码里写死 14 天 TTL（`internal/store/candidates.go`），
+# 但唯一执行者是手工 `mem gc --candidates`。2026-11-17 实测本机 2 条 11-02 候选已超期
+# 14.8 天仍是 pending，crontab / LaunchAgents 均无调度——TTL 存在却形同虚设，
+# 后果是 pending 只增不减、R8 长期 FAIL，且这个失效是**静默的**（不报错，只是永远不生效）。
+#
+# 自主边界（重要）：只执行「状态迁移」pending → expired——行仍在库、`--status expired` 可查、
+# 不删 memories、不影响 R6。不执行「行删除」：GCCandidates 还带一条 DELETE（删 90 天以上的
+# accepted 行），所以先查是否存在待删的已采纳行，**有就不执行**，转人工——
+# 删除不可逆，属 design-write-governance.md §12.5 明确要人判的那一类。
+#
+# 顺序要求：R15 必须排在 R8/R9 之后。R8 反映的是过期前的真实积压，先采集再处置，
+# 否则会把自己刚清空的结果当成「没有积压」。
+TTL_DAYS=14
+TTL_ACCEPTED_DAYS=90
+STALE_PENDING=$(printf '%s' "$CAND_PENDING" | jq -r --argjson now "$NOW" --argjson ttl $(( TTL_DAYS * 86400 )) '
+  [ .[] | select(($now - (.created_at // 0)) > $ttl) ] | length' 2>/dev/null || echo 0)
+case "$STALE_PENDING" in ''|*[!0-9]*) STALE_PENDING=0 ;; esac
+
+if [ "$CAND_READ_FAIL" -eq 1 ]; then
+  add R15 WARN "候选 TTL 未核查" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
+elif [ "$STALE_PENDING" -eq 0 ]; then
+  add R15 PASS "候选 TTL 无超期" "无超过 ${TTL_DAYS} 天的 pending（与 GCCandidates 默认阈值同源）"
+elif [ "$GC_DISABLED" -eq 1 ]; then
+  add R15 WARN "候选超期 ${STALE_PENDING} 条" "已超 ${TTL_DAYS} 天仍 pending；--no-gc 下不自动过期，按 §5 手工执行 mem gc --candidates"
+else
+  ACC_JSON=$( "$MEM_BIN" candidates ls --json --status accepted --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null || echo '[]' )
+  ACC_OLD=0
+  if printf '%s' "$ACC_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    ACC_OLD=$(printf '%s' "$ACC_JSON" | jq -r --argjson now "$NOW" --argjson ttl $(( TTL_ACCEPTED_DAYS * 86400 )) '
+      [ .[] | select(($now - (.created_at // 0)) > $ttl) ] | length' 2>/dev/null || echo 0)
+  fi
+  case "$ACC_OLD" in ''|*[!0-9]*) ACC_OLD=0 ;; esac
+  if [ "$ACC_OLD" -gt 0 ]; then
+    add R15 WARN "候选超期 ${STALE_PENDING} 条·未执行" "另有 ${ACC_OLD} 条 ${TTL_ACCEPTED_DAYS} 天前的已采纳行会被连带删除（不可逆），故不自动执行；确认后跑 mem gc --candidates"
+  elif GC_OUT=$( "$MEM_BIN" gc --candidates -db "$V2MEM_DIR/mem.db" 2>&1 ); then
+    add R15 WARN "候选超期已过期 ${STALE_PENDING} 条" "已执行 mem gc --candidates（pending → expired，行仍在库，--status expired 可查，未动 memories）；R8 本窗口仍按过期前计数"
+  else
+    add R15 WARN "候选过期执行失败" "${GC_OUT:-mem gc --candidates 无输出}；按 §5 手工执行并查库权限与磁盘"
+  fi
 fi
 
 # ---------- 输出 ----------

@@ -843,6 +843,7 @@ func cmdCandidates(args []string) error {
 	project := fs.String("project", "", "限定工程（就近裁决用）")
 	limit := fs.Int("limit", 50, "条数上限")
 	policy := fs.Bool("policy", false, "显示提交矩阵裁决（只读，不写库）")
+	triage := fs.Bool("triage", false, "标注 reviewable：按现行准入判据是否仍值得人工裁决（只读）")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -888,16 +889,50 @@ func cmdCandidates(args []string) error {
 		return nil
 	}
 	if c.json {
+		if *triage {
+			return printJSON(triageView(list))
+		}
 		return printJSON(list)
 	}
 	if len(list) == 0 {
 		fmt.Println("（没有候选）")
 		return nil
 	}
+	if *triage {
+		// 文本模式只多一个标记位，不打乱既有解析方的行格式。
+		for _, cand := range list {
+			mark := "可裁决"
+			if !distill.Reviewable(cand.Content, cand.AttributedTo, cand.Kind) {
+				mark = "不可裁决"
+			}
+			fmt.Printf("%s  [%s] %s  %s  %s\n",
+				shortID(cand.ID), cand.Kind, cand.Status, mark, oneLine(cand.Content))
+		}
+		return nil
+	}
 	for _, cand := range list {
 		fmt.Printf("%s  [%s] %s  %s\n", shortID(cand.ID), cand.Kind, cand.Status, oneLine(cand.Content))
 	}
 	return nil
+}
+
+// candidateTriageView 是 candidates ls --triage 的只读视图：在候选原有字段上追加
+// reviewable。用嵌入而不是包一层，JSON 保持扁平——既有解析方按 .status / .project
+// 取值的（R8 的 jq、MCP 的等价逻辑）不用改，多出来的键不影响。
+type candidateTriageView struct {
+	store.Candidate
+	Reviewable bool `json:"reviewable"`
+}
+
+func triageView(list []store.Candidate) []candidateTriageView {
+	out := make([]candidateTriageView, 0, len(list))
+	for _, cand := range list {
+		out = append(out, candidateTriageView{
+			Candidate:  cand,
+			Reviewable: distill.Reviewable(cand.Content, cand.AttributedTo, cand.Kind),
+		})
+	}
+	return out
 }
 
 // candidatePolicyView 是 candidates ls --policy 的只读视图。

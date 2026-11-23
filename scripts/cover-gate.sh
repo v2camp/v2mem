@@ -24,7 +24,7 @@ for arg in "$@"; do
   --force       配合 --update 使用，允许下调下限（须在提交信息里说明原因）
 USAGE
       exit 0 ;;
-    *) echo "未知参数：$arg（用 --help 查看用法）" >&2; exit 2 ;;
+    *) echo "未知参数：${arg}（用 --help 查看用法）" >&2; exit 2 ;;
   esac
 done
 

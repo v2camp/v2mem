@@ -124,7 +124,7 @@ detect_platform() {
 		OS="windows"
 		ARCH="$arch"
 		if [[ "$arch" != "amd64" ]]; then
-			die "Windows 只提供 amd64 预编译（mem-windows-amd64.exe），当前架构是 $arch。请在 amd64 的 Git Bash 中安装，或自行交叉编译。"
+			die "Windows 只提供 amd64 预编译（mem-windows-amd64.exe），当前架构是 ${arch}。请在 amd64 的 Git Bash 中安装，或自行交叉编译。"
 		fi
 		BIN_NAME="mem-windows-amd64.exe"
 		EXE_NAME="mem.exe"

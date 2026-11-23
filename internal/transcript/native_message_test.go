@@ -114,6 +114,20 @@ func TestUserQueryText(t *testing.T) {
 			"",
 		},
 		{"普通文本原样", "直接提问，不带标签", "直接提问，不带标签"},
+		{
+			// 宿主把后台任务完成通知也当 user 消息发出来；整段没有一句用户的话，
+			// 必须清成空串，调用方据此判「不可提案」。
+			"宿主任务通知整段清空",
+			"<task-notification><task-id>iKjIwS</task-id><status>completed</status>" +
+				"<summary>Background command done</summary></task-notification>",
+			"",
+		},
+		{
+			"通知与注入块混排后仍留用户原话",
+			"<task-notification> <task-id>T1</task-id> <status>completed</status> </task-notification>" +
+				"<system-reminder data-role=\"user-context\">OS: darwin</system-reminder>\n继续上一轮的修复",
+			"继续上一轮的修复",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

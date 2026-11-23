@@ -80,38 +80,43 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **I4** | MCP 进程 | `pgrep -f "mem mcp"` | ≥1 | 0 | — |
 | **I5** | Trae 钩子执行环境 | `agent-hooks.log` 中 traecode 块的 `ExecEnv` | `Host` | `Sandbox`（读得到、写不进） | 未匹配到 traecode 块时 `INFO` |
 | **R1** | 钩子被真实触发 | 窗口内审计事件数 | ≥1 | — | 0 |
-| **R2** | 检索命中率 | **按 `project` 分组**：仅统计「该工程库内 ≥20 条」的 `prompt-submit`，`1 - empty 占比`；库内 <20 条的工程样本单列为冷启动剔除 | ≥30% | 10–30% | <10% |
+| **R2** | 检索命中率 | **按 `project` 分组**：仅统计「该工程库内 ≥20 条」的 `prompt-submit`，`1 - empty 占比`；库内 <20 条的工程样本单列为冷启动剔除，并在 `INFO` 里报出这批样本的实际注入次数 | ≥30% | 10–30% | <10% |
 | **R3** | 检索延迟 | 窗口内 `prompt-submit` / `session-start` 的 **`search_ms`** 均值（检索+渲染；总 `ms` 只作 detail，见下） | <50ms | 50–200ms | >200ms |
 | **R4** | 写侧活动 | 窗口内 `manual-add` 数 | ≥1 | 0（库≥20 条时） | — |
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
 | **R6** | 库规模 | `mem stats` 总条数 vs 上次快照 | 未下降 | 下降 | — |
-| **R7** | spool 积压 | `spool/*.jsonl` 数 | 0 | 1–3 | >3 |
-| **R8** | 候选积压 | `mem candidates ls --json` 按 `project` 分组后的**单工程** pending 数；窗口取各工程最大值 | ≤5 | 6–15 | >15 |
+| **R7** | spool 积压 | `spool/**/seg-*.jsonl` 数 **加上** `*.jsonl.processing` 数（后者是 drain 已认领、未读完的段，与 `evidence.isSpoolSegment` 同口径；detail 另读窗口内 `mode=spool-drain` 的 `failed` 区分「下次会补写」与「重试已跑但没消化」） | 0 | 1–3 | >3 |
+| **R8** | 候选积压 | `mem candidates ls --json --triage` 按 `project` 分组后的**单工程** `reviewable != false` 的 pending 数；窗口取各工程最大值。不可裁决的（过程叙述/助手偏好）单独报数，不计入 | ≤5 | 6–15 | >15 |
 | **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中载荷残留条数，两种形态都算：transcript 原始 JSON（`{"id"…}`/`{"type"…}`）与工具载荷文本（`Grep {`/`Shell {` 等工具名 + 对象字面量开头） | 0 | 1–3 | >3 |
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
-| **R11** | WAL 堆积 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0） | ≤1000 帧 | 1001–2000 | >2000 |
+| **R11** | WAL 高水位 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0）；量的是**文件高水位**，不是积压量 | ≤1000 帧 | 1001–2000 | >2000 |
 | **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `source` 分流）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
 | **R13** | 注入体量 | 窗口内读侧（`session-start` / `prompt-submit` / `pre-compact`）审计记录 `inject_bytes` 的**最大值**（无样本记 `INFO`） | ≤3600 | 3601–8000 | >8000 |
 | **R14** | 归档体量 | `~/.v2mem/evidence` 下文件数与总字节（`find` / `du`，只读）；detail 附 `mem stats --json` 的 `size_bytes` 作对照 | ≤512MiB | >512MiB | —（不设 FAIL，见依据） |
+| **R15** | 候选 TTL 执行 | `mem candidates ls --json` 中 `created_at` 超过 **14 天**的 pending 条数；超期时执行 `mem gc --candidates` 做 pending → expired（存在 90 天前的已采纳行时**不执行**，转人工） | 0 条超期 | 有超期（已自动过期，或转人工未执行） | — |
 
 阈值依据（不凭空定）：
 
 - **R3 的 50ms**：README 声明 200 条库检索平均 ~9ms，实测量级 9–15ms。50ms 是 5 倍冗余，
   越过说明库膨胀或 WAL 写锁竞争。
   **采集口径**：只取 `prompt-submit` / `session-start`（读侧注入），**且判级用 `search_ms`**。
-  总 `ms` 是一个 hook 进程的生命周期，含进程启动、开库、去重事务、证据归档 fsync、
-  session-start 的 spool 排空与内联蒸馏——这些都不是检索，其中证据 fsync 与内联蒸馏
-  （200ms 上限）单次就能顶到 FAIL 线。`stop` 与 `obs-append` 共用同一个 Stop hook 计时器，
-  其 `ms` 是整个捕获/归档流程耗时，不是检索耗时；早期脚本对所有带 `ms` 的事件取均值，
-  把 500ms 级写侧耗时混进来，产生稳定误报。
-  脚本在 R3 detail 展示总 `ms` 与各分段均值供观察，**只有 `search_ms` 参与判级**。
-  **判级字段切换（2026-11-23）**：此前判总 `ms`，在库内 0 条、注入体量恒定、宿主 load 34/12 核时
-  判出 202ms FAIL，而同一时刻 `mem search -no-audit` 与 `mem stats` 空启动同为 0.04–0.05s——
-  测的是宿主排队而非检索。旧记录没有 `search_ms` 字段时判 `INFO`（无样本），**不当 0 判 PASS**。
-  **均值对并发敏感（2026-11-17 实证）**：某窗口 8 个读侧样本全部落在 45 秒内、分两批同秒触发
-  （3 个 hook 并发时 1737–1873ms，4 个并发时 158–368ms），均值 809ms 判 FAIL，而同一时刻
-  纯读路径实测 10–20ms、库仅 29MB、WAL 663 帧。故 R3 越线时**先看样本时间分布与宿主 load**，
-  再判检索退化；分因动作见 §5 R3。
+  `stop` 与 `obs-append` 共用同一个 Stop hook 计时器，其 `ms` 是整个捕获/归档流程耗时，不是检索
+  （早期脚本对所有带 `ms` 的事件取均值，把 500ms 级写侧耗时混进来，产生稳定误报），写侧现归 R10。
+  **判级字段切换（2026-11-23）**：此前判总 `ms`——它是端到端，含进程启动、开库、去重事务、
+  证据归档 fsync、spool 排空与内联蒸馏（200ms 上限），单次就能顶到 FAIL 线。切换前在库内 0 条、
+  注入体量恒定、宿主 load 34/12 核时判出 202ms FAIL，而同一时刻 `mem search -no-audit` 与
+  `mem stats` 空启动同为 0.04–0.05s——测的是宿主排队而非检索。脚本在 detail 展示总 `ms` 与各分段
+  均值供观察，**只有 `search_ms` 参与判级**；旧记录无 `search_ms` 判 `INFO`（无样本），**不当 0 判 PASS**。
+  **端到端为什么不能当判据（2026-11-19/20 复核，452 个读侧样本）**：按日中位 11-10→11-18 为
+  11→17→24→37→45.5ms，11-20 十四样本均值 94.7／中位 102；同期纯检索仍 ~10ms、单测 p95=2.72ms。
+  库副本对照（`cp mem.db{,-wal,-shm}` 到 /tmp 后用同一二进制打）副本 6–15ms、活库 43–205ms，指向运行态，
+  但「常驻 `mem mcp` 数」与「`-wal` 大小」**已否证**（副本挂常驻 mcp 11.5ms、带 4.2MB `-wal` 11.7ms），
+  R11 的 `-wal` 帧数同理只作参考（量的是文件高水位），不能拿来解释 R3；
+  同 2266 字符 prompt 端到端 40→205→54/54→191/49ms **非单调**、进程内检索 18→55ms，故成因在
+  **进程启动 + 审计写入**，不是检索回归。另抓到写侧偶发失败：11-20 14:22 的 `prompt-submit` 证据未入库
+  而落 `spool/<session>/seg-*.jsonl`（`seq=0`/`generation=0`，`openEvidenceSession` 失败分支）。
+  **均值对并发敏感（2026-11-17 实证）**：某窗口 8 个读侧样本分两批同秒触发（3 个 hook 并发 1737–1873ms、
+  4 个并发 158–368ms），旧口径（总 `ms`）均值 809ms 判 FAIL 而同期纯读 10–20ms——越线先看样本分布与宿主 load，分因见 §5 R3。
   **`open_ms` / `search_ms` 分段（2026-11-19）**：读侧审计除总 `ms` 外，另记
   `open_ms`（`store.Open`）与 `search_ms`（检索+渲染）。只记总耗时无法区分
   「检索变慢」与「开库/进程启动变慢」，2026-11-18 那轮（hook 210ms、纯读 20ms、
@@ -120,7 +125,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   `evidence_ms`（prompt-submit 落用户原话证据：`openEvidenceSession` + 归档 fsync）、
   `maint_ms`（session-start 的 spool 排空与挂起蒸馏）。脚本 R3 detail 在字段存在时展示
   分段均值与「其余」（＝`ms` 减去五段，含 stdout 写与审计追加）。有了这五段，R3 越线时
-  能直接指出是哪一段，而不是只得出「不在检索上」。判级口径不变，仍是窗口均值。
+  能直接指出是哪一段，而不是只得出「不在检索上」。判级仍取窗口均值，字段见上（`search_ms`）。
 - **R2 的 30%**：`docs/design-eval.md` 的口径是「能取到的细节无限深」，命中率随库内容增长而上升；
   初期低是必然。30% 是"库有料但仍常空手"的告警线。
 - **R2 的分组口径（2026-11-15）**：与 R8 同源——库是全局的、`project` 是列，一个工程库里有料
@@ -139,9 +144,22 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   `candidates_ls` 提供就近查看。R9 的采集同步改读 `--json` 的 `content`，检测式与旧版
   `grep '\{"(id|parentId|callId|type)"'` 等价，**判定语义与阈值均未变**。
   `candidates ls --json` 不可解析时 R8/R9 按 `WARN` 观察，不静默判 `PASS`。
+  **只数可裁决（2026-11-20）**：阈值 5/15 未变，**计量对象**改为「现行准入判据下仍可裁决的 pending」。
+  起因：助手准入判据 2026-11-17 才落到写侧，此前入库的行按定义都没过这道门——本机 50 条 pending 里
+  17 条是同一台 cron 的进度汇报、8 条是助手过程叙述、6 条是巡检报告本身。把它们当「待办」，
+  R8 会长期 `FAIL` 且 §5 的处置不可执行：它不是没人裁决，是**不可裁决**。
+  判据只能约束新行、不能追认旧行，故在读侧重算：`--triage` 由 `internal/distill.Reviewable`
+  对每条打分，与写侧共用同一套规则（`assistantDurable` / 助手不产 preference），脚本里不另写正则。
+  认定规则：`attributed_to=user` 一律可裁决；`assistant` 须过准入判据且非 `preference`；
+  来源为空（判据落地前的旧行）按可裁决处理，不替人下结论。
+  旧行**不删不改**，`mem candidates ls --triage` 照常可见，并按 R15 的 TTL 自然过期；
+  detail 固定报出「另有 N 条不可裁决」，口径修正不等于静默丢弃。
+  **脚本与二进制需同批发布**：老 `mem` 不认 `--triage`，脚本会退回纯 pending 口径并在 detail
+  注明「二进制不支持 --triage」，不判「候选读取失败」——否则版本错配会被误诊成库权限故障。
   **detail 附「可先裁决」（2026-11-19）**：越线时按最积压工程取前 3 条，写
   `id:正文前 40 字`。裁决本身仍是人做的，这一步只省掉裁决前的一次 `candidates ls`——
-  判定语义、阈值与级别均未变。
+  判定语义、阈值与级别均未变。取数集与积压计数同源（可裁决集合），不可裁决的行不列进
+  「可先裁决」，否则会把人引到本来就无法 reject 的条目上。
   **检测式补第二种形态（2026-11-15）**：上面那个 grep 只认 transcript JSON。工具调用载荷的
   文本形态（`Shell {"command"…`、`Grep {"pattern"…`，即工具名 + 对象字面量开头）不含这些键，
   会被判成干净候选——本机 2 条 11-02 存量候选就是这样漏到 pending 里的，R9 一直报 `PASS`。
@@ -157,8 +175,12 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   （存量不清就一直计数，这是有意的），但候选不随窗口淘汰，只报条数会把 11-02 的残留说成
   「单窗口内产生」，把历史遗留误诊成「过滤刚失效」，诱导去改本来正常的准入逻辑。
   故 detail 拆两段：命中集里 `created_at > 窗口下界` 的记为**窗口内新增**，其余记为存量并给出
-  最早年龄（`最早 N 天前` / `最早为今日` / `创建时间不可读`）。**只有窗口内新增 >0 才允许
+  最早年龄（`最早 N 天前` / `最早为今日` / `创建时间不可读`）。  **只有窗口内新增 >0 才允许
   写「过滤未生效」**；全为存量时结论落在「用 mem reject 清理」，不提过滤。阈值与级别不变。
+  **产出端收窄（2026-11-17）**：`internal/distill` 加了助手准入判据与否定语境判断
+  （[`design-speaker-attribution.md`](./design-speaker-attribution.md) §5），实测同一批会话
+  重放候选 42 → 9 条。**候选数下降、R8 随之转 PASS 属预期**，不要当成「蒸馏断链」——
+  断链看 R12（`event=distill` 是否还在写、失败数是否为 0）。
 - **R10 的 1000 / 3000ms**：宿主 `Stop` hook 是同步调用，`~/.workbuddy/settings.json`
   给的 `timeout` 为 20s，这是会话收尾的硬上限。1000ms 占预算 5%、3000ms 占 15%，
   越线即应介入，但距中断会话仍有余量。实测对照（`~/.v2mem/audit.jsonl`，
@@ -176,12 +198,19 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   同一台机器会因「图形实例启动」与「终端启动」出现两种行为。
 - **R11 的 1000 / 2000 帧**：`internal/store/store.go:70` 只设了 `journal_mode=WAL`、
   `busy_timeout=5000`、`synchronous=NORMAL`，未改 `wal_autocheckpoint`，即 SQLite
-  默认 1000 页；超过 1000 帧说明被动 checkpoint 已跟不上写入。2000 帧约为阈值的
-  2 倍（按 `page_size=4096` ≈ 8MB）。脚本按 4096 字节/页整除折算，是巡检的近似
-  口径（未扣 WAL 头与每帧 24 字节头，误差约 0.6%，不影响分级），detail 同时给出
-  原始字节数供复核。实测 11-08 04:19 为 1118 帧 / 4.5MB，
+  默认 1000 页；超过 1000 帧只说明历史上写到过这个位置，**不等于 checkpoint 跟不上**。
+  2000 帧约为阈值的 2 倍（按 `page_size=4096` ≈ 8MB）。脚本按 4096 字节/页整除折算，
+  是巡检的近似口径（未扣 WAL 头与每帧 24 字节头，误差约 0.6%，不影响分级），
+  detail 同时给出原始字节数供复核。实测 11-08 04:19 为 1118 帧 / 4.5MB，
   手动 `PRAGMA wal_checkpoint(TRUNCATE)` 返回 `0|0|0` 并归零，证明可回收。
-  **局限**：这是单点采样，刚 checkpoint 完会读到 0；它只反映 checkpoint 状态，
+  **判据命名的更正（2026-11-20）**：帧数由 `-wal` 文件大小折算，量的是**文件高水位**。
+  SQLite 的被动 checkpoint 只把页回写主库、**不缩文件**，只有 `TRUNCATE` 或最后一个
+  连接关闭才收缩——所以「帧数 > 1000」与「有数据滞留」不是同一件事。实证：仅取主库
+  文件（不含 `-wal`）的快照仍含 5249/5264 条观测（99.7%，最新到 11-19 20:29），
+  说明 checkpoint 一直在推进，而同期 `-wal` 稳定在 4.0MB / 约 1018 帧。此前 R11 的
+  detail 断言「被动 checkpoint 未跟上」，据此外推「WAL 拖慢读侧」的两轮结论都缺依据；
+  判滞留改看 §5 的 `(busy,log,checkpointed)` 三元组（`log == checkpointed` 即无滞留）。
+  **局限**：这是单点采样，刚 checkpoint 完会读到 0；它只反映 WAL 文件状态，
   **不用于推断写侧延迟**——11-08 黑盒实测中 hook 进程退出后 WAL 帧恒为 0，
   而 Stop 耗时仍随 transcript 行数线性上升，两者无因果关系（见
   [`design-write-batch.md`](./design-write-batch.md) §0）。R10 与 R11 各自独立判级。
@@ -241,6 +270,25 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
     判据只量落盘量，不量语义。主库 `size_bytes` 仅作对照——主库与归档通常同源增长（观测行），
     但主库会因 freelist 复用而平台化，归档不会。
   - **不随冷启动降级**：它是累计量，与库里有几条记忆无关。
+    （R15 的 `gc --candidates` 是**唯一例外**，且只做状态迁移，见下条。）
+- **R15 的 14 天与「单侧自主」（2026-11-17 新增）**：TTL 阈值不是新定的，是照抄
+  `GCCandidates` 的默认值（`internal/store/candidates.go:380`，`cmd/mem/main.go:849`
+  传入 `14*24h` / `90*24h`）。加这条判据的原因是**机制存在但没人执行**：
+  2026-11-17 实测本机 2 条 11-02 候选已超期 14.8 天仍是 `pending`，`crontab` 与
+  `LaunchAgents` 均无调度，而 `mem gc --candidates` 只有手工入口——TTL 形同虚设，
+  且失效是**静默的**（不报错，只是永不生效），表现为 pending 只增不减、R8 长期 FAIL。
+  - 为什么不在 hook 里做：`design-write-governance.md` §12.5 已否决「挂 `SessionStart`
+    自动过期」——撞 §5 hooks 只读护栏、污染 R3 读侧延迟口径、且用户看不见。
+    巡检是宿主侧运维动作（§6），不在这三条理由的适用范围内，故只在此处落地。
+  - **只做状态迁移，不做行删除**：`pending → expired` 行仍在库、`--status expired` 可查、
+    不删 `memories`、不影响 R6。`GCCandidates` 还含一条「删 90 天以上 accepted 行」的
+    `DELETE`，不可逆，属 §12.5 要人判的那一类：脚本先查是否存在待删的已采纳行，
+    **有就不执行**，只报 `WARN` 并给出命令。
+  - 判级无 `FAIL` 档：自动过期后即自愈，下一窗口回 `PASS`；`WARN` 的含义是「本窗口发生了
+    过期处置」或「该处置被转人工」，都需要人知道一次。
+  - **顺序约束**：R15 必须排在 R8 / R9 之后。先按过期前的实际状态判积压，再处置，
+    否则会把自己刚清空的结果误读成「本来就没积压」。detail 会注明「R8 本窗口仍按过期前计数」。
+  - `--no-gc` 关掉处置（只判级不动库），供排障与只读复现使用。
 
 ---
 
@@ -253,11 +301,16 @@ R2 的「库条数」是**按工程**读的：某个工程库内 <20 条，落�
 不参与命中率；只有库内 ≥20 条的工程才按 30% / 10% 判级。这样同一台机器上「A 工程有料、
 B 工程刚起步」不会被混算成一个 FAIL。
 
+**冷启动剔除 ≠ 注入为空（2026-11-21 起）**：`memories` 条数只决定「不按 30% 判级」，不决定
+「一定没有注入」——规则段与观测注入不看 `memories` 条数，冷启动工程的注入率实测可达一半
+（11-21 02:30 窗口：31 次提问全落在库内 <20 条的工程，其中 16 次仍有注入）。因此 `INFO` 会把
+这批样本的注入次数与空次数一并报出；`空注入属设计预期` 的文案只在真的全部为空时出现。
+
 判据必须阶段化，否则「符合预期」这四个字没有定义。跨过 20 条后自动启用完整阈值。
 
-**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13、R14 不降级：候选载荷残留是输入过滤失效、写侧延迟
-是同步 hook 的耗时、WAL 堆积是 checkpoint 未跟上、写侧决策断链是自动链路没推进、注入体量是
-单次注入的字节数、归档体量是累计落盘量，都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
+**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13、R14、R15 不降级：候选载荷残留是输入过滤失效、写侧延迟
+是同步 hook 的耗时、WAL 高水位是文件量级、写侧决策断链是自动链路没推进、注入体量是
+单次注入的字节数、归档体量是累计落盘量、候选 TTL 是「到期未过期」的机制失效，都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
 与 R3 / R10 / R13 的「无样本」同类，**不是**本节的降级。
 
 ---
@@ -268,19 +321,20 @@ B 工程刚起步」不会被混算成一个 FAIL。
 |:---|:---|:---|
 | R1 = 0（钩子零事件） | 配置写错文件 | 查 `WORKBUDDY_CONFIG_DIR`，确认钩子在 `~/.workbuddy/settings.json` 而**非** `~/.codebuddy/settings.json` |
 | R2 低但 R1 正常 | 库稀疏 / 同义词未覆盖 / **找到了但供给弃答** | 先分因，再对症：① `mem eval activity --since 12h` 列出空命中 query；② 手工复跑 `mem search "<query>"`，**也空** → 检索侧（补记忆或 `mem lexicon init`）；**有结果** → 供给侧弃答，直接查结局分布：`sqlite3 -readonly ~/.v2mem/mem.db "SELECT outcome, COUNT(*) FROM read_traces WHERE created_at > strftime('%s','now')-43200 GROUP BY outcome;"`。`abstained_no_hit` 是检索侧没找到，`abstained_low_quality` 是**找到了但被判无支持**（典型：只有 broad 单路支持），`skipped_gate` 是客套跳过（正常）。第三种（低质量弃答）的机制证据与复现见 [`design-eval.md`](./design-eval.md) §17.1 与 `make eval-hook-ab`——**不要**靠调低质量门阈值来让 R2 变好看 |
-| R3 检索延迟越线 | 库膨胀 / WAL 写锁竞争拖慢检索（总 `ms` 高而 `search_ms` 正常则属启动或写侧，已不判 R3） | 先分因，**不要先动阈值**：① 看 detail 里 `search_ms` 与总 `ms` 的差——差得远说明慢在启动/证据/维护，不是检索；② 复测纯读路径 `mem search -no-audit -scope current "<query>"` 跑 3–5 次取中位数，健康值 10–20ms（含进程启动约 40ms）；③ 复测仍高，再查库膨胀（`mem stats` 条数与体积）与 `-wal` 帧数（R11）；④ 高负载时不用单窗口均值下结论，等窗口滑过再复评。判 `INFO`「无分段样本」说明二进制早于分段埋点，先 `make build` 再评。**不要**为让读数回落而删观测行或改阈值 |
-| R7 持续增长 | 写库失败 | 查 `~/.v2mem` 权限与磁盘；spool 会在下次 SessionStart 重试 |
+| R3 检索延迟越线 | 库膨胀 / WAL 写锁竞争拖慢检索（总 `ms` 高而 `search_ms` 正常则属启动或写侧，已不判 R3） | 先分因，**不要先动阈值**：① 看 detail 里 `search_ms` 与总 `ms` 的差——差得远说明慢在启动/证据/维护，不是检索；② 复测纯读路径 `mem search -no-audit -scope current "<query>"` 跑 3–5 次取中位数，健康值 10–20ms（含进程启动约 40ms）；③ `search_ms` 仍高再查库膨胀（`mem stats` 条数与体积）；④ **库副本对照**：`cp mem.db{,-wal,-shm} /tmp/p/` 后用同一二进制打 `mem hook -db /tmp/p/mem.db`（2026-11-20 实测副本 6–15ms / 活库 43–205ms）——副本正常而活库慢指向运行态，但**不要**归因到「常驻 `mem mcp` 数」或「`-wal` 未回收」（两者已否证），改为查同秒并发 hook 与宿主 IO；⑤ 查本会话有无 `spool/<session>/seg-*.jsonl`：有则说明同一时刻写路径也失败过，先修争用再谈延迟；⑥ 高负载时不用单窗口均值下结论，等窗口滑过再复评。判 `INFO`「无分段样本」说明二进制早于分段埋点，先 `make build` 再评。**不要**为让读数回落而删观测行或改阈值 |
+| R7 持续增长 | 写库失败 | 查 `~/.v2mem` 权限与磁盘；spool 在下次 SessionStart 重试，**同一文件跨会话存活即重试本身在失败**（看 audit `mode=spool-drain` 的 `failed`），别只等下一次；先用库副本跑同一段确认能否补上 |
 | R6 下降 | 非预期删除 | 查 `mem gc` / `mem consolidate` 是否自动跑过；库被外部删除后重建也走这条 |
 | I2 掉到 1–3 | 宿主升级覆盖配置 | 重跑 `mem init --harness workbuddy`（幂等、带备份） |
 | I5 = WARN（`ExecEnv: Sandbox`） | Trae 钩子跑在沙箱，`~/.v2mem` 禁写 | Hooks 面板运行方式改「本地自动运行」；或在沙箱配置放行 `~/.v2mem` |
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |
-| R8 候选积压 | 隔离区长期未裁决 | 先看 detail 里的**按工程分组**计数，在**对应工程的会话里**就近裁决：`mem candidates ls --project P --policy` 或 MCP `candidates_ls` 逐条看；可读候选 `mem accept` / MCP `accept`，载荷残留 `mem reject` / MCP `reject`（顶层命令，非 `mem candidates reject`）。不要跨工程批量 reject |
+| R8 候选积压 | 隔离区长期未裁决 | 先看 detail 里的**按工程分组**计数，在**对应工程的会话里**就近裁决：`mem candidates ls --project P --triage` 先分清哪些可裁决（`不可裁决` 的是过程叙述/助手偏好，别逐条 reject，交给 R15 的 TTL），再 `--policy` 或 MCP `candidates_ls` 逐条看；可读候选 `mem accept` / MCP `accept`，载荷残留 `mem reject` / MCP `reject`（顶层命令，非 `mem candidates reject`）。不要跨工程批量 reject |
 | R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
 | R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。**2026-11-19 复核：批量开启后生产仍约 15ms/行（748 行 9 秒），设计验收的 0.6ms/行只在小样本上成立**，故 Stop 侧另有 8s 时间预算（`transcriptStopBudget`）：超预算停在块边界、游标只推进到该处、下一次 Stop 续传，这是 20s 硬超时下的兜底，开关只算优化。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
-| R11 WAL 帧数越线 | 被动 checkpoint 未跟上 | `sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(TRUNCATE);"` 并记下返回三元组 `(busy,log,checkpointed)`；`busy=1` 说明有长读事务，查各 harness 的 `mem mcp` 连接。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务 |
+| R11 WAL 高水位越线 | 文件不缩是常态（passive checkpoint 不收缩 `-wal`），先判是否真有滞留 | 先取三元组：`sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(PASSIVE);"`（或 `PRAGMA wal_checkpoint;`）并记下 `(busy, log, checkpointed)`——`log == checkpointed` 即无滞留，帧数只是历史高水位，**不必**清。确有滞留（`busy=1` 说明有长读事务）再查各 harness 的 `mem mcp` 长连，确认后 `PRAGMA wal_checkpoint(TRUNCATE);` 回收文件。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务；也**不要**把 R11 的帧数当作 R3 延迟的证据 |
 | R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
 | R14 归档体量越线 | 归档只增不减，且没有回收用例 | 先分因：① **量增长**（文件数与字节同步涨）→ 裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处；也**不要**用 `mem gc --obs` 期待回收字节（它只删观测行）。确认接受现状就上调阈值并在提交信息里写明原因 |
+| R15 候选超期 / 转人工 | TTL 从未被执行，或存在待删的已采纳行 | 看 detail 区分两种情形：①「已过期 N 条」= 本轮已执行迁移，无需动作，下个窗口应回 `PASS`；②「未执行」= 有 90 天前的已采纳行会被连带删除，确认后手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`，或先 `mem candidates ls --status accepted` 复核。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
@@ -293,6 +347,10 @@ B 工程刚起步」不会被混算成一个 FAIL。
 - 脚本**只读**库与配置，唯一写入是上述快照。`--quiet` 只输出非 PASS 项，`--json` 供机器消费。
   R12 额外调用的 `mem eval activity --json` 只读 `audit.jsonl`（`cmdEvalActivity` 不打开数据库），
   不写审计、不写库；该命令不可用时 R12 仍按审计独立判级。
+- **R15 是「只读」的唯一例外**：候选超期时脚本会执行一次 `mem gc --candidates`（只做
+  `pending → expired`，不删 `memories`；存在待删已采纳行时转人工不执行）。这是有意的：
+  TTL 机制在代码里，执行者若只有「用户记得跑 CLI」，它就永远不会生效。`--no-gc` 可关掉
+  这一步，使脚本回到纯只读。
 - 告警口径：只有 `FAIL` 需要人介入；`WARN` 观察，`INFO` 忽略。
 
 ---
@@ -309,7 +367,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R14） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R15） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |
@@ -406,7 +464,7 @@ grep '"source":"distill"'  ~/.v2mem/audit.jsonl | tail -5   # 有输出 = 旧规
 | ID | 看到什么算正常 |
 |:---|:---|
 | **R1** 钩子被真实触发 | 每窗口 ≥1 事件，且窗口内存在 `source=proposal` 的 distill 记录；连续两窗只有 `provider=none` → 按 8.3 查名单 |
-| **R2** 检索命中率 | ≥30%（库 ≥20 条）；<20 条时为 `INFO`，不看数值 |
+| **R2** 检索命中率 | ≥30%（库 ≥20 条）；<20 条时为 `INFO`，不看数值；但 `INFO` 里报出的注入次数要跟着看——非零说明规则段/观测在供给，检索侧并非「无料可给」 |
 | **R4** 写侧活动 | 库 ≥20 条时每窗口 `manual-add` ≥1；为 0 记 `WARN`，不是 FAIL |
 | **R5** 观测落库 | 每窗口 `obs-append` ≥1（归档链路未断） |
 | **R8** 候选积压 | 各 `project` 的 `pending` 计数，窗口值取最大值（§3 口径）；≤5 正常，6–15 为 `WARN`，>15 为 `FAIL` |

@@ -30,6 +30,13 @@ printf '%s' "$r8_row" | grep -q '≤5'  || fail "§3 R8 的 PASS 线不是 ≤5"
 printf '%s' "$r8_row" | grep -q '>15' || fail "§3 R8 的 FAIL 线不是 >15"
 grep -q 'CAND_MAX" -le 5'  "$SCRIPT" || fail "脚本 R8 的 PASS 线不是 ≤5"
 grep -q 'CAND_MAX" -le 15' "$SCRIPT" || fail "脚本 R8 的 WARN 上界不是 15"
+# ②b R8 计量对象（2026-11-20 起「只数可裁决」）：文档写了 reviewable 口径，
+# 脚本就必须真的带 --triage 并按 reviewable 过滤；单侧改会退回「数 pending 行数」。
+printf '%s' "$r8_row" | grep -q 'reviewable' \
+  || fail "§3 R8 未写明只数 reviewable（口径与脚本脱钩）"
+grep -q -- '--triage' "$SCRIPT" || fail "脚本 R8 未带 --triage"
+grep -q 'select(.reviewable != false)' "$SCRIPT" || fail "脚本 R8 未按 reviewable 过滤"
+grep -q '另有 \${CAND_EXHAUST} 条' "$SCRIPT" || fail "脚本 R8 未报出不可裁决条数"
 
 # ③ ID 枚举漂移：§7 等处的「I1…Rn」/「R1…Rn」必须与 §3 的实际最大 R 一致。
 # 实证：判据表已扩到 R11 时，§7 仍写「I1…R9」，长期无人发现。
@@ -62,4 +69,105 @@ if ! sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -qE '^\| R3 '; then
   fail "§5 缺 R3 处置行（R3 FAIL 时会无动作可引用）"
 fi
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；枚举到 R${max_r}"
+# ⑦ R15 阈值与自主边界：TTL 14 天两侧同步；「只迁移不删除」的保护不许被删。
+# 这条判据是唯一会写库的（gc --candidates），边界退化比阈值漂移更危险：
+# 少了 ACC_OLD 检查，脚本就会替人执行 GCCandidates 里那条 DELETE。
+r15_row="$(grep -E '^\| \*\*R15\*\*' "$DOC" | head -1)"
+[ -n "$r15_row" ] || fail "§3 找不到 R15 行"
+printf '%s' "$r15_row" | grep -q '14 天' || fail "§3 R15 的 TTL 不是 14 天"
+grep -q 'TTL_DAYS=14'  "$SCRIPT" || fail "脚本 R15 的 TTL_DAYS 不是 14"
+grep -q 'GC_DISABLED'  "$SCRIPT" || fail "脚本 R15 缺 --no-gc 逃生开关"
+grep -q 'ACC_OLD'      "$SCRIPT" || fail "脚本 R15 缺「待删已采纳行则转人工」保护"
+
+# ⑧ R3 口径：脚本 detail 与文档依据段都必须写明「端到端」。
+# 实证：文档长期写「实测量级 9–15ms」，而 R3 量的是端到端（进程启动 + 冷缓存 + 注入渲染），
+# 2026-11-19 复核端到端按日中位数已到 45.5ms、长尾 167ms，纯检索仍 10ms。
+# 口径不分，每个窗口都会把「进程启动 + 并发」读成「检索退化」，并去删库/改阈值。
+printf '%s' "$(grep 'add R3 WARN' "$SCRIPT" || true)" | grep -q '端到端' \
+  || fail "脚本 R3 WARN 文案未区分端到端口径"
+r3_basis="$(sed -n '/\*\*R3 的 50ms\*\*/,/\*\*R2 的 30%\*\*/p' "$DOC")"
+[ -n "$r3_basis" ] || fail "§3 找不到 R3 阈值依据段"
+printf '%s' "$r3_basis" | grep -q '端到端' \
+  || fail "§3 R3 依据段未区分端到端口径"
+printf '%s' "$r3_basis" | grep -q '纯检索' \
+  || fail "§3 R3 依据段未保留纯检索对照值"
+# 反向断言：两处都不许再出现「9ms 是典型值 / 实测量级 9–15ms」的旧口径。
+if grep -q '典型值 ~9ms' "$SCRIPT"; then
+  fail "脚本 R3 WARN 退回「典型值 ~9ms」旧口径"
+fi
+if printf '%s' "$r3_basis" | grep -q '实测量级 9–15ms'; then
+  fail "§3 R3 依据段退回「实测量级 9–15ms」旧口径"
+fi
+# ⑨ R3 副本对照法必须两处都在：这是 2026-11-20 唯一能把「运行态慢」与「代码慢」分开的
+# 手段（同二进制对库副本 6–15ms / 活库 43–205ms）。删了就只剩拍脑袋分因。
+printf '%s' "$(grep 'add R3 WARN' "$SCRIPT" || true)" | grep -q '副本对照' \
+  || fail "脚本 R3 WARN 文案缺「副本对照」分流手段"
+printf '%s' "$r3_basis" | grep -q '库副本对照' \
+  || fail "§3 R3 依据段缺库副本对照法与实测值"
+
+# ⑨b R3 的归因必须是「尚未定论」，不许把已否证的两个原因写回判据文案。
+# 实证：2026-11-20 对照实验——整目录副本挂一个常驻 `mem mcp` 6 次 11–13ms（中位 11.5ms）；
+# 带 4.2MB `-wal` 的副本 11.7ms，与只含主库文件的副本同值。故「常驻连接」与「WAL 常驻」
+# 单独都解释不了活库 150–205ms，写回文案会让下一轮照着错原因排障。
+r3_warn="$(grep 'add R3 WARN' "$SCRIPT" || true)"
+if printf '%s' "$r3_warn" | grep -q '常驻连接'; then
+  fail "脚本 R3 WARN 把「常驻连接」当已定原因（2026-11-20 已否证）"
+fi
+if printf '%s' "$r3_warn" | grep -q 'WAL 常驻'; then
+  fail "脚本 R3 WARN 把「WAL 常驻」当已定原因（2026-11-20 已否证）"
+fi
+# 正向断言：否证结论与 spool 旁证必须留在文案里，否则下一轮会重做同一实验。
+printf '%s' "$r3_warn" | grep -q '否证' \
+  || fail "脚本 R3 WARN 缺「mcp 数量 / WAL 大小已否证」的结论"
+printf '%s' "$r3_warn" | grep -q 'spool' \
+  || fail "脚本 R3 WARN 缺「本会话 spool 可作写失败旁证」的提示"
+printf '%s' "$r3_basis" | grep -q '已否证' \
+  || fail "§3 R3 依据段缺否证结论（会重复归因到 mcp/WAL）"
+
+# ⑩ R11 语义：帧数量的是 -wal **文件高水位**，不等于数据滞留。
+# 实证：2026-11-20 仅取主库文件（不含 -wal）的快照仍含 5249/5264 条观测，checkpoint 一直在推进，
+# 而 -wal 稳定 4.0MB；此前 detail 断言「被动 checkpoint 未跟上」，据此外推「WAL 拖慢读侧」缺依据。
+grep -q '被动 checkpoint 未跟上' "$SCRIPT" \
+  && fail "脚本 R11 detail 退回「被动 checkpoint 未跟上」的错误归因"
+printf '%s' "$(grep 'add R11 WARN' "$SCRIPT" || true)" | grep -q '不代表数据滞留' \
+  || fail "脚本 R11 WARN 未说明「帧数≠滞留」"
+printf '%s' "$(grep 'add R11 WARN' "$SCRIPT" || true)" | grep -q '高水位' \
+  || fail "脚本 R11 WARN 未用「高水位」口径"
+r11_row="$(grep -E '^\| \*\*R11\*\*' "$DOC" | head -1)"
+[ -n "$r11_row" ] || fail "§3 找不到 R11 行"
+printf '%s' "$r11_row" | grep -q '高水位' \
+  || fail "§3 R11 名称未改成「WAL 高水位」"
+printf '%s' "$r11_row" | grep -q 'WAL 堆积' \
+  && fail "§3 R11 名称退回「WAL 堆积」"
+r11_basis="$(sed -n '/\*\*R11 的 1000 \/ 2000 帧\*\*/,/\*\*R12 的 0 \/ 3/p' "$DOC")"
+[ -n "$r11_basis" ] || fail "§3 找不到 R11 阈值依据段"
+printf '%s' "$r11_basis" | grep -q '文件高水位' \
+  || fail "§3 R11 依据段未说明帧数是文件高水位"
+printf '%s' "$r11_basis" | grep -q '5249/5264' \
+  || fail "§3 R11 依据段缺主库独立快照的实证数据"
+r11_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R11 ' || true)"
+printf '%s' "$r11_action" | grep -q 'log == checkpointed' \
+  || fail "§5 R11 处置未给「log == checkpointed 即无滞留」的判据"
+
+# ⑩ R7 计量对象：2026-11-22 前脚本只数 `*.jsonl`，漏掉 drain 认领后残留的
+# `*.jsonl.processing`——那种段明明还在盘上（重启后 DrainSpool 仍会读它），
+# 判据却数 0 报 PASS。文档与脚本必须同时覆盖两种后缀，且 detail 要能区分
+# 「下次会补写」与「重试已跑但没消化」。
+r7_row="$(grep -E '^\| \*\*R7\*\*' "$DOC" | head -1)"
+[ -n "$r7_row" ] || fail "§3 找不到 R7 行"
+printf '%s' "$r7_row" | grep -q 'jsonl.processing' \
+  || fail "§3 R7 未把 *.jsonl.processing 计入（口径与 isSpoolSegment 脱钩）"
+grep -q "SPOOL_STUCK=\$(find" "$SCRIPT" \
+  || fail "脚本 R7 未统计 *.jsonl.processing"
+grep -q 'SPOOL_TOTAL=\$(( ${SPOOL_FILES:-0} + ${SPOOL_STUCK:-0} ))' "$SCRIPT" \
+  || fail "脚本 R7 判级未按 jsonl + processing 合计"
+grep -q 'mode // "") == "spool-drain"' "$SCRIPT" \
+  || fail "脚本 R7 未读 spool-drain 审计（无法区分「会补写」与「补写在失败」）"
+# 文案在 R7_TAIL 里组装（add 行只拼接变量），所以按全文断言，不按某一行。
+grep -q '重试已跑但没消化' "$SCRIPT" \
+  || fail "脚本 R7 detail 缺「重试已跑但没消化」分支"
+r7_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R7 ' || true)"
+printf '%s' "$r7_action" | grep -q '重试本身在失败' \
+  || fail "§5 R7 处置未说明「同一文件跨会话存活即重试本身在失败」"
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"

@@ -244,3 +244,71 @@ func TestJudgeModelTag(t *testing.T) {
 		}
 	}
 }
+
+// ---------- CLI 入口的三个早退分支 ----------
+//
+// 这三种「什么都没判」必须各自说话：没有候选 ≠ 模型不可用 ≠ 判定失败。
+// 把「判定器没起来」说成「0 条判定」，读的人会以为候选都干净。
+
+// 空库：直接提示没有待判候选，不去碰模型配置（否则离线环境会报配置错误）。
+func TestCmdJudgeNoPendingSkipsModel(t *testing.T) {
+	out, err := captureStdout(t, func() error {
+		return cmdJudge([]string{"--db", testDB(t)})
+	})
+	if err != nil {
+		t.Fatalf("cmdJudge 空库应正常返回，got %v", err)
+	}
+	if !strings.Contains(out, "没有待判候选") {
+		t.Fatalf("空库应提示没有待判候选，got %q", out)
+	}
+}
+
+// -stats 只读库不调模型：它得在模型没配的机器上也能用。
+func TestCmdJudgeStatsJSONNeedsNoModel(t *testing.T) {
+	db := testDB(t)
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	c := seedCandidate(t, st, "fact", "候选表量级在千条以内，不为它加索引")
+	if err := st.MarkJudgeVerdict(c.ID, "reject", "ollama@judge-v2", "process_narrative"); err != nil {
+		st.Close()
+		t.Fatalf("MarkJudgeVerdict: %v", err)
+	}
+	st.Close()
+
+	out, err := captureStdout(t, func() error {
+		// 指向不存在的配置文件：-stats 不该走到读配置那一步。
+		return cmdJudge([]string{"--db", db, "--config", filepath.Join(t.TempDir(), "absent.json"), "--stats", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("cmdJudge -stats: %v", err)
+	}
+	if !strings.Contains(out, `"verdict":"reject"`) {
+		t.Fatalf("stats 输出应含 reject 分组，got %q", out)
+	}
+}
+
+// 有候选但模型起不来：必须报「判定器不可用」，且提示出路（mem setup / 加 API key）。
+// 出路文案随模型来源配置改版：旧版指向手写 model.json，现由 mem setup 统一落配置。
+func TestCmdJudgeUnavailableModelIsExplicit(t *testing.T) {
+	db := testDB(t)
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	seedCandidate(t, st, "fact", "MCP 与 hook 注入相互独立")
+	st.Close()
+
+	_, err = captureStdout(t, func() error {
+		return cmdJudge([]string{"--db", db, "--config", filepath.Join(t.TempDir(), "absent.json"), "--provider", "none"})
+	})
+	if err == nil {
+		t.Fatal("模型不可用时应返回错误，而不是静默判 0 条")
+	}
+	for _, want := range []string{"判定器不可用", "mem setup"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息应含 %q，got %v", want, err)
+		}
+	}
+}

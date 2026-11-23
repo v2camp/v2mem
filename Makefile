@@ -9,7 +9,7 @@ build:
 install:
 	CGO_ENABLED=0 go install $(PKG)
 
-test: fmt-check
+test: fmt-check test-watch
 	CGO_ENABLED=0 go test ./...
 
 # 格式门禁：任一 .go 未 gofmt 即非零退出。挂在 test 前，避免格式漂移脱离门禁

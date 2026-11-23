@@ -61,7 +61,7 @@ case "$BUMP" in
   major) major=$((major+1)); minor=0; patch=0 ;;
   minor) minor=$((minor+1)); patch=0 ;;
   patch) patch=$((patch+1)) ;;
-  *) echo "非法 --override: $BUMP（可选 major|minor|patch）" >&2; exit 2 ;;
+  *) echo "非法 --override: ${BUMP}（可选 major|minor|patch）" >&2; exit 2 ;;
 esac
 
 echo "v$major.$minor.$patch"
