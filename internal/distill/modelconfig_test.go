@@ -113,6 +113,61 @@ func TestResolveOptionsPrecedence(t *testing.T) {
 	}
 }
 
+// 只给 --model 不给 --provider 是常见的临时换模型用法，任何分支都不能吞掉它。
+func TestResolveOptionsFlagModelOnly(t *testing.T) {
+	cliCfg := ModelConfig{Mode: "cli", CLI: "claude", ModelTag: "claude@1+tpl1"}
+	if opt := ResolveOptions(cliCfg, "", "foo"); opt.ModelTag != "foo" || opt.CLI != "claude" {
+		t.Errorf("cli 下单给 --model 应映射到 ModelTag，got %+v", opt)
+	}
+	apiCfg := ModelConfig{Mode: "api", Provider: "deepseek", Model: "m"}
+	if opt := ResolveOptions(apiCfg, "", "foo"); opt.Model != "foo" || opt.Provider != "deepseek" {
+		t.Errorf("api 下单给 --model 应覆盖 Model，got %+v", opt)
+	}
+}
+
+// 零值配置等于「没有配置文件」，必须按 api 处理而不是落进 cli 分支。
+func TestResolveOptionsEmptyConfigIsAPI(t *testing.T) {
+	if opt := ResolveOptions(ModelConfig{}, "", ""); opt.CLI != "" || opt.Provider != "" {
+		t.Errorf("零值配置应按 api 处理，got %+v", opt)
+	}
+}
+
+// 原文件存在但读不出来时不能继续写：否则用户配置被覆盖且没有备份可回退。
+func TestSaveModelConfigFailsWhenExistingUnreadable(t *testing.T) {
+	// 路径是目录：读失败，rename 也失败，原路径必须保持原样。
+	p := filepath.Join(t.TempDir(), "model.json")
+	if err := os.Mkdir(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveModelConfig(p, ModelConfig{Mode: "off"}); err == nil {
+		t.Error("原文件不可读应报错，而不是覆盖")
+	}
+	if st, err := os.Stat(p); err != nil || !st.IsDir() {
+		t.Errorf("原路径应保持原样，got %v err=%v", st, err)
+	}
+
+	// 权限不可读的文件：目录可写，rename 会成功，只能靠读原文件时 fail-closed 兜住。
+	if os.Geteuid() == 0 {
+		return // root 无视权限位，这一半验不出东西
+	}
+	locked := filepath.Join(t.TempDir(), "model.json")
+	if err := os.WriteFile(locked, []byte(`{"provider":"old"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o200); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveModelConfig(locked, ModelConfig{Mode: "off"}); err == nil {
+		t.Error("读不到原文件时应报错，而不是无备份覆盖")
+	}
+	if err := os.Chmod(locked, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(locked); err != nil || !strings.Contains(string(b), `"old"`) {
+		t.Errorf("原文件内容应保持不变，got %q err=%v", b, err)
+	}
+}
+
 // DeepSeek 走 OpenAI 兼容协议，只有 base 与 model 名不同；默认模型名必须自己兜，
 // 不能落到 ollama 的 qwen2.5:7b 上。
 func TestResolveDeepSeek(t *testing.T) {

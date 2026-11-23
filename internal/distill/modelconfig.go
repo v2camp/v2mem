@@ -19,6 +19,7 @@ import (
 // Mode 用来区分两条互斥的来源：api（走 provider 解析）与 cli（走本机已装的 CLI）。
 // 老文件没有 mode 字段，一律按 api，行为与加这个字段之前完全一致。
 type ModelConfig struct {
+	// "" 表示没有配置文件（零值契约），运行期按 api 处理；下游只比较 cli/off。
 	Mode     string `json:"mode,omitempty"`
 	CLI      string `json:"cli,omitempty"`
 	ModelTag string `json:"model_tag,omitempty"`
@@ -89,7 +90,12 @@ func SaveModelConfig(path string, c ModelConfig) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if old, err := os.ReadFile(path); err == nil {
+	if old, err := os.ReadFile(path); err != nil {
+		// 只有「没有原文件」才能跳过备份；读不出来就停下，别把用户唯一的配置盖掉。
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	} else {
 		bak := path + ".v2mem.bak"
 		// 已有备份不覆盖：保留最早的状态，--undo 才能一直回到最初。
 		if _, statErr := os.Stat(bak); errors.Is(statErr, fs.ErrNotExist) {
@@ -125,6 +131,7 @@ func SaveModelConfig(path string, c ModelConfig) error {
 // ResolveOptions 是「flag > model.json > 环境变量 > auto」的唯一实现点。
 // 调用方只管把 flag 值原样传进来，不要各自判断 flag 是否显式给过 —— 5 处构造点
 // 各判一次必然漂移。resolve() 本身只看 Options.CLI 是否非空，不重复判优先级。
+// flagModel 单独给出时也不能吞：api/off 覆盖 Model，cli 映射到 ModelTag。
 func ResolveOptions(cfg ModelConfig, flagProvider, flagModel string) Options {
 	// flag 显式给了 provider：按 flag 走，并且清空 CLI 让 resolve() 不进 CLI 分支。
 	if flagProvider != "" {
@@ -136,10 +143,19 @@ func ResolveOptions(cfg ModelConfig, flagProvider, flagModel string) Options {
 	}
 	switch cfg.Mode {
 	case "cli":
-		return Options{CLI: cfg.CLI, ModelTag: cfg.ModelTag}
+		// 单给 --model 时映射到 ModelTag：resolve() 会拼成 cli:<tag>，版本归因不丢。
+		tag := cfg.ModelTag
+		if flagModel != "" {
+			tag = flagModel
+		}
+		return Options{CLI: cfg.CLI, ModelTag: tag}
 	case "off":
-		return Options{Provider: "none"}
+		return Options{Provider: "none", Model: flagModel}
 	default:
-		return Options{Provider: cfg.Provider, Model: cfg.Model, APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}
+		model := cfg.Model
+		if flagModel != "" {
+			model = flagModel
+		}
+		return Options{Provider: cfg.Provider, Model: model, APIKey: cfg.APIKey, BaseURL: cfg.BaseURL}
 	}
 }
