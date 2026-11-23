@@ -235,6 +235,12 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   - **采集只读**：`audit.jsonl` + `mem eval activity --json`（`cmdEvalActivity` 不开库），
     不执行 `mem distill` / `accept` / `reject` / `gc`。`distill_runs` 的 `status` / `error` /
     `attempt` 与 `evidence_bundles` 积压留作 §5 的深挖命令，不进脚本采集，避免引入 sqlite 依赖。
+  - **`distill_runs` 有保留期（2026-11-23 起）**：`mem gc --audit`（默认 720h）会删超期运行账，
+    但**每个会话必留最新一条 `ok`/`empty`**——那是 `SessionsNeedingDistill` 的游标，删了会话会被
+    无限重蒸。所以 §5 R12 的 `SELECT ... FROM distill_runs ORDER BY started_at DESC LIMIT 20`
+    查的是「近期运行」，不是全史；追查 30 天以上的断链只剩 `audit.jsonl`（轮转 3 份）。
+    `read_traces` 同样有保留期，且**只删「所属会话已无新观测」的轨迹**——它是
+    `SessionInjectedRuleIDs` 的注入去重依据（按 session 无时间窗读）。
 - **R13 的 3600 / 8000 字节（2026-11-10 新增）**：单位是**字节**不是 rune。宿主按 stdout 的字节
   （字符）数设硬上限，本仓库的预算按 rune 收，CJK 下两者最坏差 3 倍（UTF-8 一个汉字 3 字节），
   所以只能拿字节对齐宿主的尺子。
@@ -263,7 +269,8 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   - **512MiB ≈ 10 万份归档**：实测 2026-11-12 为 8215 份 / 41MiB（均值 5.1KB/条）。
     `GCObservations` 的 `maxKeep` 默认 50000 条是产品自己声明的观测保留上限，
     512MiB ≈ 其 2 倍。越过说明归档量已超出「自己认为需要保留」的量级，应显式裁决保留策略。
-  - **为什么不设 FAIL 档**：归档按设计只增不减，任何 FAIL 线都会被自然增长永久触发，
+  - **为什么不设 FAIL 档**：归档的准出依赖观测先被回收（观测默认保留 720h），水位既不随
+    清理即时下降、也不会降到零，任何 FAIL 线都会被「归档量本就长期偏高」永久触发，
     与 R12 断链不判 FAIL 同理——恒久误报会让判据失去意义。越过 512MiB 后按 §5 R14 处置；
     确认接受现状就上调阈值并留记录（口径同 §5 R13）。
   - **口径是磁盘占用，不是条数**：`du -sk` 的块数（APFS 稀疏文件不占块，故样本必须实写）

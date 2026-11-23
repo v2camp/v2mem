@@ -99,6 +99,8 @@ gc 选项:
   --candidates          只回收候选：pending 超 14 天标过期，accepted 超 90 天删除（不删 memories）
   --evidence            回收无观测引用的证据归档段与磁盘文件（可与 --obs 合用，先观测后归档）
   --evidence-grace <dur> 与 --evidence 合用：写入保护期（默认 1h，刚写入的段不回收）
+  --audit               回收审计账本：超期的 distill_runs / read_traces（不删 memories）
+  --audit-age <dur>     与 --audit 合用：账本保留时长（默认 720h）
 
 consolidate 选项:
   --threshold <f>       相似度阈值 0..1（默认 0.7）
@@ -796,6 +798,8 @@ func cmdGC(args []string) error {
 	candOnly := fs.Bool("candidates", false, "只回收候选，不删除 memories")
 	evOnly := fs.Bool("evidence", false, "回收无观测引用的证据归档（可与 --obs 合用）")
 	evGrace := fs.Duration("evidence-grace", time.Hour, "证据归档写入保护期（配合 --evidence）")
+	auditOnly := fs.Bool("audit", false, "回收超期的审计账本 distill_runs / read_traces（不删 memories）")
+	auditAge := fs.Duration("audit-age", 720*time.Hour, "审计账本保留时长（配合 --audit）")
 	maxAge := fs.Duration("max-age", 720*time.Hour, "observations 保留时长（配合 --obs）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -804,9 +808,10 @@ func cmdGC(args []string) error {
 	if *obsOnly && *candOnly {
 		return errors.New("--obs 与 --candidates 不能同时使用")
 	}
-	// --obs 与 --evidence 允许合并且顺序固定：先回收观测，被删观测对应的归档段
-	// 这一轮才成为孤儿。反过来跑，归档要等下一次才清得掉。
-	if *obsOnly || *candOnly || *evOnly {
+	// --obs / --evidence / --audit 允许合并且顺序固定：先回收观测，被删观测对应的
+	// 归档段这一轮才成为孤儿；账本排在最后，因为「会话是否还在写观测」正是它判断
+	// 「这条轨迹能不能删」的依据——观测没先清掉，活跃会话的轨迹就不会被回收。
+	if *obsOnly || *candOnly || *evOnly || *auditOnly {
 		if *obsOnly {
 			if err := cmdGCObservations(c, *maxAge); err != nil {
 				return err
@@ -818,7 +823,12 @@ func cmdGC(args []string) error {
 			}
 		}
 		if *evOnly {
-			return cmdGCEvidence(c, *evGrace)
+			if err := cmdGCEvidence(c, *evGrace); err != nil {
+				return err
+			}
+		}
+		if *auditOnly {
+			return cmdGCAudit(c, *auditAge)
 		}
 		return nil
 	}
@@ -890,6 +900,29 @@ func cmdGCEvidence(c common, grace time.Duration) error {
 	if res.Failed > 0 {
 		fmt.Printf("%d 段删文件失败，已留在账本里等下轮重试\n", res.Failed)
 	}
+	return nil
+}
+
+// cmdGCAudit 回收审计账本里「已结束会话」的超期记录。
+//
+// 与 --obs 一样是只删账本、不碰 memories。两条保留规则写在 store.GCAudit 里：
+// 每个会话留一条蒸馏游标，活跃会话的轨迹不动。默认保留 720h，远大于巡检窗口
+// （12h），所以不会影响 R3/R12 的窗口统计。
+func cmdGCAudit(c common, age time.Duration) error {
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	res, err := st.GCAudit(time.Now().Add(-age).Unix())
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(res)
+	}
+	fmt.Printf("已回收审计账本：distill_runs %d 条，read_traces %d 条（明细 %d 条）；未改动 memories\n",
+		res.DistillRuns, res.ReadTraces, res.ReadTraceItems)
 	return nil
 }
 
