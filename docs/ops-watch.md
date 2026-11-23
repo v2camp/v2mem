@@ -82,11 +82,11 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R1** | 钩子被真实触发 | 窗口内审计事件数 | ≥1 | — | 0 |
 | **R2** | 检索命中率 | **按 `project` 分组**：仅统计「该工程库内 ≥20 条」的 `prompt-submit`，`1 - empty 占比`；库内 <20 条的工程样本单列为冷启动剔除，并在 `INFO` 里报出这批样本的实际注入次数 | ≥30% | 10–30% | <10% |
 | **R3** | 检索延迟 | 窗口内 `prompt-submit` / `session-start` 的 **`search_ms`** 均值（检索+渲染；总 `ms` 只作 detail，见下） | <50ms | 50–200ms | >200ms |
-| **R4** | 写侧活动 | 窗口内 `manual-add` 数 | ≥1 | 0（库≥20 条时） | — |
+| **R4** | 写侧活动 | 窗口内**记忆层写入**数：`manual-add` + `write` + `accept`（`accept` 是裁决闭环的落库出口，`mem batch --plan` 批量准出也记 `accept`；观测写入由 R5 单独判，不在这里双计） | ≥1 | 0（库≥20 条时） | — |
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
 | **R6** | 库规模 | `mem stats` 总条数（全库各数据表之和，见「按表」行）vs 上次快照 | 未下降 | 下降 | — |
 | **R7** | spool 积压 | `spool/**/seg-*.jsonl` 数 **加上** `*.jsonl.processing` 数（后者是 drain 已认领、未读完的段，与 `evidence.isSpoolSegment` 同口径；detail 另读窗口内 `mode=spool-drain` 的 `failed` 区分「下次会补写」与「重试已跑但没消化」） | 0 | 1–3 | >3 |
-| **R8** | 候选积压 | `mem candidates ls --json --triage` 按 `project` 分组后的**单工程** `reviewable != false` 的 pending 数；窗口取各工程最大值。不可裁决的（过程叙述/助手偏好）单独报数，不计入 | ≤5 | 6–15 | >15 |
+| **R8** | 候选积压 | `mem candidates ls --json --triage` 按 `project` 分组后的**单工程** `reviewable != false` 的 pending 数；**判级取各工程最大值**，标题另报可裁决议总数（两个数并列，避免「5 条散在 3 个工程」被读成 2 条）。不可裁决的（过程叙述/助手偏好）单独报数，不计入 | ≤5 | 6–15 | >15 |
 | **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中载荷残留条数，两种形态都算：transcript 原始 JSON（`{"id"…}`/`{"type"…}`）与工具载荷文本（`Grep {`/`Shell {` 等工具名 + 对象字面量开头） | 0 | 1–3 | >3 |
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
 | **R11** | WAL 高水位 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0）；量的是**文件高水位**，不是积压量 | ≤1000 帧 | 1001–2000 | >2000 |
@@ -97,8 +97,8 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 
 阈值依据（不凭空定）：
 
-- **R3 的 50ms**：README 声明 200 条库检索平均 ~9ms，实测量级 9–15ms。50ms 是 5 倍冗余，
-  越过说明库膨胀或 WAL 写锁竞争。
+- **R3 的 50ms**：本判据量的是**进程内检索**（`search_ms`，热态健康值 10–20ms）；**端到端**（进程启动 + 开库 + 去重事务 + 证据 fsync + 维护 + 注入渲染）实测 40–200ms，只作 detail，不参与判级。
+  50ms 是纯检索的 5 倍冗余，越过说明库膨胀或检索路径退化；端到端越线先看分段，**不要先动阈值**。
   **采集口径**：只取 `prompt-submit` / `session-start`（读侧注入），**且判级用 `search_ms`**。
   `stop` 与 `obs-append` 共用同一个 Stop hook 计时器，其 `ms` 是整个捕获/归档流程耗时，不是检索
   （早期脚本对所有带 `ms` 的事件取均值，把 500ms 级写侧耗时混进来，产生稳定误报），写侧现归 R10。

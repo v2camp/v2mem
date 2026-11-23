@@ -584,4 +584,66 @@ assert_r3 r3_search_warn "$(printf '{"ts":%s,"event":"prompt-submit","ms":120,"e
 assert_r3 r3_search_fail "$(printf '{"ts":%s,"event":"prompt-submit","ms":300,"empty":false,"search_ms":250}\n' "$NOW")" FAIL
 assert_r3 r3_no_seg_info "$(printf '{"ts":%s,"event":"prompt-submit","ms":300,"empty":false}\n' "$NOW")" INFO
 
+# ---- R6/TOTAL：stats「总条数」带中文注解（2026-11-23 6c167a3 起）----
+# 旧解析 `awk '{print $2}'` 会把「20527（全库各数据表之和）」整段当数字，后果是三重的：
+# `[ "$TOTAL" -lt 20 ]` 报 "integer expression expected"、json 头写出 `"total":20527（…）`
+# 不合法、watch-state.json 也写成坏 JSON（下一轮 R6 拿不到基线，静默退回「首次基线」）。
+# 这里断言：stderr 无 integer 报错、标题只留数字、state 文件可被 jq 解析。
+TOT_DIR="$TMP/tot_annotated"
+build_fixture "$TOT_DIR" none 0 no
+TOT_ERR="$TMP/tot.err"
+tot_out="$(V2MEM_DIR="$TOT_DIR/v2mem" WORKBUDDY_CONFIG_DIR="$TOT_DIR/wb" HOME="$TOT_DIR/home" \
+  MEM_BIN="$TOT_DIR/mem-stub" STUB_CAND_JSON="$EMPTY" STUB_ACC_JSON="$EMPTY" \
+  STUB_TOTAL='20527（全库各数据表之和）' \
+  bash "$WATCH" --json $R15_FLAGS 2>"$TOT_ERR" || true)"
+if grep -qi 'integer expression' "$TOT_ERR"; then
+  echo "FAIL tot_annotated: 仍把 stats 注解当数字: $(tr '\n' ' ' < "$TOT_ERR")" >&2
+  exit 1
+fi
+i1_title="$(printf '%s' "$tot_out" | jq -r '.items[] | select(.id=="I1") | .title' 2>/dev/null || true)"
+i1_detail="$(printf '%s' "$tot_out" | jq -r '.items[] | select(.id=="I1") | .detail' 2>/dev/null || true)"
+if [[ "$i1_detail" == *"（"* ]]; then
+  echo "FAIL tot_annotated: I1 detail 仍带注解: ${i1_detail}" >&2
+  exit 1
+fi
+state_total="$(jq -r '.total' "$TOT_DIR/v2mem/watch-state.json" 2>/dev/null || echo BAD)"
+if [ "$state_total" != "20527" ]; then
+  echo "FAIL tot_annotated: watch-state.json 不可用/基线不是数字: ${state_total}" >&2
+  cat "$TOT_DIR/v2mem/watch-state.json" >&2 2>/dev/null || true
+  exit 1
+fi
+N=$((N+1))
+printf 'ok  %-26s I1=%s state=%s\n' "tot_annotated" "$i1_title" "$state_total"
+
+# ---- R4：只发生 accept 也必须算「有写入活动」----
+# accept 是裁决闭环的落库出口（6 条 accept 就是 6 条新记忆）。旧口径只数
+# manual-add/write，会在「55 reject + 6 accept」的窗口里报「窗口内无写入」。
+ACC_DIR="$TMP/r4_accept_only"
+build_fixture "$ACC_DIR" none 0 no "$(printf '{"ts":%s,"event":"accept","source":"distill-accept"}\n' "$NOW")"
+acc_out="$(run_watch "$ACC_DIR")"
+acc_lvl="$(printf '%s' "$acc_out" | jq -r '.items[] | select(.id=="R4") | .level')"
+acc_detail="$(printf '%s' "$acc_out" | jq -r '.items[] | select(.id=="R4") | .detail')"
+if [ "$acc_lvl" != "PASS" ] || [[ "$acc_detail" != *"accept"* ]]; then
+  echo "FAIL r4_accept_only: want=PASS(mention accept) got=${acc_lvl} ${acc_detail}" >&2
+  exit 1
+fi
+N=$((N+1))
+printf 'ok  %-26s R4=%-4s\n' "r4_accept_only" "$acc_lvl"
+
+# ---- R8：标题要同时报总数与判级依据 ----
+# 5 条 pending 散在 3 个工程（2/2/1）时，判级取最大单工程 2（PASS），
+# 但标题只写 2 会与 detail 列出的 5 条自相矛盾，读起来像「只有 2 条待办」。
+MIX_CANDS="$(merge_json "$(cand_json pa 2)" "$(merge_json "$(cand_json pb 2)" "$(cand_json pc 1)")")"
+MIX_DIR="$TMP/r8_title_mix"
+build_fixture "$MIX_DIR" none 0 no
+mix_out="$(run_watch "$MIX_DIR" "$MIX_CANDS")"
+mix_lvl="$(printf '%s' "$mix_out" | jq -r '.items[] | select(.id=="R8") | .level')"
+mix_title="$(printf '%s' "$mix_out" | jq -r '.items[] | select(.id=="R8") | .title')"
+if [ "$mix_lvl" != "PASS" ] || [[ "$mix_title" != *"5 条"* ]] || [[ "$mix_title" != *"最大单工程 2"* ]]; then
+  echo "FAIL r8_title_mix: want=PASS 且标题含总数 5 与「最大单工程 2」，got=${mix_lvl} ${mix_title}" >&2
+  exit 1
+fi
+N=$((N+1))
+printf 'ok  %-26s R8=%-4s %s\n' "r8_title_mix" "$mix_lvl" "$mix_title"
+
 echo "watch-v2mem 判据回归 ${N}/${N} PASS"
