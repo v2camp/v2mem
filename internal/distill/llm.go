@@ -17,6 +17,9 @@ func completeLLM(ctx context.Context, spec ModelSpec, prompt string) (string, er
 		return completeOllama(ctx, spec.Name, prompt)
 	case "openai":
 		return completeOpenAI(ctx, spec, prompt)
+	case "cli":
+		// 本机已登录的 harness CLI 走白名单模板；错误已由 runCLI 包成 ErrLLMUnavailable。
+		return runCLI(ctx, spec.Name, prompt)
 	default:
 		return "", fmt.Errorf("未知模型种类: %s", spec.Kind)
 	}

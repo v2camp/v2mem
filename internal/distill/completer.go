@@ -25,9 +25,6 @@ func PromptCompleter(opt Options) (func(context.Context, string) (string, error)
 	if opt.Timeout <= 0 {
 		opt.Timeout = DefaultTimeout
 	}
-	if opt.Model == "" {
-		opt.Model = DefaultModel
-	}
 	name, spec, err := resolve(opt)
 	if err != nil {
 		return nil, name, fmt.Errorf("%w: %w", ErrLLMUnavailable, err)

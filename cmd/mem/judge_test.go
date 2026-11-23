@@ -223,3 +223,24 @@ func TestPrintJudgeStatsText(t *testing.T) {
 		t.Fatalf("printJudgeStats: %v", err)
 	}
 }
+
+// judge_model 的分段决定历史判定能不能按模型分组：flag 显式给了就写 flag，
+// 否则写 ResolveOptions 解析出的实际模型（model.json 或 deepseek 默认）。
+// cli 的版本分量已经在 provider 里，Model 为空，不能再拼一段。
+func TestJudgeModelTag(t *testing.T) {
+	cases := []struct {
+		provider, flagModel, resolved, want string
+	}{
+		{"cli:claude@1+tpl1", "", "", "cli:claude@1+tpl1@judge-v2"},
+		{"cli:m1@1+tpl1", "m1", "", "cli:m1@1+tpl1@judge-v2"}, // 模型已在 cli: 前缀里，不能再拼一次
+		{"deepseek", "", "deepseek-flash", "deepseek:deepseek-flash@judge-v2"},
+		{"deepseek", "m1", "", "deepseek:m1@judge-v2"},
+		{"ollama", "", "", "ollama@judge-v2"}, // ollama 的默认模型是运行期兜底，不写进归因
+	}
+	for _, tc := range cases {
+		if got := judgeModelTag(tc.provider, tc.flagModel, tc.resolved); got != tc.want {
+			t.Errorf("judgeModelTag(%q,%q,%q)=%q，要 %q",
+				tc.provider, tc.flagModel, tc.resolved, got, tc.want)
+		}
+	}
+}

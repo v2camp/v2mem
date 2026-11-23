@@ -21,13 +21,29 @@ import (
 // 蒸馏只写 candidates 与 distill_runs。本文件没有 store.Add。
 // 采纳在 cmdAccept，那是唯一把候选升格进 memories 的入口。
 
+// proposalOptions 把 model.json 的 mode 语义带进 proposal 的 local/byok 两条来源。
+//
+// cli 与 off 都必须走 ResolveOptions：只判断 cli 会让 mode=off 落回硬编码的
+// ollama/openai，`mem distill --proposal` 就还会外发，与配置说的「关闭」不符。
+// api 保持原行为：local 试 ollama、byok 试 openai，模型取 config.toml 的 model。
+func proposalOptions(cfg distill.ModelConfig, provider, model string, timeout time.Duration) distill.Options {
+	if cfg.Mode == "cli" || cfg.Mode == "off" {
+		// 只读 model.json 的 cli/model_tag：config.toml 的 model 不是显式 --model，
+		// 传进去会把归因标签覆盖成 cli:<config.toml 的模型名>。
+		opt := distill.ResolveOptions(cfg, "", "")
+		opt.Timeout = timeout
+		return opt
+	}
+	return distill.Options{Provider: provider, Model: model, Timeout: timeout}
+}
+
 func cmdDistill(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("distill", flag.ContinueOnError)
 	c.register(fs)
 	session := fs.String("session", "", "只蒸馏这个会话")
 	since := fs.Duration("since", 0, "只看这段时间之内的观测，如 24h")
-	provider := fs.String("provider", "auto", "auto|none|openai|ollama")
+	provider := fs.String("provider", "", "auto|none|openai|ollama（空=读 model.json，再退回 auto）")
 	dry := fs.Bool("dry-run", false, "只打印候选，不写库")
 	strict := fs.Bool("strict", false, "失败时非零退出（默认 fail-open，退出码 0）")
 	pending := fs.Bool("pending", false, "蒸馏所有尚未处理的会话")
@@ -44,6 +60,13 @@ func cmdDistill(args []string) error {
 		return errors.New("需要 --session、--pending、--proposal 或 --bundle")
 	}
 	model, timeout := distill.LoadConfig(distill.ConfigPath())
+	// model.json 的 mode=cli 要同时接管 proposal 的 local/byok 两条来源，
+	// 否则 `mem distill --proposal` 还会去连 ollama/openai，与配置说的不符。
+	// 读不出来必须 fail-closed：把非法配置当「没配」会让用户选的 CLI 静默变成外发。
+	cfg, err := distill.LoadModelConfig("")
+	if err != nil {
+		return fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
+	}
 	st, err := store.Open(c.db)
 	if err != nil {
 		return err
@@ -64,10 +87,10 @@ func cmdDistill(args []string) error {
 		unavailable := func(label string, cause error) proposal.Generator {
 			return proposal.UnavailableGenerator(label, cause)
 		}
+		localOpt := proposalOptions(cfg, "ollama", model, timeout)
+		byokOpt := proposalOptions(cfg, "openai", model, timeout)
 		local := func() proposal.Generator {
-			fn, name, cerr := distill.PromptCompleter(distill.Options{
-				Provider: "ollama", Model: model, Timeout: timeout,
-			})
+			fn, name, cerr := distill.PromptCompleter(localOpt)
 			if cerr != nil {
 				return unavailable("local", cerr)
 			}
@@ -81,9 +104,7 @@ func cmdDistill(args []string) error {
 			deps.Local = local()
 		case "byok":
 			deps.Local = local()
-			fn, name, cerr := distill.PromptCompleter(distill.Options{
-				Provider: "openai", Model: model, Timeout: timeout,
-			})
+			fn, name, cerr := distill.PromptCompleter(byokOpt)
 			if cerr != nil {
 				deps.BYOK = unavailable("byok", cerr)
 			} else {
@@ -396,6 +417,13 @@ func distillObservationEligible(metaJSON, event string) bool {
 func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 	started := time.Now()
 	report := &distillReport{Session: job.Session, Status: distill.StatusSkipped}
+	// 先读配置再干活：非法 model.json 当「没配」处理会退回 auto 外发，
+	// 所以这里 fail-closed，且放在读库之前，避免白跑一遍观测查询。
+	cfg, err := distill.LoadModelConfig("")
+	if err != nil {
+		err = fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
+		return failReport(report, err), err
+	}
 	var sinceUnix int64
 	if job.Since > 0 {
 		sinceUnix = time.Now().Add(-job.Since).Unix()
@@ -443,7 +471,14 @@ func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 	if done {
 		return report, nil
 	}
-	out := distill.Run(in, distill.Options{Provider: provider, Model: job.Model, Timeout: job.Timeout})
+	// 优先级统一走 ResolveOptions；job.Model（config.toml 的 [distill] model）只在
+	// api 路径上当兜底，绝不作为 flagModel 传入 —— 它不是显式 --model。
+	opt := distill.ResolveOptions(cfg, job.Provider, "")
+	if opt.CLI == "" && opt.Model == "" {
+		opt.Model = job.Model
+	}
+	opt.Timeout = job.Timeout
+	out := distill.Run(in, opt)
 	report.Provider = out.Provider
 	report.Facts = out.Facts
 

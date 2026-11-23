@@ -63,6 +63,16 @@ func TestPromptCompleterWiresModel(t *testing.T) {
 	}
 }
 
+func TestPromptCompleterCLI(t *testing.T) {
+	fn, name, err := PromptCompleter(Options{CLI: "claude", ModelTag: "claude@1+tpl1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "cli:claude@1+tpl1" || fn == nil {
+		t.Fatalf("name=%q fn=%v", name, fn != nil)
+	}
+}
+
 func TestPromptCompleterLocalOllama(t *testing.T) {
 	fn, name, err := PromptCompleter(Options{
 		Provider: "ollama", Model: "qwen",
@@ -82,5 +92,32 @@ func TestPromptCompleterLocalOllama(t *testing.T) {
 	}
 	if out, err := fn(context.Background(), "hi"); err != nil || out != "[]" {
 		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+// deepseek 的默认模型必须在 resolve() 里补，不能先被 ollama 的 qwen2.5:7b 占位：
+// PromptCompleter 在 resolve 之前填 DefaultModel，会让 deepseek 请求打到 qwen 这个模型名。
+func TestPromptCompleterDeepSeekDoesNotUseOllamaDefault(t *testing.T) {
+	got := ""
+	fn, name, err := PromptCompleter(Options{
+		Provider: "deepseek",
+		APIKey:   "k",
+		Getenv:   func(string) string { return "" },
+		Complete: func(_ context.Context, spec ModelSpec, _ string) (string, error) {
+			got = spec.Name
+			return "[]", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "deepseek" {
+		t.Fatalf("provider=%q", name)
+	}
+	if _, err := fn(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if got != "deepseek-flash" {
+		t.Fatalf("deepseek 默认模型应为 deepseek-flash，got %q", got)
 	}
 }

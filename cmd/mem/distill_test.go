@@ -638,3 +638,44 @@ func TestAcceptAllPendingKeepsSuccessesOnFailure(t *testing.T) {
 		t.Fatalf("failed 应列出失败项，got %v", got["failed"])
 	}
 }
+
+// model.json 写坏了必须 fail-closed：读不出来就当 api/auto 处理，
+// 等于用户配的 CLI 被静默换成外发路径。这条只能靠断言守住。
+func TestCmdDistillRejectsBadModelConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".v2mem"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(home, ".v2mem", "model.json")
+	if err := os.WriteFile(bad, []byte(`{"mode":"bogus"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(t.TempDir(), "m.db")
+	err := cmdDistill([]string{"--session", "x", "--db", db, "--audit-file", "-"})
+	if err == nil {
+		t.Fatal("配置文件非法时应返回错误，不得退回 api/auto")
+	}
+	if !strings.Contains(err.Error(), "model.json") {
+		t.Errorf("错误应指出配置文件：%v", err)
+	}
+	// 配置在读库之前校验：没有库文件就说明没有走到 store.Open，更不可能外发。
+	if _, statErr := os.Stat(db); !os.IsNotExist(statErr) {
+		t.Errorf("应在打开数据库前失败，db 却被创建了: %v", statErr)
+	}
+}
+
+// proposalOptions 必须把 model.json 的 mode 语义带进 proposal 的 local/byok 两条来源：
+// mode=off 走规则路径（provider=none），否则 `mem distill --proposal` 仍会去连 ollama/openai。
+func TestProposalOptionsOffIsNone(t *testing.T) {
+	if got := proposalOptions(distill.ModelConfig{Mode: "off"}, "ollama", "m", time.Second); got.Provider != "none" {
+		t.Errorf("mode=off 应映射 provider=none，got %+v", got)
+	}
+	cli := distill.ModelConfig{Mode: "cli", CLI: "claude", ModelTag: "claude@1+tpl1"}
+	if got := proposalOptions(cli, "ollama", "m", time.Second); got.CLI != "claude" || got.Timeout != time.Second {
+		t.Errorf("mode=cli 应填 CLI 与 timeout，got %+v", got)
+	}
+	if got := proposalOptions(distill.ModelConfig{Mode: "api", Provider: "deepseek"}, "ollama", "m", time.Second); got.Provider != "ollama" || got.Model != "m" {
+		t.Errorf("mode=api 应保持原来的 local 硬编码 provider，got %+v", got)
+	}
+}
