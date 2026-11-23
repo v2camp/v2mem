@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"strings"
@@ -56,6 +57,7 @@ func cmdSetup(args []string) error {
 	dryRun := fs.Bool("dry-run", false, "只探测与验证，不写盘")
 	status := fs.Bool("status", false, "显示当前配置（不联网、不调用 CLI）")
 	mode := fs.String("mode", "", "显式指定来源: api|cli|off")
+	provider := fs.String("provider", "", "--mode api 的供应商: deepseek|openai（缺省读 model.json，仍为空则 deepseek）")
 	undo := fs.Bool("undo", false, "恢复最近一次写盘前的备份")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -67,6 +69,14 @@ func cmdSetup(args []string) error {
 	case "", "api", "cli", "off":
 	default:
 		return fmt.Errorf("未知 --mode %q（可选 api|cli|off）", *mode)
+	}
+	if *provider != "" && *mode != "api" {
+		return errors.New("--provider 只用于 --mode api")
+	}
+	switch strings.ToLower(*provider) {
+	case "", "deepseek", "openai":
+	default:
+		return fmt.Errorf("未知 --provider %q（api 模式可选 deepseek|openai）", *provider)
 	}
 	// --status / --undo 是只读动作，和「改配置」互斥：同时给只会让人猜不透要执行哪个。
 	if *status && *undo {
@@ -109,19 +119,34 @@ func cmdSetup(args []string) error {
 		fmt.Printf("已关闭判定器与蒸馏的模型来源（mode=off）。\n回退：mem setup --undo。\n")
 		return nil
 	case "api":
-		next, err := apiConfigFromEnv(cfg)
+		// 流程第 1 步：没有 model.json 就先建一个空壳（0600），后续只往这个文件里存密钥。
+		if !setupConfigExists(path) {
+			if *dryRun {
+				fmt.Printf("dry-run：将创建 %s（不写盘）\n", path)
+			} else if err := distill.SaveModelConfig(path, distill.ModelConfig{Mode: "api"}); err != nil {
+				return fmt.Errorf("创建 %s 失败: %w", path, err)
+			} else {
+				fmt.Printf("已创建 %s（0600）。\n", path)
+			}
+		}
+		// 第 2 步：只认 model.json 里已有的 key 或用户当场输入，不读任何 API key 环境变量。
+		next, err := apiConfigFromModelJSON(path, cfg, strings.ToLower(*provider), os.Stdin, os.Stdout)
 		if err != nil {
 			return err
 		}
+		// 第 3 步：真实调用一次 judge 端点；没通过就不把密钥落盘。
+		if err := apiDryRun(next); err != nil {
+			return fmt.Errorf("API dry-run 未通过，未写入 %s: %w", path, err)
+		}
 		if *dryRun {
-			fmt.Printf("dry-run：将写入 mode=api provider=%s model=%s api_key=%s（不写盘）\npath      %s\n",
+			fmt.Printf("dry-run 成功：provider=%s model=%s api_key=%s。未写盘。\npath      %s\n",
 				next.Provider, next.Model, redactKey(next.APIKey), path)
 			return nil
 		}
 		if err := distill.SaveModelConfig(path, next); err != nil {
 			return err
 		}
-		fmt.Printf("已将模型来源切换为 API：%s / %s。\n密钥只写入 %s（0600），不经命令行参数传入。\n回退：mem setup --undo。\n",
+		fmt.Printf("已将模型来源切换为 API：%s / %s。\n密钥只写入 %s（0600），不经命令行参数或环境变量传入。\n回退：mem setup --undo。\n",
 			next.Provider, next.Model, path)
 		return nil
 	}
@@ -213,37 +238,93 @@ func verifySetupCLI(name, tag string) error {
 	return nil
 }
 
-// apiConfigFromEnv 优先用环境变量构造 API 配置：不读 stdin，避免密钥回显与依赖终端。
-// 没有环境变量时沿用 model.json 里已有的 api_key —— spec §4 说 mode=cli 时这四个字段
-// 保留不删，正是为了让 --mode api 不再要求用户重新 export 一遍。
-func apiConfigFromEnv(cfg distill.ModelConfig) (distill.ModelConfig, error) {
+// apiDryRun / readAPIKey 是测试替身入口：生产实现分别打真实端点、读真实终端，
+// 测试替换后不必有网络或 TTY。签名即契约，别在调用点各自判断来源。
+var apiDryRun = dryRunAPIConfig
+var readAPIKey = promptSecretLine
+
+// apiConfigFromModelJSON 是 --mode api 的唯一配置来源：model.json + 当场输入。
+// 刻意不读 DEEPSEEK_API_KEY / OPENAI_API_KEY —— 密钥必须确定性落盘，
+// 否则定时任务与宿主钩子继承不到环境时，判定器会以「没配」静默失效。
+func apiConfigFromModelJSON(path string, cfg distill.ModelConfig, flagProvider string, in *os.File, out io.Writer) (distill.ModelConfig, error) {
 	next := cfg
 	next.Mode = "api"
-	if key := strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY")); key != "" {
-		next.Provider = "deepseek"
-		next.Model = distill.DefaultDeepSeekModel
-		next.BaseURL = "https://api.deepseek.com/v1"
-		next.APIKey = key
-		return next, nil
+
+	provider := strings.TrimSpace(flagProvider)
+	if provider == "" {
+		provider = strings.TrimSpace(cfg.Provider)
 	}
-	if key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); key != "" {
-		next.Provider = "openai"
-		next.Model = "gpt-4o-mini"
-		next.BaseURL = "https://api.openai.com/v1"
-		next.APIKey = key
-		return next, nil
+	if provider == "" {
+		provider = "deepseek"
+		fmt.Fprintln(out, "model.json 未指定 provider，按 deepseek 配置；换家用 --provider deepseek|openai 重跑。")
 	}
-	// 文件里的 key 可以直接复用，但没有 provider 就不知道往哪发；这时不能猜，只能报错。
-	if strings.TrimSpace(cfg.APIKey) != "" {
-		if strings.TrimSpace(cfg.Provider) == "" {
-			return distill.ModelConfig{}, errors.New(
-				"--mode api 复用了 model.json 里已有的 api_key，但缺少 provider；请设置 DEEPSEEK_API_KEY 或 OPENAI_API_KEY 后重跑，或在 model.json 里补 provider")
+	switch provider {
+	case "deepseek":
+		next.Provider, next.Model, next.BaseURL = provider, distill.DefaultDeepSeekModel, "https://api.deepseek.com/v1"
+	case "openai":
+		next.Provider, next.Model, next.BaseURL = provider, "gpt-4o-mini", "https://api.openai.com/v1"
+	default:
+		return distill.ModelConfig{}, fmt.Errorf("--mode api 只支持 --provider deepseek|openai，当前为 %q", provider)
+	}
+	// 用户自己维护的 model / base_url 优先于默认值（自建网关、代理）；
+	// 但换 provider 时不带走旧值，避免把 deepseek 端点配到 openai 上。
+	if strings.EqualFold(strings.TrimSpace(cfg.Provider), provider) {
+		if strings.TrimSpace(cfg.Model) != "" {
+			next.Model = cfg.Model
 		}
-		return next, nil
+		if strings.TrimSpace(cfg.BaseURL) != "" {
+			next.BaseURL = cfg.BaseURL
+		}
 	}
-	return distill.ModelConfig{}, errors.New(
-		"--mode api 需要环境变量 DEEPSEEK_API_KEY 或 OPENAI_API_KEY，或 model.json 里已有的 api_key；请先 export 其中之一后重跑 mem setup --mode api（不读 stdin，密钥不回显）")
+
+	key := strings.TrimSpace(cfg.APIKey)
+	if key == "" {
+		fmt.Fprintln(out, "model.json 里没有 api_key；本流程不读环境变量，请直接输入。")
+		var err error
+		key, err = readAPIKey(in, out, fmt.Sprintf("请输入 %s API Key（输入不回显）: ", provider))
+		if err != nil {
+			return distill.ModelConfig{}, fmt.Errorf("读取 API Key 失败: %w", err)
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return distill.ModelConfig{}, errors.New("API Key 不能为空，未写盘")
+		}
+	} else {
+		fmt.Fprintf(out, "已读取 %s 里的 api_key（%s，不回显全量）。\n", path, redactKey(key))
+	}
+	next.APIKey = key
+	return next, nil
 }
+
+// dryRunAPIConfig 用真实 judge prompt 打一次 API，验证 key / 端点 / 模型三者可用，
+// 并且返回值能被现有解析器吃下。Getenv 显式返回空：dry-run 也不得借环境变量补 key。
+func dryRunAPIConfig(cfg distill.ModelConfig) error {
+	complete, name, err := distill.PromptCompleter(distill.Options{
+		Provider: cfg.Provider,
+		Model:    cfg.Model,
+		APIKey:   cfg.APIKey,
+		BaseURL:  cfg.BaseURL,
+		Timeout:  setupDryRunTimeout,
+		Getenv:   func(string) string { return "" },
+	})
+	if err != nil {
+		return fmt.Errorf("调用器不可用: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), setupDryRunTimeout)
+	defer cancel()
+	raw, err := complete(ctx, fmt.Sprintf(judgePrompt,
+		`[{"id":"aaaaaaaa","kind":"fact","scope":"project","project":"setup","content":"测试候选"}]`))
+	if err != nil {
+		return fmt.Errorf("%s 调用失败: %w", name, err)
+	}
+	if _, err := parseJudgeVerdicts(raw); err != nil {
+		return fmt.Errorf("输出不可解析: %w（原文前 200 字节：%s）", err, truncateRunes(raw, 200))
+	}
+	return nil
+}
+
+// promptSecretLine 的实现在同包的 secret.go：真终端临时关 ECHO，管道逐行读。
+// 放在独立文件是为了把终端 ioctl 的 OS 差异挡在 setup 主流程之外。
 
 // printSetupStatus 只读本地文件：不探测 PATH、不调用 CLI、不出网。
 func printSetupStatus(path string) error {
@@ -266,6 +347,13 @@ func printSetupStatus(path string) error {
 	fmt.Printf("mode      %s\n", mode)
 	fmt.Printf("cli       %s\n", setupOrDash(cfg.CLI))
 	fmt.Printf("model_tag %s\n", setupOrDash(cfg.ModelTag))
+	fmt.Printf("provider  %s\n", setupOrDash(cfg.Provider))
+	fmt.Printf("model     %s\n", setupOrDash(cfg.Model))
+	if cfg.APIKey == "" {
+		fmt.Printf("api_key   —\n")
+	} else {
+		fmt.Printf("api_key   %s（来自 model.json）\n", redactKey(cfg.APIKey))
+	}
 	fmt.Printf("perm      %s\n", perm)
 	return nil
 }

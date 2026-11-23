@@ -170,11 +170,17 @@ mem setup --undo       # 回退到上一次写盘前
 
 `mem setup` 按白名单（`claude` → `codex` → `cursor-agent` → `gemini` → `copilot` → `qoder` → `codebuddy` → `traecli`）逐个验证 judge 与 distill 两条真实路径，首个通过者胜出；
 验证时各跑一次真实调用，可能消耗额度与时间。全都不可用时退出 0、不写盘，安装流程不因此中断。
-想显式指定分支：`--mode api`（把 API 来源写入 `model.json`，密钥取 setup 时环境里的
-`DEEPSEEK_API_KEY` / `OPENAI_API_KEY`，需先 export）、`--mode cli`（必须探测成功，否则报错）、
-`--mode off`；`--dry-run` 只验证不写盘。
+想显式指定分支：`--mode cli`（必须探测成功，否则报错）、`--mode off`、`--mode api`。
+`--mode api` 只认 `model.json` 和当场输入，三步固定：
 
-完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）；真正的 `mem judge` 不再报「判定器不可用」。
+1. 检查 `~/.v2mem/model.json`，不存在就先创建（0600）；
+2. 文件里已有 `api_key` 就复用（掩码显示），否则提示从终端输入，输入不回显；**不读取 `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`**，不必 export；
+3. 拿该 key 真跑一次 judge dry-run，通过后才写盘；失败保留原文件不动。
+
+可加 `--provider deepseek|openai` 指定供应商（缺省沿用文件里的 provider，仍为空则 deepseek）；
+`--dry-run` 走同样流程但不写盘。
+
+完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）及 `api_key` 掩码；真正的 `mem judge` 不再报「判定器不可用」。
 
 **已知不兼容**：`freebuff` 免费，但官方声明是 TUI-only、没有 headless / `-p` 输出模式，
 不能当非交互后端，因此不在上面的白名单里。本机装了它时 `mem setup` 会点名说明，而不是静默忽略；
