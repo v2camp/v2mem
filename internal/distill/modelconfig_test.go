@@ -42,6 +42,77 @@ func writeBad(t *testing.T) string {
 	return p
 }
 
+func writeJSON(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "model.json")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return p
+}
+
+// 老文件没有 mode 字段：必须归一化成 api，保持既有行为不变。
+func TestLoadModelConfigLegacyDefaultsToAPI(t *testing.T) {
+	p := writeJSON(t, `{"provider":"deepseek","model":"m","api_key":"k"}`)
+	c, err := LoadModelConfig(p)
+	if err != nil || c.Mode != "api" {
+		t.Fatalf("老文件应归一化为 api，got %+v err=%v", c, err)
+	}
+}
+
+// 未知 mode 不得静默退化成 api；cli 模式缺字段等于配置不可执行，同样报错。
+func TestLoadModelConfigRejectsBadMode(t *testing.T) {
+	for _, body := range []string{
+		`{"mode":"bogus"}`,
+		`{"mode":"cli","cli":"claude"}`,
+		`{"mode":"cli","model_tag":"claude@1+tpl1"}`,
+	} {
+		if _, err := LoadModelConfig(writeJSON(t, body)); err == nil {
+			t.Errorf("应报错: %s", body)
+		}
+	}
+}
+
+// 新写入必须是 0600（含 key），并保留一份写前备份。
+func TestSaveModelConfig0600AndBackup(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "model.json")
+	if err := os.WriteFile(p, []byte(`{"provider":"old"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveModelConfig(p, ModelConfig{Mode: "cli", CLI: "claude", ModelTag: "claude@1+tpl1"}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := os.Stat(p)
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("权限应为 0600，got %v", st.Mode().Perm())
+	}
+	bak, err := os.ReadFile(p + ".v2mem.bak")
+	if err != nil || !strings.Contains(string(bak), `"old"`) {
+		t.Errorf("备份应保留原内容，got %q err=%v", bak, err)
+	}
+	c, _ := LoadModelConfig(p)
+	if c.Mode != "cli" || c.CLI != "claude" {
+		t.Errorf("写后读不一致: %+v", c)
+	}
+}
+
+// 优先级只在 ResolveOptions 里实现一次：flag > cli > off > api 字段。
+func TestResolveOptionsPrecedence(t *testing.T) {
+	cli := ModelConfig{Mode: "cli", CLI: "claude", ModelTag: "claude@1+tpl1"}
+	if opt := ResolveOptions(cli, "deepseek", ""); opt.CLI != "" || opt.Provider != "deepseek" {
+		t.Errorf("显式 flag 应压过 cli，got %+v", opt)
+	}
+	if opt := ResolveOptions(cli, "", ""); opt.CLI != "claude" || opt.ModelTag != "claude@1+tpl1" {
+		t.Errorf("无 flag 应用 cli，got %+v", opt)
+	}
+	if opt := ResolveOptions(ModelConfig{Mode: "off"}, "", ""); opt.Provider != "none" {
+		t.Errorf("off 应映射 none，got %+v", opt)
+	}
+	if opt := ResolveOptions(ModelConfig{Mode: "api", Provider: "deepseek", Model: "m"}, "", ""); opt.Provider != "deepseek" || opt.CLI != "" {
+		t.Errorf("api 应保持旧行为，got %+v", opt)
+	}
+}
+
 // DeepSeek 走 OpenAI 兼容协议，只有 base 与 model 名不同；默认模型名必须自己兜，
 // 不能落到 ollama 的 qwen2.5:7b 上。
 func TestResolveDeepSeek(t *testing.T) {

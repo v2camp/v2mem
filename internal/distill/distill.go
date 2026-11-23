@@ -130,6 +130,10 @@ type Options struct {
 	// 而这正是「换个模型要改一堆环境」的来源。
 	APIKey  string
 	BaseURL string
+	// CLI / ModelTag 是 mode=cli 时的来源：CLI 是内置白名单里的名字（不是命令串），
+	// ModelTag 形如 cli@<ver>+tpl<ver>，供 judge_model 按版本归因。由 ResolveOptions 填。
+	CLI      string
+	ModelTag string
 }
 
 // ModelSpec 是一次本地或兼容 OpenAI 的调用参数。
