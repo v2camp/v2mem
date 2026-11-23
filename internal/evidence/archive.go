@@ -239,9 +239,8 @@ func ReadArchiveRecord(locator string) (RawEvent, error) {
 	return rec.event(), nil
 }
 
-// readArchiveRecord 逐行扫描 gzip JSONL，按 seq 定位，而不是把整个流当成一个
-// JSON 对象。返回 segmentRecord 以便包内校验身份字段。
-func readArchiveRecord(locator string) (segmentRecord, error) {
+// parseLocator 拆出归档 locator 的路径与 seq（seq=0 表示兼容首行）。
+func parseLocator(locator string) (string, int, error) {
 	path := strings.TrimSpace(locator)
 	seq := 0
 	if i := strings.LastIndex(path, "#"); i >= 0 {
@@ -250,13 +249,48 @@ func readArchiveRecord(locator string) (segmentRecord, error) {
 		if s != "" {
 			v, err := strconv.Atoi(s)
 			if err != nil {
-				return segmentRecord{}, fmt.Errorf("归档 locator 的 seq 无效: %q", s)
+				return "", 0, fmt.Errorf("归档 locator 的 seq 无效: %q", s)
 			}
 			seq = v
 		}
 	}
 	if path == "" {
-		return segmentRecord{}, errors.New("归档 locator 缺少路径")
+		return "", 0, errors.New("归档 locator 缺少路径")
+	}
+	return path, seq, nil
+}
+
+// RefHealth 只读校验外置内容引用：文件存在、压缩后字节 hash 匹配、#seq 可定位。
+// 不改库、不删文件；巡检结果由调用方决定如何呈现。
+func RefHealth(locator, wantHash string) error {
+	path, seq, err := parseLocator(locator)
+	if err != nil {
+		return err
+	}
+	if wantHash == "" {
+		return fmt.Errorf("引用缺少内容 hash: %s", path)
+	}
+	ok, err := fileHashMatches(path, wantHash)
+	if err != nil {
+		return fmt.Errorf("读取外置内容失败: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("外置内容 hash 不匹配或文件不存在: %s", path)
+	}
+	if seq > 0 {
+		if _, err := readArchiveRecord(locator); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readArchiveRecord 逐行扫描 gzip JSONL，按 seq 定位，而不是把整个流当成一个
+// JSON 对象。返回 segmentRecord 以便包内校验身份字段。
+func readArchiveRecord(locator string) (segmentRecord, error) {
+	path, seq, err := parseLocator(locator)
+	if err != nil {
+		return segmentRecord{}, err
 	}
 	f, err := os.Open(path)
 	if err != nil {
