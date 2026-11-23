@@ -74,7 +74,11 @@ STATS_RAW=""
 PROJ_TABLE=""
 if "$MEM_BIN" stats >/dev/null 2>&1; then
   STATS_RAW=$("$MEM_BIN" stats 2>/dev/null)
-  TOTAL=$(printf '%s\n' "$STATS_RAW" | awk '/^总条数/{print $2}')
+  # 只取「总条数」行开头的连续数字：值后面可能跟中文注解（2026-11-23 起 mem stats
+  # 输出「20527（全库各数据表之和）」，见 6c167a3）。整段塞进 TOTAL 会让 R4/R6 的
+  # `[ "$TOTAL" -lt ... ]` 报 "integer expression expected"，并把坏值写进 watch-state.json
+  # （`{"total":20527（…）}` 不是合法 JSON，下一轮拿不到基线、R6 静默退回 INFO）。
+  TOTAL=$(printf '%s\n' "$STATS_RAW" | awk '/^总条数/{print $2; exit}' | grep -oE '^[0-9]+' || true)
   TOTAL=${TOTAL:-0}
   PROJ_TABLE=$(printf '%s\n' "$STATS_RAW" | awk '
     /^按工程/ { for (i = 2; i <= NF; i++) { if (split($i, a, "=") == 2) print a[1]"="a[2] } }')
@@ -174,7 +178,11 @@ if [ -f "$AUDIT" ]; then
       "A_PROMPT_EMPTY=\([$e[] | select(.event=="prompt-submit" and .empty==true)] | length)",
       "A_SS=\([$e[] | select(.event=="session-start")] | length)",
       "A_OBS=\([$e[] | select(.event=="obs-append")] | length)",
-      "A_ADD=\([$e[] | select(.event=="manual-add" or .event=="write")] | length)",
+      # A_ADD 数「记忆层真的写进去了几次」：manual-add / write 是手写路径，accept 是
+      # 裁决路径（含 `mem batch --plan` 批量准出，它落的也是 accept 事件）。
+      # 只数前两种会让 R4 在「55 条 reject + 6 条 accept 已落 6 条记忆」的窗口里
+      # 报「12h 无写入」——决策闭环一旦恢复，这就不再是稀疏写侧，而是判据漏计。
+      "A_ADD=\([$e[] | select(.event=="manual-add" or .event=="write" or .event=="accept")] | length)",
       "A_READ_N=\([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms != null and .ms > 0)] | length)",
       "A_MS=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))",
       "A_WRITE_N=\([$e[] | select(.event=="stop" and .ms != null and .ms > 0)] | length)",
@@ -345,7 +353,13 @@ if [ "$A_SEG_SEARCH_N" -gt 0 ]; then
   if [ "$A_SEG_SEARCH" -lt 50 ]; then
     add R3 PASS "检索延迟 ${A_SEG_SEARCH}ms" "低于 50ms 目标线；${R3_NOTE}"
   elif [ "$A_SEG_SEARCH" -lt 200 ]; then
-    add R3 WARN "检索延迟 ${A_SEG_SEARCH}ms" "高于典型值 ~9ms，观察是否库膨胀或锁竞争（分因见 docs/ops-watch.md §5 R3）；${R3_NOTE}"
+    # 文案三条硬约束（由 scripts/test-watch-sync.sh 守）：必须区分端到端与纯检索、
+    # 必须保留「副本对照」这个唯一能把运行态慢与代码慢分开的手段、必须写明
+    # 「mcp 数量 / WAL 大小已否证」。旧文案把这些压成一句「高于典型值」的旧口径，
+    # 既把纯检索热态量级当成了端到端典型值（端到端早已 40–200ms），
+    # 又让排障回到已否证的两个原因上——该文案在 9f3abe5 后的某次合并里被取边回退，
+    # 导致 test-watch-sync 四条断言全败、`make test` 自 11-22 起为红。
+    add R3 WARN "检索延迟 ${A_SEG_SEARCH}ms" "高于 50ms 目标线；本判据量的是进程内检索（search_ms），端到端另含进程启动/开库/证据/维护（分段见 detail）。先做库副本对照——同一二进制打「库副本」跑同一 prompt，副本快而活库慢指向运行态；「mcp 数量」与「WAL 大小」已由 2026-11-20 对照组否证，不必再试；再看本会话 spool/ 有无 seg-*.jsonl（有则同一时刻写路径也失败过）（分因见 docs/ops-watch.md §5 R3）；${R3_NOTE}"
   else
     add R3 FAIL "检索延迟 ${A_SEG_SEARCH}ms" "超过 200ms，检查库膨胀与 WAL 写锁竞争（分因见 docs/ops-watch.md §5 R3）；${R3_NOTE}"
   fi
@@ -356,12 +370,14 @@ else
 fi
 
 # R4 写侧活动
+# 口径是「记忆层写入」，不是「观测写入」（后者由 R5 判）：accept 是决策闭环的落库
+# 出口，与 manual-add/write 同权计入（见上方 A_ADD 采集处的说明）。
 if [ "$A_ADD" -ge 1 ]; then
-  add R4 PASS "有写入活动" "窗口内新增 ${A_ADD} 条"
+  add R4 PASS "有写入活动" "窗口内记忆写入 ${A_ADD} 次（manual-add/write/accept）"
 elif [ "$TOTAL" -lt 20 ]; then
   add R4 INFO "窗口内无写入" "冷启动期，写侧稀疏属预期"
 else
-  add R4 WARN "窗口内无写入" "库已有 ${TOTAL} 条但 12h 无新增；确认是否有值得落库的决策/坑点"
+  add R4 WARN "窗口内无记忆写入" "库已有 ${TOTAL} 条但 12h 无 manual-add/write/accept；确认是否有值得落库的决策/坑点"
 fi
 
 # R5 观测落库
@@ -387,7 +403,8 @@ if [ -n "$PREV_TOTAL" ]; then
 else
   add R6 INFO "首次基线" "已记录基线 ${TOTAL} 条"
 fi
-printf '{"ts":%s,"total":%s,"window":"%s"}\n' "$NOW" "$TOTAL" "$WINDOW" > "$STATE" 2>/dev/null
+printf '%s\n' "$(jq -nc --argjson ts "$NOW" --argjson total "$TOTAL" --arg w "$WINDOW" \
+  '{ts:$ts,total:$total,window:$w}')" > "$STATE" 2>/dev/null
 
 # R7 spool 积压
 #
@@ -504,14 +521,17 @@ CAND_TODO=$(printf '%s' "$CAND_REVIEWABLE" | jq -r '
   | map(((.id // "")[0:8]) + ":" + (((.content // "")[0:40]) | gsub("[\\n\"|*#]"; "/")))
   | join(" / ")' 2>/dev/null || echo '')
 
+# 标题同时报两个数：总数（CAND_REV）与判级依据（单工程最大值 CAND_MAX）。
+# 只报 CAND_MAX 时，5 条分散在 3 个工程的窗口会显示「候选待处理 2」，
+# 与 detail 里列出的 5 条自相矛盾（2026-11-23 实测：Claw=2, Code=2, buddy=1 → 标题 2）。
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
   add R8 WARN "候选读取失败" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
 elif [ "$CAND_MAX" -le 5 ]; then
-  add R8 PASS "候选待处理 ${CAND_MAX}" "隔离区未积压；按工程：${CAND_GROUPS:-无}${CAND_EXHAUST_TXT}"
+  add R8 PASS "候选待处理 ${CAND_REV} 条（最大单工程 ${CAND_MAX}）" "隔离区未积压；按工程：${CAND_GROUPS:-无}${CAND_EXHAUST_TXT}"
 elif [ "$CAND_MAX" -le 15 ]; then
-  add R8 WARN "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
+  add R8 WARN "候选积压 ${CAND_REV} 条（最大单工程 ${CAND_MAX}）" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
 else
-  add R8 FAIL "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
+  add R8 FAIL "候选积压 ${CAND_REV} 条（最大单工程 ${CAND_MAX}）" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
 fi
 
 # R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤。
