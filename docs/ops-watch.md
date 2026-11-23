@@ -254,11 +254,12 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
     与「读侧记录全是旧格式」，`A_INJ_N` 是其中带 `inject_bytes` 字段的样本数。
 - **R14 的 512MiB（2026-11-13 新增，只有 PASS / WARN 两档）**：量的是观测归档
   `~/.v2mem/evidence` 的**磁盘水位**。它是 [`VALUE.md`](./VALUE.md) §4.1 定义的
-  「只写的事实源」，一条观测一份 `.jsonl.gz`，**没有任何自动回收路径**：
-  `mem gc --obs` 删的是 `observations` 表行，不碰归档文件（`internal/store/observe.go` 的
-  `GCObservations` 只发 `DELETE FROM observations`）；而手工删归档会破坏 `memory_evidence`
-  的溯源目标——记忆会显示「有证据」却打不开原始记录。因此这条判据回答的是「水位要不要裁决」，
-  不是「是否故障」。
+  「只写的事实源」，一条观测一份 `.jsonl.gz`。**准出路径自 2026-11-23 起存在，但有前提**：
+  `mem gc --evidence` 只删「已经没有任何观测引用」的段（含磁盘文件），因此必须先跑
+  `mem gc --obs` 回收观测行，归档才随之成为孤儿；单跑 `--evidence` 在观测未回收时
+  释放 0 字节（本机实证：3474 段全部被观测引用）。**仍不能手工删 `~/.v2mem/evidence`**：
+  那会破坏 `memory_evidence` 的溯源目标——记忆会显示「有证据」却打不开原始记录。
+  因此这条判据回答的是「水位要不要裁决」，不是「是否故障」。
   - **512MiB ≈ 10 万份归档**：实测 2026-11-12 为 8215 份 / 41MiB（均值 5.1KB/条）。
     `GCObservations` 的 `maxKeep` 默认 50000 条是产品自己声明的观测保留上限，
     512MiB ≈ 其 2 倍。越过说明归档量已超出「自己认为需要保留」的量级，应显式裁决保留策略。
@@ -333,7 +334,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | R11 WAL 高水位越线 | 文件不缩是常态（passive checkpoint 不收缩 `-wal`），先判是否真有滞留 | 先取三元组：`sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(PASSIVE);"`（或 `PRAGMA wal_checkpoint;`）并记下 `(busy, log, checkpointed)`——`log == checkpointed` 即无滞留，帧数只是历史高水位，**不必**清。确有滞留（`busy=1` 说明有长读事务）再查各 harness 的 `mem mcp` 长连，确认后 `PRAGMA wal_checkpoint(TRUNCATE);` 回收文件。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务；也**不要**把 R11 的帧数当作 R3 延迟的证据 |
 | R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
-| R14 归档体量越线 | 归档只增不减，且没有回收用例 | 先分因：① **量增长**（文件数与字节同步涨）→ 裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处；也**不要**用 `mem gc --obs` 期待回收字节（它只删观测行）。确认接受现状就上调阈值并在提交信息里写明原因 |
+| R14 归档体量越线 | 归档增长快于观测保留策略 | 先分因：① **量增长**（文件数与字节同步涨）→ 按下面两步回收，再裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**回收只有一条路**：先 `mem gc --obs`（删观测行）再 `mem gc --evidence`（删已无观测引用的段与磁盘文件），两条合跑即同一轮生效；`--evidence` 有 1h 写入保护期。单跑 `--evidence` 在观测未回收时释放 0 字节——**不要**据此认为功能失效。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处。确认接受现状就上调阈值并在提交信息里写明原因 |
 | R15 候选超期 / 转人工 | TTL 从未被执行，或存在待删的已采纳行 | 看 detail 区分两种情形：①「已过期 N 条」= 本轮已执行迁移，无需动作，下个窗口应回 `PASS`；②「未执行」= 有 90 天前的已采纳行会被连带删除，确认后手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`，或先 `mem candidates ls --status accepted` 复核。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。

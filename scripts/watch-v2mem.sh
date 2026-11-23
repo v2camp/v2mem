@@ -22,7 +22,8 @@
 # R13 取读侧审计 inject_bytes 的最大值（**字节**，不是 rune）：宿主对 hook stdout
 # 有硬上限，越线会整块换占位且仍报成功，R2 的命中率看不出来。
 # R14 只量 evidence 归档目录的落盘量（文件数 + 字节），不折算成观测条数：gc 之后
-# 行数会降而文件数不降，两者本就会脱钩；归档是只写事实源，无自动回收路径。
+# 行数会降而文件数不降，两者本就会脱钩。归档的准出路径是 mem gc --obs → --evidence
+# （后者只删「已无观测引用」的段），脚本侧仍只读不回收。
 # R15 在候选超期时执行 pending → expired 的状态迁移（行仍在库，不删行）；--no-gc 可关。
 # 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
@@ -637,9 +638,10 @@ elif [ "$A_INJ_MAX" -gt 8000 ]; then
   add R13 FAIL "注入体量 ${A_INJ_MAX} 字节" "本次最大 ${A_INJ_MAX} 字节，超过 8000，≈${R13_RUNES} rune（按 3 字节/rune 估）；读侧样本 ${A_INJ_N} 次。宿主可能整块替换为占位且仍报成功，记忆会静默消失"
 fi
 
-# R14 归档体量：evidence 是只写事实源（VALUE §4.1），一条观测一份 .jsonl.gz，且没有自动
-# 回收路径——mem gc --obs 删的是 observations 表行，不碰归档文件。故只量落盘量（文件数 +
-# 字节），不折算成「多少条观测」：gc 之后行数降而文件数不降，两者本就会脱钩。
+# R14 归档体量：evidence 是只写事实源（VALUE §4.1），一条观测一份 .jsonl.gz。
+# 准出路径是 mem gc --obs 之后再 mem gc --evidence（只删已无观测引用的段与文件）；
+# 本脚本只读，不做回收。故只量落盘量（文件数 + 字节），不折算成「多少条观测」：
+# gc 之后行数降而文件数不降，两者本就会脱钩。
 # 阈值与「为何不设 FAIL」见 docs/ops-watch.md §3 R14。
 EV_DIR="$V2MEM_DIR/evidence"
 EV_FILES=0; EV_BYTES=0
