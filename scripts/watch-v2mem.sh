@@ -370,7 +370,8 @@ else
   add R5 INFO "窗口内无观测" "Stop/SessionEnd 未产出 obs-append，可能窗口内无长会话"
 fi
 
-# R6 库规模对比上次快照
+# R6 库规模对比上次快照。TOTAL 取自 mem stats「总条数」，口径是全库各数据表之和
+# （按表分布见同命令的「按表」行；memories 为空但观测/候选有料时不再误报 0）。
 STATE="$V2MEM_DIR/watch-state.json"
 PREV_TOTAL=""
 if [ -f "$STATE" ]; then

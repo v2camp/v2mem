@@ -84,7 +84,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R3** | 检索延迟 | 窗口内 `prompt-submit` / `session-start` 的 **`search_ms`** 均值（检索+渲染；总 `ms` 只作 detail，见下） | <50ms | 50–200ms | >200ms |
 | **R4** | 写侧活动 | 窗口内 `manual-add` 数 | ≥1 | 0（库≥20 条时） | — |
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
-| **R6** | 库规模 | `mem stats` 总条数 vs 上次快照 | 未下降 | 下降 | — |
+| **R6** | 库规模 | `mem stats` 总条数（全库各数据表之和，见「按表」行）vs 上次快照 | 未下降 | 下降 | — |
 | **R7** | spool 积压 | `spool/**/seg-*.jsonl` 数 **加上** `*.jsonl.processing` 数（后者是 drain 已认领、未读完的段，与 `evidence.isSpoolSegment` 同口径；detail 另读窗口内 `mode=spool-drain` 的 `failed` 区分「下次会补写」与「重试已跑但没消化」） | 0 | 1–3 | >3 |
 | **R8** | 候选积压 | `mem candidates ls --json --triage` 按 `project` 分组后的**单工程** `reviewable != false` 的 pending 数；窗口取各工程最大值。不可裁决的（过程叙述/助手偏好）单独报数，不计入 | ≤5 | 6–15 | >15 |
 | **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中载荷残留条数，两种形态都算：transcript 原始 JSON（`{"id"…}`/`{"type"…}`）与工具载荷文本（`Grep {`/`Shell {` 等工具名 + 对象字面量开头） | 0 | 1–3 | >3 |
@@ -323,7 +323,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | R2 低但 R1 正常 | 库稀疏 / 同义词未覆盖 / **找到了但供给弃答** | 先分因，再对症：① `mem eval activity --since 12h` 列出空命中 query；② 手工复跑 `mem search "<query>"`，**也空** → 检索侧（补记忆或 `mem lexicon init`）；**有结果** → 供给侧弃答，直接查结局分布：`sqlite3 -readonly ~/.v2mem/mem.db "SELECT outcome, COUNT(*) FROM read_traces WHERE created_at > strftime('%s','now')-43200 GROUP BY outcome;"`。`abstained_no_hit` 是检索侧没找到，`abstained_low_quality` 是**找到了但被判无支持**（典型：只有 broad 单路支持），`skipped_gate` 是客套跳过（正常）。第三种（低质量弃答）的机制证据与复现见 [`design-eval.md`](./design-eval.md) §17.1 与 `make eval-hook-ab`——**不要**靠调低质量门阈值来让 R2 变好看 |
 | R3 检索延迟越线 | 库膨胀 / WAL 写锁竞争拖慢检索（总 `ms` 高而 `search_ms` 正常则属启动或写侧，已不判 R3） | 先分因，**不要先动阈值**：① 看 detail 里 `search_ms` 与总 `ms` 的差——差得远说明慢在启动/证据/维护，不是检索；② 复测纯读路径 `mem search -no-audit -scope current "<query>"` 跑 3–5 次取中位数，健康值 10–20ms（含进程启动约 40ms）；③ `search_ms` 仍高再查库膨胀（`mem stats` 条数与体积）；④ **库副本对照**：`cp mem.db{,-wal,-shm} /tmp/p/` 后用同一二进制打 `mem hook -db /tmp/p/mem.db`（2026-11-20 实测副本 6–15ms / 活库 43–205ms）——副本正常而活库慢指向运行态，但**不要**归因到「常驻 `mem mcp` 数」或「`-wal` 未回收」（两者已否证），改为查同秒并发 hook 与宿主 IO；⑤ 查本会话有无 `spool/<session>/seg-*.jsonl`：有则说明同一时刻写路径也失败过，先修争用再谈延迟；⑥ 高负载时不用单窗口均值下结论，等窗口滑过再复评。判 `INFO`「无分段样本」说明二进制早于分段埋点，先 `make build` 再评。**不要**为让读数回落而删观测行或改阈值 |
 | R7 持续增长 | 写库失败 | 查 `~/.v2mem` 权限与磁盘；spool 在下次 SessionStart 重试，**同一文件跨会话存活即重试本身在失败**（看 audit `mode=spool-drain` 的 `failed`），别只等下一次；先用库副本跑同一段确认能否补上 |
-| R6 下降 | 非预期删除 | 查 `mem gc` / `mem consolidate` 是否自动跑过；库被外部删除后重建也走这条 |
+| R6 下降 | 非预期删除 | 口径是全库各表之和（`mem stats`「按表」行），下降先对位是**哪张表**少了；再查 `mem gc` / `mem consolidate` 是否自动跑过。`candidates` 的 pending→expired 是状态迁移、行数不变，不该触发本项；库被外部删除后重建也走这条 |
 | I2 掉到 1–3 | 宿主升级覆盖配置 | 重跑 `mem init --harness workbuddy`（幂等、带备份） |
 | I5 = WARN（`ExecEnv: Sandbox`） | Trae 钩子跑在沙箱，`~/.v2mem` 禁写 | Hooks 面板运行方式改「本地自动运行」；或在沙箱配置放行 `~/.v2mem` |
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |

@@ -1043,8 +1043,20 @@ func cmdStats(args []string) error {
 
 	fmt.Printf("库路径   %s\n", s.Path)
 	fmt.Printf("大小     %.1f KB\n", float64(s.SizeBytes)/1024)
-	fmt.Printf("总条数   %d\n", s.Total)
-	fmt.Printf("检索可见 %d（未被取代；已过期的另计）\n", s.Live)
+	fmt.Printf("总条数   %d（全库各数据表之和）\n", s.Total)
+	if len(s.ByTable) > 0 {
+		keys := make([]string, 0, len(s.ByTable))
+		for k := range s.ByTable {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%d", k, s.ByTable[k]))
+		}
+		fmt.Printf("按表     %s\n", strings.Join(parts, " "))
+	}
+	fmt.Printf("检索可见 %d（记忆层；未被取代；已过期的另计）\n", s.Live)
 	if s.Superseded > 0 {
 		fmt.Printf("已归并   %d（被相似归并取代，保留可追溯）\n", s.Superseded)
 	}

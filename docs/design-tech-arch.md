@@ -113,7 +113,7 @@ make build-onnx  # M5 可选分支：-tags local_onnx，需 CGO + libonnxruntime
 
 - `mem add`：原子事实写入；**相同知识覆盖**（归一化 hash，忽略大小写/空白/句尾标点差异）；工程名默认取当前 git 仓库根；支持 `--kind/--project/--tag/--tool/--device/--salience/--ttl`
 - `mem search`：FTS5 + bm25；支持中文（含二字词）、英文、混合；`--limit/--project/--kind` 过滤；已过期自动排除
-- `mem stats`：条数 / 类型分布 / 工程分布 / 待回收 / 库大小
+- `mem stats`：全库总条数（各数据表之和，「按表」列出分布）/ 记忆层类型分布 / 工程分布 / 待回收 / 库大小。`总条数` 是全库口径——observations / candidates / 证据表都算；`检索可见` 只计记忆层，两者不可混读
 - 全局：`--db`（默认 `~/.v2mem/mem.db`）、`--json`（供 LLM 解析）
 - 并发：`journal_mode=WAL` + `busy_timeout=5000`（已验证）
 
