@@ -36,6 +36,9 @@ type Candidate struct {
 	MemoryID  string   `json:"memory_id,omitempty"`
 	// AttributedTo 是事实的原始来源，不是写候选的人：user|assistant|空串（旧行）。
 	AttributedTo string `json:"attributed_to,omitempty"`
+	// Scope 只给准入判定用（global / cross_project 一律不许自动 accept）。
+	// 它是 WHERE 之外的额外列，不影响 ListCandidates 的空值语义。
+	Scope string `json:"scope,omitempty"`
 }
 
 // normalizeAttributedTo 收敛写入值，避免第三类来源悄悄进库。
@@ -210,8 +213,8 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 
 func (s *Store) candidateByID(id string) (*Candidate, error) {
 	row := s.db.QueryRow(`SELECT id, session_id, project, kind, content, content_hash,
-		status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id,
-		attributed_to
+		status, source, channel, salience, obs_ids_json, 		created_at, decided_at, memory_id,
+		attributed_to, scope
 		FROM candidates WHERE id = ?`, id)
 	return scanCandidate(row)
 }
@@ -227,7 +230,7 @@ func scanCandidate(row rowScanner) (*Candidate, error) {
 	var memory sql.NullString
 	if err := row.Scan(&c.ID, &c.SessionID, &c.Project, &c.Kind, &c.Content, &c.Hash,
 		&c.Status, &c.Source, &c.Channel, &c.Salience, &obsJSON, &c.CreatedAt, &decided, &memory,
-		&c.AttributedTo); err != nil {
+		&c.AttributedTo, &c.Scope); err != nil {
 		return nil, err
 	}
 	c.ObsIDs = unmarshalObsIDs(obsJSON)
@@ -256,8 +259,8 @@ func (s *Store) ListCandidatesByProject(status, session, project string, limit i
 		limit = 50
 	}
 	q := `SELECT id, session_id, project, kind, content, content_hash,
-		status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id,
-		attributed_to
+		status, source, channel, salience, obs_ids_json, 		created_at, decided_at, memory_id,
+		attributed_to, scope
 		FROM candidates WHERE 1=1`
 	var args []any
 	if status != "" {

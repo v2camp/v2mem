@@ -21,8 +21,10 @@ func TestExtractRulesFromSyntheticObs(t *testing.T) {
 		{ID: "e", Summary: "待办：还剩 accept 没做"},
 	}
 	facts := ExtractRules(obs)
-	if len(facts) < 4 {
-		t.Fatalf("规则抽取应至少 4 条，got %+v", facts)
+	// 供大于求是积压的成因（R8），故按 RulesMaxFacts 截断：
+	// 保留输入顺序的前 3 条，套话 a 不占位。
+	if len(facts) != RulesMaxFacts {
+		t.Fatalf("规则抽取应按 RulesMaxFacts=%d 截断，got %d: %+v", RulesMaxFacts, len(facts), facts)
 	}
 	got := map[string]string{}
 	for _, f := range facts {
@@ -31,10 +33,13 @@ func TestExtractRulesFromSyntheticObs(t *testing.T) {
 			t.Errorf("事实缺 salience/obs_ids: %+v", f)
 		}
 	}
-	for _, kind := range []string{"decision", "pitfall", "preference", "task"} {
+	for _, kind := range []string{"decision", "pitfall", "preference"} {
 		if got[kind] == "" {
 			t.Errorf("缺 kind %s，got %+v", kind, got)
 		}
+	}
+	if _, over := got["task"]; over {
+		t.Errorf("task 在第 4 位，应被截断，got %+v", got)
 	}
 	if strings.Contains(got["decision"], "stop status") {
 		t.Fatal("套话不应成为候选")
@@ -210,6 +215,22 @@ func TestNegatedHelpers(t *testing.T) {
 	}
 	if negatedBefore("2026-11-10 ") {
 		t.Error("日期末尾的 0 不是计数零")
+	}
+}
+
+// TestExtractRulesKeepsEarlierKindsWithinCap：截断只砍超出上限的部分，
+// 靠前的 task/decision 不能被上限吃掉（与上一条的「套话不占位」互补）。
+func TestExtractRulesKeepsEarlierKindsWithinCap(t *testing.T) {
+	// 截断只砍超出上限的部分：靠前的 task/decision 不能被上限吃掉。
+	got := map[string]string{}
+	for _, f := range ExtractRules([]Observation{
+		{ID: "1", Summary: "待办：还剩 accept 没做"},
+		{ID: "2", Summary: "决定：上限按条数给"},
+	}) {
+		got[f.Kind] = f.Content
+	}
+	if got["task"] == "" || got["decision"] == "" {
+		t.Fatalf("截断不应吃掉靠前的 task/decision，got %+v", got)
 	}
 }
 

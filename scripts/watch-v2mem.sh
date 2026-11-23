@@ -177,12 +177,20 @@ if [ -f "$AUDIT" ]; then
       "A_READ_N=\([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms != null and .ms > 0)] | length)",
       "A_MS=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))",
       "A_WRITE_N=\([$e[] | select(.event=="stop" and .ms != null and .ms > 0)] | length)",
-      "A_WRITE_MS=\(([$e[] | select(.event=="stop" and .ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))"
+      "A_WRITE_MS=\(([$e[] | select(.event=="stop" and .ms != null and .ms > 0) | .ms] | if length>0 then (add/length|floor) else 0 end))",
+      "A_SEG_HAS=\([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and (.claim_ms != null or .evidence_ms != null or .maint_ms != null))] | length)",
+      "A_SEG_OPEN=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .open_ms != null) | .open_ms] | if length>0 then (add/length|floor) else 0 end))",
+      "A_SEG_SEARCH=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .search_ms != null) | .search_ms] | if length>0 then (add/length|floor) else 0 end))",
+      "A_SEG_CLAIM=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .claim_ms != null) | .claim_ms] | if length>0 then (add/length|floor) else 0 end))",
+      "A_SEG_EVID=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .evidence_ms != null) | .evidence_ms] | if length>0 then (add/length|floor) else 0 end))",
+      "A_SEG_MAINT=\(([$e[] | select((.event=="prompt-submit" or .event=="session-start") and .ms > 0 and .maint_ms != null) | .maint_ms] | if length>0 then (add/length|floor) else 0 end))"
   ' "$AUDIT" 2>/dev/null)"
 fi
 A_EVENTS=${A_EVENTS:-0}; A_PROMPT=${A_PROMPT:-0}; A_PROMPT_EMPTY=${A_PROMPT_EMPTY:-0}
 A_SS=${A_SS:-0}; A_OBS=${A_OBS:-0}; A_ADD=${A_ADD:-0}; A_MS=${A_MS:-0}
 A_READ_N=${A_READ_N:-0}; A_WRITE_MS=${A_WRITE_MS:-0}; A_WRITE_N=${A_WRITE_N:-0}
+A_SEG_HAS=${A_SEG_HAS:-0}; A_SEG_OPEN=${A_SEG_OPEN:-0}; A_SEG_SEARCH=${A_SEG_SEARCH:-0}
+A_SEG_CLAIM=${A_SEG_CLAIM:-0}; A_SEG_EVID=${A_SEG_EVID:-0}; A_SEG_MAINT=${A_SEG_MAINT:-0}
 
 # R12 写侧事件单独采集：不复用上面的 eval 字符串插值 —— 插值内部再嵌字符串字面量
 # 会触发 jq INVALID_CHARACTER。这里输出 TSV 后由 read 拆列，表达式里没有插值。
@@ -320,7 +328,14 @@ fi
 
 # R3 检索延迟：只取读侧 hook，写侧 Stop 单独展示但不判级
 if [ "$A_MS" -gt 0 ]; then
-  R3_NOTE="读侧样本 ${A_READ_N} 次；写侧 Stop ${A_WRITE_MS}ms 由 R10 单独判级，不计入本判据"
+  R3_NOTE="读侧样本 ${A_READ_N} 次"
+  # 有分段字段的窗口才展开：旧记录没有这三段，硬算「其余」会把整段 ms 都算成空白
+  # 变量名一律用花括号收口：macOS 自带 bash 3.2 在 set -u 下会把紧邻的
+  # 全角分号首字节并进变量名（"$R3_NOTE；" → R3_NOTE\xEF unbound variable）。
+  if [ "$A_SEG_HAS" -gt 0 ]; then
+    R3_NOTE="${R3_NOTE}；分段均值 开库 ${A_SEG_OPEN} / 检索 ${A_SEG_SEARCH} / 去重 ${A_SEG_CLAIM} / 证据 ${A_SEG_EVID} / 维护 ${A_SEG_MAINT} / 其余 $((A_MS - A_SEG_OPEN - A_SEG_SEARCH - A_SEG_CLAIM - A_SEG_EVID - A_SEG_MAINT))（stdout+审计）"
+  fi
+  R3_NOTE="${R3_NOTE}；写侧 Stop ${A_WRITE_MS}ms 由 R10 单独判级，不计入本判据"
   if [ "$A_MS" -lt 50 ]; then
     add R3 PASS "检索延迟 ${A_MS}ms" "低于 50ms 端到端目标线；${R3_NOTE}"
   elif [ "$A_MS" -lt 200 ]; then
@@ -472,15 +487,22 @@ fi
 if [ "${CAND_TRIAGE:-1}" -eq 0 ]; then
   CAND_EXHAUST_TXT="；二进制不支持 --triage，本窗口按 pending 行数计（重建 mem 后恢复可裁决口径）"
 fi
+# 越线时直接给出「最积压工程的前 3 条」，省掉裁决前的一次 candidates ls。
+# 只给 id 前半段 + 正文前 40 字：够认出是哪件事，又不把 detail 撑长。
+# 取数集与积压计数同源（CAND_REVIEWABLE）：不可裁决的行列进来只会误导裁决。
+CAND_TODO=$(printf '%s' "$CAND_REVIEWABLE" | jq -r '
+  (group_by(.project) | max_by(length) // [])[0:3]
+  | map(((.id // "")[0:8]) + ":" + (((.content // "")[0:40]) | gsub("[\\n\"|*#]"; "/")))
+  | join(" / ")' 2>/dev/null || echo '')
 
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
   add R8 WARN "候选读取失败" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
 elif [ "$CAND_MAX" -le 5 ]; then
   add R8 PASS "候选待处理 ${CAND_MAX}" "隔离区未积压；按工程：${CAND_GROUPS:-无}${CAND_EXHAUST_TXT}"
 elif [ "$CAND_MAX" -le 15 ]; then
-  add R8 WARN "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决${CAND_EXHAUST_TXT}"
+  add R8 WARN "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
 else
-  add R8 FAIL "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响${CAND_EXHAUST_TXT}"
+  add R8 FAIL "候选积压 ${CAND_MAX}" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
 fi
 
 # R9 候选内容质量：结构化载荷残留不是原子事实，说明蒸馏输入未按准入过滤。

@@ -37,6 +37,8 @@ var evidenceColumns = []struct {
 	{"candidates", "review_class", "TEXT NOT NULL DEFAULT ''"},
 	{"candidates", "revision", "INTEGER NOT NULL DEFAULT 0"},
 	{"candidates", "schema_version", "INTEGER NOT NULL DEFAULT 0"},
+	{"candidates", "judge_verdict", "TEXT NOT NULL DEFAULT ''"},
+	{"candidates", "judge_model", "TEXT NOT NULL DEFAULT ''"},
 
 	{"distill_runs", "bundle_id", "TEXT NOT NULL DEFAULT ''"},
 	{"distill_runs", "executor", "TEXT NOT NULL DEFAULT ''"},

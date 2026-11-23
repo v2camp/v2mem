@@ -175,6 +175,11 @@ MCP `add` 的 schema 声明 `required:["content"]`；写侧一律带 `source`（
 
 不引入常驻进程、不把 LLM 放进关键路径、**不自动裁决**。
 
+> **2026-11-20 修订**：允许「影子自动判定」——模型可以在写侧异步给出 verdict，但默认只写痕迹、
+> 不改状态；改状态须显式 `--apply`。权限、影子期与回滚条件见
+> [`design-admission.md`](./design-admission.md)。「不自动裁决」因此收敛为
+> 「不自动**授予**」：模型可以自动否决，不能自动采纳非 fact/task 的类。
+
 | # | 改动 | 落点 | 边界 |
 |:--|:---|:---|:---|
 | 1 | **发现**：SessionStart 注入按当前 `project` 的 pending 计数与就近裁决提示 | `cmd/mem/hook.go` `sessionStartContext` + 新增 `store.CountPendingByProject` | 只读 COUNT、失败开放当 0、计入固定预算预留（预算不足时给 hint 让路）、不写审计与 read trace；仅 N>0 时出现 |

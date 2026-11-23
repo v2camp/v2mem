@@ -37,6 +37,24 @@ func TestInjectBytesJSON(t *testing.T) {
 	}
 }
 
+// 三个分段与 open_ms 同理：0 也必须落字段。否则「这段不耗时」与「这条记录来自
+// 没有该字段的旧版本」在后处理里分不开，R3 的分因会再次落空。
+func TestSegmentMSAlwaysSerialized(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := Append(p, Record{Event: "prompt-submit", MS: 270}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for _, k := range []string{"claim_ms", "evidence_ms", "maint_ms"} {
+		if !strings.Contains(string(b), `"`+k+`":0`) {
+			t.Errorf("0 值也应落字段 %s，got %s", k, b)
+		}
+	}
+}
+
 func TestAppendReadRoundTrip(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "sub", "audit.jsonl")
 	for _, q := range []string{"第一个查询", "第二个查询"} {
