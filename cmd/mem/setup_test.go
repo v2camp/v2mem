@@ -512,3 +512,77 @@ esac
 		t.Fatalf("dry-run 观测应可产出事实并写盘，got %+v err=%v", c, err)
 	}
 }
+
+// setup 配好模型后必须同时打开自动触发，并把「怎么开、怎么关」讲清楚：
+// 只说「默认关（环境变量未设 1）」是死路 —— 宿主钩子不继承 shell 的 export。
+func TestSetupEnablesAutoSpawnAndExplainsIt(t *testing.T) {
+	p := setupHome(t)
+	t.Setenv("PATH", writeFakeCLI(t, setupCLIStub))
+
+	out, err := captureStdout(t, func() error { return cmdSetup(nil) })
+	if err != nil {
+		t.Fatalf("cmdSetup: %v", err)
+	}
+	c, err := distill.LoadModelConfig(p)
+	if err != nil || !c.AutoSpawn {
+		t.Fatalf("setup 成功后应写入 auto_spawn=true，got %+v err=%v", c, err)
+	}
+	for _, want := range []string{"已开启", "关闭", "mem setup --mode off", "影子"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("告知应包含 %q，got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "MEM_JUDGE_SPAWN 未设 1") {
+		t.Errorf("不应再让用户去设环境变量（宿主钩子不继承 shell），got:\n%s", out)
+	}
+}
+
+// --mode api 同样配好了模型来源，也应默认开启自动触发。
+func TestSetupModeAPIEnablesAutoSpawn(t *testing.T) {
+	p := setupHome(t)
+	t.Setenv("DEEPSEEK_API_KEY", "sk-test")
+	t.Setenv("OPENAI_API_KEY", "")
+	if err := cmdSetup([]string{"--mode", "api"}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := distill.LoadModelConfig(p)
+	if err != nil || !c.AutoSpawn {
+		t.Fatalf("--mode api 也应写 auto_spawn=true，got %+v err=%v", c, err)
+	}
+}
+
+// --mode off 是关闭模型来源，必须同时关掉自动触发，不能留着开关在配置里。
+func TestSetupModeOffDisablesAutoSpawn(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"mode":"cli","cli":"codebuddy","model_tag":"codebuddy@1+tpl2","auto_spawn":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdSetup([]string{"--mode", "off"}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := distill.LoadModelConfig(p)
+	if err != nil || c.AutoSpawn {
+		t.Fatalf("--mode off 应写 auto_spawn=false，got %+v err=%v", c, err)
+	}
+}
+
+// --status 要能看到自动触发状态，让用户不必打开 model.json 确认。
+func TestSetupStatusShowsAutoSpawn(t *testing.T) {
+	p := setupHome(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"mode":"cli","cli":"codebuddy","model_tag":"codebuddy@1+tpl2","auto_spawn":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(t, func() error { return cmdSetup([]string{"--status"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "auto_spawn") || !strings.Contains(out, "开") {
+		t.Errorf("status 应显示 auto_spawn 状态，got:\n%s", out)
+	}
+}

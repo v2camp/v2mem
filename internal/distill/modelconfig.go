@@ -27,6 +27,13 @@ type ModelConfig struct {
 	Model    string `json:"model,omitempty"`
 	BaseURL  string `json:"base_url,omitempty"`
 	APIKey   string `json:"api_key,omitempty"`
+	// AutoSpawn 是「配好模型后自动触发判定」的持久化授权。
+	//
+	// 为什么写进文件而不是只靠 MEM_JUDGE_SPAWN 环境变量：钩子由宿主进程启动，
+	// 不继承用户交互 shell 的 export（GUI 宿主尤其）。只提示用户 export 等于没说。
+	// 老文件没有这个字段 → false：升级后不会突然开始烧 API。
+	// 它只开「跑判定」，不开「改库」—— MEM_JUDGE_APPLY 仍是独立的默认关闸门。
+	AutoSpawn bool `json:"auto_spawn,omitempty"`
 }
 
 // DefaultModelConfigPath 返回 ~/.v2mem/model.json。

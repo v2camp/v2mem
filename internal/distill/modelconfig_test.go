@@ -132,6 +132,21 @@ func TestResolveOptionsEmptyConfigIsAPI(t *testing.T) {
 	}
 }
 
+// auto_spawn 持久化在配置里：宿主钩子不继承 shell 环境，只提示用户 export
+// 等于没说。老配置没有这个字段时必须默认 false —— 升级后不得突然开始烧 API。
+func TestLoadModelConfigAutoSpawn(t *testing.T) {
+	p := writeJSON(t, `{"mode":"cli","cli":"claude","model_tag":"claude@1+tpl1","auto_spawn":true}`)
+	c, err := LoadModelConfig(p)
+	if err != nil || !c.AutoSpawn {
+		t.Fatalf("auto_spawn 应读回 true，got %+v err=%v", c, err)
+	}
+	legacy := writeJSON(t, `{"provider":"deepseek","api_key":"k"}`)
+	old, err := LoadModelConfig(legacy)
+	if err != nil || old.AutoSpawn {
+		t.Fatalf("老配置 auto_spawn 应默认 false，got %+v err=%v", old, err)
+	}
+}
+
 // 原文件存在但读不出来时不能继续写：否则用户配置被覆盖且没有备份可回退。
 func TestSaveModelConfigFailsWhenExistingUnreadable(t *testing.T) {
 	// 路径是目录：读失败，rename 也失败，原路径必须保持原样。

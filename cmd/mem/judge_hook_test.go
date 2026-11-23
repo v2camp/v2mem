@@ -4,10 +4,12 @@ package main
 // 所以两条判据（阈值、冷却）都单独测，且默认必须是关的。
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/v2camp/v2mem/internal/distill"
 	"github.com/v2camp/v2mem/internal/harness"
 	"github.com/v2camp/v2mem/internal/store"
 )
@@ -135,5 +137,115 @@ func TestMaybeSpawnJudgeSkipsReadEvents(t *testing.T) {
 	maybeSpawnJudge(db, harness.EventSessionStart)
 	if called != 0 {
 		t.Fatalf("读路径事件不应触发判定，called=%d", called)
+	}
+}
+
+// 用临时 HOME 写一个开了 auto_spawn 的 model.json —— 钩子读的是文件，不是用户的 shell。
+func setupAutoSpawnHome(t *testing.T, cfg distill.ModelConfig) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	p := filepath.Join(home, ".v2mem", "model.json")
+	if err := distill.SaveModelConfig(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func seedPendingAndSpy(t *testing.T) (*int, string) {
+	t.Helper()
+	db := filepath.Join(t.TempDir(), "mem.db")
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	seedPending(t, st, 25)
+	st.Close()
+
+	called := new(int)
+	startJudgeProc = func(string, int, bool) error { *called++; return nil }
+	t.Cleanup(func() { startJudgeProc = defaultStartJudge })
+	return called, db
+}
+
+// setup 配好模型后写进 model.json 的 auto_spawn，应让钩子在没有环境变量时也拉起判定。
+func TestMaybeSpawnJudgeFromModelConfig(t *testing.T) {
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
+	t.Setenv("MEM_JUDGE_SPAWN", "")
+	called, db := seedPendingAndSpy(t)
+
+	maybeSpawnJudge(db, harness.EventStop)
+	if *called != 1 {
+		t.Fatalf("model.json 开了 auto_spawn 应拉起一次，called=%d", *called)
+	}
+}
+
+// 显式 0 是总闸：即使配置文件开了也要能一键关掉（GUI 宿主没法 export，这是主要关闭方式之一）。
+func TestMaybeSpawnJudgeEnvZeroVetoesConfig(t *testing.T) {
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
+	t.Setenv("MEM_JUDGE_SPAWN", "0")
+	called, db := seedPendingAndSpy(t)
+
+	maybeSpawnJudge(db, harness.EventStop)
+	if *called != 0 {
+		t.Fatalf("MEM_JUDGE_SPAWN=0 应压过配置里的 auto_spawn，called=%d", *called)
+	}
+}
+
+// mode=off 时即使残留 auto_spawn=true 也不得拉起：关掉模型来源就该停止一切外发。
+func TestMaybeSpawnJudgeOffModeVetoesConfig(t *testing.T) {
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "off", AutoSpawn: true})
+	t.Setenv("MEM_JUDGE_SPAWN", "")
+	called, db := seedPendingAndSpy(t)
+
+	maybeSpawnJudge(db, harness.EventStop)
+	if *called != 0 {
+		t.Fatalf("mode=off 不应拉起判定，called=%d", *called)
+	}
+}
+
+// 配置里的 auto_spawn 不得成为读路径的额外 I/O：读路径在读文件之前就返回。
+func TestMaybeSpawnJudgeConfigDoesNotTouchReadPath(t *testing.T) {
+	p := setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
+	t.Setenv("MEM_JUDGE_SPAWN", "")
+	called, db := seedPendingAndSpy(t)
+
+	// 删掉配置后读路径仍必须零触发（它根本不该去读这个文件）。
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	maybeSpawnJudge(db, harness.EventPromptSubmit)
+	if *called != 0 {
+		t.Fatalf("读路径不应拉起判定，called=%d", *called)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("读路径不应尝试创建/读取 model.json，stat err=%v", err)
+	}
+}
+
+// 钩子拉起时仍必须是影子模式：auto_spawn 只开「跑」，不开「改库」。
+func TestAutoSpawnKeepsShadowDefault(t *testing.T) {
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
+	t.Setenv("MEM_JUDGE_SPAWN", "")
+	t.Setenv("MEM_JUDGE_APPLY", "")
+	db := filepath.Join(t.TempDir(), "mem.db")
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPending(t, st, 25)
+	st.Close()
+
+	var called int
+	var gotApply bool
+	startJudgeProc = func(_ string, _ int, apply bool) error { called++; gotApply = apply; return nil }
+	t.Cleanup(func() { startJudgeProc = defaultStartJudge })
+
+	maybeSpawnJudge(db, harness.EventStop)
+	if called != 1 {
+		t.Fatalf("应拉起一次，called=%d", called)
+	}
+	if gotApply {
+		t.Error("auto_spawn 只开「跑」，不开「改库」：apply 必须保持 false")
 	}
 }

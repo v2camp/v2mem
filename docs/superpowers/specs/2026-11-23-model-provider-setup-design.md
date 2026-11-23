@@ -129,7 +129,8 @@ mem setup  → Probe() → dry-run(judge prompt + 蒸馏真实 prompt) → 通�
 mem judge  → LoadModelConfig → ResolveOptions() → resolve() → runCLI
            → parseJudgeVerdicts → 影子期（默认，只写 verdict）→ --apply 才落库
 mem distill→ LoadModelConfig → ResolveOptions() → resolve() → runCLI → ParseFacts → candidates
-Stop/SessionEnd → startDistillProc（detach） / maybeSpawnJudge（MEM_JUDGE_SPAWN 仍默认关）
+Stop/SessionEnd → startDistillProc（detach） / maybeSpawnJudge（读 model.json 的 auto_spawn；
+                                            MEM_JUDGE_SPAWN=0 可一键关，MEM_JUDGE_APPLY 仍默认关）
 ```
 
 硬约束：`mem setup` 不写 hooks、不写 MCP、不写 memories、不写 candidates、不启动常驻进程。
@@ -157,11 +158,13 @@ mem setup --undo          # 恢复最近一次写盘前的备份；无备份则�
 5. 通过 → `VersionTag()` 取 `cli --version`，写 `model.json`（0600、写前 `.v2mem.bak`、原子替换）。
 6. **必须打印告知**（不是提问）：
    > 已将判定器与蒸馏的模型来源设为 `<cli>`。judge 候选正文与蒸馏观测摘要会发往该 CLI 所连的远端模型。
-   > 回退：`mem setup --undo`。自动触发仍默认关（`MEM_JUDGE_SPAWN` 未设 1）。
+   > 积压自动判定已开启（≥20 条、影子、24h 冷却）；关闭：`mem setup --mode off`。
+   > 回退：`mem setup --undo`。
 
 与 §5 红线的调和：用户**主动执行** `mem setup` 构成显式授权；探测范围限定本机已安装且
-dry-run 通过的 CLI，不是「没配就随便挑一个远端」；有告知、有 dry-run、有回退、有默认关。
-因此**不修改 `VALUE.md`**，`design-admission.md` §5 只做增补。
+dry-run 通过的 CLI，不是「没配就随便挑一个远端」；有告知、有 dry-run、有回退。
+自动触发随配置打开，但 `MEM_JUDGE_APPLY` 仍默认关——只跑判定、不回写主库，影子期红线不动；
+老配置没有 `auto_spawn` 字段，升级后不会突然开始外发。因此**不修改 `VALUE.md`**。
 
 ## 8. `docs/install.md` 落地
 

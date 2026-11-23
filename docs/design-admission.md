@@ -40,16 +40,25 @@ mem judge --apply         # 真落库：accept 走 CommitAccept，reject 走 Com
 - 一致率的**分母是人工裁决**，所以影子期内不能用 `--apply`，否则分母被判定器自己污染。
 - 转正门槛：`accept` 一致率 ≥95%，且样本 ≥200 条。未达标不放开，不因着急下调。
 
-## 3.1 积压触发（可选，默认关）
+## 3.1 积压触发（配好模型后自动开，可一键关）
 
-判定走网络，不能靠「记得去跑」。挂在写侧事件末尾按阈值触发，四条闸门缺一不发：
+判定走网络，不能靠「记得去跑」。挂在写侧事件末尾按阈值触发，四条闸门缺一不发。
 
-| 环境变量 | 默认 | 作用 |
+**开关有两层，环境变量不再是唯一入口**：
+
+| 入口 | 默认 | 作用 |
 |:---|:---|:---|
-| `MEM_JUDGE_SPAWN` | 关 | 总闸。未设 `1` 一律不拉起——升级后自己开始烧 API 是最坏的一种惊喜 |
+| `model.json` 的 `auto_spawn` | 关 | `mem setup` / `--mode api` 配好模型后写入 `true`；`--mode off` 写回 `false`。钩子由宿主进程启动、不继承 shell 环境，所以授权必须落在文件上 |
+| `MEM_JUDGE_SPAWN` | 未设 | 显式总闸：`1` 强制开（脚本/CI），`0` 强制关（一键关闭，GUI 宿主无法 export 时的退路）。其它值退回文件判断 |
 | `MEM_JUDGE_MIN_PENDING` | 20 | 全库 pending ≥ 该值才触发。取值略高于 R8 的 FAIL 线（>15），避免刚 WARN 就烧一次调用 |
 | `MEM_JUDGE_COOLDOWN_H` | 24 | 冷却小时数。一个会话能 Stop 几十次，没有冷却等于每轮都跑 |
 | `MEM_JUDGE_APPLY` | 关 | 子进程是否带 `--apply`。默认影子，转正前必须保持关 |
+
+为什么从「默认关」改为「配好模型就开」：用户**主动执行** `mem setup` 已构成显式授权，
+关着却只提示 `export MEM_JUDGE_SPAWN=1` 是死路——宿主钩子读不到交互 shell 的变量。
+升级后的老用户不受影响：老 `model.json` 没有 `auto_spawn` 字段，读出来就是 `false`。
+`auto_spawn` 只开「跑判定」，**不开「改库」**——`MEM_JUDGE_APPLY` 仍是独立的默认关闸门，
+影子期的红线不动。
 
 - 只挂 `Stop` / `SessionEnd`。**读路径（PromptSubmit / SessionStart）永不触发**——判定要走网络，
   进了注入链路就直接违约。

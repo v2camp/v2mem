@@ -174,7 +174,14 @@ mem setup --undo       # 回退到上一次写盘前
 `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`，需先 export）、`--mode cli`（必须探测成功，否则报错）、
 `--mode off`；`--dry-run` 只验证不写盘。
 
-完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）；真正的 `mem judge` 不再报「判定器不可用」。
+配好模型后**积压自动判定默认开启**：候选 ≥20 条时，在会话结束时由钩子后台拉起一次判定，
+默认影子（只记判定、不改记忆），有 24h 冷却。开关写在 `model.json` 的 `auto_spawn`，
+`mem setup --status` 能看到；关闭用 `mem setup --mode off`，临时关闭可设 `MEM_JUDGE_SPAWN=0`。
+不要依赖 `export MEM_JUDGE_SPAWN=1` 来开启——宿主钩子不继承交互 shell 的环境变量。
+详见 [`design-admission.md`](./design-admission.md) §3.1。
+
+完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）与 `auto_spawn`（开 / 关）；
+真正的 `mem judge` 不再报「判定器不可用」。
 
 **已知不兼容**：`freebuff` 免费，但官方声明是 TUI-only、没有 headless / `-p` 输出模式，
 不能当非交互后端，因此不在上面的白名单里。本机装了它时 `mem setup` 会点名说明，而不是静默忽略；
