@@ -28,10 +28,26 @@ const (
 
 // metadataTypes 是宿主自己产生的控制行，明确不是用户内容，可解释地跳过。
 // 新增宿主元数据类型时加到这里；**不要**把「看不懂的行」加进来。
+//
+// session-meta / ai-title 来自 WorkBuddy / CodeBuddy 的原生行（活库实证：
+// 2026-11-23 有 23 条落进了 unparsed）。前者是 hostKind 之类的会话元信息，
+// 后者是宿主自己给会话起的标题——都不是用户或助手说过的话。
 var metadataTypes = map[string]bool{
 	"queue-operation":       true,
 	"file-history-snapshot": true,
 	"progress":              true,
+	"session-meta":          true,
+	"ai-title":              true,
+}
+
+// modelStateTypes 是模型自己的中间态，不是可引用的事实。
+//
+// 与 content 里的 thinking 块同等处理：Claude 的 thinking 走 parseBlock 的
+// default 分支被丢弃，WorkBuddy 的 reasoning 行（content="[]"，正文在
+// rawContent 的 reasoning_text 里）必须在顶层就跳过，否则它会落 unparsed。
+// 一律不进证据：这类文本是草稿，不是结论，留着只会让「证据」变噪音。
+var modelStateTypes = map[string]bool{
+	"reasoning": true,
 }
 
 // Record 是 transcript 里的一条事件。
@@ -159,6 +175,9 @@ func parseLine(line []byte, start int64) []Record {
 	if metadataTypes[lineType] {
 		return nil
 	}
+	if modelStateTypes[lineType] {
+		return nil
+	}
 
 	// WorkBuddy / CodeBuddy 的原生 message 行：role 与 content 在顶层，
 	// 块类型是 input_text / output_text，且另有一个 usage 用的 message 字段
@@ -166,6 +185,13 @@ func parseLine(line []byte, start int64) []Record {
 	// 整份会话只剩 pointer 证据，用户请求永远进不了提案。
 	if isNativeMessage(raw) {
 		return parseNativeMessage(base, raw, line)
+	}
+
+	// 宿主原生工具事件：function_call / function_call_result 是 Claude 的
+	// tool_use / tool_result 的等价物。之前它们落到 unparsed，等于把「工具载荷」
+	// 记成了「看不懂的行」——归档体积照占，语义却没解析出来。
+	if rec, ok := parseHostToolEvent(base, raw, lineType); ok {
+		return []Record{rec}
 	}
 
 	msg := raw["message"]
@@ -234,8 +260,8 @@ func isNativeMessage(raw map[string]json.RawMessage) bool {
 //
 // Text 保持块内原文，不做剥离：注入的 system-reminder 与 <user_query> 都属于
 // 「归档要保真、提案要清洗」的范畴，清洗交给 UserQueryText 在 cmd 层做。
-// 其余类型的行（function_call / reasoning / session-meta …）一律继续走
-// unparsed，原文照存、语义不猜测。
+// 工具事件（function_call / function_call_result）由 parseHostToolEvent 单独处理；
+// reasoning / session-meta / ai-title 在 parseLine 里就已判为可解释跳过。
 func parseNativeMessage(base Record, raw map[string]json.RawMessage, line []byte) []Record {
 	var blocks []json.RawMessage
 	if err := json.Unmarshal(raw["content"], &blocks); err != nil {
@@ -263,6 +289,66 @@ func parseNativeMessage(base Record, raw map[string]json.RawMessage, line []byte
 		}
 	}
 	return out
+}
+
+// parseHostToolEvent 把 WorkBuddy / CodeBuddy 的原生工具事件翻成 tool-use / tool-result。
+//
+// 字段对应关系（活库实证 2026-11-23）：
+//
+//	function_call        {callId, name, arguments}      → tool_use    {id, name, input}
+//	function_call_result {callId, name, status, output} → tool_result {tool_use_id, content}
+//
+// Text / HostUID / ToolID 刻意与 parseBlock 产出同一套形态：cmd 层的
+// recordEvidence 只认这套（用 tools[ToolID] 回填工具名、按 "tool_result" 前缀
+// 拼名字）。两边不一致，工具结果就会认不出是被谁调用的。
+func parseHostToolEvent(base Record, raw map[string]json.RawMessage, lineType string) (Record, bool) {
+	uuid := jsonString(raw, "uuid", "id")
+	callID := jsonString(raw, "callId", "call_id")
+	switch lineType {
+	case "function_call":
+		name := jsonString(raw, "name")
+		r := base
+		r.Role, r.EventType, r.ToolID, r.ToolName = "assistant", EventToolUse, callID, name
+		r.HostUID = blockUID(uuid, 0)
+		r.Text = "tool:" + name
+		if args := strings.TrimSpace(jsonString(raw, "arguments")); args != "" && args != "null" {
+			r.Text += "\n" + args
+		}
+		if callID != "" {
+			r.HostUID = "tool_use:" + callID
+		}
+		return r, true
+	case "function_call_result":
+		r := base
+		r.Role, r.EventType, r.ToolID = "user", EventToolResult, callID
+		r.HostUID = blockUID(uuid, 0)
+		r.Text = "tool_result"
+		if out := strings.TrimSpace(hostContentText(raw["output"])); out != "" {
+			r.Text += "\n" + out
+		}
+		if callID != "" {
+			r.HostUID = "tool_result:" + callID
+		}
+		return r, true
+	}
+	return Record{}, false
+}
+
+// hostContentText 解宿主的 output 字段：可能是字符串、单个 {type,text} 对象，
+// 也可能是 Claude 风格的块数组。contentText 覆盖其中两种，单个对象要单独试，
+// 否则 {"type":"text","text":"…"} 会被当成「没有正文」而丢掉工具输出。
+func hostContentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var one struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &one); err == nil && one.Text != "" {
+		return one.Text
+	}
+	return contentText(raw)
 }
 
 var (
