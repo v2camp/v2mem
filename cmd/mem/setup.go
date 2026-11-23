@@ -110,8 +110,10 @@ func cmdSetup(args []string) error {
 		return printSetupStatus(path)
 	}
 
-	name, ok := distill.Probe()
-	if !ok {
+	// 按白名单顺序逐个 dry-run，首个通过者胜出：某个模板可能探测得到却跑不通
+	// （argv 未实测），此时换下一个，而不是让用户手工排查。
+	candidates := distill.ProbeAll()
+	if len(candidates) == 0 {
 		msg := "没有探测到可用的 CLI（白名单：claude / codex）。判定器与蒸馏的模型来源未改变。"
 		if *mode == "cli" {
 			return errors.New(msg + "\n装了其中任一个后重跑 mem setup，或改用 mem setup --mode api / --mode off。")
@@ -120,13 +122,24 @@ func cmdSetup(args []string) error {
 		return nil
 	}
 
-	tag := distill.VersionTag(name)
-	if err := verifySetupCLI(name, tag); err != nil {
-		// 默认流程里失败不阻塞安装；显式要求 cli 时必须让人知道没配上。
-		if *mode == "cli" {
-			return fmt.Errorf("CLI %s 验证未通过，未写盘: %w", name, err)
+	var name, tag string
+	var reasons []string
+	for _, cand := range candidates {
+		candTag := distill.VersionTag(cand)
+		if err := verifySetupCLI(cand, candTag); err != nil {
+			reasons = append(reasons, fmt.Sprintf("%s: %v", cand, err))
+			continue
 		}
-		fmt.Printf("%s 验证未通过，未写盘：%v\n可改用 mem setup --mode api，或 mem setup --mode off。\n", name, err)
+		name, tag = cand, candTag
+		break
+	}
+	if name == "" {
+		// 全部候选失败：不写盘。默认流程不阻塞安装（退出 0），显式要求 cli 则报错。
+		if *mode == "cli" {
+			return fmt.Errorf("所有候选 CLI 验证均未通过，未写盘:\n  %s", strings.Join(reasons, "\n  "))
+		}
+		fmt.Printf("未配置：%d 个候选 CLI 全部未通过验证，未写盘。\n  %s\n可改用 mem setup --mode api，或 mem setup --mode off。\n",
+			len(candidates), strings.Join(reasons, "\n  "))
 		return nil
 	}
 

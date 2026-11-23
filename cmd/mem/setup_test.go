@@ -276,7 +276,51 @@ func TestSetupModeCLIWithoutCLIErrors(t *testing.T) {
 	}
 }
 
-// 显式 --mode cli 而 dry-run 失败时同样报错，不写盘。
+// 第一个候选失败时要按白名单顺序换下一个，而不是直接放弃（spec §7 step 4）。
+func TestSetupFallsBackToSecondCLI(t *testing.T) {
+	p := setupHome(t)
+	dir := t.TempDir()
+	// claude 能报版本，但 prompt 一律非零退出 → judge dry-run 失败。
+	bad := "#!/bin/sh\ncase \"$1\" in --version) echo \"1.0.0\"; exit 0 ;; esac\nexit 1\n"
+	// codex 同形脚本，prompt 按内容回合法 JSON。
+	good := `#!/bin/sh
+case "$1" in --version) echo "2.0.0"; exit 0 ;; esac
+in=$(/bin/cat)
+case "$in" in
+  *"候选"*) echo '[{"id":"aaaaaaaa","verdict":"reject","reason":"process_narrative"}]' ;;
+  *) echo '{"kind":"preference","content":"默认短句","salience":0.6,"obs_ids":["setup"]}' ;;
+esac
+`
+	for name, body := range map[string]string{"claude": bad, "codex": good} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+
+	out, err := captureStdout(t, func() error { return cmdSetup(nil) })
+	if err != nil {
+		t.Fatalf("cmdSetup: %v", err)
+	}
+	c, err := distill.LoadModelConfig(p)
+	if err != nil {
+		t.Fatalf("LoadModelConfig: %v", err)
+	}
+	if c.Mode != "cli" || c.CLI != "codex" {
+		t.Fatalf("claude 失败后应落到 codex，got %+v", c)
+	}
+	if !strings.HasPrefix(c.ModelTag, "codex@") {
+		t.Errorf("ModelTag 应以 codex@ 开头，got %q", c.ModelTag)
+	}
+	if !strings.Contains(out, "会发往") {
+		t.Errorf("换到第二个候选也要打印外发告知，got:\n%s", out)
+	}
+	if _, err := os.Stat(p + ".v2mem.bak"); !os.IsNotExist(err) {
+		t.Errorf("首次写盘不应产生备份，got err=%v", err)
+	}
+}
+
+// 显式 --mode cli 且 dry-run 失败时同样报错，不写盘。
 func TestSetupModeCLIDryRunFailureErrors(t *testing.T) {
 	p := setupHome(t)
 	t.Setenv("PATH", writeFakeCLI(t, "#!/bin/sh\nexit 1\n"))

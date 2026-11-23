@@ -26,12 +26,25 @@ var cliTemplates = []cliTemplate{
 	{Name: "codex", Args: []string{"exec", "--sandbox", "read-only", "--skip-git-repo-check", "-"}, VersionArgs: []string{"--version"}, Ver: "1"},
 }
 
-// Probe 按白名单顺序返回第一个可用的 CLI 名字。不提问、不列编号。
-func Probe() (name string, ok bool) {
+// ProbeAll 按白名单顺序返回本机所有可用的 CLI 名。
+//
+// 为什么需要遍历而不是只取第一个：模板 argv 未实测，某个候选可能探测得到却
+// 在 dry-run 里失败；此时应当换下一个，而不是让用户手工排查。
+func ProbeAll() []string {
+	var names []string
 	for _, t := range cliTemplates {
 		if _, err := exec.LookPath(t.Name); err == nil {
-			return t.Name, true
+			names = append(names, t.Name)
 		}
+	}
+	return names
+}
+
+// Probe 按白名单顺序返回第一个可用的 CLI 名字。不提问、不列编号。
+// 它等价于 ProbeAll()[0]：保留旧签名，调用方不必都改成切片。
+func Probe() (name string, ok bool) {
+	if all := ProbeAll(); len(all) > 0 {
+		return all[0], true
 	}
 	return "", false
 }

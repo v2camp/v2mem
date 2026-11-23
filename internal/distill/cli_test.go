@@ -27,6 +27,26 @@ func TestProbeOrderAndTemplate(t *testing.T) {
 	}
 }
 
+func TestProbeAllOrder(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"codex", "claude"} {
+		p := filepath.Join(dir, n)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\necho "+n+"-v1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir)
+	got := ProbeAll()
+	want := []string{"claude", "codex"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("ProbeAll 应按白名单顺序返回全部可用 CLI，want %v got %v", want, got)
+	}
+	// Probe 必须仍是 ProbeAll 的首个元素，老调用方语义不变。
+	if name, ok := Probe(); !ok || name != got[0] {
+		t.Fatalf("Probe 应返回 ProbeAll 首项，got %q ok=%v", name, ok)
+	}
+}
+
 func TestRunCLIStdinStdoutAndError(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "claude")
