@@ -1,6 +1,6 @@
 # 存储分层：运转逻辑留库，知识内容外置
 
-> 状态：**方案已拍板，P0 契约已落地**（§8 五项决策见下；生产读侧与存量数据未改）。
+> 状态：**P0 已落地；§8-2 于 2026-11-24 重开**（`summary` / `summary_idx` 一律外置，P1 验收口径按实测重写）。生产读侧与存量数据仍未改。
 > 判据权威：[`VALUE.md`](./VALUE.md)（冲突时以它为准）。本方案不新增红线，只把既有的「事实源 / 查询源分离」推广到全部知识内容。
 > 相关：[`design-capture.md`](./design-capture.md) §2.3 / §9、[`design-write-batch.md`](./design-write-batch.md)、[`design-cross-device.md`](./design-cross-device.md)、[`design-db-stamp.md`](./design-db-stamp.md)、[`ops-watch.md`](./ops-watch.md)。
 > 实施按 [`AGENTS.md`](../AGENTS.md) 的任务流程在独立 worktree 进行；P0 契约正文见 [`contracts/storage-layering.md`](../contracts/storage-layering.md)。
@@ -58,18 +58,20 @@ v2mem 已经在做这件事，本文是收敛与补全，不是另起一套：
 
 结论：**不动检索架构的现实收益是 19%~36%；超过 50% 要连检索层一起改造。**
 
+> 2026-11-24 本机复核（10,097 行，基线 31.54 MiB；`backup()` 副本上把两列置空 + `VACUUM`，外置内容按日期分片 gzip 后计入净额）：A → 25.51 MiB（DB -19.1%，外部 1.35 MiB，净 -14.8%）；B → 20.09 MiB（DB **-36.3%**，外部 2.36 MiB，净 **-28.8%**）。副本已清理。
+
 「库大拖慢启动」不成立，别拿它当理由。另以临时基准库（0.24 MB / 1 千行 与 93.5 MB / 40 万行，测完已清理）对照：`connect()` + 读 schema 0.244 → 0.209 ms、索引点查 0.008 → 0.007 ms，只有 `PRAGMA quick_check` 0.4 → 45.4 ms 随体积线性增长。本次改造的真实收益是**主库体积、备份 / 同步成本、内容可读性与保留策略**，不是启动速度。
 
 ## 4. 表级映射
 
 | 表 | 留库（状态 / 约束 / 引用） | 外置（内容） |
 |:---|:---|:---|
-| `observations` | `id` / `event_uid` / `source_id` / `source_seq` / `content_hash` / `archive_hash` / `raw_record_hash` / `raw_ref` / `channel` / `event` / `created_at` / `occurred_at_ns` / `parser_version` | `summary` → JSONL；`summary_idx` → 外部索引 sidecar |
+| `observations` | `id` / `event_uid` / `source_id` / `source_seq` / `content_hash` / `archive_hash` / `raw_record_hash` / `raw_ref` / `channel` / `event` / `created_at` / `occurred_at_ns` / `parser_version` | `summary` / `summary_idx` → JSONL（一律外置，见 §8-2） |
 | `evidence_archives` | **整表**（账与引用） | 正文已在 gzip JSONL，无需再动 |
 | `evidence_sources` / `memories` / `candidates` / `commit_decisions` / `distill_runs` / `edges` / `hook_dedup` / `db_meta` / `migration_marks` / `tags` | 整表 | — |
 | `read_traces` / `read_trace_items` | `feedback` / `feedback_reason` / `feedback_at`、判据依赖的计数列 | `raw_query` / `focus_query` / `gate_reason` / `signals_json` 等只写不改的诊断字段 → JSONL（P2，须先确认 `ops-watch.md` 判据依赖） |
 | `fts_mem_*` | 整组保留 | — |
-| `fts_obs_*` | 待 §8 第 3 点决策 | 外部检索 sidecar 或精简索引 |
+| `fts_obs_*` | **整组保留精简索引**（见 §8-3） | — |
 | `memories.content` | **留库**（查询源；仅 18 行 / 0.03 MB） | 单向投影到 Markdown |
 
 `memories` 体量极小，外置正文没有收益；Markdown 只做给人 / 给其他 AI 工具读的投影。
@@ -89,7 +91,7 @@ v2mem 已经在做这件事，本文是收敛与补全，不是另起一套：
 
 ### 5.3 阈值
 
-内容 < 2 KB 内联库，≥ 2 KB 外置；加 `payload_bytes` 记录决策。依据：`summary` 均 449 B、`summary_idx` 均 431 B（内联侧），归档 Raw 上限 32000 rune（外置侧）。避免为一句短摘要也建一个文件和一个 ref。
+**例外优先**：`summary` / `summary_idx` 一律外置（2026-11-24 重开 §8-2），不走字节阈值——前者被 `eventSummary` 硬截到 512 B，后者是其一/二元组展开、实测上限 1,523 B，按 2 KB 判定永远不会命中。其余新增内容字段仍是 `< 2 KB` 内联、`≥ 2 KB` 外置，并记 `payload_bytes`。归档 Raw 上限 32000 rune 属外置侧。
 
 ### 5.4 Markdown 是投影，不是真源
 
@@ -122,17 +124,17 @@ v2mem 已经在做这件事，本文是收敛与补全，不是另起一套：
 | 阶段 | 动作 | 验收 |
 |:---|:---|:---|
 | **P0 契约先行（已完成）** | `contracts/storage-layering.md` 定 ref 格式、两类写入顺序、阈值、Markdown 投影边界；`internal/evidence.RefHealth` 巡检骨架；**不改生产读侧** | 契约文档 + `ref_health_test.go`；`make cover-gate` 通过 |
-| **P1 写侧外置** | `observations.summary` 外置到 `content/`，DB 留 ref；复用批量归档与 spool 补偿；按 `#seq` 补读取 API | 变体 B 口径：库约 19 MB；`ops-watch` 判据不降级；重放不新增行、哈希稳定 |
-| **P2 检索与投影** | `summary_idx` / `fts_obs_*` 的替代方案；Markdown 蒸馏；`read_traces` 诊断字段外置 | 变体 C 口径约 14.5 MB；`mem search --layer observation` 通过既有评测；跨工具可读记忆 |
+| **P1 写侧外置** | `observations.summary` / `summary_idx` 一律外置到 `content/`，DB 留 ref；`fts_obs_*` 保留精简索引；复用批量归档与 spool 补偿；按 `#seq` 补读取 API | **相对比例验收**（不写死绝对 MB）：同一快照 `backup()` 取基线，副本上把两列置空 + `VACUUM`，`dbstat` 取 `sum(pgsize)` → DB 降幅 ≥30%（本机 36.3%）；外置内容按日期分片 gzip 计入后净降幅 ≥25%（本机 28.8%）；`ops-watch` 判据不降级；`mem search --layer observation` 通过既有评测；重放不新增行、hash 稳定 |
+| **P2 检索与投影** | `fts_obs_*` 替代方案（若仍要冲压）；Markdown 蒸馏；`read_traces` 诊断字段外置 | 变体 C 只是理论上限（2026-11-23 基线约 14.5 MB），**不作验收线**；Markdown 投影跨工具可读；`mem search --layer observation` 通过既有评测 |
 
 **非目标**：不删观测行或归档来降耗时（[`design-write-batch.md`](./design-write-batch.md) 已明确）、不改 `mem.db` 的查询源地位、不引入常驻进程（[`VALUE.md`](./VALUE.md) §4 红线）、不改 `kind` 枚举。
 
-## 8. 决策（2026-11-23 拍板）
+## 8. 决策（2026-11-23 拍板；§8-2 于 2026-11-24 重开）
 
 | 点 | 决议 | 影响 |
 |:---|:---|:---|
 | ref 定位 | **路径 + `#seq`**；内容 hash 存库内单列 | 复用现有解析与 `ReadArchiveRecord`；分片迁移需同步改 ref |
-| 阈值 | **2 KB 统一阈值** + `payload_bytes` 留痕 | 不为字段开特例；现有摘要多为内联 |
+| 阈值 | **2026-11-24 重开：`summary` / `summary_idx` 一律外置**；其余字段仍走 2 KB + `payload_bytes` | 两字段有 512 B / <2 KB 硬上限，按阈值永不外置；实测 DB -36.3%、净 -28.8% |
 | `fts_obs_*` | **保留精简索引** | 收益停在约 36%；外部 sidecar 留到 P2 再评估 |
 | Markdown | **单向投影、不回写** | 不做 `source_ref` / `version` 导入协议 |
 | `read_traces` | **诊断字段 P2 再拆** | 拆前先核对 `ops-watch.md` 判据依赖 |

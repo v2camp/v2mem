@@ -1,8 +1,8 @@
 # 存储分层契约（P0）
 
 > 来源：[`docs/design-storage-layering.md`](../docs/design-storage-layering.md) §5；判据权威 [`docs/VALUE.md`](../docs/VALUE.md)。
-> 状态：契约已对齐（2026-11-23 五项拍板），P0 只落契约与巡检骨架，不改生产读侧。
-> 决策：路径 + `#seq` 定位 · 2 KB 统一阈值 · 保留精简 `fts_obs_*` · Markdown 只读不回写 · `read_traces` 诊断字段 P2 再拆。
+> 状态：P0 契约已落地；§8-2 于 2026-11-24 重开，阈值改为字段硬规定，P1 验收口径按本机实测重写。
+> 决策：路径 + `#seq` 定位 · **`summary` / `summary_idx` 一律外置**（其他字段仍走 2 KB） · 保留精简 `fts_obs_*` · Markdown 只读不回写 · `read_traces` 诊断字段 P2 再拆。
 
 ## 1. 三层与真源
 
@@ -33,7 +33,9 @@
 
 ## 4. 阈值
 
-`payload_bytes < 2048` 内联库，`>= 2048` 外置；每行记 `payload_bytes` 作为决策留痕。按字节数统一判定，不为 `summary` / `summary_idx` 另开硬编码规则。
+**例外优先**：`summary` 与 `summary_idx` **一律外置**，不走字节阈值——前者被 `eventSummary` 硬截到 512 B，后者是该输入的一/二元组展开（实测上限 1,523 B），按 2 KB 判定永远不会外置。
+
+其余新增内容字段沿用默认阈值：`payload_bytes < 2048` 内联库，`>= 2048` 外置，并记 `payload_bytes` 留痕。
 
 ## 5. Markdown 投影边界
 
