@@ -48,6 +48,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
   mem reject <id|前缀>             拒绝候选
   mem batch  [选项]                批量裁决：按方案文件一次 accept/reject（--dry-run 只校验，--rollback 撤销）
+  mem migrate --summary-external   把 observations.summary / summary_idx 迁移到 content/（--dry-run 只估算）
                                     --reject-judged 批量否决影子判定为 reject 的候选（只否决、不采纳）
   mem candidates ls [选项]         列出隔离区候选
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
@@ -139,7 +140,7 @@ var knownSubcommands = []string{
 	"add", "search", "asset", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
 	"gc", "consolidate", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
-	"distill", "accept", "reject", "batch", "candidates", "judge", "setup",
+	"distill", "accept", "reject", "batch", "candidates", "judge", "setup", "migrate",
 }
 
 func main() {
@@ -192,6 +193,8 @@ func main() {
 		err = cmdReject(os.Args[2:])
 	case "batch":
 		err = cmdBatch(os.Args[2:])
+	case "migrate":
+		err = cmdMigrate(os.Args[2:])
 	case "candidates":
 		err = cmdCandidates(os.Args[2:])
 	case "sync":
@@ -491,6 +494,9 @@ func cmdSearch(args []string) error {
 		Layer:   *layer,
 	})
 	if err != nil {
+		return err
+	}
+	if err := hydrateHits(st.Path(), hits); err != nil {
 		return err
 	}
 

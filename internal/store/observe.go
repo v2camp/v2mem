@@ -21,19 +21,22 @@ const (
 
 // Observation 是一条会话观测。Summary 是有界摘要，不是工具 stdout 全文。
 type Observation struct {
-	ID        string `json:"id"`
-	SessionID string `json:"session_id"`
-	Project   string `json:"project"`
-	Harness   string `json:"harness"`
-	Event     string `json:"event"`
-	ToolName  string `json:"tool_name"`
-	Summary   string `json:"summary"`
-	RawRef    string `json:"raw_ref"`
-	Hash      string `json:"hash"`
-	CreatedAt int64  `json:"created_at"`
-	MetaJSON  string `json:"meta_json"`
-	Channel   string `json:"channel,omitempty"`
-	EventID   string `json:"event_id,omitempty"`
+	ID           string `json:"id"`
+	SessionID    string `json:"session_id"`
+	Project      string `json:"project"`
+	Harness      string `json:"harness"`
+	Event        string `json:"event"`
+	ToolName     string `json:"tool_name"`
+	Summary      string `json:"summary"`
+	SummaryRef   string `json:"summary_ref,omitempty"`
+	SummaryHash  string `json:"summary_hash,omitempty"`
+	PayloadBytes int    `json:"payload_bytes,omitempty"`
+	RawRef       string `json:"raw_ref"`
+	Hash         string `json:"hash"`
+	CreatedAt    int64  `json:"created_at"`
+	MetaJSON     string `json:"meta_json"`
+	Channel      string `json:"channel,omitempty"`
+	EventID      string `json:"event_id,omitempty"`
 
 	// Evidence 身份列。legacy 观测（AppendObservation 写的）全为空；
 	// 新证据路径（CaptureEvidence）写的行带这些值。两条路径共用 observations
@@ -52,7 +55,8 @@ type Observation struct {
 // observationColumns 是 observations 的完整读列，三条读路径共用。
 // 新增列时必须同步这里，避免 AppendObservation(legacy) 与
 // CaptureEvidence(evidence) 双写路径在读侧再次分叉。
-const observationColumns = `id, session_id, project, harness, event, tool_name, summary, raw_ref,
+const observationColumns = `id, session_id, project, harness, event, tool_name, summary,
+	summary_ref, summary_hash, payload_bytes, raw_ref,
 	content_hash, created_at, meta_json, channel, event_id,
 	event_uid, source_id, source_generation, source_seq, occurred_at_ns,
 	archive_hash, raw_record_hash, parser_version`
@@ -129,17 +133,36 @@ func (s *Store) AppendObservation(in ObsInput) (*ObsResult, error) {
 	id := newID()
 	now := time.Now().Unix()
 	idx := observationIndexText(summary)
+	storedSummary, storedIdx := summary, idx
+	var ref, sumHash string
+	var payloadBytes int
+	if s.summaryExternal {
+		day := time.Unix(now, 0).Format("2006/01/02")
+		seq, err := NextSummarySeq(s.db, day)
+		if err != nil {
+			return nil, err
+		}
+		ref, sumHash, payloadBytes, err = AppendSummaryLine(SummaryContentRoot(s.path), now, SummaryLine{
+			V: 1, Seq: seq, ID: id, Summary: summary, SummaryIdx: idx,
+		})
+		if err != nil {
+			return nil, err
+		}
+		storedSummary, storedIdx = "", ""
+	}
 
 	// legacy 观测没有原始证据身份：显式把这 8 列留空，而不是依赖 DEFAULT。
 	// 这样命中 ux_obs_dedup_legacy 的部分索引条件（event_uid='' AND source_id=''），
 	// 旧去重语义保持不变；有身份的行由 CaptureEvidence 单独写入。
 	res, err := s.db.Exec(`INSERT OR IGNORE INTO observations(
-		id, session_id, project, harness, event, tool_name, summary, summary_idx, raw_ref,
+		id, session_id, project, harness, event, tool_name, summary, summary_idx,
+		summary_ref, summary_hash, payload_bytes, raw_ref,
 		content_hash, created_at, meta_json, channel, event_id,
 		event_uid, source_id, source_generation, source_seq, occurred_at_ns,
 		archive_hash, raw_record_hash, parser_version
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, '', '', 0, 0, 0, '', '', '')`,
-		id, in.SessionID, in.Project, in.Harness, event, in.ToolName, summary, idx, in.RawRef,
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, '', '', 0, 0, 0, '', '', '')`,
+		id, in.SessionID, in.Project, in.Harness, event, in.ToolName, storedSummary, storedIdx,
+		ref, sumHash, payloadBytes, in.RawRef,
 		hash, now, meta, ch, eventID)
 	if err != nil {
 		return nil, err
@@ -149,6 +172,11 @@ func (s *Store) AppendObservation(in ObsInput) (*ObsResult, error) {
 		return nil, err
 	}
 	if n > 0 {
+		if s.summaryExternal {
+			if err := obsFTSPut(s.db, id, idx); err != nil {
+				return nil, err
+			}
+		}
 		return &ObsResult{ID: id, Created: true, Hash: hash}, nil
 	}
 	if eventID != "" {
@@ -216,7 +244,8 @@ func (s *Store) ListObservations(sessionID string, limit int) ([]Observation, er
 func scanObservation(row interface{ Scan(...any) error }) (Observation, error) {
 	var o Observation
 	err := row.Scan(&o.ID, &o.SessionID, &o.Project, &o.Harness, &o.Event,
-		&o.ToolName, &o.Summary, &o.RawRef, &o.Hash, &o.CreatedAt, &o.MetaJSON,
+		&o.ToolName, &o.Summary, &o.SummaryRef, &o.SummaryHash, &o.PayloadBytes,
+		&o.RawRef, &o.Hash, &o.CreatedAt, &o.MetaJSON,
 		&o.Channel, &o.EventID,
 		&o.EventUID, &o.SourceID, &o.SourceGeneration, &o.SourceSeq,
 		&o.OccurredAtNS, &o.ArchiveHash, &o.RawRecordHash, &o.ParserVersion)
@@ -272,6 +301,12 @@ func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult,
 		}
 		deleted += more
 		n -= int(more)
+	}
+	if s.summaryExternal {
+		// 独立 FTS 表没有触发器，GC 后必须显式清掉悬空索引。
+		if _, err := s.db.Exec(`DELETE FROM fts_obs WHERE obs_id NOT IN (SELECT id FROM observations)`); err != nil {
+			return nil, err
+		}
 	}
 	return &ObsGCResult{Deleted: int(deleted), Kept: n}, nil
 }
@@ -366,6 +401,39 @@ func ensureObservationSearch(db *sql.DB) error {
 
 // searchObservations 检索会话痕迹。不做 MinHash，不读 candidates。
 // kind 与 tag 只属于已定记忆；在这一层出现就是调用方用错了层。
+// 迁移后的 fts_obs 是独立表：索引文本自带副本，observations.summary_idx 恒为空。
+// 用 obs_id 连接而不是 rowid —— VACUUM 会重排没有 INTEGER PRIMARY KEY 的表 rowid。
+const obsFTSCreateStandalone = `CREATE VIRTUAL TABLE IF NOT EXISTS fts_obs USING fts5(
+	summary_idx,
+	obs_id UNINDEXED
+)`
+
+func ensureStandaloneObsFTS(db *sql.DB) error {
+	if _, err := db.Exec(obsFTSCreateStandalone); err != nil {
+		return err
+	}
+	for _, trigger := range []string{"observations_ai", "observations_ad", "observations_au"} {
+		if _, err := db.Exec(`DROP TRIGGER IF EXISTS ` + trigger); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func obsFTSPut(db sqlExecer, id, idx string) error {
+	_, err := db.Exec(`INSERT INTO fts_obs(summary_idx, obs_id) VALUES (?, ?)`, idx, id)
+	return err
+}
+
+func obsFTSDelete(db sqlExecer, id string) error {
+	_, err := db.Exec(`DELETE FROM fts_obs WHERE obs_id = ?`, id)
+	return err
+}
+
 func (s *Store) searchObservations(q SearchQuery) ([]Hit, error) {
 	if q.Kind != "" || len(q.Tags) > 0 {
 		return nil, errors.New("kind 与 tag 只过滤已定记忆；查痕迹请用 layer=observation 并不要带 kind/tag，或改用 layer=both")
@@ -408,10 +476,17 @@ func (s *Store) obsSearchWith(expr string, q SearchQuery) ([]Hit, error) {
 	if where != "" {
 		sqlWhere += " AND " + where
 	}
+	cols := `o.id, o.summary, o.event, o.tool_name, o.project, o.created_at, bm25(fts_obs) AS rank`
+	join := `o.rowid = fts_obs.rowid`
+	if s.summaryExternal {
+		cols = `o.id, o.summary, o.summary_ref, o.summary_hash, o.payload_bytes,
+			o.event, o.tool_name, o.project, o.created_at, bm25(fts_obs) AS rank`
+		join = `o.id = fts_obs.obs_id`
+	}
 	rows, err := s.db.Query(
-		`SELECT o.id, o.summary, o.event, o.tool_name, o.project, o.created_at, bm25(fts_obs) AS rank
+		`SELECT `+cols+`
 		   FROM fts_obs
-		   JOIN observations o ON o.rowid = fts_obs.rowid
+		   JOIN observations o ON `+join+`
 		  WHERE `+sqlWhere+`
 		  ORDER BY rank ASC, o.created_at DESC
 		  LIMIT ?`, args...)
@@ -423,7 +498,13 @@ func (s *Store) obsSearchWith(expr string, q SearchQuery) ([]Hit, error) {
 	for rows.Next() {
 		var h Hit
 		var event, tool string
-		if err := rows.Scan(&h.ID, &h.Content, &event, &tool, &h.Project, &h.UpdatedAt, &h.Rank); err != nil {
+		if s.summaryExternal {
+			err = rows.Scan(&h.ID, &h.Content, &h.SummaryRef, &h.SummaryHash, &h.PayloadBytes,
+				&event, &tool, &h.Project, &h.UpdatedAt, &h.Rank)
+		} else {
+			err = rows.Scan(&h.ID, &h.Content, &event, &tool, &h.Project, &h.UpdatedAt, &h.Rank)
+		}
+		if err != nil {
 			return nil, err
 		}
 		h.Kind = tool

@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 // segmentRecord 是归档 segment 与 spool segment 共用的记录格式。
@@ -283,6 +285,13 @@ func RefHealth(locator, wantHash string) error {
 		}
 	}
 	return nil
+}
+
+// RefHealthLine 校验外置内容分片中的一行：按 #seq 定位并核对行级 hash。
+// 与 RefHealth 不同，它不看整文件 hash —— 分片会 append，整文件 hash 会变。
+func RefHealthLine(root, locator, wantHash string) error {
+	_, err := store.ReadSummaryLine(root, locator, wantHash)
+	return err
 }
 
 // readArchiveRecord 逐行扫描 gzip JSONL，按 seq 定位，而不是把整个流当成一个

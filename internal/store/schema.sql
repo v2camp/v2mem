@@ -92,8 +92,8 @@ CREATE INDEX IF NOT EXISTS idx_hook_dedup_ts ON hook_dedup(ts);
 -- 观测缓冲与蒸馏隔离区（同库另表，不进 fts_mem）。
 -- hooks 只许写 observations。candidates 由 distill / import 写入，accept 才进 memories。
 -- 写失败不在这里处理：调用方把行落到 spool，下次 SessionStart 再灌回来。
--- summary_idx 是痕迹层的可检索形态，规则与 memories.content_idx 相同。
--- fts_obs 与触发器在 Open 里补齐：旧库先 ALTER 出 summary_idx，再建索引。
+-- summary / summary_idx 在 P1 全外置后恒为空，正文走 summary_ref；两列保留只为兼容读取。
+-- fts_obs 在 Open 里补齐：未迁移库仍是 external-content 表；迁移后改为独立表。
 -- 默认 mem search 仍只查 memories；--layer observation|both 才查这张表。
 CREATE TABLE IF NOT EXISTS observations (
   id            TEXT PRIMARY KEY,
@@ -102,8 +102,11 @@ CREATE TABLE IF NOT EXISTS observations (
   harness       TEXT NOT NULL DEFAULT '',
   event         TEXT NOT NULL,            -- post-tool-use|stop|session-end|…
   tool_name     TEXT NOT NULL DEFAULT '',
-  summary       TEXT NOT NULL DEFAULT '', -- 有界摘要，非全量 stdout
-  summary_idx   TEXT NOT NULL DEFAULT '', -- 一元组+二元组，供 fts_obs
+  summary       TEXT NOT NULL DEFAULT '', -- P1 后为空；legacy 行仍可读
+  summary_idx   TEXT NOT NULL DEFAULT '', -- P1 后为空；FTS 自带索引副本
+  summary_ref   TEXT NOT NULL DEFAULT '', -- content/YYYY/MM/DD/observations.jsonl.gz#<seq>
+  summary_hash  TEXT NOT NULL DEFAULT '', -- 规范 JSON 行的 sha256
+  payload_bytes INTEGER NOT NULL DEFAULT 0,
   raw_ref       TEXT NOT NULL DEFAULT '', -- 可选外部路径，勿存密钥
   content_hash  TEXT NOT NULL,
   created_at    INTEGER NOT NULL,
@@ -121,6 +124,11 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS ix_obs_session ON observations(session_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_obs_project ON observations(project, created_at);
+-- 外置分片的当日序号；不放 db_meta，避免破坏「db_meta 恒 3 行」的既有断言。
+CREATE TABLE IF NOT EXISTS summary_seq (
+  day TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL
+);
 -- ix_obs_archive（证据归档准出按 archive_hash 反查）不能写在这里：存量库还没有
 -- archive_hash 列，CREATE INDEX 会先于 ensureColumn 执行而失败。它由
 -- ensureEvidenceSchema 在补列之后建。

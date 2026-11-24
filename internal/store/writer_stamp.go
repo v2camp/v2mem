@@ -12,7 +12,7 @@ import (
 
 // CurrentSchemaVersion 是当前二进制理解的数据结构版本。任何改变「读出来的数据形状」的
 // 迁移都必须 +1，否则降级守卫失效。
-const CurrentSchemaVersion = 1
+const CurrentSchemaVersion = 2
 
 // ErrDBSchemaNewer 表示库由更新的二进制写过，当前二进制只理解更旧的 schema。
 // 调用方应直接用 errors.Is 判定并拒绝打开，而不是尝试降级读。

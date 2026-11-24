@@ -37,6 +37,9 @@ type Ref struct {
 	RawRecordHash    string
 	RawLocator       string
 	Summary          string
+	SummaryRef       string
+	SummaryHash      string
+	PayloadBytes     int
 	ParserVersion    string
 	ProposalEligible bool
 	Fidelity         Fidelity

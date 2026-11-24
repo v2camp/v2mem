@@ -34,9 +34,10 @@ var schemaSQL string
 
 // Store 持有一个到本地记忆库的连接。
 type Store struct {
-	db   *sql.DB
-	path string
-	syn  *SynonymDict // 同义词展开词典；nil = 未启用（文件缺失或 MEM_SYN_DICT=0）
+	db              *sql.DB
+	path            string
+	summaryExternal bool         // 迁移完成后 fts_obs 是独立表，JOIN 用 obs_id 而非 rowid
+	syn             *SynonymDict // 同义词展开词典；nil = 未启用（文件缺失或 MEM_SYN_DICT=0）
 }
 
 // DefaultPath 返回默认库路径：~/.v2mem/mem.db。
@@ -124,14 +125,23 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("迁移 edges.dst 外键失败: %w", err)
 	}
-	st := &Store{db: db, path: path}
+	st := &Store{db: db, path: path, summaryExternal: summaryExternalMigrated(db)}
 	// 词库加载失败不致命：检索不该因辅助配置坏了而崩。
 	_ = st.reloadSynonyms()
 	if err := st.backfillSigs(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("补齐 MinHash 签名失败: %w", err)
 	}
-	if err := ensureObservationSearch(db); err != nil {
+	if err := ensureSummaryExternalSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("补齐外置内容 schema 失败: %w", err)
+	}
+	if st.summaryExternal {
+		if err := ensureStandaloneObsFTS(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("补齐独立观测检索失败: %w", err)
+		}
+	} else if err := ensureObservationSearch(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("补齐观测检索失败: %w", err)
 	}
@@ -633,12 +643,15 @@ type SearchQuery struct {
 
 // Hit 是一条检索结果。
 type Hit struct {
-	ID        string  `json:"id"`
-	Content   string  `json:"content"`
-	Kind      string  `json:"kind"`
-	Project   string  `json:"project"`
-	Salience  float64 `json:"salience"`
-	UpdatedAt int64   `json:"updated_at"`
+	ID           string  `json:"id"`
+	Content      string  `json:"content"`
+	SummaryRef   string  `json:"-"`
+	SummaryHash  string  `json:"-"`
+	PayloadBytes int     `json:"-"`
+	Kind         string  `json:"kind"`
+	Project      string  `json:"project"`
+	Salience     float64 `json:"salience"`
+	UpdatedAt    int64   `json:"updated_at"`
 	// Layer 标出命中来自哪一层。默认的记忆检索留空，避免旧输出多一个字段。
 	// observation 与 both 会写成 memory 或 observation。
 	Layer string `json:"layer,omitempty"`

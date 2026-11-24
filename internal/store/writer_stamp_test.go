@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -125,7 +126,7 @@ func TestEnsureWriterStampNewerDB(t *testing.T) {
 		t.Fatalf("应可用 errors.Is 判定为 ErrDBSchemaNewer，got %v", err)
 	}
 	msg := err.Error()
-	for _, want := range []string{"3", "v0.8.0", "1"} {
+	for _, want := range []string{"3", "v0.8.0", strconv.Itoa(CurrentSchemaVersion)} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("错误文案应含 %q，实际: %s", want, msg)
 		}
@@ -152,8 +153,8 @@ func TestEnsureWriterStampOlderDB(t *testing.T) {
 		t.Fatalf("应升到 %d，got %d", CurrentSchemaVersion, st.SchemaVersion)
 	}
 	kv := stampMetaKV(t, db)
-	if kv["schema_version"] != "1" {
-		t.Fatalf("落库的 schema_version 应为 1，got %q", kv["schema_version"])
+	if kv["schema_version"] != strconv.Itoa(CurrentSchemaVersion) {
+		t.Fatalf("落库的 schema_version 应为 %d，got %q", CurrentSchemaVersion, kv["schema_version"])
 	}
 	if kv["written_by"] != "v0.9.3" {
 		t.Fatalf("written_by 应更新为 v0.9.3，got %q", kv["written_by"])
@@ -178,8 +179,8 @@ func TestEnsureWriterStampUnparsableVersion(t *testing.T) {
 				t.Fatal("无法解析时应视为首次打戳，Fresh=true")
 			}
 			kv := stampMetaKV(t, db)
-			if kv["schema_version"] != "1" {
-				t.Fatalf("应覆盖为当前版本 1，got %q", kv["schema_version"])
+			if kv["schema_version"] != strconv.Itoa(CurrentSchemaVersion) {
+				t.Fatalf("应覆盖为当前版本 %d，got %q", CurrentSchemaVersion, kv["schema_version"])
 			}
 			if kv["written_by"] != "v0.9.3" {
 				t.Fatalf("written_by 应写入当前二进制，got %q", kv["written_by"])

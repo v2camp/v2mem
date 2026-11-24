@@ -16,11 +16,11 @@
 
 ## 2. ref 格式与不可变性
 
-- 定位串沿用现有归档契约：`<path>#<seq>`。`path` 是 gzip JSONL 文件路径（可为绝对路径，或相对数据根如 `content/2026/11/23/observations.jsonl.gz`）；`seq` 是分片内 1 起的行序号，与 `segmentRecord.Seq` 一致。
+- 定位串沿用现有归档契约：`<path>#<seq>`。`path` 是 gzip JSONL 文件路径（可为绝对路径，或相对数据根如 `content/2026/11/23/observations.jsonl.gz`）；`seq` 是分片内 1 起的行序号。
 - 不引入设计稿里的 `#L<seq>` 变体；不带 `#seq` 只作兼容读取（等价首行），新写入必须带。
-- 内容 `sha256` 单独存在库里的账字段中（与 `archive_hash` 同为压缩后字节的 sha256），不塞进 locator。
-- 当日分片只 append；关闭后不可变，禁止重写或改名历史分片。引用才稳定。
-- 读取复用 `internal/evidence.ReadArchiveRecord`；不得新造第二套 JSONL 解析格式。
+- 两种 hash 不能混用：`evidence_archives.archive_hash` 是**不可变归档**压缩后整文件字节的 sha256，由 `RefHealth` 校验；外置 `summary_hash` 是**规范 JSON 行**（不含结尾换行）的 sha256，由 `RefHealthLine` 校验。hash 单独存库，不塞进 locator。
+- 当日分片只 append：每次写入增加一个 gzip member，历史 member 永不被重写或改名。整文件 hash 会随 append 变化，所以行级 hash 才是稳定 ref 的依据。
+- 归档读取复用 `internal/evidence.ReadArchiveRecord`；外置内容读写统一走 `internal/store/summary_external.go`，不得新造第二套 JSONL 解析格式。
 
 ## 3. 写入顺序（两类，方向相反）
 
@@ -43,11 +43,11 @@
 
 ## 6. 完整性与巡检
 
-- `RefHealth(locator, wantHash)` 只读校验三件事：文件存在、字节 hash 匹配、`#seq` 可定位；不改库、不删文件。
-- P0 巡检只暴露结果，不新增 `ops-watch.md` 判据、不改 R 编号；判据变更须同步文档与脚本两处。
+- `RefHealth(locator, wantHash)` 只读校验不可变归档：文件存在、压缩后整文件 hash 匹配、`#seq` 可定位；`RefHealthLine(root, locator, wantHash)` 校验外置内容的行级 hash 与 `#seq`，不读整文件 hash。两者都不改库、不删文件。
+- 巡检只暴露结果，不新增 `ops-watch.md` 判据、不改 R 编号；判据变更须同步文档与脚本两处。
 - 备份顺序：冻结写 → `mem.db` 一致性备份 → 复制 JSONL 目录 → 恢复写。观测层允许最终一致。
-- 孤儿文件 GC（无引用且超保留期）属于 P1+；删除日期目录前仍需 dry-run 列清单并确认。
+- 孤儿文件 GC（无引用且超保留期）属于后续阶段；删除日期目录前仍需 dry-run 列清单并确认。
 
-## 7. P0 边界
+## 7. 落地边界
 
-本契约落地范围为：契约文档、`RefHealth` 巡检骨架及单测、设计文档决策状态更新。不迁存量数据、不改 schema、不改 `mem search` / `mem recall` 等生产读路径。
+P0：契约文档、`RefHealth` 巡检骨架及单测。P1：`summary` / `summary_idx` 全外置、显式 `mem migrate --summary-external`、迁移后 `fts_obs` 独立表、按 ref 回填读侧；不新增 R 判据、不做孤儿 GC、不做 P2 Markdown 投影。

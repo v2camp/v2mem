@@ -33,9 +33,10 @@ const (
 
 // Engine 同时实现 Writer 与 Reader。
 type Engine struct {
-	st         *store.Store
-	archiveDir string
-	spoolRoot  string
+	st          *store.Store
+	archiveDir  string
+	spoolRoot   string
+	contentRoot string
 }
 
 var (
@@ -59,9 +60,10 @@ func Open(dbPath string) (*Engine, error) {
 func New(st *store.Store) *Engine {
 	dir := filepath.Dir(st.Path())
 	return &Engine{
-		st:         st,
-		archiveDir: filepath.Join(dir, "evidence", "archives"),
-		spoolRoot:  filepath.Join(dir, "spool"),
+		st:          st,
+		archiveDir:  filepath.Join(dir, "evidence", "archives"),
+		spoolRoot:   filepath.Join(dir, "spool"),
+		contentRoot: store.SummaryContentRoot(st.Path()),
 	}
 }
 
@@ -72,6 +74,9 @@ func (e *Engine) ArchiveDir() string { return e.archiveDir }
 
 // SpoolRoot 暴露 spool 根目录（诊断与测试用）。
 func (e *Engine) SpoolRoot() string { return e.spoolRoot }
+
+// ContentRoot 暴露外置内容目录（诊断与测试用）。
+func (e *Engine) ContentRoot() string { return e.contentRoot }
 
 // Capture 归档一条原始事件。
 //
@@ -324,7 +329,15 @@ func (e *Engine) ListEvidence(bundleID string) ([]Ref, error) {
 	}
 	out := make([]Ref, 0, len(recs))
 	for _, rec := range recs {
-		out = append(out, toRef(rec))
+		ref := toRef(rec)
+		if ref.SummaryRef != "" {
+			line, err := store.ReadSummaryLine(e.contentRoot, ref.SummaryRef, ref.SummaryHash)
+			if err != nil {
+				return nil, err
+			}
+			ref.Summary = line.Summary
+		}
+		out = append(out, ref)
 	}
 	return out, nil
 }
@@ -340,7 +353,9 @@ func toRef(rec store.EvidenceRecord) Ref {
 		Seq: rec.Seq, OccurredAtNS: rec.OccurredAtNS, SessionID: rec.SessionID,
 		Project: rec.Project, Harness: rec.Harness, EventType: rec.EventType,
 		ArchiveHash: rec.ArchiveHash, RawRecordHash: rec.RawRecordHash,
-		RawLocator: rec.RawLocator, Summary: rec.Summary, ParserVersion: rec.ParserVersion,
+		RawLocator: rec.RawLocator, Summary: rec.Summary,
+		SummaryRef: rec.SummaryRef, SummaryHash: rec.SummaryHash, PayloadBytes: rec.PayloadBytes,
+		ParserVersion:    rec.ParserVersion,
 		ProposalEligible: rec.ProposalEligible, Fidelity: Fidelity(rec.Fidelity),
 	}
 }
