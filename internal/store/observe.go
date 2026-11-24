@@ -409,7 +409,8 @@ func ensureObservationSearch(db *sql.DB) error {
 const obsFTSCreateStandalone = `CREATE VIRTUAL TABLE IF NOT EXISTS fts_obs USING fts5(
 	summary_idx,
 	content = '',
-	contentless_delete = 1
+	contentless_delete = 1,
+	detail = none
 )`
 
 func ensureStandaloneObsFTS(db *sql.DB) error {
