@@ -229,7 +229,7 @@ func dayStartUnix(day string) (int64, error) {
 
 func gzipLines(lines []SummaryLine) ([]byte, error) {
 	var buf bytes.Buffer
-	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
 	if err != nil {
 		return nil, err
 	}

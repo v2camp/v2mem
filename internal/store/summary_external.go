@@ -81,7 +81,7 @@ func AppendSummaryLine(root string, ts int64, l SummaryLine) (ref, hash string, 
 	cleanup := func() {
 		f.Close()
 	}
-	zw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	zw, err := gzip.NewWriterLevel(f, gzip.BestCompression)
 	if err != nil {
 		cleanup()
 		return "", "", 0, err
@@ -123,7 +123,7 @@ func WriteSummaryDay(root string, ts int64, lines []SummaryLine) (refs, hashes [
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	zw, err := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	zw, err := gzip.NewWriterLevel(f, gzip.BestCompression)
 	if err != nil {
 		f.Close()
 		return nil, nil, nil, err
