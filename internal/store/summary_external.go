@@ -277,8 +277,13 @@ func ensureSummaryExternalSchema(db *sql.DB) error {
 			return err
 		}
 	}
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS summary_seq (
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS summary_seq (
 		day TEXT PRIMARY KEY, seq INTEGER NOT NULL
+	)`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS obs_fts_map (
+		rowid INTEGER PRIMARY KEY, obs_id TEXT NOT NULL UNIQUE
 	)`)
 	return err
 }

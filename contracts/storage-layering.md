@@ -44,6 +44,7 @@
 ## 6. 完整性与巡检
 
 - `RefHealth(locator, wantHash)` 只读校验不可变归档：文件存在、压缩后整文件 hash 匹配、`#seq` 可定位；`RefHealthLine(root, locator, wantHash)` 校验外置内容的行级 hash 与 `#seq`，不读整文件 hash。两者都不改库、不删文件。
+- 观测检索的 `fts_obs` 是 contentless FTS，`obs_fts_map` 只存 rowid → obs_id 映射；不存 `summary_idx` 列值副本，检索行由映射反查观测。
 - 巡检只暴露结果，不新增 `ops-watch.md` 判据、不改 R 编号；判据变更须同步文档与脚本两处。
 - 备份顺序：冻结写 → `mem.db` 一致性备份 → 复制 JSONL 目录 → 恢复写。观测层允许最终一致。
 - 孤儿文件 GC（无引用且超保留期）属于后续阶段；删除日期目录前仍需 dry-run 列清单并确认。

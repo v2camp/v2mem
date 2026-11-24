@@ -303,8 +303,11 @@ func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult,
 		n -= int(more)
 	}
 	if s.summaryExternal {
-		// 独立 FTS 表没有触发器，GC 后必须显式清掉悬空索引。
-		if _, err := s.db.Exec(`DELETE FROM fts_obs WHERE obs_id NOT IN (SELECT id FROM observations)`); err != nil {
+		// 独立 FTS 表没有触发器，GC 后先清映射，再清失去映射的索引行。
+		if _, err := s.db.Exec(`DELETE FROM obs_fts_map WHERE obs_id NOT IN (SELECT id FROM observations)`); err != nil {
+			return nil, err
+		}
+		if _, err := s.db.Exec(`DELETE FROM fts_obs WHERE rowid NOT IN (SELECT rowid FROM obs_fts_map)`); err != nil {
 			return nil, err
 		}
 	}
@@ -401,16 +404,22 @@ func ensureObservationSearch(db *sql.DB) error {
 
 // searchObservations 检索会话痕迹。不做 MinHash，不读 candidates。
 // kind 与 tag 只属于已定记忆；在这一层出现就是调用方用错了层。
-// 迁移后的 fts_obs 是独立表：索引文本自带副本，observations.summary_idx 恒为空。
-// 用 obs_id 连接而不是 rowid —— VACUUM 会重排没有 INTEGER PRIMARY KEY 的表 rowid。
+// 迁移后的 fts_obs 是 contentless FTS：索引体自带 token，不再存一份 5MB 的列值副本。
+// obs_fts_map 用固定 rowid 映射 obs_id，VACUUM 重排 observations.rowid 也不影响检索。
 const obsFTSCreateStandalone = `CREATE VIRTUAL TABLE IF NOT EXISTS fts_obs USING fts5(
 	summary_idx,
-	obs_id UNINDEXED
+	content = '',
+	contentless_delete = 1
 )`
 
 func ensureStandaloneObsFTS(db *sql.DB) error {
-	if _, err := db.Exec(obsFTSCreateStandalone); err != nil {
-		return err
+	for _, stmt := range []string{
+		obsFTSCreateStandalone,
+		`CREATE TABLE IF NOT EXISTS obs_fts_map (rowid INTEGER PRIMARY KEY, obs_id TEXT NOT NULL UNIQUE)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
 	}
 	for _, trigger := range []string{"observations_ai", "observations_ad", "observations_au"} {
 		if _, err := db.Exec(`DROP TRIGGER IF EXISTS ` + trigger); err != nil {
@@ -425,12 +434,28 @@ type sqlExecer interface {
 }
 
 func obsFTSPut(db sqlExecer, id, idx string) error {
-	_, err := db.Exec(`INSERT INTO fts_obs(summary_idx, obs_id) VALUES (?, ?)`, idx, id)
+	res, err := db.Exec(`INSERT OR IGNORE INTO obs_fts_map(obs_id) VALUES (?)`, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		return err
+	}
+	rowid, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO fts_obs(rowid, summary_idx) VALUES (?, ?)`, rowid, idx)
 	return err
 }
 
 func obsFTSDelete(db sqlExecer, id string) error {
-	_, err := db.Exec(`DELETE FROM fts_obs WHERE obs_id = ?`, id)
+	if _, err := db.Exec(`DELETE FROM fts_obs WHERE rowid IN
+		(SELECT rowid FROM obs_fts_map WHERE obs_id = ?)`, id); err != nil {
+		return err
+	}
+	_, err := db.Exec(`DELETE FROM obs_fts_map WHERE obs_id = ?`, id)
 	return err
 }
 
@@ -481,12 +506,16 @@ func (s *Store) obsSearchWith(expr string, q SearchQuery) ([]Hit, error) {
 	if s.summaryExternal {
 		cols = `o.id, o.summary, o.summary_ref, o.summary_hash, o.payload_bytes,
 			o.event, o.tool_name, o.project, o.created_at, bm25(fts_obs) AS rank`
-		join = `o.id = fts_obs.obs_id`
+		join = `o.id = m.obs_id`
+	}
+	from := `FROM fts_obs JOIN observations o ON ` + join
+	if s.summaryExternal {
+		from = `FROM fts_obs JOIN obs_fts_map m ON m.rowid = fts_obs.rowid
+			JOIN observations o ON ` + join
 	}
 	rows, err := s.db.Query(
 		`SELECT `+cols+`
-		   FROM fts_obs
-		   JOIN observations o ON `+join+`
+		   `+from+`
 		  WHERE `+sqlWhere+`
 		  ORDER BY rank ASC, o.created_at DESC
 		  LIMIT ?`, args...)
