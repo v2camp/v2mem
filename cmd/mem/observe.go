@@ -833,7 +833,8 @@ func safeName(session string) string {
 // spoolRecord 逐字段镜像 internal/evidence 的 segmentRecord。
 //
 // 这里是**契约复制**，不是自由格式：drain 由 evidence.Engine 读，字段对不上就等于
-// 丢证据。TestSpoolSegmentContractDrainsViaEngine 用真实 drain 锁住这份镜像。
+// 丢证据。TestSpoolSegmentContractDrainsViaEngine 锁住路径与可回放，
+// TestSpoolEvidenceKeepsCleanSummary 锁住 SummaryOverride 这一字段级镜像。
 type spoolRecord struct {
 	Version          int    `json:"v"`
 	EventUID         string `json:"event_uid"`
@@ -848,6 +849,10 @@ type spoolRecord struct {
 	ParserVersion    string `json:"parser_version,omitempty"`
 	ProposalEligible bool   `json:"proposal_eligible,omitempty"`
 	Raw              []byte `json:"raw"`
+	// SummaryOverride 必须镜像：宿主的 prompt 里常把注入上下文与用户原话拼在
+	// 一条消息里，归档 Raw 保真、查询源只留用户原话。漏掉这个字段，回放时
+	// 摘要会退回「拿全文生成」——宿主包裹被当成用户说的话写进证据。
+	SummaryOverride string `json:"summary_override,omitempty"`
 }
 
 // spoolEvidence 在库根本打不开时兜底：每条事件一个独立段，
@@ -873,6 +878,7 @@ func spoolEvidence(db string, ev evidence.RawEvent) error {
 		SessionID: ev.SessionID, Project: ev.Project, Harness: ev.Harness,
 		EventType: ev.EventType, ParserVersion: ev.ParserVersion,
 		ProposalEligible: ev.ProposalEligible, Raw: ev.Raw,
+		SummaryOverride: ev.SummaryOverride,
 	})
 	if err != nil {
 		return err

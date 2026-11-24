@@ -897,6 +897,63 @@ func TestSpoolSegmentContractDrainsViaEngine(t *testing.T) {
 	}
 }
 
+// 兜底 spool 必须逐字段镜像 segmentRecord：漏掉 summary_override，
+// 回放时摘要会退回「拿未清洗的宿主原文生成」，注入上下文就被当成用户原话。
+func TestSpoolEvidenceKeepsCleanSummary(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "mem.db")
+	const cleaned = "巡检一下今天的记忆库"
+	ev := evidence.RawEvent{
+		EventUID: "evt:test:clean", SourceID: "hook:workbuddy:clean", SessionID: "clean",
+		Project: "demo", Harness: "workbuddy", EventType: transcript.EventUserPrompt,
+		OccurredAtNS:     time.Now().UnixNano(),
+		ProposalEligible: true, Fidelity: evidence.FidelityFull,
+		Raw: []byte("<user_query>\n" + cleaned + "\n</user_query>"),
+		// 真实链路里 SummaryOverride 由 transcript.UserQueryText 剥壳得到。
+		SummaryOverride: cleaned,
+	}
+	if err := spoolEvidence(db, ev); err != nil {
+		t.Fatalf("spoolEvidence: %v", err)
+	}
+	seg, err := filepath.Glob(filepath.Join(spoolDir(db), "clean", "seg-*.jsonl"))
+	if err != nil || len(seg) != 1 {
+		t.Fatalf("应落 1 个段, got %v err %v", seg, err)
+	}
+	body, err := os.ReadFile(seg[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"summary_override"`) {
+		t.Fatalf("段内必须带 summary_override 字段: %s", body)
+	}
+
+	e, err := evidence.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := e.DrainSpool(10)
+	if err != nil || res.Drained != 1 {
+		t.Fatalf("drain: %+v err %v", res, err)
+	}
+	e.Close()
+
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ref, ok, err := st.LookupEvidence(ev.EventUID, ev.SourceID, 0, 0)
+	if err != nil || !ok {
+		t.Fatalf("drain 后应可查到证据: ok=%v err=%v", ok, err)
+	}
+	if strings.Contains(ref.Summary, "user_query") {
+		t.Fatalf("回放摘要不得含宿主包裹: %q", ref.Summary)
+	}
+	if !strings.Contains(ref.Summary, cleaned) {
+		t.Fatalf("回放摘要应为清洗后的用户原话, got %q", ref.Summary)
+	}
+}
+
 // 段数上限必须可见：兜底路径静默把磁盘写满比丢观测更糟。
 func TestSpoolSegmentLimitIsVisible(t *testing.T) {
 	old := spoolMaxSegments
