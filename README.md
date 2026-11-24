@@ -288,8 +288,8 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-ref-landscape.md`](./docs/design-ref-landscape.md) | 所有者 / 开发者 | **架构参考**：mem0 与 agentmemory 的全面对照，可借鉴/不借鉴/待评估三档，两边踩过的坑 |
 | [`docs/design-anti-agentmemory.md`](./docs/design-anti-agentmemory.md) | 所有者 / 开发者 | 为何不照搬常驻 iii 与 54 个 MCP 工具；默认零常驻 |
 | [`docs/design-db-stamp.md`](./docs/design-db-stamp.md) | 开发者 | **库版本台账**：`db_meta` 写入者版本戳、库比二进制新时拒绝打开、与 `user_version` 门控的边界 |
-| [`docs/design-storage-layering.md`](./docs/design-storage-layering.md) | 所有者 / 开发者 | **存储分层方案**：运转逻辑留库、知识内容外置为 JSONL / Markdown；实测体积、表级映射、五项决策与分阶段验收 |
-| [`contracts/storage-layering.md`](./contracts/storage-layering.md) | 开发者 | **存储分层 P0 契约**：ref 格式、两类写入顺序、2 KB 阈值、Markdown 只读边界与 `RefHealth` 巡检范围 |
+| [`docs/design-storage-layering.md`](./docs/design-storage-layering.md) | 所有者 / 开发者 | **存储分层方案**：运转逻辑留库、知识内容外置为 JSONL / Markdown；实测体积、表级映射、五项决策与相对比例验收（§8-2 已重开） |
+| [`contracts/storage-layering.md`](./contracts/storage-layering.md) | 开发者 | **存储分层 P0 契约**：ref 格式、两类写入顺序、`summary` / `summary_idx` 一律外置（其他字段 2 KB）、Markdown 只读边界与 `RefHealth` 巡检范围 |
 | [`docs/superpowers/specs/2026-11-23-model-provider-setup-design.md`](./docs/superpowers/specs/2026-11-23-model-provider-setup-design.md) | 所有者 / 开发者 | **模型来源配置设计**：api canonical + CLI 便利路径、`mem setup` 零填写向导、install.md S6 落地（第一份 spec；更新能力另立） |
 
 设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
