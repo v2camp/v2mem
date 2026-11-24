@@ -129,6 +129,11 @@ CREATE TABLE IF NOT EXISTS summary_seq (
   day TEXT PRIMARY KEY,
   seq INTEGER NOT NULL
 );
+-- contentless FTS 不存列值，用固定 rowid 映射 obs_id；VACUUM 重排 observations.rowid 也不影响。
+CREATE TABLE IF NOT EXISTS obs_fts_map (
+  rowid  INTEGER PRIMARY KEY,
+  obs_id TEXT NOT NULL UNIQUE
+);
 -- ix_obs_archive（证据归档准出按 archive_hash 反查）不能写在这里：存量库还没有
 -- archive_hash 列，CREATE INDEX 会先于 ensureColumn 执行而失败。它由
 -- ensureEvidenceSchema 在补列之后建。

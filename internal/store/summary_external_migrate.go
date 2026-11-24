@@ -139,11 +139,22 @@ func (s *Store) MigrateSummaryExternal(dryRun bool) (SummaryMigrationStats, erro
 	if _, err := tx.Exec(`DROP TABLE IF EXISTS fts_obs`); err != nil {
 		return stats, err
 	}
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS obs_fts_map`); err != nil {
+		return stats, err
+	}
+	if _, err := tx.Exec(`CREATE TABLE obs_fts_map (rowid INTEGER PRIMARY KEY, obs_id TEXT NOT NULL UNIQUE)`); err != nil {
+		return stats, err
+	}
 	if _, err := tx.Exec(obsFTSCreateStandalone); err != nil {
 		return stats, err
 	}
-	if _, err := tx.Exec(`INSERT INTO fts_obs(summary_idx, obs_id)
-		SELECT summary_idx, id FROM observations WHERE summary_idx <> ''`); err != nil {
+	if _, err := tx.Exec(`INSERT INTO obs_fts_map(obs_id)
+		SELECT id FROM observations WHERE summary_idx <> ''`); err != nil {
+		return stats, err
+	}
+	if _, err := tx.Exec(`INSERT INTO fts_obs(rowid, summary_idx)
+		SELECT m.rowid, o.summary_idx FROM obs_fts_map m
+		JOIN observations o ON o.id = m.obs_id`); err != nil {
 		return stats, err
 	}
 	for _, w := range all {

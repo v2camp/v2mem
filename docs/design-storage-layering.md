@@ -124,7 +124,7 @@ v2mem 已经在做这件事，本文是收敛与补全，不是另起一套：
 | 阶段 | 动作 | 验收 |
 |:---|:---|:---|
 | **P0 契约先行（已完成）** | `contracts/storage-layering.md` 定 ref 格式、两类写入顺序、阈值、Markdown 投影边界；`internal/evidence.RefHealth` 巡检骨架；**不改生产读侧** | 契约文档 + `ref_health_test.go`；`make cover-gate` 通过 |
-| **P1 写侧外置（已落地）** | `observations.summary` / `summary_idx` 一律外置到 `content/`，DB 留 ref / hash / payload_bytes；`fts_obs` 改独立表（保留精简索引）；`mem migrate --summary-external [--dry-run]` 显式迁移；读侧按 ref 回填摘要 | **相对比例验收**（不写死绝对 MB）：同一快照 `backup()` 取基线，迁移后 `VACUUM`，`dbstat` 取 `sum(pgsize)` → DB 降幅 ≥30%（本机 36.3%）；外置内容按日期分片 gzip 计入后净降幅 ≥25%（本机 28.8%）；`ops-watch` 判据不降级；`mem search --layer observation` 通过既有评测；重放不新增行、hash 稳定 |
+| **P1 写侧外置（已落地）** | `observations.summary` / `summary_idx` 一律外置到 `content/`，DB 留 ref / hash / payload_bytes；`fts_obs` 改 contentless 独立表 + `obs_fts_map` 行号映射（保留精简索引，不存列值副本）；`mem migrate --summary-external [--dry-run]` 显式迁移；读侧按 ref 回填摘要 | **相对比例验收**（不写死绝对 MB）：同一快照 `backup()` 取基线，迁移后 `VACUUM`，`dbstat` 取 `sum(pgsize)` → DB 降幅 ≥30%（本机 36.3%）；外置内容按日期分片 gzip 计入后净降幅 ≥25%（本机 28.8%）；`ops-watch` 判据不降级；`mem search --layer observation` 通过既有评测；重放不新增行、hash 稳定 |
 | **P2 检索与投影** | `fts_obs_*` 替代方案（若仍要冲压）；Markdown 蒸馏；`read_traces` 诊断字段外置 | 变体 C 只是理论上限（2026-11-23 基线约 14.5 MB），**不作验收线**；Markdown 投影跨工具可读；`mem search --layer observation` 通过既有评测 |
 
 **非目标**：不删观测行或归档来降耗时（[`design-write-batch.md`](./design-write-batch.md) 已明确）、不改 `mem.db` 的查询源地位、不引入常驻进程（[`VALUE.md`](./VALUE.md) §4 红线）、不改 `kind` 枚举。

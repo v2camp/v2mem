@@ -180,7 +180,7 @@ func TestAppendObservationExternalAndLegacy(t *testing.T) {
 		t.Fatalf("外置摘要读回失败: %+v %v", line, err)
 	}
 	var ftsN int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM fts_obs WHERE obs_id=?`, res.ID).Scan(&ftsN); err != nil || ftsN != 1 {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM fts_obs JOIN obs_fts_map m ON m.rowid = fts_obs.rowid WHERE m.obs_id=?`, res.ID).Scan(&ftsN); err != nil || ftsN != 1 {
 		t.Fatalf("独立 FTS 未写入: %d %v", ftsN, err)
 	}
 	hits, err := s.Search(SearchQuery{Query: "新路径", Layer: "observation"})
@@ -289,6 +289,9 @@ func TestSummaryExternalErrorBranches(t *testing.T) {
 		}
 		if err := obsFTSDelete(s.db, "ev"); err == nil {
 			t.Fatal("obsFTSDelete 应报错")
+		}
+		if err := obsFTSPut(s.db, "ev", "idx"); err == nil {
+			t.Fatal("obsFTSPut 应报错")
 		}
 		if err := SetSummarySeq(s.db, "2026/11/24", 1); err == nil {
 			t.Fatal("SetSummarySeq 应报错")
@@ -459,5 +462,28 @@ func TestAppendObservationEventIDLookupError(t *testing.T) {
 	_ = s.Close()
 	if _, err := s.AppendObservation(ObsInput{SessionID: "s", Event: "stop", EventID: "evt-err"}); err == nil {
 		t.Fatal("event_id 查询失败时应报错")
+	}
+}
+
+func TestObsFTSHelpers(t *testing.T) {
+	s := newTestStore(t)
+	if err := ensureStandaloneObsFTS(s.db); err != nil {
+		t.Fatal(err)
+	}
+	if err := obsFTSPut(s.db, "ev-a", "甲"); err != nil {
+		t.Fatal(err)
+	}
+	if err := obsFTSPut(s.db, "ev-a", "乙"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM obs_fts_map`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("重复 put 不应新增映射: %d %v", n, err)
+	}
+	if err := obsFTSDelete(s.db, "ev-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM obs_fts_map`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("delete 应清映射: %d %v", n, err)
 	}
 }
