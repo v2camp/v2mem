@@ -778,6 +778,12 @@ func cmdEvalActivity(args []string) error {
 
 // activityVerdict 给出可直接写进交付物的一句话结论。
 // 「只查未记」与「只记未查」是两种不同的故障，必须分开说。
+//
+// 结论只陈述计数能证明的事，不替用户判定内容价值。旧文案在写入 0 时断言
+// 「这次任务没有留下可复用的东西」——但写入 0 的成因至少有三种：确实没有
+// 可复用内容、钩子走了规则抽取（`--provider none`，模型没参与）、候选未被裁决。
+// 2026-11-24 巡检即撞上第二种：窗口内有 26 条可提案观测、蒸馏 9 次全为规则空，
+// 断言把「抽取没覆盖」说成了「内容没价值」，会让后续巡检验错方向。
 func activityVerdict(s audit.Summary) string {
 	observed := s.Observations > 0 || s.DistillOK > 0 || s.DistillFail > 0
 	switch {
@@ -789,9 +795,17 @@ func activityVerdict(s audit.Summary) string {
 	case s.Retrievals == 0:
 		return fmt.Sprintf("只记未查：记录 %d 条但一次未检索 —— 记忆被写入却没被用上", s.Writes)
 	case s.Writes == 0 && s.Accepts == 0 && observed:
-		return fmt.Sprintf("只查未记：检索 %d 次但未沉淀任何新事实 —— 这次任务没有留下可复用的东西；有观测无采纳", s.Retrievals)
+		// 蒸馏次数取 by_event 的总数：只报 ok/fail 会把「跑了但都是合法空」显示成
+		// 「0 次蒸馏」，与「模型没参与」是两件事，不能用一个 0 混过去。
+		distillN := s.ByEvent["distill"]
+		if distillN == 0 {
+			distillN = s.DistillOK + s.DistillFail
+		}
+		return fmt.Sprintf("只查未记：检索 %d 次、写入 0 次（观测 %d 次，蒸馏 %d 次：ok %d / 失败 %d，采纳 %d）"+
+			" —— 写入 0 只说明没落库；是「无可复用内容」还是「抽取没覆盖」，要看候选与蒸馏来源",
+			s.Retrievals, s.Observations, distillN, s.DistillOK, s.DistillFail, s.Accepts)
 	case s.Writes == 0:
-		return fmt.Sprintf("只查未记：检索 %d 次但未沉淀任何新事实 —— 这次任务没有留下可复用的东西", s.Retrievals)
+		return fmt.Sprintf("只查未记：检索 %d 次、写入 0 次 —— 写入 0 只说明没落库，不等于没有可复用内容", s.Retrievals)
 	}
 	v := fmt.Sprintf("读 %d / 写 %d，两侧都有活动", s.Retrievals, s.Writes)
 	if s.EmptyRate > 0.5 {

@@ -890,6 +890,44 @@ func TestCmdEvalActivityDistinguishesReadOnlyAndWriteOnly(t *testing.T) {
 	}
 }
 
+// 写入 0 不等于「内容没有可复用价值」：钩子走规则抽取、候选未被裁决都会让写入停在 0。
+// 结论只能陈述计数证明得了的事，否则巡检会把「抽取没覆盖」误读成「内容没价值」。
+func TestActivityVerdictDoesNotClaimContentWasWorthless(t *testing.T) {
+	withObs := audit.Summary{
+		Total: 34, Retrievals: 16, Writes: 0, Accepts: 0,
+		Observations: 26, DistillOK: 9,
+		ByEvent: map[string]int{"distill": 9, "obs-append": 26},
+	}
+	got := activityVerdict(withObs)
+	if !strings.Contains(got, "只查未记") {
+		t.Errorf("仍应判为「只查未记」，got: %s", got)
+	}
+	if strings.Contains(got, "没有留下可复用") {
+		t.Errorf("写入 0 不足以断言内容没有可复用价值，got: %s", got)
+	}
+	for _, want := range []string{"观测 26", "蒸馏 9 次", "写入 0 只说明没落库"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("结论应给出可核对的计数 %q，got: %s", want, got)
+		}
+	}
+
+	// 只报 ok/fail 会把「跑了 9 次但都是合法空」显示成「0 次蒸馏」，
+	// 与「模型没参与」混为一谈 —— 次数必须取 by_event 的总量。
+	allEmpty := audit.Summary{
+		Total: 20, Retrievals: 8, Writes: 0, Observations: 5,
+		ByEvent: map[string]int{"distill": 9, "obs-append": 5},
+	}
+	if got = activityVerdict(allEmpty); !strings.Contains(got, "蒸馏 9 次：ok 0 / 失败 0") {
+		t.Errorf("全为合法空时应报 9 次蒸馏，got: %s", got)
+	}
+
+	noObs := audit.Summary{Total: 6, Retrievals: 6, Writes: 0}
+	got = activityVerdict(noObs)
+	if !strings.Contains(got, "只查未记") || strings.Contains(got, "没有留下可复用") {
+		t.Errorf("无观测样本时也不该断言内容价值，got: %s", got)
+	}
+}
+
 // 空命中的查询原文必须列出来 —— 它们正是标注金标准的候选样本。
 func TestCmdEvalActivityListsEmptyHitQueries(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "audit.jsonl")
