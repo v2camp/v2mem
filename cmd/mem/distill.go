@@ -432,6 +432,9 @@ func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
 	if err != nil {
 		return failReport(report, err), err
 	}
+	if err := hydrateObservations(st.Path(), obs); err != nil {
+		return failReport(report, err), err
+	}
 	provider := job.Provider
 	if provider == "" {
 		provider = "auto"

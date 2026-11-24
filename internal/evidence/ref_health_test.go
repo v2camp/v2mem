@@ -11,6 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/v2camp/v2mem/internal/store"
 )
 
 func healthTestSegment(t *testing.T, dir string) (string, string) {
@@ -80,5 +83,41 @@ func TestRefHealthDoesNotChangeSegment(t *testing.T) {
 	}
 	if string(before) != string(after) {
 		t.Fatal("巡检不应改写外置内容")
+	}
+}
+
+func TestRefHealthLine(t *testing.T) {
+	root := t.TempDir()
+	ts := time.Date(2026, 11, 24, 10, 0, 0, 0, time.Local).Unix()
+	ref, hash, _, err := store.AppendSummaryLine(root, ts, store.SummaryLine{
+		V: 1, Seq: 1, ID: "ev-1", Summary: "原行",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RefHealthLine(root, ref, hash); err != nil {
+		t.Fatalf("合法行应通过: %v", err)
+	}
+	// append 新 member 后，旧行级 hash 仍稳定；整文件 hash 已变，但这里不依赖它。
+	if _, _, _, err := store.AppendSummaryLine(root, ts, store.SummaryLine{
+		V: 1, Seq: 2, ID: "ev-2", Summary: "新行",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RefHealthLine(root, ref, hash); err != nil {
+		t.Fatalf("append 后旧行仍应通过: %v", err)
+	}
+	cases := []struct{ name, ref, hash string }{
+		{"坏 hash", ref, strings.Repeat("1", 64)},
+		{"坏 seq", strings.Replace(ref, "#1", "#9", 1), hash},
+		{"缺文件", "content/1999/01/01/observations.jsonl.gz#1", hash},
+		{"空 locator", "", hash},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := RefHealthLine(root, tc.ref, tc.hash); err == nil {
+				t.Fatal("坏引用应报错")
+			}
+		})
 	}
 }

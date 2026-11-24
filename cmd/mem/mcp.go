@@ -329,6 +329,9 @@ func (s *mcpServer) toolSearch(id any, args map[string]any) map[string]any {
 	if err != nil {
 		return mcpError(id, -32603, "search 失败: "+err.Error())
 	}
+	if err := hydrateHits(s.st.Path(), hits); err != nil {
+		return mcpError(id, -32603, "读取外置摘要失败: "+err.Error())
+	}
 	// 审计：与 CLI 手工检索同一埋点，MCP 使用也进评测样本（不写则 MCP 通道不可观测）
 	if s.auditFile != "-" {
 		rec := audit.Record{
@@ -498,6 +501,9 @@ func (s *mcpServer) toolRecall(id any, args map[string]any) map[string]any {
 	hits, err := s.st.Search(store.SearchQuery{Query: q, Project: project, Scope: scope, Limit: defaultHookLimit, Layer: layer})
 	if err != nil {
 		return mcpError(id, -32603, "recall_context 失败: "+err.Error())
+	}
+	if err := hydrateHits(s.st.Path(), hits); err != nil {
+		return mcpError(id, -32603, "读取外置摘要失败: "+err.Error())
 	}
 	s.auditSearch(started, project, q, hits)
 	text := recallText(s.st, hits, budget)

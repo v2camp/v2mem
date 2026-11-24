@@ -96,6 +96,9 @@ type EvidenceRecord struct {
 	RawRecordHash    string
 	RawLocator       string
 	Summary          string
+	SummaryRef       string
+	SummaryHash      string
+	PayloadBytes     int
 	ParserVersion    string
 	ProposalEligible bool
 	Fidelity         string
@@ -135,7 +138,8 @@ type EvidenceBundleRecord struct {
 
 const evidenceRecordColumns = `o.id, o.event_uid, o.source_id, o.source_generation, o.source_seq,
 	o.occurred_at_ns, o.session_id, o.project, o.harness, o.event, o.archive_hash,
-	o.raw_record_hash, o.raw_ref, o.summary, o.parser_version, o.meta_json`
+	o.raw_record_hash, o.raw_ref, o.summary, o.summary_ref, o.summary_hash, o.payload_bytes,
+	o.parser_version, o.meta_json`
 
 // EvidenceSourceHead 返回证据源当前代与捕获水位；源不存在时返回 generation=1、
 // last_seq=0（不创建行）。
@@ -202,7 +206,7 @@ func (s *Store) CaptureEvidence(in EvidenceCaptureInput) (EvidenceRecord, bool, 
 		return EvidenceRecord{}, false, err
 	}
 	defer tx.Rollback()
-	rec, created, err := captureEvidenceTx(tx, in, channel, meta, time.Now().Unix())
+	rec, created, err := captureEvidenceTx(tx, SummaryContentRoot(s.path), s.summaryExternal, in, channel, meta, time.Now().Unix())
 	if err != nil {
 		return EvidenceRecord{}, false, err
 	}
@@ -241,10 +245,11 @@ func (s *Store) CaptureEvidenceBatch(ins []EvidenceCaptureInput) ([]EvidenceReco
 	}
 	defer tx.Rollback()
 	now := time.Now().Unix()
+	root := SummaryContentRoot(s.path)
 	recs := make([]EvidenceRecord, 0, len(items))
 	created := make([]bool, 0, len(items))
 	for _, it := range items {
-		rec, ok, err := captureEvidenceTx(tx, it.in, it.channel, it.meta, now)
+		rec, ok, err := captureEvidenceTx(tx, root, s.summaryExternal, it.in, it.channel, it.meta, now)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -285,7 +290,7 @@ func prepareEvidenceInput(in EvidenceCaptureInput) (string, []byte, error) {
 
 // captureEvidenceTx 是单条与批量共用的事务体，不负责 Commit。
 // 判重命中时返回已有行且不推进水位，与重构前行为逐字一致。
-func captureEvidenceTx(tx *sql.Tx, in EvidenceCaptureInput, channel string, meta []byte, now int64) (EvidenceRecord, bool, error) {
+func captureEvidenceTx(tx *sql.Tx, root string, external bool, in EvidenceCaptureInput, channel string, meta []byte, now int64) (EvidenceRecord, bool, error) {
 	gen, lastSeq, tip, err := ensureEvidenceSourceTx(tx, in, now)
 	if err != nil {
 		return EvidenceRecord{}, false, err
@@ -357,16 +362,40 @@ func captureEvidenceTx(tx *sql.Tx, in EvidenceCaptureInput, channel string, meta
 	if occurred == 0 {
 		occurred = time.Now().UnixNano()
 	}
+	idx := observationIndexText(summary)
+	storedSummary, storedIdx := summary, idx
+	var summaryRef, summaryHash string
+	var payloadBytes int
+	if external {
+		day := time.Unix(now, 0).Format("2006/01/02")
+		summarySeq, err := nextSummarySeqTx(tx, day)
+		if err != nil {
+			return EvidenceRecord{}, false, err
+		}
+		summaryRef, summaryHash, payloadBytes, err = AppendSummaryLine(root, now, SummaryLine{
+			V: 1, Seq: summarySeq, ID: id, Summary: summary, SummaryIdx: idx,
+		})
+		if err != nil {
+			return EvidenceRecord{}, false, err
+		}
+		storedSummary, storedIdx = "", ""
+	}
 	if _, err := tx.Exec(`INSERT INTO observations(
-		id, session_id, project, harness, event, tool_name, summary, summary_idx, raw_ref,
+		id, session_id, project, harness, event, tool_name, summary, summary_idx,
+		summary_ref, summary_hash, payload_bytes, raw_ref,
 		content_hash, created_at, meta_json, channel, event_id, event_uid, source_id,
 		source_generation, source_seq, occurred_at_ns, archive_hash, raw_record_hash, parser_version
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		id, sessionID, in.Project, in.Harness, in.EventType, "", summary,
-		observationIndexText(summary), locator, obsHash(in.EventType, "", summary),
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, sessionID, in.Project, in.Harness, in.EventType, "", storedSummary, storedIdx,
+		summaryRef, summaryHash, payloadBytes, locator, obsHash(in.EventType, "", summary),
 		now, string(meta), channel, "", in.EventUID, in.SourceID, gen, seq, occurred,
 		in.ArchiveHash, in.RawRecordHash, in.ParserVersion); err != nil {
 		return EvidenceRecord{}, false, fmt.Errorf("写 canonical observation 失败: %w", err)
+	}
+	if external {
+		if err := obsFTSPut(tx, id, idx); err != nil {
+			return EvidenceRecord{}, false, fmt.Errorf("写观测检索索引失败: %w", err)
+		}
 	}
 
 	newTip := evidenceTip(tip, in.EventUID, in.ArchiveHash, seq)
@@ -379,7 +408,9 @@ func captureEvidenceTx(tx *sql.Tx, in EvidenceCaptureInput, channel string, meta
 		ID: id, EventUID: in.EventUID, SourceID: in.SourceID, Generation: gen, Seq: seq,
 		OccurredAtNS: occurred, SessionID: sessionID, Project: in.Project, Harness: in.Harness,
 		EventType: in.EventType, ArchiveHash: in.ArchiveHash, RawRecordHash: in.RawRecordHash,
-		RawLocator: locator, Summary: summary, ParserVersion: in.ParserVersion,
+		RawLocator: locator, Summary: summary,
+		SummaryRef: summaryRef, SummaryHash: summaryHash, PayloadBytes: payloadBytes,
+		ParserVersion:    in.ParserVersion,
 		ProposalEligible: in.ProposalEligible, Fidelity: in.Fidelity, Adapter: in.Adapter,
 	}, true, nil
 }
@@ -446,6 +477,7 @@ func scanEvidenceRecord(row interface{ Scan(...any) error }) (EvidenceRecord, er
 	err := row.Scan(&rec.ID, &rec.EventUID, &rec.SourceID, &rec.Generation, &rec.Seq,
 		&rec.OccurredAtNS, &rec.SessionID, &rec.Project, &rec.Harness, &rec.EventType,
 		&rec.ArchiveHash, &rec.RawRecordHash, &rec.RawLocator, &rec.Summary,
+		&rec.SummaryRef, &rec.SummaryHash, &rec.PayloadBytes,
 		&rec.ParserVersion, &meta)
 	if err != nil {
 		return EvidenceRecord{}, err
