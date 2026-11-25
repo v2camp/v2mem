@@ -33,6 +33,9 @@
 | U7 | 休眠唤醒 | 超期如实显示 + 追赶完成，水位不伪装已消费 |
 | U8 | 高影响抽样复核 | global/rule 类约 10% 进复核摘要，其余不打扰 |
 
+> 走查步骤、命令级操作、证据留痕与判定人见
+> [`acceptance-p4.md`](./acceptance-p4.md) §4（U1–U8）。
+
 ## 3. Case 矩阵：内容流转（逐跳，每跳三类）
 
 每跳至少：**正常、边界（空/超长/重复/乱序）、故障（写失败/坏数据）**。
@@ -81,6 +84,11 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 >   算成终态会让准出率虚高，与 §3「失败→failed 不算 noop」是同一句话）。
 > - 实现见 `internal/eval/flow_check.go`；用例 `TestCheckFlowG9AdmitsFailedQuarantinedWithdrawn`、
 >   `TestCheckFlowG9PendingIgnoresDecisionsBeforeReopen`、`TestCheckFlowG12TerminalSet`。
+
+> **验收状态（波 5，基线 `079c98d`）**：G1–G13 已被两套互证覆盖——`test/flow`
+> 门禁（E2 全绿 / E3 单点破坏 / E4 只读 / R8 回滚回归）与 CLI 真实动线基线
+> （`mem eval flow` 全 PASS）。逐条结果与动线构造见
+> [`acceptance-p4.md`](./acceptance-p4.md) §3；S12/S14 合入后由主控复跑基线。
 
 ### 3.2 故障矩阵（S9a/S9b：hook / gc / distill / maintain）
 
