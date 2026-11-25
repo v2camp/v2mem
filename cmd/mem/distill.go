@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,12 +13,16 @@ import (
 	"github.com/v2camp/v2mem/internal/distill"
 	"github.com/v2camp/v2mem/internal/evidence"
 	"github.com/v2camp/v2mem/internal/proposal"
-	"github.com/v2camp/v2mem/internal/scrub"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
-// 蒸馏只写 candidates 与 distill_runs。本文件没有 store.Add。
+// distill 只写 candidates 与 distill_runs。本文件没有 store.Add。
 // 采纳在 cmdAccept，那是唯一把候选升格进 memories 的入口。
+//
+// S12 命令面收编（design-data-lifecycle §12.1）：旧规则蒸馏单轨（--session /
+// --pending / distillOne）已退役——自动写侧只剩 SessionStart 的 proposal spawn
+// 与一次性冷启动，手动入口只有 --proposal / --bundle / 三个运维出口。
+// distillOne、SessionsNeedingDistill、ObservationsForDistill 等旧轨代码一并删除。
 
 // proposalOptions 把 model.json 的 mode 语义带进 proposal 的 local/byok 两条来源。
 //
@@ -41,16 +44,12 @@ func cmdDistill(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("distill", flag.ContinueOnError)
 	c.register(fs)
-	session := fs.String("session", "", "只蒸馏这个会话")
-	since := fs.Duration("since", 0, "只看这段时间之内的观测，如 24h")
-	provider := fs.String("provider", "", "auto|none|openai|ollama（空=读 model.json，再退回 auto）")
-	dry := fs.Bool("dry-run", false, "只打印候选，不写库")
+	dry := fs.Bool("dry-run", false, "只打印候选，不写库（需配合 --bundle：dry-run 不得推进连续游标）")
 	strict := fs.Bool("strict", false, "失败时非零退出（默认 fail-open，退出码 0）")
-	pending := fs.Bool("pending", false, "蒸馏所有尚未处理的会话")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
 	noScrub := fs.Bool("no-scrub", false, "关闭密钥打码（仅本地调试）")
-	proposalMode := fs.Bool("proposal", false, "从证据账本取连续 Bundle 生成候选（T2）")
-	bundleID := fs.String("bundle", "", "只处理指定证据 Bundle（隐含 --proposal）")
+	proposalMode := fs.Bool("proposal", false, "从证据账本取连续 Bundle 生成候选")
+	bundleID := fs.String("bundle", "", "只处理指定证据 Bundle")
 	quarantined := fs.Bool("quarantined", false, "列出被隔离（quarantined）的 Bundle，需单独使用")
 	requeue := fs.String("requeue", "", "把指定隔离 Bundle 放回队列（attempt 归零），需单独使用")
 	gaps := fs.Bool("gaps", false, "列出已跳过并记录的序号洞，需单独使用（洞不是 Bundle，不提供回捞）")
@@ -59,7 +58,7 @@ func cmdDistill(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	// 隔离查看/回捞/序号洞是运维入口：不生成候选，也不要求 --session 等必填项；
+	// 隔离查看/回捞/序号洞是运维入口：不生成候选，也不要求 --proposal 等必填项；
 	// 与正常蒸馏路径互斥，避免「顺手带个 --proposal」把库写脏。
 	requeueID := strings.TrimSpace(*requeue)
 	outlets := 0
@@ -72,8 +71,8 @@ func cmdDistill(args []string) error {
 		return errors.New("--quarantined、--requeue 与 --gaps 需单独使用，不能同时指定")
 	}
 	if outlets == 1 {
-		if *pending || strings.TrimSpace(*session) != "" || *proposalMode || strings.TrimSpace(*bundleID) != "" {
-			return errors.New("--quarantined/--requeue/--gaps 需单独使用，不能与 --session/--pending/--proposal/--bundle 同用")
+		if *proposalMode || strings.TrimSpace(*bundleID) != "" {
+			return errors.New("--quarantined/--requeue/--gaps 需单独使用，不能与 --proposal/--bundle 同用")
 		}
 		st, err := store.Open(c.db)
 		if err != nil {
@@ -90,8 +89,8 @@ func cmdDistill(args []string) error {
 			return requeueProposalBundle(st, requeueID, c.json, *auditFile)
 		}
 	}
-	if !*pending && strings.TrimSpace(*session) == "" && strings.TrimSpace(*bundleID) == "" && !*proposalMode {
-		return errors.New("需要 --session、--pending、--proposal、--bundle 或 --gaps")
+	if strings.TrimSpace(*bundleID) == "" && !*proposalMode {
+		return errors.New("需要 --proposal 或 --bundle（--quarantined/--requeue/--gaps 为运维出口，需单独使用）")
 	}
 	model, timeout := distill.LoadConfig(distill.ConfigPath())
 	// model.json 的 mode=cli 要同时接管 proposal 的 local/byok 两条来源，
@@ -277,66 +276,6 @@ func cmdDistill(args []string) error {
 		}
 		return nil
 	}
-
-	sessions := []string{strings.TrimSpace(*session)}
-	if *pending {
-		sessions, err = st.SessionsNeedingDistill(20)
-		if err != nil {
-			return err
-		}
-	}
-	if len(sessions) == 0 || (len(sessions) == 1 && sessions[0] == "") {
-		if c.json {
-			return printJSON(map[string]any{
-				"status": "skipped", "candidates": 0, "inserted": 0, "failed": 0, "sessions": 0,
-			})
-		}
-		fmt.Println("没有需要蒸馏的会话")
-		return nil
-	}
-
-	reports := make([]*distillReport, 0, len(sessions))
-	// 逐个会话独立计数。不能只留第一个 failed —— 其余会话的失败会被静默吞掉，
-	// 用户看到的「退出码 0」与「有 3 个会话失败」的事实不符。
-	var failures []error
-	inserted, failed := 0, 0
-	for _, sid := range sessions {
-		rep, err := distillOne(st, distillJob{
-			Session: sid, Provider: *provider, Model: model, Timeout: timeout,
-			Since: *since, Dry: *dry, Audit: *auditFile, DB: c.db, NoScrub: *noScrub,
-		})
-		reports = append(reports, rep)
-		inserted += rep.Inserted
-		failed += rep.Failed
-		if err != nil {
-			failures = append(failures, err)
-		}
-		if c.json {
-			continue
-		}
-		fmt.Printf("会话 %s  provider=%s status=%s 候选 %d\n", sid, rep.Provider, rep.Status, rep.Inserted)
-		if rep.Failed > 0 {
-			// 落库失败必须单独说，不能并进「候选」数字里。
-			fmt.Fprintf(os.Stderr, "v2mem distill: %s 有 %d 条候选未能落库\n", sid, rep.Failed)
-		}
-		if rep.Error != "" {
-			fmt.Fprintf(os.Stderr, "v2mem distill: %s\n", rep.Error)
-		}
-		if *dry {
-			for _, f := range rep.Facts {
-				fmt.Printf("  [%s] %s\n", f.Kind, f.Content)
-			}
-		}
-	}
-	if c.json {
-		if err := printJSON(summarizeDistill(reports, inserted, failed, len(sessions))); err != nil {
-			return err
-		}
-	}
-	if len(failures) > 0 && *strict {
-		// errors.Join 保留每个会话的原因，而不是只报第一个。
-		return errors.Join(failures...)
-	}
 	return nil
 }
 
@@ -464,310 +403,6 @@ func writeProposalAudit(auditFile string, o *proposal.Outcome) {
 			Provider: o.Executor, Mode: o.BundleStatus, Source: "proposal",
 		})
 	}
-}
-
-// distillReport 是一次蒸馏的完整账目。
-//
-// 为什么 inserted 与 failed 必须同时存在：候选是逐条插入的，中途失败时前 n 条已经落库。
-// 只报 inserted 会掩盖丢数据，只报 failed 会让人以为一条都没成——两种单数字都在说谎。
-type distillReport struct {
-	Session  string         `json:"session"`
-	Provider string         `json:"provider"`
-	Status   string         `json:"status"` // ok|empty|partial|fail|skipped
-	Inserted int            `json:"inserted"`
-	Failed   int            `json:"failed"`
-	Error    string         `json:"error,omitempty"`
-	Facts    []distill.Fact `json:"-"`
-	Err      error          `json:"-"`
-}
-
-// summarizeDistill 汇总多次蒸馏。顶层 status 取最坏的那个，
-// 让 `--json` 的调用方不必遍历 results 也能判断整批是否可信。
-func summarizeDistill(reports []*distillReport, inserted, failed, sessions int) map[string]any {
-	var emptyN, skippedN, failN, partialN int
-	for _, r := range reports {
-		switch r.Status {
-		case distill.StatusEmpty:
-			emptyN++
-		case distill.StatusSkipped:
-			skippedN++
-		case statusPartial:
-			partialN++
-		case distill.StatusFail:
-			failN++
-		}
-	}
-	status := distill.StatusOK
-	switch {
-	case failN == len(reports) && failN > 0:
-		status = distill.StatusFail
-	case failN > 0 || partialN > 0:
-		status = statusPartial
-	case emptyN == len(reports):
-		status = distill.StatusEmpty
-	case skippedN == len(reports):
-		status = distill.StatusSkipped
-	}
-	return map[string]any{
-		"status": status,
-		// candidates 保留旧字段名，语义与 inserted 相同（真正落库的条数）。
-		"candidates":      inserted,
-		"inserted":        inserted,
-		"failed":          failed,
-		"failed_sessions": failN,
-		"partial":         partialN,
-		"sessions":        sessions,
-		"empty":           emptyN,
-		"skipped":         skippedN,
-		"results":         reports,
-	}
-}
-
-// statusPartial 表示「部分落库」：既不是成功也不是全败，必须单独一个状态，
-// 否则调用方只能在 inserted>0 且 failed>0 之间自己推断。
-const statusPartial = "partial"
-
-type distillJob struct {
-	Session  string
-	Provider string
-	Model    string
-	Timeout  time.Duration
-	Since    time.Duration
-	Dry      bool
-	Audit    string
-	DB       string
-	NoScrub  bool
-}
-
-// distillObservationEligible 判断一条 observations 行能否进入规则蒸馏输入。
-//
-// 字段契约来自 internal/store/evidence.go 的 evidenceMeta（W0 冻结）：
-// proposal_eligible=false 或 fidelity=pointer/none 的行只保住原始载荷，不是可抽取的
-// 事实（design-capture §4.3、observe.go 的 pointer 标注）。把这类 summary 交给
-// distill.Run 会产出 240 字符的 JSON 截断片段当候选，见 ops-watch §3 R9。
-//
-// 旧行没有 proposal_eligible 键时按事件类型兜底：工具载荷 / 未解析行不算事实，
-// 其余仍按兼容语义放行（历史窗口要能收敛）。判定本身复用 proposal.Eligible，
-// 这里只做 meta_json + event 到 evidence.Ref 的映射。
-func distillObservationEligible(metaJSON, event string) bool {
-	var m struct {
-		ProposalEligible *bool  `json:"proposal_eligible"`
-		Fidelity         string `json:"fidelity,omitempty"`
-	}
-	if strings.TrimSpace(metaJSON) != "" {
-		_ = json.Unmarshal([]byte(metaJSON), &m)
-	}
-	eligible := true
-	if m.ProposalEligible != nil {
-		eligible = *m.ProposalEligible
-	} else if distill.SpeakerForEvent(event) == "" {
-		// 旧行没有 proposal_eligible 键：不能一律放行。post-tool-use /
-		// unparsed 这类不是事实陈述的行，正是 R9 里 20 条 JSON 噪音的来源。
-		// 其余（stop / user-prompt / 空事件夹具）仍按兼容语义放行，
-		// 避免历史窗口永远停在 pending。
-		eligible = false
-	}
-	return proposal.Eligible(evidence.Ref{
-		ProposalEligible: eligible,
-		Fidelity:         evidence.Fidelity(m.Fidelity),
-	})
-}
-
-func distillOne(st *store.Store, job distillJob) (*distillReport, error) {
-	started := time.Now()
-	report := &distillReport{Session: job.Session, Status: distill.StatusSkipped}
-	// 先读配置再干活：非法 model.json 当「没配」处理会退回 auto 外发，
-	// 所以这里 fail-closed，且放在读库之前，避免白跑一遍观测查询。
-	cfg, err := distill.LoadModelConfig("")
-	if err != nil {
-		err = fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
-		return failReport(report, err), err
-	}
-	var sinceUnix int64
-	if job.Since > 0 {
-		sinceUnix = time.Now().Add(-job.Since).Unix()
-	}
-	obs, err := st.ObservationsForDistill(job.Session, sinceUnix, 200)
-	if err != nil {
-		return failReport(report, err), err
-	}
-	if err := hydrateObservations(st.Path(), obs); err != nil {
-		return failReport(report, err), err
-	}
-	provider := job.Provider
-	if provider == "" {
-		provider = "auto"
-	}
-	report.Provider = provider
-	if len(obs) == 0 {
-		writeDistillAudit(job, report, time.Since(started))
-		return report, nil
-	}
-	// ids 保留全量用于窗口身份（不改历史 DistillWindowDone 语义）；
-	// 只有准入通过的观测才进入蒸馏输入，pointer/none 载荷不参与抽取。
-	ids := make([]string, len(obs))
-	project := ""
-	in := make([]distill.Observation, 0, len(obs))
-	for i, o := range obs {
-		ids[i] = o.ID
-		if !distillObservationEligible(o.MetaJSON, o.Event) {
-			continue
-		}
-		if project == "" {
-			project = o.Project
-		}
-		in = append(in, distill.Observation{
-			ID: o.ID, SessionID: o.SessionID, Project: o.Project,
-			Event: o.Event, Summary: scrub.Apply(o.Summary, job.NoScrub),
-		})
-	}
-	if len(in) == 0 {
-		writeDistillAudit(job, report, time.Since(started))
-		return report, nil
-	}
-	window := distill.WindowKey(ids)
-	done, err := st.DistillWindowDone(job.Session, window)
-	if err != nil {
-		return failReport(report, err), err
-	}
-	if done {
-		return report, nil
-	}
-	// 优先级统一走 ResolveOptions；job.Model（config.toml 的 [distill] model）只在
-	// api 路径上当兜底，绝不作为 flagModel 传入 —— 它不是显式 --model。
-	opt := distill.ResolveOptions(cfg, job.Provider, "")
-	if opt.CLI == "" && opt.Model == "" {
-		opt.Model = job.Model
-	}
-	opt.Timeout = job.Timeout
-	out := distill.Run(in, opt)
-	report.Provider = out.Provider
-	report.Facts = out.Facts
-
-	if job.Dry {
-		// dry-run 也要如实反射三态：原来是 fail 被静默吞成 (0, nil)，
-		// 于是「模型没起来」在 dry-run 下看起来和「没有候选」一模一样。
-		switch out.Status {
-		case distill.StatusOK:
-			report.Status = distill.StatusOK
-			report.Inserted = len(out.Facts)
-		case distill.StatusEmpty:
-			report.Status = distill.StatusEmpty
-		default:
-			failReport(report, runErr(out))
-		}
-		writeDistillAudit(job, report, time.Since(started))
-		return report, report.Err
-	}
-	switch out.Status {
-	case distill.StatusFail:
-		failReport(report, runErr(out))
-		_ = st.SaveDistillRun(store.DistillRun{
-			SessionID: job.Session, Provider: report.Provider, Status: distill.StatusFail,
-			Error: report.Error, StartedAt: started.Unix(), FinishedAt: time.Now().Unix(),
-		})
-		writeDistillAudit(job, report, time.Since(started))
-		return report, report.Err
-	case distill.StatusEmpty:
-		// 合法 0 条：这是成功结论。仍然记 run 并占住窗口，
-		// 否则同一批观测每次启动都会被重新蒸馏，白白再问一次模型。
-		report.Status = distill.StatusEmpty
-		if err := st.SaveDistillRun(store.DistillRun{
-			SessionID: job.Session, Provider: report.Provider, Status: distill.StatusEmpty,
-			CandCount: 0, WindowKey: window,
-			StartedAt: started.Unix(), FinishedAt: time.Now().Unix(),
-		}); err != nil && !errors.Is(err, store.ErrAlreadyDistilled) {
-			return failReport(report, err), err
-		}
-		writeDistillAudit(job, report, time.Since(started))
-		return report, nil
-	}
-
-	// 逐条插入。失败不中断：能落库的先落库，再把失败的条数与原因一起报出来。
-	var insertErrs []error
-	for _, f := range out.Facts {
-		res, err := st.InsertCandidate(store.CandidateInput{
-			SessionID: job.Session, Project: project, Kind: f.Kind,
-			Content: scrub.Apply(f.Content, job.NoScrub), Source: "distill", Channel: store.ChannelAgent,
-			Salience: f.Salience, ObsIDs: f.ObsIDs, AttributedTo: f.AttributedTo,
-		})
-		if err != nil {
-			report.Failed++
-			insertErrs = append(insertErrs, err)
-			continue
-		}
-		if res.Created {
-			report.Inserted++
-		}
-	}
-	runStatus := distill.StatusOK
-	switch {
-	case len(insertErrs) == 0:
-	case report.Inserted == 0:
-		runStatus = distill.StatusFail
-	default:
-		runStatus = statusPartial
-	}
-	report.Status = runStatus
-	if len(insertErrs) > 0 {
-		report.Err = errors.Join(insertErrs...)
-		report.Error = report.Err.Error()
-		_ = st.SaveDistillRun(store.DistillRun{
-			SessionID: job.Session, Provider: report.Provider, Status: runStatus,
-			Error: report.Error, CandCount: report.Inserted,
-			StartedAt: started.Unix(), FinishedAt: time.Now().Unix(),
-		})
-		writeDistillAudit(job, report, time.Since(started))
-		return report, report.Err
-	}
-	if err := st.SaveDistillRun(store.DistillRun{
-		SessionID: job.Session, Provider: report.Provider, Status: distill.StatusOK,
-		CandCount: report.Inserted, WindowKey: window,
-		StartedAt: started.Unix(), FinishedAt: time.Now().Unix(),
-	}); err != nil && !errors.Is(err, store.ErrAlreadyDistilled) {
-		return failReport(report, err), err
-	}
-	writeDistillAudit(job, report, time.Since(started))
-	return report, nil
-}
-
-// runErr 取结构化原因；老代码路径只给了文本时补一个兜底 error，避免 Err 为空。
-func runErr(out distill.Outcome) error {
-	if out.Err != nil {
-		return out.Err
-	}
-	if out.Error != "" {
-		return errors.New(out.Error)
-	}
-	return errors.New("蒸馏失败")
-}
-
-// failReport 把一次失败写进报告，保持 Status/Inserted/Failed/Error/Err 自洽。
-func failReport(report *distillReport, err error) *distillReport {
-	report.Status = distill.StatusFail
-	if err != nil {
-		report.Error = err.Error()
-		report.Err = err
-	}
-	return report
-}
-
-// writeDistillAudit 写一条蒸馏审计。
-//
-// Empty 只表示「合法空结果」：旧实现写 n == 0，把 fail 和 ok-空混成一类，
-// 事后统计空结果率时会把模型故障算成「没有可记的事实」，指标直接失真。
-func writeDistillAudit(job distillJob, report *distillReport, d time.Duration) {
-	if job.Audit == "-" {
-		return
-	}
-	// Mode 取报告的最终状态（ok|empty|partial|fail|skipped），而不是 distill.Run 的原始状态：
-	// 逐条插入失败时 Run 仍然是 ok，只有报告知道这次其实是 partial。
-	_ = audit.Append(auditPath(job.Audit), audit.Record{
-		TS: time.Now().Unix(), Event: "distill", SessionID: job.Session,
-		Provider: report.Provider, Mode: report.Status, Count: report.Inserted,
-		Failed: report.Failed, Source: "distill",
-		MS: d.Milliseconds(), Empty: report.Status == distill.StatusEmpty,
-	})
 }
 
 func cmdAccept(args []string) error {

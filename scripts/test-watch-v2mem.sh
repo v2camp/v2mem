@@ -543,7 +543,7 @@ assert_case r8_read_fail       100 0 no 'not-json' PASS PASS WARN WARN
 # 2026-11-15 起连续四个窗口的 INFO 分支都丢了 D12，靠人工发现。
 assert_r12 r12_no_sample        no  '' '' INFO '观测 0'
 assert_r12 r12_pass_rules       yes "$(dline proposal rules ok false)$(dline proposal rules empty false)" "$(activity_json '本次任务有沉淀')" PASS 'rules 2'
-assert_r12 r12_broken_chain     yes '' '' WARN 'MEM_DISTILL_SPAWN'
+assert_r12 r12_broken_chain     yes '' '' WARN 'MEM_NO_AUTOMATION'
 assert_r12 r12_fail_1           yes "$(dline proposal rules fail true)" '' WARN
 assert_r12 r12_fail_3           yes "$(dline proposal rules fail true)$(dline proposal rules fail true)$(dline proposal rules fail true)" '' WARN
 assert_r12 r12_fail_4           yes "$(dline proposal rules fail true)$(dline proposal rules fail true)$(dline proposal rules fail true)$(dline proposal rules fail true)" '' FAIL

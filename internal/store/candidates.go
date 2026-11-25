@@ -553,74 +553,7 @@ func (s *Store) SaveDistillRun(r DistillRun) error {
 	return ErrAlreadyDistilled
 }
 
-// SessionsNeedingDistill 返回「有观测、且比上次成功蒸馏更新」的会话。
-// empty 与 ok 一样算成功：空结果不会因为重跑而变出事实。
-func (s *Store) SessionsNeedingDistill(limit int) ([]string, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	rows, err := s.db.Query(`
-		SELECT o.session_id
-		  FROM observations o
-		  LEFT JOIN (
-		    SELECT session_id, MAX(finished_at) AS fin
-		      FROM distill_runs WHERE status IN ('ok','empty') GROUP BY session_id
-		  ) d ON d.session_id = o.session_id
-		 WHERE o.session_id <> ''
-		 GROUP BY o.session_id
-		HAVING MAX(o.created_at) > IFNULL(d.fin, 0)
-		 ORDER BY MAX(o.created_at) DESC
-		 LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
-}
-
-// ObservationsForDistill 取某会话的观测。sinceUnix>0 时只取该时刻之后的。
-func (s *Store) ObservationsForDistill(sessionID string, sinceUnix int64, limit int) ([]Observation, error) {
-	if limit <= 0 {
-		limit = 200
-	}
-	q := `SELECT ` + observationColumns + ` FROM observations WHERE 1=1`
-	var args []any
-	if sessionID != "" {
-		q += ` AND session_id = ?`
-		args = append(args, sessionID)
-	}
-	if sinceUnix > 0 {
-		q += ` AND created_at >= ?`
-		args = append(args, sinceUnix)
-	}
-	q += ` ORDER BY created_at DESC, id DESC LIMIT ?`
-	args = append(args, limit)
-	rows, err := s.db.Query(q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Observation
-	for rows.Next() {
-		o, err := scanObservation(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, o)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
-	return out, nil
-}
+// SessionsNeedingDistill / ObservationsForDistill（旧规则蒸馏双轨的取数口）已随
+// S12 命令面收编（design-data-lifecycle §12.1）退役：自动写侧只剩 proposal 单轨，
+// 从证据 Bundle 取数，不再按观测水位挑会话。蒸馏游标（distill_runs）语义由
+// DistillWindowDone / SaveDistillRun 保留，供审计 GC 与 R12 判据继续使用。

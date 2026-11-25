@@ -43,9 +43,9 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem export [路径.jsonl]          导出为 JSONL（省略路径则写标准输出）
   mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
   mem import-transcript [选项]     从 Claude 会话 JSONL 回填观测（默认不写 memories）
-  mem distill [选项]                从观测抽出候选（不写 memories）
+  mem distill [选项]                从证据 Bundle 抽出候选（--proposal 或 --bundle；不写 memories）
+                                    --quarantined/--requeue/--gaps 为运维出口，需单独使用
   mem judge [选项]                  准入判定：只记 verdict，不改状态（影子期）
-                                    --stats 看影子期一致率；落库入口待回滚命令落地后开放
   mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
   mem reject <id|前缀>             拒绝候选
   mem batch  [选项]                批量裁决：按方案文件一次 accept/reject（--dry-run 只校验，--rollback 撤销）
@@ -63,7 +63,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem budget --file <文件>          检查 Level 1 文件是否超出注入预算
   mem audit  [--stats]             审计日志：钩子激活次数、空注入率、可评测样本数
   mem eval   recall|write|activity|flow  评测：检索准不准（recall）／记录准不准（write）／用量视图（activity）／逐跳验收（flow）
-  mem mcp                           MCP server（stdio）：search/add/ls/touch/recall_context + 候选裁决 candidates_ls/accept/reject
+  mem mcp                           MCP server（stdio）：search/add/ls/touch/recall_context + review_ls/review_withdraw/maintain_wake
   mem stats  [选项]                 库概览
   mem help
 
@@ -155,99 +155,142 @@ var knownSubcommands = []string{
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usageText)
-		os.Exit(2)
-	}
+	os.Exit(run(os.Args[1:]))
+}
 
+// run 是 main 的可测形态：吃掉 os.Args[1:]，返回进程退出码。
+// 0 成功（含 --help）；2 用法错误（未知子命令、未定义或写错的 flag）；1 其余业务错误。
+func run(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprint(os.Stderr, usageText)
+		return 2
+	}
+	err := dispatch(args)
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		return 0
+	}
+	var usage usageError
+	if errors.As(err, &usage) {
+		fmt.Fprintf(os.Stderr, "%s\n\n%s", usage.msg, usageText)
+		return 2
+	}
+	// flag 包的解析错误（未定义 flag / 坏语法 / 缺值 / 值非法）与未知子命令同级，
+	// 都是「调用方式不对」：退出码 2。flag 包自己已把错误与用法打到 stderr。
+	if isFlagUsageError(err) {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		return 2
+	}
+	fmt.Fprintln(os.Stderr, "错误:", err)
+	return 1
+}
+
+// usageError 是用法级错误的哨兵：退出码 2，并附带完整 usage。
+type usageError struct{ msg string }
+
+func (e usageError) Error() string { return e.msg }
+
+// isFlagUsageError 按文案前缀识别 flag 包的解析错误。ContinueOnError 下
+// flag/flag.go 产出的这些字符串是稳定的，比给每个子命令包一层错误类型更省。
+func isFlagUsageError(err error) bool {
+	msg := err.Error()
+	for _, p := range []string{
+		"flag provided but not defined",
+		"bad flag syntax",
+		"flag needs an argument",
+		"invalid value",
+	} {
+		if strings.HasPrefix(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func dispatch(args []string) error {
 	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "add":
-		err = cmdAdd(os.Args[2:])
+		err = cmdAdd(args[1:])
 	case "search":
-		err = cmdSearch(os.Args[2:])
+		err = cmdSearch(args[1:])
 	case "asset":
-		err = cmdAsset(os.Args[2:])
+		err = cmdAsset(args[1:])
 	case "ls":
-		err = cmdLs(os.Args[2:])
+		err = cmdLs(args[1:])
 	case "stats":
-		err = cmdStats(os.Args[2:])
+		err = cmdStats(args[1:])
 	case "touch":
-		err = cmdTouch(os.Args[2:])
+		err = cmdTouch(args[1:])
 	case "show":
-		err = cmdShow(os.Args[2:])
+		err = cmdShow(args[1:])
 	case "feedback":
-		err = cmdFeedback(os.Args[2:])
+		err = cmdFeedback(args[1:])
 	case "forget":
-		err = cmdForget(os.Args[2:])
+		err = cmdForget(args[1:])
 	case "notes":
-		err = cmdNotes(os.Args[2:])
+		err = cmdNotes(args[1:])
 	case "lexicon":
-		err = cmdLexicon(os.Args[2:])
+		err = cmdLexicon(args[1:])
 	case "gc":
-		err = cmdGC(os.Args[2:])
+		err = cmdGC(args[1:])
 	case "consolidate":
-		err = cmdConsolidate(os.Args[2:])
+		err = cmdConsolidate(args[1:])
 	case "maintain":
-		err = cmdMaintain(os.Args[2:])
+		err = cmdMaintain(args[1:])
 	case "export":
-		err = cmdExport(os.Args[2:])
+		err = cmdExport(args[1:])
 	case "import":
-		err = cmdImport(os.Args[2:])
+		err = cmdImport(args[1:])
 	case "import-transcript":
-		err = cmdImportTranscript(os.Args[2:])
+		err = cmdImportTranscript(args[1:])
 	case "distill":
-		err = cmdDistill(os.Args[2:])
+		err = cmdDistill(args[1:])
 	case "judge":
-		err = cmdJudge(os.Args[2:])
+		err = cmdJudge(args[1:])
 	case "accept":
-		err = cmdAccept(os.Args[2:])
+		err = cmdAccept(args[1:])
 	case "reject":
-		err = cmdReject(os.Args[2:])
+		err = cmdReject(args[1:])
 	case "batch":
-		err = cmdBatch(os.Args[2:])
+		err = cmdBatch(args[1:])
 	case "migrate":
-		err = cmdMigrate(os.Args[2:])
+		err = cmdMigrate(args[1:])
 	case "candidates":
-		err = cmdCandidates(os.Args[2:])
+		err = cmdCandidates(args[1:])
 	case "review":
-		err = cmdReview(os.Args[2:])
+		err = cmdReview(args[1:])
 	case "sync":
-		err = cmdSync(os.Args[2:])
+		err = cmdSync(args[1:])
 	case "hook":
-		err = cmdHook(os.Args[2:])
+		err = cmdHook(args[1:])
 	case "harness":
-		err = cmdHarness(os.Args[2:])
+		err = cmdHarness(args[1:])
 	case "setup":
-		err = cmdSetup(os.Args[2:])
+		err = cmdSetup(args[1:])
 	case "init":
-		err = cmdInit(os.Args[2:])
+		err = cmdInit(args[1:])
 	case "uninstall":
-		err = cmdUninstall(os.Args[2:])
+		err = cmdUninstall(args[1:])
 	case "ingest":
-		err = cmdIngest(os.Args[2:])
+		err = cmdIngest(args[1:])
 	case "budget":
-		err = cmdBudget(os.Args[2:])
+		err = cmdBudget(args[1:])
 	case "audit":
-		err = cmdAudit(os.Args[2:])
+		err = cmdAudit(args[1:])
 	case "eval":
-		err = cmdEval(os.Args[2:])
+		err = cmdEval(args[1:])
 	case "mcp":
-		err = cmdMCP(os.Args[2:])
+		err = cmdMCP(args[1:])
 	case "help", "-h", "--help":
 		fmt.Print(usageText)
-		return
+		return nil
 	default:
-		fmt.Fprintf(os.Stderr, "未知子命令: %s\n\n%s", os.Args[1], usageText)
-		os.Exit(2)
+		return usageError{msg: "未知子命令: " + args[0]}
 	}
-	if err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return
-		}
-		fmt.Fprintln(os.Stderr, "错误:", err)
-		os.Exit(1)
-	}
+	return err
 }
 
 type common struct {

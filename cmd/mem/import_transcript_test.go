@@ -10,7 +10,9 @@ import (
 	"github.com/v2camp/v2mem/internal/store"
 )
 
-func TestImportTranscriptObsOnlyAndBoth(t *testing.T) {
+// S12 后 import-transcript 只写证据（--into 已退役）：观测可读、密钥被打码、
+// 幂等重跑不重复，且不产候选、不写 memories。
+func TestImportTranscriptObsOnly(t *testing.T) {
 	db := testDB(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
@@ -22,7 +24,7 @@ func TestImportTranscriptObsOnlyAndBoth(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := cmdImportTranscript([]string{"--db", db, "--file", path, "--into", "obs"}); err != nil {
+	if err := cmdImportTranscript([]string{"--db", db, "--file", path}); err != nil {
 		t.Fatal(err)
 	}
 	st, err := store.Open(db)
@@ -47,9 +49,16 @@ func TestImportTranscriptObsOnlyAndBoth(t *testing.T) {
 	if len(mem) != 0 {
 		t.Fatal("import 不得写 memories")
 	}
+	cands, err := st.ListCandidates("pending", "imp", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("import 不再产候选（--into 已退役），got %+v", cands)
+	}
 	st.Close()
 
-	if err := cmdImportTranscript([]string{"--db", db, "--file", path, "--into", "obs"}); err != nil {
+	if err := cmdImportTranscript([]string{"--db", db, "--file", path}); err != nil {
 		t.Fatal(err)
 	}
 	st, _ = store.Open(db)
@@ -58,26 +67,6 @@ func TestImportTranscriptObsOnlyAndBoth(t *testing.T) {
 		t.Fatalf("重跑应幂等，got %d", len(obs))
 	}
 	st.Close()
-
-	if err := cmdImportTranscript([]string{
-		"--db", db, "--file", path, "--into", "both", "--cursor-dir", dir,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	st, _ = store.Open(db)
-	defer st.Close()
-	list, err := st.ListCandidates("pending", "imp", 10)
-	if err != nil || len(list) == 0 {
-		t.Fatalf("both 应有 pending，got %+v %v", list, err)
-	}
-	hits, err := st.Search(store.SearchQuery{Query: "冷启动", Limit: 5})
-	if err != nil || len(hits) != 0 {
-		t.Fatalf("accept 前不得检索到，got %+v %v", hits, err)
-	}
-	mem, err = st.List(store.ListQuery{Scope: "all", Limit: 20})
-	if err != nil || len(mem) != 0 {
-		t.Fatalf("both 仍不得写 memories，mem=%d err=%v", len(mem), err)
-	}
 }
 
 // 导入必须把「重复 / 空内容 / since 过滤 / 写失败」分开报。

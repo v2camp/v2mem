@@ -30,6 +30,8 @@ func countAllMemories(t *testing.T, db string) int {
 	return len(hits)
 }
 
+// S12 后旧规则蒸馏单轨已退役：候选由 proposal（--proposal/--bundle）产出。
+// 这里用 store 直接造 pending 候选，守「候选不进检索、accept 才升格」的链路事实。
 func TestDistillNoneThenAcceptAndReject(t *testing.T) {
 	db := testDB(t)
 	ap := t.TempDir() + "/audit.jsonl"
@@ -37,9 +39,9 @@ func TestDistillNoneThenAcceptAndReject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.AppendObservation(store.ObsInput{
-		SessionID: "sess", Project: "demo", Event: "user-prompt",
-		Summary: "决策：记忆库放在用户目录，不放代码目录",
+	if _, err := st.InsertCandidate(store.CandidateInput{
+		SessionID: "sess", Project: "demo", Kind: "decision",
+		Content: "决策：记忆库放在用户目录，不放代码目录", Source: "distill",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -47,9 +49,6 @@ func TestDistillNoneThenAcceptAndReject(t *testing.T) {
 
 	memBefore := countAllMemories(t, db)
 
-	if err := cmdDistill([]string{"--db", db, "--session", "sess", "--provider", "none", "--audit-file", ap}); err != nil {
-		t.Fatal(err)
-	}
 	out, err := captureStdout(t, func() error {
 		return cmdSearch([]string{"--db", db, "用户目录"})
 	})
@@ -57,7 +56,7 @@ func TestDistillNoneThenAcceptAndReject(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Contains(out, "用户目录") {
-		t.Fatalf("蒸馏结果不得被 search 命中，got %s", out)
+		t.Fatalf("候选不得被 search 命中，got %s", out)
 	}
 	listed, err := captureStdout(t, func() error {
 		return cmdCandidates([]string{"ls", "--db", db, "--json"})
@@ -70,7 +69,7 @@ func TestDistillNoneThenAcceptAndReject(t *testing.T) {
 	}
 
 	if countAllMemories(t, db) != memBefore {
-		t.Fatalf("distill 不得写 memories，before=%d after=%d", memBefore, countAllMemories(t, db))
+		t.Fatalf("候选不得写 memories，before=%d after=%d", memBefore, countAllMemories(t, db))
 	}
 
 	accepted, err := captureStdout(t, func() error {
@@ -92,53 +91,22 @@ func TestDistillNoneThenAcceptAndReject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sawDistill, sawAccept bool
+	var sawAccept bool
 	for _, r := range rs {
-		if r.Event == "distill" && r.Provider == "none" && r.Mode == "ok" {
-			sawDistill = true
-		}
 		if r.Event == "accept" && r.Source == "distill-accept" {
 			sawAccept = true
 		}
 	}
-	if !sawDistill || !sawAccept {
-		t.Fatalf("审计缺 distill/accept，got %+v", rs)
+	if !sawAccept {
+		t.Fatalf("审计缺 accept，got %+v", rs)
 	}
 }
 
-func TestDistillStrictAndFailOpen(t *testing.T) {
-	db := testDB(t)
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.AppendObservation(store.ObsInput{
-		SessionID: "sess", Event: "stop", Summary: "决策：超时也不能写记忆",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
-	t.Setenv("OPENAI_API_KEY", "")
-	if err := cmdDistill([]string{"--db", db, "--session", "sess", "--provider", "openai", "--audit-file", "-"}); err != nil {
-		t.Fatalf("缺 key 默认应 exit 0 语义（返回 nil），got %v", err)
-	}
-	if err := cmdDistill([]string{"--db", db, "--session", "sess", "--provider", "openai", "--strict", "--audit-file", "-"}); err == nil {
-		t.Fatal("--strict 在失败时应返回错误")
-	}
-	st, err = store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	list, err := st.ListCandidates("", "sess", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(list) != 0 {
-		t.Fatalf("失败不得写候选，got %+v", list)
-	}
-	if countAllMemories(t, db) != 0 {
-		t.Fatal("失败不得写 memories")
+// bare `mem distill` 必须报错并指明唯一入口：单轨后没有「顺手跑一把」的默认路径。
+func TestCmdDistillRequiresProposalOrBundle(t *testing.T) {
+	err := cmdDistill([]string{"--db", testDB(t), "--audit-file", "-"})
+	if err == nil || !strings.Contains(err.Error(), "--proposal") {
+		t.Fatalf("无 --proposal/--bundle 应报错并指路，got %v", err)
 	}
 }
 
@@ -173,7 +141,8 @@ func TestHookStopDoesNotInsertMemories(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
 	raw := `{"hook_event_name":"Stop","cwd":"` + proj + `","session_id":"s-stop","status":"completed","transcript_path":"/tmp/t.jsonl"}`
-	t.Setenv("MEM_DISTILL_SPAWN", "1")
+	// S12 收敛后 Stop/SessionEnd 不再有常规蒸馏 spawn（MEM_DISTILL_SPAWN 已退役）。
+	t.Setenv("MEM_DISTILL_SPAWN", "1") // 退役开关必须被无视
 	var spawned int
 	prev := startDistillProc
 	startDistillProc = func(db string) error {
@@ -186,8 +155,8 @@ func TestHookStopDoesNotInsertMemories(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if spawned != 1 {
-		t.Fatalf("应拉起一次 proposal，got %d", spawned)
+	if spawned != 0 {
+		t.Fatalf("Stop 不应拉起蒸馏子进程（自动写侧唯一常规路径是 SessionStart），got %d", spawned)
 	}
 	if countAllMemories(t, db) != 0 {
 		t.Fatal("Stop 钩子不得写 memories")
@@ -203,13 +172,13 @@ func TestHookStopDoesNotInsertMemories(t *testing.T) {
 	}
 }
 
-// TestHookSpawnsProposalWithoutTranscript：单轨后 Stop 只要求 session_id 非空。
-// proposal 从证据 Bundle 读输入，不依赖 transcript_path，因此缺它也必须拉起。
-func TestHookSpawnsProposalWithoutTranscript(t *testing.T) {
+// TestSessionStartSpawnsProposalWithoutTranscript：proposal 从证据 Bundle 读输入，
+// 不依赖 transcript_path，因此缺它也必须拉起。S12 后 SessionStart 是唯一常规 spawn 点。
+func TestSessionStartSpawnsProposalWithoutTranscript(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
-	raw := `{"hook_event_name":"Stop","cwd":"` + proj + `","session_id":"s-no","status":"completed"}`
-	t.Setenv("MEM_DISTILL_SPAWN", "1")
+	raw := `{"hook_event_name":"SessionStart","cwd":"` + proj + `","session_id":"s-no"}`
+	unsetGrayEnv(t, "MEM_NO_AUTOMATION")
 	called := false
 	prev := startDistillProc
 	startDistillProc = func(string) error { called = true; return nil }
@@ -224,14 +193,13 @@ func TestHookSpawnsProposalWithoutTranscript(t *testing.T) {
 	}
 }
 
-// TestSessionStartSpawnsProposalWithoutWritingMemories：单轨后 SessionStart 只拉起
-// proposal 子进程，不再内联跑 distillOne——因此既不平白写 candidates，也不碰 memories。
-// 子进程是否拉起只受 MEM_NO_DISTILL 关断，与 MEM_DISTILL_SPAWN 无关。
+// TestSessionStartSpawnsProposalWithoutWritingMemories：SessionStart 只拉起
+// proposal 子进程，不内联跑任何蒸馏——因此既不平白写 candidates，也不碰 memories。
+// 唯一关断是 MEM_NO_AUTOMATION 总闸。
 func TestSessionStartSpawnsProposalWithoutWritingMemories(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
-	unsetGrayEnv(t, "MEM_DISTILL_SPAWN")
-	t.Setenv("MEM_NO_DISTILL", "")
+	unsetGrayEnv(t, "MEM_NO_AUTOMATION")
 	var calls int
 	prev := startDistillProc
 	startDistillProc = func(string) error { calls++; return nil }
@@ -319,45 +287,18 @@ func TestCmdGCCandidatesAndTextList(t *testing.T) {
 	}
 }
 
-func TestDistillDryRunPrintsAndSkipsEmpty(t *testing.T) {
+// S12 后 dry-run 只在 --bundle 的 Peek 路径有意义（不得推进连续游标），
+// 语义由 distill_proposal_test.go 覆盖；这里守空库的输出仍说得清楚。
+func TestDistillSkippedOnEmptyQueue(t *testing.T) {
 	db := testDB(t)
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.AppendObservation(store.ObsInput{
-		SessionID: "sess", Event: "user-prompt", Summary: "决定：dry-run 不落库",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
 	out, err := captureStdout(t, func() error {
-		return cmdDistill([]string{"--db", db, "--session", "sess", "--provider", "none", "--dry-run", "--audit-file", "-"})
+		return cmdDistill([]string{"--db", db, "--proposal", "--audit-file", "-"})
 	})
-	if err != nil || !strings.Contains(out, "dry-run 不落库") {
-		t.Fatalf("dry-run 应打印候选，got %q %v", out, err)
-	}
-	if countAllMemories(t, db) != 0 {
-		t.Fatal("dry-run 不得写记忆")
-	}
-	st, err = store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	list, err := st.ListCandidates("", "sess", 10)
-	st.Close()
-	if err != nil || len(list) != 0 {
-		t.Fatalf("dry-run 不得写候选，got %+v %v", list, err)
-	}
-	emptyDB := testDB(t)
-	empty, err := captureStdout(t, func() error {
-		return cmdDistill([]string{"--db", emptyDB, "--pending", "--provider", "none", "--audit-file", "-"})
-	})
-	if err != nil || !strings.Contains(empty, "没有需要蒸馏") {
-		t.Fatalf("无待蒸馏会话应说明，got %q %v", empty, err)
+	if err != nil || !strings.Contains(out, "没有待处理的证据窗口") {
+		t.Fatalf("空队列应说明，got %q %v", out, err)
 	}
 	none, err := captureStdout(t, func() error {
-		return cmdCandidates([]string{"ls", "--db", emptyDB})
+		return cmdCandidates([]string{"ls", "--db", db})
 	})
 	if err != nil || !strings.Contains(none, "没有候选") {
 		t.Fatalf("空候选列表，got %q %v", none, err)
@@ -394,8 +335,10 @@ func TestImportTranscriptDirSinceAndDryRun(t *testing.T) {
 	if countAllMemories(t, db) != 0 {
 		t.Fatal("dry-run 不得写库")
 	}
-	if err := cmdImportTranscript([]string{"--db", db, "--into", "nope"}); err == nil {
-		t.Fatal("非法 --into 应失败")
+	// --into 已随 S12 退役：传了必须按未定义 flag 报错（不再有候选直产路径）。
+	if err := cmdImportTranscript([]string{"--db", db, "--into", "nope"}); err == nil ||
+		!strings.Contains(err.Error(), "flag provided but not defined") {
+		t.Fatalf("--into 应按未定义 flag 报错，got %v", err)
 	}
 }
 
@@ -430,141 +373,6 @@ func num(m map[string]any, key string) float64 {
 		return v
 	}
 	return -1
-}
-
-// --json 必须能区分 ok / empty / fail 三种结局。
-// 旧实现只输出 {"candidates":N}，失败与「合法 0 条」长得一模一样。
-func TestDistillJSONDistinguishesTriState(t *testing.T) {
-	db := testDB(t)
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, o := range []store.ObsInput{
-		{SessionID: "s-ok", Event: "user-prompt", Summary: "决策：JSON 要能看出成功"},
-		{SessionID: "s-empty", Event: "stop", Summary: "stop status=completed"},
-		{SessionID: "s-fail", Event: "user-prompt", Summary: "决策：模型不可用要能看出来"},
-	} {
-		if _, err := st.AppendObservation(o); err != nil {
-			t.Fatal(err)
-		}
-	}
-	st.Close()
-
-	out, err := captureStdout(t, func() error {
-		return cmdDistill([]string{"--db", db, "--session", "s-ok", "--provider", "none", "--json", "--audit-file", "-"})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := decodeJSONOut(t, out)
-	if got["status"] != "ok" || num(got, "inserted") != 1 || num(got, "failed") != 0 {
-		t.Fatalf("成功应为 ok/inserted=1，got %v", got)
-	}
-
-	out, err = captureStdout(t, func() error {
-		return cmdDistill([]string{"--db", db, "--session", "s-empty", "--provider", "none", "--json", "--audit-file", "-"})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got = decodeJSONOut(t, out)
-	if got["status"] != "empty" {
-		t.Fatalf("合法 0 条应为 empty，got %v", got)
-	}
-	if num(got, "inserted") != 0 || num(got, "failed") != 0 || num(got, "failed_sessions") != 0 {
-		t.Fatalf("empty 不应计失败，got %v", got)
-	}
-
-	// 缺 key ⇒ 模型不可用 ⇒ fail，且与 empty 明确不同。
-	t.Setenv("OPENAI_API_KEY", "")
-	out, err = captureStdout(t, func() error {
-		return cmdDistill([]string{"--db", db, "--session", "s-fail", "--provider", "openai", "--json", "--audit-file", "-"})
-	})
-	if err != nil {
-		t.Fatalf("默认 fail-open，不该以 error 返回: %v", err)
-	}
-	got = decodeJSONOut(t, out)
-	if got["status"] != "fail" || num(got, "failed_sessions") != 1 {
-		t.Fatalf("模型不可用应为 fail，got %v", got)
-	}
-	if err := cmdDistill([]string{"--db", db, "--session", "s-fail", "--provider", "openai", "--strict", "--audit-file", "-"}); err == nil {
-		t.Fatal("--strict 下 fail 必须非零退出")
-	}
-}
-
-// 部分落库时必须同时报 inserted 与 failed。
-// 只报一个数都会说谎：报了 inserted 会掩盖丢数据，报 failed 会让人以为一条没成。
-func TestDistillPartialInsertReportsBothCounts(t *testing.T) {
-	db := testDB(t)
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, o := range []store.ObsInput{
-		{SessionID: "s", Event: "user-prompt", Summary: "决策：甲条要进库"},
-		{SessionID: "s", Event: "user-prompt", Summary: "报错：乙条会写失败"},
-	} {
-		if _, err := st.AppendObservation(o); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// 只让含「乙」的候选插入失败，制造「一条成一条败」。
-	execSQL(t, db, `CREATE TRIGGER fail_cand BEFORE INSERT ON candidates
-		WHEN NEW.content LIKE '%乙%' BEGIN SELECT RAISE(ABORT, 'boom'); END`)
-	st.Close()
-
-	out, err := captureStdout(t, func() error {
-		return cmdDistill([]string{"--db", db, "--session", "s", "--provider", "none", "--json", "--audit-file", "-"})
-	})
-	if err != nil {
-		t.Fatalf("默认 fail-open，不该以 error 返回: %v", err)
-	}
-	got := decodeJSONOut(t, out)
-	if got["status"] != "partial" {
-		t.Fatalf("部分落库应为 partial，got %v", got)
-	}
-	if num(got, "inserted") != 1 || num(got, "failed") != 1 {
-		t.Fatalf("必须同时报 inserted=1 failed=1，got %v", got)
-	}
-	if err := cmdDistill([]string{"--db", db, "--session", "s", "--provider", "none", "--strict", "--audit-file", "-"}); err == nil {
-		t.Fatal("--strict 下部分失败必须非零退出（沉默的成功就是谎报）")
-	}
-
-	st, err = store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	list, err := st.ListCandidates("pending", "s", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(list) != 1 || !strings.Contains(list[0].Content, "甲") {
-		t.Fatalf("失败的候选不应落库，成功的应在，got %+v", list)
-	}
-	// 部分失败不能占窗口，否则丢掉的那条永远补不回来。
-	done, err := st.DistillWindowDone("s", distill.WindowKey(observationIDs(t, st, "s")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if done {
-		t.Fatal("partial 不得占住蒸馏窗口")
-	}
-}
-
-// observationIDs 取会话观测 id（按时间正序，与 distillOne 一致），用于算窗口键。
-func observationIDs(t *testing.T, st *store.Store, session string) []string {
-	t.Helper()
-	obs, err := st.ObservationsForDistill(session, 0, 200)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids := make([]string, len(obs))
-	for i, o := range obs {
-		ids[i] = o.ID
-	}
-	return ids
 }
 
 // --all-pending 中途失败时，已采纳的结果不能被丢掉。
@@ -648,7 +456,7 @@ func TestCmdDistillRejectsBadModelConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	db := filepath.Join(t.TempDir(), "m.db")
-	err := cmdDistill([]string{"--session", "x", "--db", db, "--audit-file", "-"})
+	err := cmdDistill([]string{"--proposal", "--db", db, "--audit-file", "-"})
 	if err == nil {
 		t.Fatal("配置文件非法时应返回错误，不得退回 api/auto")
 	}

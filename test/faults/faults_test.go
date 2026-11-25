@@ -96,9 +96,9 @@ func (e *faultEnv) env() []string {
 	out = append(out,
 		"HOME="+e.home,
 		"PATH="+e.binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
-		// 子落盘/后续蒸馏都由用例显式驱动，关掉 hook 的自动拉起。
-		"MEM_NO_DISTILL=1",
-		"MEM_NO_COLDSTART=1",
+		// 子落盘/后续蒸馏都由用例显式驱动：唯一总闸拦掉全部自动 spawn
+		//（S12 已退役 MEM_NO_DISTILL / MEM_NO_COLDSTART / MEM_DISTILL_SPAWN 散闸）。
+		"MEM_NO_AUTOMATION=1",
 	)
 	return out
 }

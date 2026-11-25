@@ -185,27 +185,6 @@ func TestJudgeStatsExcludesSelfRun(t *testing.T) {
 	if stats[0].Rejected != 0 || stats[0].SelfRun != 1 {
 		t.Fatalf("自裁应计入 SelfRun 而非人工否决，got %+v", stats[0])
 	}
-	if !noHuman(stats) {
-		t.Error("只有自裁样本时应判为「无人工样本」")
-	}
-}
-
-// 文本输出是给人看的最后一步：分母口径改了，表头与「无人工样本」提示必须同步。
-func TestPrintJudgeStatsText(t *testing.T) {
-	st := newJudgeStore(t)
-	if err := printJudgeStats(st, false); err != nil { // 空表
-		t.Fatalf("printJudgeStats 空表: %v", err)
-	}
-	c := seedCandidate(t, st, "fact", "人工裁决样本")
-	if err := st.MarkJudgeVerdict(c.ID, "accept", "deepseek@judge-v2", "durable"); err != nil {
-		t.Fatalf("MarkJudgeVerdict: %v", err)
-	}
-	if _, err := st.CommitAccept(c.ID, -1, "human"); err != nil {
-		t.Fatalf("CommitAccept: %v", err)
-	}
-	if err := printJudgeStats(st, false); err != nil {
-		t.Fatalf("printJudgeStats: %v", err)
-	}
 }
 
 // judge_model 的分段决定历史判定能不能按模型分组：flag 显式给了就写 flag，
@@ -247,29 +226,11 @@ func TestCmdJudgeNoPendingSkipsModel(t *testing.T) {
 	}
 }
 
-// -stats 只读库不调模型：它得在模型没配的机器上也能用。
-func TestCmdJudgeStatsJSONNeedsNoModel(t *testing.T) {
-	db := testDB(t)
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	c := seedCandidate(t, st, "fact", "候选表量级在千条以内，不为它加索引")
-	if err := st.MarkJudgeVerdict(c.ID, "reject", "ollama@judge-v2", "process_narrative"); err != nil {
-		st.Close()
-		t.Fatalf("MarkJudgeVerdict: %v", err)
-	}
-	st.Close()
-
-	out, err := captureStdout(t, func() error {
-		// 指向不存在的配置文件：-stats 不该走到读配置那一步。
-		return cmdJudge([]string{"--db", db, "--config", filepath.Join(t.TempDir(), "absent.json"), "--stats", "--json"})
-	})
-	if err != nil {
-		t.Fatalf("cmdJudge -stats: %v", err)
-	}
-	if !strings.Contains(out, `"verdict":"reject"`) {
-		t.Fatalf("stats 输出应含 reject 分组，got %q", out)
+// S12 退役 --stats（§12.1）：统计面并入 mem review stats，这里只验引导文案。
+func TestCmdJudgeStatsRetired(t *testing.T) {
+	err := cmdJudge([]string{"--db", testDB(t), "--config", filepath.Join(t.TempDir(), "absent.json"), "--stats", "--json"})
+	if err == nil || !strings.Contains(err.Error(), "mem review stats") {
+		t.Fatalf("--stats 应退役并指向 mem review stats，got %v", err)
 	}
 }
 

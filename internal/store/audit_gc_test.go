@@ -7,8 +7,9 @@ import (
 // 审计账本准出的数据面测试。
 //
 // 这组用例守的不是「删掉了几行」，而是「删完之后判据还成立」：
-//   - distill_runs 是蒸馏游标（SessionsNeedingDistill 取每会话 MAX(finished_at)），
-//     删错会让会话永远「需要蒸馏」，每轮巡检都重新烧一次推理；
+//   - distill_runs 是蒸馏游标（每会话最新一次 ok/empty 运行必须保留——
+//     S12 后 proposal 单轨不再按观测水位挑会话，但游标仍是审计 GC 与
+//     R12 判据的依据，删错最新运行等于抹掉「蒸馏过」的事实）；
 //   - read_traces 是注入去重的依据（SessionInjectedRuleIDs 按 session 无时间窗读），
 //     删掉活跃会话的轨迹会让同一条规则在同一会话里被重复注入。
 // 所以每个用例都断言「允许删的删了」+「不该删的还在」。
@@ -106,53 +107,6 @@ func TestGCAuditKeepsNewestDistillRunPerSession(t *testing.T) {
 	}
 	if n := auditCount(t, s, `SELECT COUNT(*) FROM distill_runs WHERE id = 'b-fail'`); n != 0 {
 		t.Errorf("失败运行不构成游标，超期应回收，实际剩 %d 条", n)
-	}
-}
-
-// 真正的判据不是行数，而是「下一个该蒸馏谁」没变。
-func TestGCAuditDoesNotRequeueDistilledSession(t *testing.T) {
-	s := newTestStore(t)
-
-	// 会话 A 有一条比成功蒸馏更早的观测，以及一条更新后的观测：
-	// GC 前后都应当「需要蒸馏」（因为新观测晚于上次成功）。
-	addObservationAt(t, s, "o1", "A", auditTestOld)
-	addDistillRun(t, s, "a-old", "A", "ok", auditTestOld+100, "")
-	addObservationAt(t, s, "o2", "A", auditTestNew)
-
-	needBefore, err := s.SessionsNeedingDistill(10)
-	if err != nil {
-		t.Fatalf("SessionsNeedingDistill: %v", err)
-	}
-	if len(needBefore) != 1 {
-		t.Fatalf("前置条件不成立：期望会话 A 需要蒸馏，got %v", needBefore)
-	}
-
-	if _, err := s.GCAudit(auditTestCut); err != nil {
-		t.Fatalf("GCAudit: %v", err)
-	}
-
-	needAfter, err := s.SessionsNeedingDistill(10)
-	if err != nil {
-		t.Fatalf("SessionsNeedingDistill: %v", err)
-	}
-	if len(needAfter) != len(needBefore) || (len(needAfter) == 1 && needAfter[0] != needBefore[0]) {
-		t.Errorf("GC 改变了蒸馏队列：前 %v，后 %v", needBefore, needAfter)
-	}
-
-	// 反向：一个「已蒸馏且无新观测」的会话，GC 后不能变成待蒸馏。
-	addObservationAt(t, s, "o3", "B", auditTestOld)
-	addDistillRun(t, s, "b-done", "B", "ok", auditTestNew, "")
-	if _, err := s.GCAudit(auditTestCut); err != nil {
-		t.Fatalf("GCAudit: %v", err)
-	}
-	need, err := s.SessionsNeedingDistill(10)
-	if err != nil {
-		t.Fatalf("SessionsNeedingDistill: %v", err)
-	}
-	for _, sid := range need {
-		if sid == "B" {
-			t.Errorf("会话 B 已蒸馏且无新观测，GC 后不应重回队列：%v", need)
-		}
 	}
 }
 

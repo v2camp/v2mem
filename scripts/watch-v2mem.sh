@@ -640,7 +640,7 @@ if [ "$A_OBS" -eq 0 ]; then
 elif [ "$A_DISTILL_FAIL" -gt 3 ]; then
   add R12 FAIL "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；按 §5 R12 查 distill_runs 的 error 与 attempt，不要重跑 distill 掩盖"
 elif [ "$A_DISTILL" -eq 0 ]; then
-  add R12 WARN "自动蒸馏未推进" "${D12}；有观测但窗口内 0 条 distill；按 §5 R12 核对 MEM_DISTILL_SPAWN / MEM_NO_DISTILL（SessionStart 只受 MEM_NO_DISTILL 关断），确认是否是有意关闭"
+  add R12 WARN "自动蒸馏未推进" "${D12}；有观测但窗口内 0 条 distill；按 §5 R12 核对 MEM_NO_AUTOMATION 总闸（S12 已退役 MEM_DISTILL_SPAWN / MEM_NO_DISTILL 散闸），确认是否是有意关闭"
 elif [ "$A_DISTILL_FAIL" -ge 1 ]; then
   add R12 WARN "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；查 distill_runs 的 error 与 evidence_bundles 是否 backlog"
 else

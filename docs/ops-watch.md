@@ -219,10 +219,11 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   `observations → distill_runs → candidates` 链，**不含** `accept` / `reject` —— 后者是显式裁决，
   积压由 R8 判级、动作在 §5 R8。R12 只回答「自动段有没有推进」：
   - `obs-append = 0` → `INFO`。这是**无样本**，与 R3 / R10 同类，不是 §4 的冷启动降级。
-  - `event=distill = 0` 而有观测 → `WARN`（断链）。成因按 §5 R12 的两个开关
-    （`MEM_DISTILL_SPAWN` / `MEM_NO_DISTILL`）与 `startDistillProc` 失败
+  - `event=distill = 0` 而有观测 → `WARN`（断链）。成因按 §5 R12 的唯一总闸
+    `MEM_NO_AUTOMATION`（S12 已退役 `MEM_DISTILL_SPAWN` / `MEM_NO_DISTILL` 散闸，
+    自动写侧唯一常规路径是 SessionStart 的 proposal spawn）与 `startDistillProc` 失败
     （只打 stderr、不写审计，故库里看不出来）逐项排查。
-    **不判 `FAIL`**：`MEM_NO_DISTILL=1` 完全停掉蒸馏是合法配置，判 FAIL 会制造恒久误报。
+    **不判 `FAIL`**：`MEM_NO_AUTOMATION=1` 完全停掉自动化是合法配置，判 FAIL 会制造恒久误报。
   - 失败状态沿用 R7 / R9 的「单窗口可人工处理余量」分档 `0 / 1–3 / >3`。失败集合取
     `failed=true` 或 `mode ∈ {fail, partial, invalid, backlog}`：Proposal 会写 `noop` /
     `invalid` / `backlog`，而 `audit.Summarize` 只认 `mode=ok` / `mode=fail`，
@@ -361,11 +362,11 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | I2 掉到 1–3 | 宿主升级覆盖配置 | 重跑 `mem init --harness workbuddy`（幂等、带备份） |
 | I5 = WARN（`ExecEnv: Sandbox`） | Trae 钩子跑在沙箱，`~/.v2mem` 禁写 | Hooks 面板运行方式改「本地自动运行」；或在沙箱配置放行 `~/.v2mem` |
 | I3 缺失 | 连接器开关被关 | 连接器管理页重新开启；**不影响 R 组**，hook 与 MCP 相互独立 |
-| R8 候选积压 | 隔离区长期未裁决 | 先看 detail 里的**按工程分组**计数，在**对应工程的会话里**就近裁决：`mem candidates ls --project P --triage` 先分清哪些可裁决（`不可裁决` 的是过程叙述/助手偏好，别逐条 reject，交给 R15 的 TTL），再 `--policy` 或 MCP `candidates_ls` 逐条看；可读候选 `mem accept` / MCP `accept`，载荷残留 `mem reject` / MCP `reject`（顶层命令，非 `mem candidates reject`）。不要跨工程批量 reject |
-| R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
+| R8 候选积压 | 隔离区长期未裁决 | 先看 detail 里的**按工程分组**计数，在**对应工程的会话里**就近裁决：`mem candidates ls --project P --triage` 先分清哪些可裁决（`不可裁决` 的是过程叙述/助手偏好，别逐条 reject，交给 R15 的 TTL），再 `--policy` 逐条看（MCP 面已由 review_ls/review_withdraw 取代候选裁决三件，§12.3）；可读候选 `mem accept`，载荷残留 `mem reject`（顶层命令）。不要跨工程批量 reject |
+| R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `internal/proposal` 的 `Eligible` 判据（`distillOne` 旧轨已随 S12 退役，输入过滤全在 proposal 链路），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
 | R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。**2026-11-19 复核：批量开启后生产仍约 15ms/行（748 行 9 秒），设计验收的 0.6ms/行只在小样本上成立**，故 Stop 侧另有 8s 时间预算（`transcriptStopBudget`）：超预算停在块边界、游标只推进到该处、下一次 Stop 续传，这是 20s 硬超时下的兜底，开关只算优化。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
 | R11 WAL 高水位越线 | 文件不缩是常态（passive checkpoint 不收缩 `-wal`），先判是否真有滞留 | 先取三元组：`sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(PASSIVE);"`（或 `PRAGMA wal_checkpoint;`）并记下 `(busy, log, checkpointed)`——`log == checkpointed` 即无滞留，帧数只是历史高水位，**不必**清。确有滞留（`busy=1` 说明有长读事务）再查各 harness 的 `mem mcp` 长连，确认后 `PRAGMA wal_checkpoint(TRUNCATE);` 回收文件。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务；也**不要**把 R11 的帧数当作 R3 延迟的证据 |
-| R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：核对 `MEM_DISTILL_SPAWN` / `MEM_NO_DISTILL` 是否按预期导出（SessionStart 只受后者关断，Stop / SessionEnd 另需前者），查宿主 stderr 有无 `startDistillProc` 失败；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `rules=0` 但其他 provider 有量属正常（远端成功），不要据此回滚；detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决。quarantined 是人工出口，不计失败率；用 mem distill --quarantined 查看、--requeue 回捞 |
+| R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：核对 `MEM_NO_AUTOMATION` 总闸是否被导出（S12 后它是唯一自动化开关，SessionStart 的 proposal spawn 是唯一常规写侧路径），查宿主 stderr 有无 `startDistillProc` 失败；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `rules=0` 但其他 provider 有量属正常（远端成功），不要据此回滚；detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决。quarantined 是人工出口，不计失败率；用 mem distill --quarantined 查看、--requeue 回捞 |
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
 | R14 归档体量越线 | 归档增长快于观测保留策略 | 先分因：① **量增长**（文件数与字节同步涨）→ 按下面两步回收，再裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**回收只有一条路**：先 `mem gc --obs`（删观测行）再 `mem gc --evidence`（删已无观测引用的段与磁盘文件），两条合跑即同一轮生效；`--evidence` 有 1h 写入保护期。单跑 `--evidence` 在观测未回收时释放 0 字节——**不要**据此认为功能失效。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处。确认接受现状就上调阈值并在提交信息里写明原因 |
 | R15 候选超期 | TTL 从未被执行 | 巡检**只报不处置**。先复核 90 天前的已采纳行（`mem candidates ls --status accepted -db ~/.v2mem/mem.db`）——`gc --candidates` 会连带删除它们、不可逆；确认后再手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`（pending → expired，行仍在库）。终态**物理删除**是另一条路：`mem gc --retention`（S13，默认关；rejected 90 天 / 完成 Bundle 30 天 / 孤立决策账 / 超龄 plans，删前自动备份）。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |

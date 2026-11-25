@@ -7,8 +7,7 @@ import (
 
 // observations 表被两条写路径共用：legacy 的 AppendObservation 与
 // 新证据路径 CaptureEvidence。计划 §2.2 要求读侧覆盖全部新列，
-// 否则「有证据身份」的行经 ListObservations / ObservationsForDistill
-// 读出来仍是空壳，形成事实上的双写分叉。
+// 否则「有证据身份」的行经 ListObservations 读出来仍是空壳，形成事实上的双写分叉。
 func TestObservationColumnsCoverBothWritePaths(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "mem.db")
 	st, err := Open(db)
@@ -80,10 +79,4 @@ func TestObservationColumnsCoverBothWritePaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertColumns("ListObservations", list)
-
-	distill, err := st.ObservationsForDistill("s", 0, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertColumns("ObservationsForDistill", distill)
 }

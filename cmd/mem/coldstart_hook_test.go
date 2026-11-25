@@ -25,9 +25,12 @@ func coldStartInput(sid string) hookInput {
 	return hookInput{SessionID: sid, TranscriptPath: "/tmp/t.jsonl"}
 }
 
-// clearColdStartEnv 把三个开关都置空/取消，避免宿主机环境让用例假绿。
+// clearColdStartEnv 取消自动化相关 env，避免宿主机环境让用例假绿。
+// S12 后唯一开关是 MEM_NO_AUTOMATION；退役的 MEM_NO_DISTILL / MEM_NO_COLDSTART /
+// MEM_DISTILL_SPAWN 也一并清掉，证明它们的残留值不再影响行为。
 func clearColdStartEnv(t *testing.T) {
 	t.Helper()
+	unsetGrayEnv(t, "MEM_NO_AUTOMATION")
 	unsetGrayEnv(t, "MEM_DISTILL_SPAWN")
 	unsetGrayEnv(t, "MEM_NO_DISTILL")
 	unsetGrayEnv(t, "MEM_NO_COLDSTART")
@@ -107,39 +110,31 @@ func TestColdStartSkipsOtherProjectsMemory(t *testing.T) {
 	}
 }
 
-func TestColdStartSkipsWhenSpawnGateEnabled(t *testing.T) {
+// S12 后 MEM_DISTILL_SPAWN 退役：冷启动不再有「常规路径已覆盖」的互斥让位，
+// 首会话冷启动照常发生（幂等，由标记兜底）。
+func TestColdStartRunsAfterSpawnGateRetired(t *testing.T) {
 	clearColdStartEnv(t)
-	t.Setenv("MEM_DISTILL_SPAWN", "1")
+	t.Setenv("MEM_DISTILL_SPAWN", "1") // 退役开关：必须被无视
 	const sid = "s-spawn-on"
 	db := grayDB(t)
 
 	calls := installColdStartProc(t, nil)
 	maybeSpawnColdStart(db, coldStartInput(sid), "demo", harness.EventSessionEnd)
-	if *calls != 0 {
-		t.Fatalf("MEM_DISTILL_SPAWN=1 时常规路径已覆盖，冷启动不应重复拉起，got %d", *calls)
+	if *calls != 1 {
+		t.Fatalf("MEM_DISTILL_SPAWN 退役后冷启动应照常拉起，got %d", *calls)
 	}
 }
 
-func TestColdStartKillSwitches(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		env  string
-	}{
-		{"MEM_NO_DISTILL=1", "MEM_NO_DISTILL"},
-		{"MEM_NO_COLDSTART=1", "MEM_NO_COLDSTART"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			clearColdStartEnv(t)
-			t.Setenv(tc.env, "1")
-			const sid = "s-killed"
-			db := grayDB(t)
+func TestColdStartKillSwitch(t *testing.T) {
+	clearColdStartEnv(t)
+	t.Setenv("MEM_NO_AUTOMATION", "1")
+	const sid = "s-killed"
+	db := grayDB(t)
 
-			calls := installColdStartProc(t, nil)
-			maybeSpawnColdStart(db, coldStartInput(sid), "demo", harness.EventSessionEnd)
-			if *calls != 0 {
-				t.Fatalf("%s 应关闭冷启动，got %d", tc.name, *calls)
-			}
-		})
+	calls := installColdStartProc(t, nil)
+	maybeSpawnColdStart(db, coldStartInput(sid), "demo", harness.EventSessionEnd)
+	if *calls != 0 {
+		t.Fatalf("MEM_NO_AUTOMATION=1 应关闭冷启动，got %d", *calls)
 	}
 }
 

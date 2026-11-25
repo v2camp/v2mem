@@ -71,7 +71,8 @@ func cmdJudge(args []string) error {
 	timeout := fs.Duration("timeout", 90*time.Second, "单次模型调用超时")
 	limit := fs.Int("limit", judgeDefaultBatch, "本批判定条数上限")
 	project := fs.String("project", "", "只判这个工程的候选（空=不过滤）")
-	stats := fs.Bool("stats", false, "只打印影子期统计，不调用模型")
+	// S12 退役（§12.1）：--stats 保留注册只为给出一句话引导，统计面已并入 review stats。
+	stats := fs.Bool("stats", false, "（已退役）标定统计请用 mem review stats")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -84,7 +85,9 @@ func cmdJudge(args []string) error {
 	defer st.Close()
 
 	if *stats {
-		return printJudgeStats(st, c.json)
+		// 影子期一致率的维护入口退役：标定统计是 review stats 的职责（§12.1），
+		// 这里只指路，不再打印旧表——留着旧入口只会让人在两处看到不同的数。
+		return errors.New("mem judge --stats 已退役：标定统计与阈值提示并入 `mem review stats`；影子判定的 accept/reject/unsure 计数随 `mem judge` 批次输出")
 	}
 
 	// 只取 judge_verdict='' 的：影子不改 status，若按「最旧的 pending」取，
@@ -316,50 +319,6 @@ func findByPrefix(list []store.Candidate, prefix string) *store.Candidate {
 		if strings.HasPrefix(list[i].ID, prefix) {
 			return &list[i]
 		}
-	}
-	return nil
-}
-
-func noHuman(stats []store.JudgeStat) bool {
-	for _, s := range stats {
-		if s.Accepted+s.Rejected > 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func printJudgeStats(st *store.Store, asJSON bool) error {
-	stats, err := st.JudgeStats()
-	if err != nil {
-		return err
-	}
-	if asJSON {
-		return printJSON(stats)
-	}
-	if len(stats) == 0 {
-		fmt.Println("judge: 还没有任何判定记录")
-		return nil
-	}
-	fmt.Println("verdict   总数  人工采纳  人工否决      非人工  待定  一致率")
-	for _, s := range stats {
-		// 一致率只用人工样本做分母：accept 看「人工也采纳」，reject 看「人工也否决」。
-		// 非人工（SelfRun）= 判定器自裁的历史数据 + mem batch 落库（人批准 AI 方案），
-		// 都是模型的回声，不进分母，否则门槛会被自己的产出喂饱。
-		decided := s.Accepted + s.Rejected
-		agree := "—"
-		if decided > 0 {
-			if s.Verdict == "reject" {
-				agree = fmt.Sprintf("%d%%", s.Rejected*100/decided)
-			} else {
-				agree = fmt.Sprintf("%d%%", s.Accepted*100/decided)
-			}
-		}
-		fmt.Printf("%-8s  %4d  %8d  %8d  %10d  %4d  %s\n",
-			s.Verdict, s.Total, s.Accepted, s.Rejected, s.SelfRun, s.Pending, agree)
-	}
-	if noHuman(stats) {
-		fmt.Println("（本批没有任何人工裁决样本，一致率无意义——影子期要的是人怎么判，不是模型或批量落库怎么判）")
 	}
 	return nil
 }
