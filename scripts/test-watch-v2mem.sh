@@ -369,12 +369,16 @@ r15_run() {
   R15_ARGV="$(cat "$ARGV_LOG")"
 }
 
-# ① 有超期：WARN + 「只报不处置」。
+# ① 有超期：WARN + 「只报不处置」+ S13 终态出口提示（mem gc --retention）。
+# S13 同步：物理删除出口与状态迁移是两条路，detail 必须同时给，否则值班人员
+# 只知道 gc --candidates，rejected/完成账的终态回收永远不被执行。
 r15_run r15_stale_warn_only "$(cand_json A 2 'ok' "$STALE")"
 if [ "$(r15_level)" != WARN ]; then
   r15_fail r15_stale_warn_only "want=WARN got=$(r15_level)（$(r15_detail)）"
 elif [[ "$(r15_detail)" != *"只报不处置"* ]]; then
   r15_fail r15_stale_warn_only "detail 缺「只报不处置」，got: $(r15_detail)"
+elif [[ "$(r15_detail)" != *"mem gc --retention"* ]]; then
+  r15_fail r15_stale_warn_only "detail 缺 S13 终态出口「mem gc --retention」，got: $(r15_detail)"
 else
   r15_ok r15_stale_warn_only
 fi

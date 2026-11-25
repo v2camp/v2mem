@@ -106,6 +106,8 @@ gc 选项:
   --evidence-grace <dur> 与 --evidence 合用：写入保护期（默认 1h，刚写入的段不回收）
   --audit               回收审计账本：超期的 distill_runs / read_traces（不删 memories）
   --audit-age <dur>     与 --audit 合用：账本保留时长（默认 720h）
+  --retention           终态保留回收：rejected 90 天候选 / 完成 Bundle 30 天 / 孤立决策账 / 文件轮转（默认关）
+  --dry-run             与 --retention 合用：只预览计数、零写入（默认关）
 
 maintain 选项:
   --catch-up            故障恢复模式：与默认行为等价（保留给 Harness / SOP 明示）
@@ -824,6 +826,9 @@ func cmdGC(args []string) error {
 	auditOnly := fs.Bool("audit", false, "回收超期的审计账本 distill_runs / read_traces（不删 memories）")
 	auditAge := fs.Duration("audit-age", 720*time.Hour, "审计账本保留时长（配合 --audit）")
 	maxAge := fs.Duration("max-age", 720*time.Hour, "observations 保留时长（配合 --obs）")
+	// S13：终态保留回收默认关；--dry-run 只预览不删（零写）。
+	retention := fs.Bool("retention", false, "终态保留回收：rejected 候选 / 完成 Bundle / 决策账 / 文件轮转（默认关）")
+	dryRun := fs.Bool("dry-run", false, "只预览不删除（配合 --retention）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -831,21 +836,35 @@ func cmdGC(args []string) error {
 	if *obsOnly && *candOnly {
 		return errors.New("--obs 与 --candidates 不能同时使用")
 	}
+	if *dryRun && !*retention {
+		return errors.New("--dry-run 只配合 --retention 使用")
+	}
+	if *retention && (*obsOnly || *candOnly || *evOnly || *auditOnly) {
+		return errors.New("--retention 不与 --obs / --candidates / --evidence / --audit 同用")
+	}
 
 	// 备份前置到分支派发**之前**：一次快照覆盖默认分支、四个子分支与合跑。
 	// 放在分支之后会让 --obs / --candidates / --evidence / --audit 完全不备份——
 	// 它们删的字节同样不可逆，正是 S3 要堵的口子。备份/校验失败直接返回，业务零执行。
-	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
-	if err != nil {
-		return err
-	}
-	if bak != "" && !c.json {
-		fmt.Printf("已备份 → %s\n", bak)
-	}
-	// 归档段的文件级备份与库快照共用备份根；--no-backup 是逃生口，连归档备份一起跳过。
+	// --retention --dry-run 是唯一例外：它不物理删，故跳过备份以保证「零写」；
+	// 其余路径（含 --retention 实删）一律先过这道前置，S9a 故障注入守卫不绕过。
 	backupRoot := ""
-	if !*noBackup {
-		backupRoot = backupDirFor(c.db, *backupDir)
+	if !*dryRun {
+		bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
+		if err != nil {
+			return err
+		}
+		if bak != "" && !c.json {
+			fmt.Printf("已备份 → %s\n", bak)
+		}
+		// 归档段的文件级备份与库快照共用备份根；--no-backup 是逃生口，连归档备份一起跳过。
+		if !*noBackup {
+			backupRoot = backupDirFor(c.db, *backupDir)
+		}
+	}
+
+	if *retention {
+		return cmdGCRetention(c, *dryRun, backupRoot)
 	}
 
 	// --obs / --evidence / --audit 允许合并且顺序固定：先回收观测，被删观测对应的
@@ -985,8 +1004,8 @@ func cmdGCCandidates(c common) error {
 	if c.json {
 		return printJSON(res)
 	}
-	fmt.Printf("候选过期 %d，删除已采纳行 %d、过期行 %d（未改动 memories）\n",
-		res.Expired, res.Deleted, res.DeletedExpired)
+	fmt.Printf("候选过期 %d，删除已采纳行 %d、过期行 %d、已拒行 %d（未改动 memories）\n",
+		res.Expired, res.Deleted, res.DeletedExpired, res.DeletedRejected)
 	return nil
 }
 

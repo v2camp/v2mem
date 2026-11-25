@@ -69,7 +69,9 @@ func cmdAudit(args []string) error {
 	if p == "" {
 		p = audit.Path()
 	}
-	rs, err := audit.Read(p, 0)
+	// S13（§8.2）：合并 .1–.3 轮转归档，避免日志轮转后统计断点。
+	// ReadHistory 向下兼容单文件语义，无归档时与 Read 等价。
+	rs, err := audit.ReadHistory(p, 0)
 	if err != nil {
 		return err
 	}
@@ -728,7 +730,8 @@ func cmdEvalActivity(args []string) error {
 		return nil
 	}
 
-	all, err := audit.Read(p, 0)
+	// 与 cmdAudit 一致：合并轮转归档，用量视图不因日志轮转而丢历史。
+	all, err := audit.ReadHistory(p, 0)
 	if err != nil {
 		return err
 	}
