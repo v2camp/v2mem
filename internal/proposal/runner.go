@@ -87,40 +87,78 @@ func (r *Runner) backlogDelay() time.Duration {
 	return 10 * time.Minute
 }
 
+// maxRunnableHeads 是一次 Step 内最多试几个可运行头。
+//
+// NextRunnableProposalBundle 已经把退避与租约过滤掉了，所以认领失败只剩竞态
+// （另一个 worker 在同一瞬间抢走了同一个头）。重试同一个头没有意义，按候选
+// 个数收敛即可：抢输 3 个就交回调用方，下一轮凭年龄重新排队。
+const maxRunnableHeads = 3
+
 // Step 认领并处理一个 Bundle。
 //
-// 队列顺序是严格的：只要还有未终结的 Bundle，就先重试最老的那一个，
-// 成功了才允许调用 NextBundle 取下一窗。这样 fail/partial 不会因为
-// 「后面还有新证据」而被越过，连续水位实际上由 Bundle 状态守护。
+// 调度口径是「按源头」而不是「全局队首」（design-data-lifecycle §10 P1）：
+// 每个源只看自己的最老头，头在退避或租约中就整源让位，绝不越过它去新建窗口。
+// 这样既保住了 §8.1「连续水位不得越过失败窗」——失败窗被同源新窗越过就等于
+// 永久跳过证据；也避免一个源 16 分钟的退避把全部源一起挡住。
+//
+// 三层顺序不能换：先找可运行的头 → 再判断「还有积压但全不可运行」→
+// 最后才允许 Reader.NextBundle 新建窗口。中间那层若误调 NextBundle，
+// 就会在失败头之后造出新窗口，连续语义直接打穿。
 func (r *Runner) Step(_ context.Context) (*Outcome, error) {
 	if r.St == nil || r.Reader == nil {
 		return nil, errors.New("proposal: Runner 缺少 Store 或 Reader")
 	}
 	now := r.now().Unix()
 
-	head, ok, err := r.St.NextOpenProposalBundle()
-	if err != nil {
-		return nil, err
-	}
-	var id string
-	if ok {
-		id = head.ID
-	} else {
-		b, err := r.Reader.NextBundle(r.Limit, r.MaxBytes)
+	var contended string
+	for i := 0; i < maxRunnableHeads; i++ {
+		head, ok, err := r.St.NextRunnableProposalBundle(now)
 		if err != nil {
 			return nil, err
 		}
-		if b == nil {
-			return &Outcome{Result: Result{Status: "skipped"}, Blocked: "没有待处理的连续证据窗口"}, nil
+		if !ok {
+			break
 		}
-		id = b.ID
+		contended = head.ID
+		claimed, err := r.St.ClaimProposalBundle(head.ID, r.Owner, now, r.LeaseTTL)
+		if err == nil {
+			return r.runClaimed(claimed, false)
+		}
+		if !errors.Is(err, store.ErrProposalBundleLeased) {
+			return nil, err
+		}
+		// 竞态：这个头已被别人抢走，继续试下一个可运行头，而不是整批停摆。
+	}
+	if contended != "" {
+		return &Outcome{
+			Result: Result{Status: StatusBacklog}, BundleID: contended,
+			Blocked: "可运行的头在认领时被其它 worker 抢走（认领竞态），本轮让位",
+		}, nil
 	}
 
-	claimed, err := r.St.ClaimProposalBundle(id, r.Owner, now, r.LeaseTTL)
+	// 没有可运行的头，但仍有 open 积压：所有源的头都在退避或租约中。
+	// 这里绝不能调 Reader.NextBundle——那会越过失败头新建窗口。
+	if head, ok, err := r.St.NextOpenProposalBundle(); err != nil {
+		return nil, err
+	} else if ok {
+		return &Outcome{
+			Result: Result{Status: StatusBacklog}, BundleID: head.ID,
+			Blocked: "所有源的头都在退避或租约中",
+		}, nil
+	}
+
+	b, err := r.Reader.NextBundle(r.Limit, r.MaxBytes)
+	if err != nil {
+		return nil, err
+	}
+	if b == nil {
+		return &Outcome{Result: Result{Status: "skipped"}, Blocked: "没有待处理的连续证据窗口"}, nil
+	}
+	claimed, err := r.St.ClaimProposalBundle(b.ID, r.Owner, now, r.LeaseTTL)
 	if err != nil {
 		if errors.Is(err, store.ErrProposalBundleLeased) {
 			return &Outcome{
-				Result: Result{Status: StatusBacklog}, BundleID: id,
+				Result: Result{Status: StatusBacklog}, BundleID: b.ID,
 				Blocked: "Bundle 仍在租约中或未到 not_before",
 			}, nil
 		}

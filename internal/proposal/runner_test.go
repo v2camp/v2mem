@@ -30,8 +30,14 @@ func newEnv(t *testing.T) *env {
 
 func (e *env) capture(t *testing.T, uid, session, summary string, eligible bool) {
 	t.Helper()
+	e.captureFrom(t, "src-t", uid, session, summary, eligible)
+}
+
+// captureFrom 指定证据源：按源公平调度需要多个源各自积压。
+func (e *env) captureFrom(t *testing.T, sourceID, uid, session, summary string, eligible bool) {
+	t.Helper()
 	_, created, err := e.st.CaptureEvidence(store.EvidenceCaptureInput{
-		EventUID: uid, SourceID: "src-t", SourceKind: "hook", Generation: 1,
+		EventUID: uid, SourceID: sourceID, SourceKind: "hook", Generation: 1,
 		OccurredAtNS: 1700000000000000000, SessionID: session, Project: "proj",
 		Harness: "workbuddy", EventType: "stop", ParserVersion: "evidence/v1",
 		ProposalEligible: eligible, Summary: summary,
@@ -534,6 +540,205 @@ func TestRunnerLeaseBlocksSecondWorker(t *testing.T) {
 	}
 }
 
+// F5：A 的头在退避、B 的头健康 → Step 跳过 A 去跑 B，A 保持原状。
+//
+// 这是 S6b 的核心收益：一个源 16 分钟的退避不再挡住其它源。
+func TestRunnerStepSkipsSourceInBackoff(t *testing.T) {
+	e := newEnv(t)
+	e.captureFrom(t, "src-a", "ua1", "sa", "决定：甲", true)
+	e.captureFrom(t, "src-b", "ub1", "sb", "决定：乙", true)
+	bA := e.bundle(t)
+	bB := e.bundle(t)
+	if bA.SourceID != "src-a" || bB.SourceID != "src-b" {
+		t.Fatalf("夹具源顺序不对: %s / %s", bA.SourceID, bB.SourceID)
+	}
+	var now int64 = 1000
+	setBundleCreatedAt(t, e.st.Path(), bA.ID, 100)
+	setBundleCreatedAt(t, e.st.Path(), bB.ID, 200)
+	if _, err := e.st.ClaimProposalBundle(bA.ID, "prep", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.FinishProposalBundle(bA.ID, "prep", "fail", now+3600, "run-prep"); err != nil {
+		t.Fatal(err)
+	}
+
+	g, calls := gen("fake", func(GenerateRequest, int) (string, error) {
+		return `{"kind":"decision","content":"乙","evidence_idx":[1]}`, nil
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, g)}, &now)
+	out, err := r.Step(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusOK || out.BundleID != bB.ID || *calls != 1 {
+		t.Fatalf("应跳过退避中的 A 去跑 B: %+v calls=%d", out, *calls)
+	}
+
+	a, err := e.st.LoadProposalBundle(bA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Status != "fail" || a.NotBefore != now+3600 || a.Attempt != 1 || a.LeaseOwner != "" {
+		t.Fatalf("A 应保持原状: %+v", a)
+	}
+}
+
+// F6：只有一个源且头在退避 → backlog + Blocked，且绝不新建窗口。
+//
+// 新建窗口等于越过失败头，连续水位就断了；用 Bundle 行数与 cursor 双重钉住。
+func TestRunnerStepBacksOffWhenOnlyHeadBlocked(t *testing.T) {
+	e := newEnv(t)
+	e.captureFrom(t, "src-a", "ua1", "sa", "决定：甲", true)
+	bA := e.bundle(t)
+	var now int64 = 1000
+	if _, err := e.st.ClaimProposalBundle(bA.ID, "prep", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.FinishProposalBundle(bA.ID, "prep", "fail", now+3600, "run-prep"); err != nil {
+		t.Fatal(err)
+	}
+
+	bundlesBefore := queryInt(t, e.st.Path(), `SELECT COUNT(*) FROM evidence_bundles`)
+	cursorBefore := queryInt(t, e.st.Path(), `SELECT cursor_seq FROM evidence_sources WHERE id='src-a'`)
+
+	g, calls := gen("fake", func(GenerateRequest, int) (string, error) {
+		t.Error("头在退避中不应执行")
+		return "", nil
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, g)}, &now)
+	out, err := r.Step(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusBacklog || out.Blocked == "" {
+		t.Fatalf("应返回 backlog 并说明原因: %+v", out)
+	}
+	if out.BundleStatus != "" {
+		t.Fatalf("Step 级 backlog 不应写 BundleStatus: %+v", out)
+	}
+	if *calls != 0 {
+		t.Fatalf("退避中不应调用模型，calls=%d", *calls)
+	}
+	if got := queryInt(t, e.st.Path(), `SELECT COUNT(*) FROM evidence_bundles`); got != bundlesBefore {
+		t.Fatalf("不得越过失败头新建窗口: before=%d after=%d", bundlesBefore, got)
+	}
+	if got := queryInt(t, e.st.Path(), `SELECT cursor_seq FROM evidence_sources WHERE id='src-a'`); got != cursorBefore {
+		t.Fatalf("cursor 不得前进: before=%d after=%d", cursorBefore, got)
+	}
+	a, err := e.st.LoadProposalBundle(bA.ID)
+	if err != nil || a.Status != "fail" || a.Attempt != 1 {
+		t.Fatalf("头应保持原状: %+v err=%v", a, err)
+	}
+}
+
+// 队列里一条 open Bundle 都没有时才允许新建窗口——这是 Step 的主路径，
+// 也是「不越过失败头」的对偶：没有积压就该正常开新窗。
+func TestRunnerStepCreatesWindowWhenQueueEmpty(t *testing.T) {
+	e := newEnv(t)
+	e.capture(t, "u1", "s1", "决定：甲", true)
+	var now int64 = 1000
+	g, calls := gen("fake", func(GenerateRequest, int) (string, error) {
+		return `{"kind":"decision","content":"甲","evidence_idx":[1]}`, nil
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, g)}, &now)
+	out, err := r.Step(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusOK || out.Inserted != 1 || *calls != 1 {
+		t.Fatalf("空队列应新建窗口并处理: %+v calls=%d", out, *calls)
+	}
+	if n := queryInt(t, e.st.Path(), `SELECT COUNT(*) FROM evidence_bundles`); n != 1 {
+		t.Fatalf("应只新建一个窗口，got %d", n)
+	}
+}
+
+// F7：认领竞态——NextRunnable 选中 A 后，A 被别的 worker 抢先租走 → 继续跑 B。
+//
+// 用 BEFORE UPDATE 触发器模拟「另一个 writer 先赢」：内层把 A 写成他人租约，
+// 再 RAISE(IGNORE) 让本次认领影响 0 行，store 因此返回 ErrProposalBundleLeased。
+func TestRunnerStepRetriesNextHeadOnClaimRace(t *testing.T) {
+	e := newEnv(t)
+	e.captureFrom(t, "src-a", "ua1", "sa", "决定：甲", true)
+	e.captureFrom(t, "src-b", "ub1", "sb", "决定：乙", true)
+	bA := e.bundle(t)
+	bB := e.bundle(t)
+	setBundleCreatedAt(t, e.st.Path(), bA.ID, 100)
+	setBundleCreatedAt(t, e.st.Path(), bB.ID, 200)
+	execSQL(t, e.st.Path(), `CREATE TRIGGER race_claim_a BEFORE UPDATE ON evidence_bundles
+		WHEN OLD.id = '`+bA.ID+`' AND NEW.status = 'leased' BEGIN
+			UPDATE evidence_bundles SET status='leased', lease_owner='other', lease_until=9999
+				WHERE id = OLD.id;
+			SELECT RAISE(IGNORE);
+		END`)
+
+	var now int64 = 1000
+	g, calls := gen("fake", func(GenerateRequest, int) (string, error) {
+		return `{"kind":"decision","content":"乙","evidence_idx":[1]}`, nil
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, g)}, &now)
+	out, err := r.Step(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusOK || out.BundleID != bB.ID || *calls != 1 {
+		t.Fatalf("抢输后应继续尝试下一个可运行头: %+v calls=%d", out, *calls)
+	}
+	a, err := e.st.LoadProposalBundle(bA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.LeaseOwner != "other" || a.Attempt != 0 {
+		t.Fatalf("A 应保持竞态对手的租约、本 worker 未加 attempt: %+v", a)
+	}
+}
+
+// 认领竞态的上限：最多尝试 3 个候选头，全抢输就交回给调用方。
+// 第 4 个可运行头不得被顺手消费——否则「重试」会退化成无界扫描。
+func TestRunnerStepGivesUpAfterThreeClaimRaces(t *testing.T) {
+	e := newEnv(t)
+	for _, src := range []string{"src-a", "src-b", "src-c", "src-d"} {
+		e.captureFrom(t, src, "u-"+src, "s-"+src, "决定："+src, true)
+	}
+	ids := make([]string, 0, 4)
+	for i := 0; i < 4; i++ {
+		b := e.bundle(t)
+		ids = append(ids, b.ID)
+		setBundleCreatedAt(t, e.st.Path(), b.ID, int64(100+i*10))
+	}
+	// 任何本 worker 的认领都被「另一个 writer」抢走。
+	execSQL(t, e.st.Path(), `CREATE TRIGGER race_all_claims BEFORE UPDATE ON evidence_bundles
+		WHEN NEW.status = 'leased' AND NEW.lease_owner = 'test' BEGIN
+			UPDATE evidence_bundles SET status='leased', lease_owner='other', lease_until=9999
+				WHERE id = OLD.id;
+			SELECT RAISE(IGNORE);
+		END`)
+
+	var now int64 = 1000
+	g, _ := gen("fake", func(GenerateRequest, int) (string, error) {
+		t.Error("全抢输时不应执行")
+		return "", nil
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, g)}, &now)
+	out, err := r.Step(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusBacklog || !strings.Contains(out.Blocked, "竞态") {
+		t.Fatalf("全抢输应返回 backlog 并点名竞态: %+v", out)
+	}
+	if out.BundleStatus != "" {
+		t.Fatalf("Step 级 backlog 不应写 BundleStatus: %+v", out)
+	}
+	last, err := e.st.LoadProposalBundle(ids[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.LeaseOwner != "" || last.Status != "pending" {
+		t.Fatalf("第 4 个头不该被尝试: %+v", last)
+	}
+}
+
 func TestRunnerPersistFailureBecomesPartial(t *testing.T) {
 	e := newEnv(t)
 	e.capture(t, "u1", "s1", "决定：甲", true)
@@ -621,6 +826,34 @@ func execSQL(t *testing.T, path, stmt string) {
 	defer raw.Close()
 	if _, err := raw.Exec(stmt); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func queryInt(t *testing.T, path, stmt string) int {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var n int
+	if err := raw.QueryRow(stmt).Scan(&n); err != nil {
+		t.Fatalf("查询 %q: %v", stmt, err)
+	}
+	return n
+}
+
+// setBundleCreatedAt 固定 Bundle 年龄。真实取窗按 created_at,id 排序，
+// 同一秒内靠随机 id 兜底——测试要断言「谁是头」就必须显式定死顺序。
+func setBundleCreatedAt(t *testing.T, path, id string, ts int64) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`UPDATE evidence_bundles SET created_at = ? WHERE id = ?`, ts, id); err != nil {
+		t.Fatalf("固定 Bundle %s 年龄: %v", id, err)
 	}
 }
 
