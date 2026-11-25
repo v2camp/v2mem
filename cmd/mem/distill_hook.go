@@ -76,6 +76,9 @@ func distillSpawnEnabled() bool {
 // 不依赖 transcript_path，也不再做 SessionsNeedingDistill 的 due 判定。
 // 失败只打 stderr。
 func maybeSpawnDistill(db string, in hookInput) {
+	if automationDisabled() {
+		return
+	}
 	if !distillSpawnEnabled() {
 		return
 	}
@@ -96,6 +99,10 @@ func maybeSpawnDistill(db string, in hookInput) {
 // 子进程幂等：没有待处理证据窗口时 proposal 自然 skipped。拉起失败只打 stderr，
 // 不阻断本会话的注入（fail-open）。
 func distillPendingFailOpen(db string) {
+	// 唯一总闸优先：MEM_NO_AUTOMATION=1 时 SessionStart 也不拉起写侧子进程。
+	if automationDisabled() {
+		return
+	}
 	if strings.TrimSpace(os.Getenv("MEM_NO_DISTILL")) == "1" {
 		return
 	}

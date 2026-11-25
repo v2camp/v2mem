@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -85,7 +86,7 @@ type maintainStep struct {
 	Error        string `json:"error,omitempty"`
 }
 
-func cmdMaintain(args []string) error {
+func cmdMaintain(args []string) (retErr error) {
 	var c common
 	fs := flag.NewFlagSet("maintain", flag.ContinueOnError)
 	c.register(fs)
@@ -111,6 +112,14 @@ func cmdMaintain(args []string) error {
 		return err
 	}
 	defer st.Close()
+	// 失败点亮（S11 触达面）：任何已开库后的失败都写 last_fail_at + 简短原因，
+	// 下一次 SessionStart 就能在注入行里看到「维护失败」。成功路径由 markMaintainOK
+	// 写 last_ok，触达面按 last_ok >= last_fail 判恢复，不需要手动清键。
+	defer func() {
+		if retErr != nil {
+			markMaintainFail(st, retErr)
+		}
+	}()
 
 	model, timeout := distill.LoadConfig(distill.ConfigPath())
 	cfg, err := distill.LoadModelConfig("")
@@ -299,4 +308,21 @@ func printMaintainReport(rep *maintainReport, asJSON bool) error {
 		fmt.Printf("提示: 仍有 %d 个未终结窗口（预算耗尽或让位），再跑一次 mem maintain 继续追账\n", rep.Remaining)
 	}
 	return nil
+}
+
+// markMaintainFail 记录最近一次维护失败（S11 触达面读它决定是否点亮「维护失败」）。
+//
+// 与 markMaintainOK 一样：写失败只告警，不改退出码。失败本身已经返回给调用方，
+// 一行元数据不该把错误类型再改一次。
+// 原因只留一行、截到 120 rune：注入行只显示「维护失败」，原因供 `mem stats`/排障读取，
+// 不塞进会话上下文。
+func markMaintainFail(st *store.Store, cause error) {
+	if err := st.MetaSet(store.MetaMaintainLastFailAt, strconv.FormatInt(time.Now().Unix(), 10)); err != nil {
+		fmt.Fprintf(os.Stderr, "警告：记录维护失败时间失败: %v\n", err)
+		return
+	}
+	reason := strings.TrimSpace(oneLine(truncateRunes(cause.Error(), 120)))
+	if err := st.MetaSet(store.MetaMaintainLastFailReason, reason); err != nil {
+		fmt.Fprintf(os.Stderr, "警告：记录维护失败原因失败: %v\n", err)
+	}
 }

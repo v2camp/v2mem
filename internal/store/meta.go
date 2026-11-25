@@ -6,6 +6,16 @@ import "database/sql"
 // 从未维护时键不存在 → mem stats 显示 null，「从未维护」与「刚维护过」必须可区分。
 const MetaMaintainLastOK = "maintain:last_ok"
 
+// MetaMaintainLastFailAt / MetaMaintainLastFailReason 记录最近一次维护失败（S11）。
+//
+// 与 last_ok 分开存而不是互相覆盖：两者回答的问题不同——last_ok 是水位，
+// last_fail 是「有没有需要人看一眼的故障」。触达面按 last_ok >= last_fail 判定恢复，
+// 成功维护后自动熄灭，不需要手动清键。
+const (
+	MetaMaintainLastFailAt     = "maintain:last_fail_at"
+	MetaMaintainLastFailReason = "maintain:last_fail_reason"
+)
+
 // ProjectMemoryCount 返回某个工程已入库的记忆条数。
 // 冷启动判定只关心「这个工程还没有任何已采纳记忆」，不需要扫描全库。
 func (s *Store) ProjectMemoryCount(project string) (int, error) {

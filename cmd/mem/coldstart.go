@@ -46,6 +46,10 @@ func maybeSpawnColdStart(db string, in hookInput, project string, event harness.
 	if event != harness.EventSessionEnd {
 		return
 	}
+	// 唯一总闸：冷启动也是自动 spawn，总闸下必须静默让路。
+	if automationDisabled() {
+		return
+	}
 	if distillSpawnEnabled() {
 		return
 	}
