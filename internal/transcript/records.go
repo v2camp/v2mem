@@ -366,10 +366,18 @@ var (
 	// 该声明只在「这条不是用户输入」时出现，故命中即整条判非用户；
 	// 万一用户真去逐字复述这句话，代价也只是这一条不进提案，不会污染记忆。
 	sysNoticeRe = regexp.MustCompile(`\[SYSTEM NOTIFICATION - NOT USER INPUT\]`)
-	// 宿主会把上面两个块按长度截断后送进来（活库 2026-11-23 12:05 的历史摘要
+	// 用户引用附件（文档/图片/长文本）时，宿主把正文就地展开成
+	// `@long-text:"<预览>…" <long_text_quote>全文</long_text_quote>`，并且这段
+	// 展开就在 <user_query> 里面。全文是文件内容、预览是被截断的文件开头，
+	// 两句都不是用户说的话；不剥掉的话 240 rune 的提案会被文件正文占满
+	// （活库 2026-11-23 11:55 / 20:18 四条候选即此形态），检索 query 也会被
+	// 整篇文档淹没。归档 Raw 仍保真，这里只影响查询源/提案输入。
+	longTextQuoteRe = regexp.MustCompile(`(?s)<long_text_quote\b[^>]*>.*?</long_text_quote>`)
+	longTextRefRe   = regexp.MustCompile(`@long-text:"[^"]*"`)
+	// 宿主会把上面这些块按长度截断后送进来（活库 2026-11-23 12:05 的历史摘要
 	// 就只有 391 rune、没有闭合标签）。成对剥离之后再兜一层：残留的开标签一律
-	// 剥到文末，否则半截回顾照样会被当成用户原话写进提案。
-	unterminatedHostRe = regexp.MustCompile(`(?s)<(?:task-notification|conversation_history_summary)\b[^>]*>.*`)
+	// 剥到文末，否则半截回顾/半篇附件照样会被当成用户原话写进提案。
+	unterminatedHostRe = regexp.MustCompile(`(?s)<(?:task-notification|conversation_history_summary|long_text_quote)\b[^>]*>.*`)
 )
 
 // stripHostBlocks 剥掉宿主注入的整块文本，返回剥完的结果（可能为空串）。
@@ -378,7 +386,9 @@ func stripHostBlocks(s string) string {
 	s = systemReminderRe.ReplaceAllString(s, "")
 	s = hostNoticeRe.ReplaceAllString(s, "")
 	s = historySummaryRe.ReplaceAllString(s, "")
-	return unterminatedHostRe.ReplaceAllString(s, "")
+	s = longTextQuoteRe.ReplaceAllString(s, "")
+	s = unterminatedHostRe.ReplaceAllString(s, "")
+	return longTextRefRe.ReplaceAllString(s, "")
 }
 
 // UserQueryText 从宿主拼装的用户消息里取出「用户真正说的话」。
@@ -387,14 +397,16 @@ func stripHostBlocks(s string) string {
 // 当前时间…）全部塞在同一条消息前面，真正的提问包在 <user_query> 里。若整段
 // 原样进提案，400 rune 的投影会全被注入上下文占满，用户请求反而看不到。
 // 优先取 <user_query>；没有该标签时剥掉 system-reminder、task-notification、
-// conversation_history_summary 三个块，命中 [SYSTEM NOTIFICATION - NOT USER INPUT]
-// 的整条判非用户。
+// conversation_history_summary、long_text_quote 几个块，命中
+// [SYSTEM NOTIFICATION - NOT USER INPUT] 的整条判非用户。
+// 注意：附件展开块就在 <user_query> 内部，所以取到标签之后同样要过 stripHostBlocks，
+// 不能直接返回 m[1]。
 // 只用于查询源（summary / 提案输入），归档 Raw 仍保留完整原文。
 func UserQueryText(s string) string {
 	if ms := userQueryRe.FindAllStringSubmatch(s, -1); len(ms) > 0 {
 		parts := make([]string, 0, len(ms))
 		for _, m := range ms {
-			if v := strings.TrimSpace(m[1]); v != "" {
+			if v := strings.TrimSpace(stripHostBlocks(m[1])); v != "" {
 				parts = append(parts, v)
 			}
 		}
