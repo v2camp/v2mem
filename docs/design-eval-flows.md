@@ -72,11 +72,12 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 | G12 | 候选 → 裁决 | 逐 Bundle 窗口「终态数 = 准入数」，准出率 100%（复用账本对账） | candidates | `eval flow` 的 G12 |
 | G13 | 候选 → 裁决 | 同一会话同一内容不重复落库；采纳不得无证据强写 | candidates、candidate_evidence | `eval flow` 的 G13 |
 
-### 3.2 故障矩阵（S9a：hook / gc / distill）
+### 3.2 故障矩阵（S9a/S9b：hook / gc / distill / maintain）
 
 > 判据不是「命令返回 0」，而是**不丢数据、不静默、重启幂等、退出码如实**。
 > 单元格写的是注入手法与期望终态；`—` 表示该入口无此故障面（如 gc 不读外部输入）。
-> 自动注入：`test/faults`（`make test-faults`）；maintain 入口见 S9b。
+> 自动注入：`test/faults`（`make test-faults`）；**F1–F12 覆盖 hook/gc/distill/maintain**。
+> 前三列（S9a）见下表；maintain 入口的 F7–F12 见 §3.2.1。
 
 | ID | 故障 | hook | gc | distill |
 |:---|:---|:---|:---|:---|
@@ -90,6 +91,20 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 **dry-run / force 列**：`distill --dry-run --bundle` 在候选写入被全面注入失败时仍须
 退出 0、0 写入、不消费窗口；`gc --no-backup` 是破坏性路径的 force 开关，故障用例
 一律显式带上，避免备份目录干扰注入点。hook 无 dry-run/force 面。
+
+#### 3.2.1 maintain 入口（S9b，F7–F12）
+
+| ID | 故障 | 注入与期望终态 |
+|:---|:---|:---|
+| F7 | 部分写（第 2 条候选 INSERT 失败） | `FailWritesWhere(candidates, INSERT)` 命中候选二 → JSON 报 `partial=1`、逐窗 `error` 与 stderr 带注入原因；成功那条与 `candidate_evidence` 同事务落库，无半提交；撤销后 `--force` 重跑按内容去重，恰好 2 条、0 重复 |
+| F8 | kill -9 中途（Executor 执行中） | 假 CLI 写同步 marker 后阻塞 → SIGKILL；Bundle 停在 `leased` 且租约有效、0 候选；租约到期后重启接管，`attempt` 只 +1、候选补齐且无重复、租约释放（不永久 leased） |
+| F9 | 只读/不可写（库目录 0555） | `maintain` 非 0，stderr 可诊断、不 panic；Bundle 仍 pending、attempt=0、无候选、不写 `maintain:last_ok` |
+| F10 | SQLITE_BUSY（另连接持 `BEGIN IMMEDIATE`） | 非 0，stderr 含 busy/locked，不 panic；Bundle 状态/attempt/租约不变、0 候选；解锁后重跑完成 |
+| F11 | `--dry-run` × 全表写故障 | `candidates` 与 `evidence_bundles` 装写触发器 → 仍必须退出 0；`would_generate=1`、remaining 不变、0 候选、0 运行账、Bundle 未认领、不写 `last_ok`/`last_fail_at` |
+| F12 | `--force` + 退避中的 failed 头 + 候选写故障 | 清退避后立即重试，`fail=1` 且 error 逐窗可见；`attempt` 仅由 claim 加 1（2→3），失败后重新进入退避；再次不 `--force` 只让位，attempt/status 不变、0 候选 |
+
+> F9 的 `maintain:last_fail_at` 尚未落地（基线 S8 只写 `maintain:last_ok`）：
+> 本片不改产品，只守「失败可见 + 状态一致」，该键留给 S11/后续补齐。
 
 **无法从库表/审计自动判定的口径（需 U 类人工或独立注入 case，不在 G1–G13 内）**：
 
