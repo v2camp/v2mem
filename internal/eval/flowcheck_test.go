@@ -438,3 +438,72 @@ func TestFlowCheckEdgeBranches(t *testing.T) {
 		t.Fatal("G13 无证据强写必须失败")
 	}
 }
+
+// S10a：G9 承认三类「非裁决驱动」状态。
+// failed 是重试队列（G12 仍不许它当终态），quarantined/withdrawn 是明确终态，
+// 它们本来就不该有 accept/reject 裁决——此前一律判「状态非法」，会逼实现为了过闸去伪造裁决。
+func TestCheckFlowG9AdmitsFailedQuarantinedWithdrawn(t *testing.T) {
+	s := cleanSnapshot(1_700_000_000)
+	for _, st := range []string{"failed", "quarantined", "withdrawn"} {
+		s.Candidates = append(s.Candidates, FlowCandidate{ID: "c-" + st, SessionID: "s-" + st,
+			ContentHash: "h-" + st, Status: st, BundleID: "bA", CreatedAt: s.Now})
+	}
+	c, ok := checkByID(CheckFlow(s, testFlowWindow), "G9")
+	if !ok || !c.Pass {
+		t.Fatalf("failed/quarantined/withdrawn 应被 G9 承认: %+v", c)
+	}
+	// 但真正非法的状态仍然要红：白名单不是「什么都放行」。
+	s.Candidates = append(s.Candidates, FlowCandidate{ID: "c-bad", SessionID: "s-bad",
+		ContentHash: "h-bad", Status: "weird", BundleID: "bA", CreatedAt: s.Now})
+	if c, _ := checkByID(CheckFlow(s, testFlowWindow), "G9"); c.Pass {
+		t.Fatal("未知状态仍必须判非法")
+	}
+}
+
+// S10a：`mem batch --rollback` 把候选退回 pending 后，历史终态裁决仍在。
+// pending 的「已有终态裁决」只能看**最近一次 reopen 之后**的部分，
+// 否则回滚过的候选会被永久判红。
+func TestCheckFlowG9PendingIgnoresDecisionsBeforeReopen(t *testing.T) {
+	now := int64(1_700_000_000)
+	newPending := func() FlowCandidate {
+		return FlowCandidate{ID: "cR", SessionID: "sR", ContentHash: "hR", Status: "pending",
+			BundleID: "bA", Revision: 2, CreatedAt: now}
+	}
+
+	// 回滚后 pending：accept(rev0) → reopen(rev1)，此后没有新裁决 ⇒ 合规。
+	s := cleanSnapshot(now)
+	s.Candidates = append(s.Candidates, newPending())
+	s.Decisions = append(s.Decisions,
+		FlowDecision{CandidateID: "cR", Revision: 0, Action: "human_accept", Actor: "human", MemoryID: "m1", IdempotencyKey: "kR0"},
+		FlowDecision{CandidateID: "cR", Revision: 1, Action: "reopen", Actor: "human-reviewed-llm", IdempotencyKey: "kR1"})
+	if c, _ := checkByID(CheckFlow(s, testFlowWindow), "G9"); !c.Pass {
+		t.Fatalf("reopen 之前的终态裁决不应判红: %s", c.Detail)
+	}
+
+	// reopen 之后又落了一次终态裁决 ⇒ 说明状态没跟着走，必须红。
+	s.Decisions = append(s.Decisions,
+		FlowDecision{CandidateID: "cR", Revision: 2, Action: "reject", Actor: "human", IdempotencyKey: "kR2"})
+	if c, _ := checkByID(CheckFlow(s, testFlowWindow), "G9"); c.Pass {
+		t.Fatal("reopen 之后的终态裁决必须判红")
+	}
+}
+
+// S10a：G12 终态集合 = accepted/rejected/expired/quarantined/withdrawn。
+// failed 不是终态：它还在重试队列里，算成终态会让准出率虚高。
+func TestCheckFlowG12TerminalSet(t *testing.T) {
+	now := int64(1_700_000_000)
+	s := cleanSnapshot(now)
+	s.Candidates = []FlowCandidate{
+		{ID: "c1", SessionID: "s1", ContentHash: "h1", Status: "accepted", MemoryID: "m1", BundleID: "bA", CreatedAt: now},
+		{ID: "c2", SessionID: "s2", ContentHash: "h2", Status: "quarantined", BundleID: "bA", CreatedAt: now},
+		{ID: "c3", SessionID: "s3", ContentHash: "h3", Status: "withdrawn", BundleID: "bA", CreatedAt: now},
+	}
+	if c, _ := checkByID(CheckFlow(s, testFlowWindow), "G12"); !c.Pass {
+		t.Fatalf("quarantined/withdrawn 应计入终态: %s", c.Detail)
+	}
+	s.Candidates = append(s.Candidates, FlowCandidate{ID: "c4", SessionID: "s4",
+		ContentHash: "h4", Status: "failed", BundleID: "bA", CreatedAt: now})
+	if c, _ := checkByID(CheckFlow(s, testFlowWindow), "G12"); c.Pass {
+		t.Fatal("failed 不算终态：未重试完就走完的窗口必须判悬空")
+	}
+}

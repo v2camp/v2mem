@@ -116,7 +116,10 @@ func TestEnsureWriterStampSameVersion(t *testing.T) {
 // 分支 3：库版本更高 → ErrDBSchemaNewer，且错误文本含具体版本数字。
 func TestEnsureWriterStampNewerDB(t *testing.T) {
 	db := openStampDB(t)
-	stampSetVersion(t, db, "3")
+	// 用相对版本而不是字面量：CurrentSchemaVersion 每升一版都要 +1，
+	// 写死「3」会在下一次升版时让这条守卫静默失效（3 变成「同版本」）。
+	newer := strconv.Itoa(CurrentSchemaVersion + 1)
+	stampSetVersion(t, db, newer)
 
 	_, err := EnsureWriterStamp(context.Background(), db, "v0.8.0", 1700000000)
 	if err == nil {
@@ -126,13 +129,13 @@ func TestEnsureWriterStampNewerDB(t *testing.T) {
 		t.Fatalf("应可用 errors.Is 判定为 ErrDBSchemaNewer，got %v", err)
 	}
 	msg := err.Error()
-	for _, want := range []string{"3", "v0.8.0", strconv.Itoa(CurrentSchemaVersion)} {
+	for _, want := range []string{newer, "v0.8.0", strconv.Itoa(CurrentSchemaVersion)} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("错误文案应含 %q，实际: %s", want, msg)
 		}
 	}
 	// 拒绝打开时不得改写库里的版本。
-	if kv := stampMetaKV(t, db); kv["schema_version"] != "3" {
+	if kv := stampMetaKV(t, db); kv["schema_version"] != newer {
 		t.Fatalf("拒绝打开时不应改写 schema_version，got %q", kv["schema_version"])
 	}
 }

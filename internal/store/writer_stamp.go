@@ -12,7 +12,14 @@ import (
 
 // CurrentSchemaVersion 是当前二进制理解的数据结构版本。任何改变「读出来的数据形状」的
 // 迁移都必须 +1，否则降级守卫失效。
-const CurrentSchemaVersion = 2
+//
+// 版本史（口径见 docs/design-db-stamp.md）：
+//   - v2：Evidence 账本 + 候选裁决账（commit_decisions）落地。
+//   - v3：S10a 复核数据面——memories.review_state / reviewed_at / reviewed_by、
+//     candidates.status_reason / judge_reason / attempt、commit_decisions.model_tag /
+//     created_memory。新代码依赖这些列（检索可见性看 review_state、复核视图看 attempt），
+//     旧二进制读到迁移后的库会按旧形状解释新数据，故必须 +1。
+const CurrentSchemaVersion = 3
 
 // ErrDBSchemaNewer 表示库由更新的二进制写过，当前二进制只理解更旧的 schema。
 // 调用方应直接用 errors.Is 判定并拒绝打开，而不是尝试降级读。

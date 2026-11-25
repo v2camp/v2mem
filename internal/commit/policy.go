@@ -92,6 +92,12 @@ const (
 	ActorHumanReviewedLLM = "human-reviewed-llm"
 	// ActorJudge 是判定器自己落库（历史数据）。转正前不该再产生这种样本。
 	ActorJudge = "judge"
+	// ActorModelAuto 是「模型自动采纳」这一档（docs/design-data-lifecycle.md §6.3）。
+	//
+	// 与 ActorAuto 分开：ActorAuto 是确定性提交矩阵的动作，ActorModelAuto 是模型
+	// 按提示词作出的裁决——后者的错误率要用 `model@promptver` 归因、要能被按版本回滚，
+	// 混进 ActorAuto 就永久失去这条线索。它也**不**计入人工一致率（JudgeStats 只认 ActorHuman）。
+	ActorModelAuto = "model-auto"
 )
 
 // taskStates 是 task 类候选允许的明确状态。

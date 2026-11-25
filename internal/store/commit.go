@@ -70,6 +70,9 @@ type CommitCandidate struct {
 	Revision    int     `json:"revision"`
 	Salience    float64 `json:"salience"`
 	MemoryID    string  `json:"memory_id,omitempty"`
+	// JudgeModel 是判定器给这条候选打 verdict 时用的 model@promptver（空=没判过）。
+	// 自动采纳要把它带进 commit_decisions.model_tag：按版本回滚靠这个维度。
+	JudgeModel string `json:"judge_model,omitempty"`
 }
 
 // Proposal 把提交视图映射成 commit 包的只读候选，供矩阵裁决。
@@ -102,7 +105,7 @@ type CommitResult struct {
 
 const commitCandidateColumns = `id, session_id, project, kind, content, content_hash,
 	status, channel, scope, review_class, subject_key, task_state, rationale,
-	revision, salience, memory_id`
+	revision, salience, memory_id, judge_model`
 
 func scanCommitCandidate(row interface{ Scan(...any) error }) (*CommitCandidate, error) {
 	var c CommitCandidate
@@ -110,7 +113,7 @@ func scanCommitCandidate(row interface{ Scan(...any) error }) (*CommitCandidate,
 	var review, scope, subject, task, rationale, channel string
 	if err := row.Scan(&c.ID, &c.SessionID, &c.Project, &c.Kind, &c.Content, &c.ContentHash,
 		&c.Status, &channel, &scope, &review, &subject, &task, &rationale,
-		&c.Revision, &c.Salience, &memory); err != nil {
+		&c.Revision, &c.Salience, &memory, &c.JudgeModel); err != nil {
 		return nil, err
 	}
 	c.Channel, c.Scope, c.ReviewClass = channel, scope, review
@@ -366,7 +369,7 @@ func (s *Store) CommitAccept(idOrPrefix string, expectedRevision int, actor stri
 	if err != nil {
 		return nil, err
 	}
-	return s.commitAcceptView(c, expectedRevision, actor, commit.ActionHumanAccept, nil)
+	return s.commitAcceptView(c, expectedRevision, actor, commit.ActionHumanAccept, nil, "")
 }
 
 // AutoCommitCandidate 按矩阵裁决：只有 ActionAutoCommit 才写记忆，其余只记裁决。
@@ -388,7 +391,8 @@ func (s *Store) AutoCommitCandidate(idOrPrefix string, expectedRevision int) (*C
 		return nil, err
 	}
 	if d.Action == commit.ActionAutoCommit {
-		return s.commitAcceptView(c, expectedRevision, commit.ActorAuto, d.Action, d.ReasonCodes)
+		// 自动采纳带候选的 judge_model：model_tag 是「这条是 model@promptver 写的」的唯一凭据。
+		return s.commitAcceptView(c, expectedRevision, commit.ActorAuto, d.Action, d.ReasonCodes, c.JudgeModel)
 	}
 	res := &CommitResult{
 		Action: d.Action, Actor: commit.ActorAuto, EvidenceHash: d.EvidenceHash,
@@ -400,7 +404,7 @@ func (s *Store) AutoCommitCandidate(idOrPrefix string, expectedRevision int) (*C
 			return err
 		}
 		if err := recordDecision(ctx, q, cur.ID, cur.Revision, d.EvidenceHash, d.Action,
-			commit.ActorAuto, d.ReasonCodes, cur.MemoryID); err != nil {
+			commit.ActorAuto, d.ReasonCodes, cur.MemoryID, "", false); err != nil {
 			return err
 		}
 		return nil
@@ -416,8 +420,9 @@ func (s *Store) AutoCommitCandidate(idOrPrefix string, expectedRevision int) (*C
 	return res, nil
 }
 
+// modelTag 是做出这次采纳的 model@promptver；人工裁决传空串。
 func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, actor string,
-	action commit.Action, reasons []string) (*CommitResult, error) {
+	action commit.Action, reasons []string, modelTag string) (*CommitResult, error) {
 	if actor == "" {
 		actor = commit.ActorHuman
 	}
@@ -445,7 +450,7 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 				return fmt.Errorf("%w: 候选 %s 当前 revision=%d, 期望 %d",
 					ErrRevisionConflict, cur.ID, cur.Revision, expectedRevision)
 			}
-			r, err := s.replayAccepted(ctx, q, cur, rows, evidenceHash, action, actor, reasons)
+			r, err := s.replayAccepted(ctx, q, cur, rows, evidenceHash, action, actor, reasons, modelTag)
 			if err != nil {
 				return err
 			}
@@ -494,7 +499,8 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 		} else if n == 0 {
 			return fmt.Errorf("%w: 候选 %s", ErrRevisionConflict, cur.ID)
 		}
-		if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash, action, actor, reasons, memoryID); err != nil {
+		if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash, action, actor, reasons,
+			memoryID, modelTag, createdMemory); err != nil {
 			return err
 		}
 		out = &CommitResult{
@@ -525,7 +531,7 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 // 采纳次数随重试次数膨胀，指标完全失真。同时也不重写 memories 的正文/时间戳。
 func (s *Store) replayAccepted(ctx context.Context, q sqlQuerier, cur *CommitCandidate,
 	rows []candidateEvidenceRow, evidenceHash string, action commit.Action,
-	actor string, reasons []string) (*CommitResult, error) {
+	actor string, reasons []string, modelTag string) (*CommitResult, error) {
 	if cur.MemoryID == "" {
 		return nil, fmt.Errorf("候选 %s 已采纳但缺少 memory_id，不能重放", cur.ID)
 	}
@@ -551,7 +557,9 @@ func (s *Store) replayAccepted(ctx context.Context, q sqlQuerier, cur *CommitCan
 		cur.MemoryID, cur.ID); err != nil {
 		return nil, err
 	}
-	if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash, action, actor, reasons, cur.MemoryID); err != nil {
+	// 重放不是「又新建了一条」：created_memory 必须为 0，否则按版本回滚会误删别人的记忆。
+	if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash, action, actor, reasons,
+		cur.MemoryID, modelTag, false); err != nil {
 		return nil, err
 	}
 	return &CommitResult{
@@ -638,8 +646,14 @@ func writeMemoryEvidence(ctx context.Context, q sqlQuerier, memoryID string, row
 	return nil
 }
 
+// recordDecision 写一条裁决账。
+//
+// modelTag 记录做出这次裁决的 model@promptver（非模型裁决传空串），
+// createdMemory 记录这次是否**新建**了记忆行。两者都是「按版本回滚」的前提：
+// 没有 model_tag 就只能整批撤，没有 created_memory 就会把别人的记忆一起删掉。
 func recordDecision(ctx context.Context, q sqlQuerier, candidateID string, revision int,
-	evidenceHash string, action commit.Action, actor string, reasons []string, memoryID string) error {
+	evidenceHash string, action commit.Action, actor string, reasons []string, memoryID string,
+	modelTag string, createdMemory bool) error {
 	if reasons == nil {
 		reasons = []string{}
 	}
@@ -647,13 +661,17 @@ func recordDecision(ctx context.Context, q sqlQuerier, candidateID string, revis
 	if err != nil {
 		return err
 	}
+	created := 0
+	if createdMemory {
+		created = 1
+	}
 	key := commit.IdempotencyKey(candidateID, revision, action, evidenceHash)
 	_, err = q.ExecContext(ctx, `INSERT OR IGNORE INTO commit_decisions(
 		id, candidate_id, revision, evidence_hash, action, actor, reason_codes_json,
-		memory_id, idempotency_key, created_at
-	) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		memory_id, model_tag, created_memory, idempotency_key, created_at
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		"dec_"+newID(), candidateID, revision, evidenceHash, string(action), actor,
-		string(raw), memoryID, key, time.Now().Unix())
+		string(raw), memoryID, strings.TrimSpace(modelTag), created, key, time.Now().Unix())
 	return err
 }
 
@@ -687,7 +705,7 @@ func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, rea
 					ErrRevisionConflict, cur.ID, cur.Revision, expectedRevision)
 			}
 			if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash,
-				commit.ActionReject, actor, reasons, ""); err != nil {
+				commit.ActionReject, actor, reasons, "", "", false); err != nil {
 				return err
 			}
 			out = &CommitResult{Action: commit.ActionReject, Actor: actor,
@@ -715,7 +733,7 @@ func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, rea
 			return fmt.Errorf("%w: 候选 %s", ErrRevisionConflict, cur.ID)
 		}
 		if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash,
-			commit.ActionReject, actor, reasons, ""); err != nil {
+			commit.ActionReject, actor, reasons, "", "", false); err != nil {
 			return err
 		}
 		out = &CommitResult{Action: commit.ActionReject, Actor: actor,
@@ -785,7 +803,7 @@ func (s *Store) RollbackCandidate(idOrPrefix, actor string, deleteMemory bool, e
 		// 记一笔 reopen：否则裁决历史里最后一次动作还是 accept/reject，
 		// 事后无法解释「为什么这条又回到 pending 了」。
 		if err := recordDecision(ctx, q, cur.ID, cur.Revision, "",
-			commit.ActionReopen, actor, []string{"rollback"}, cur.MemoryID); err != nil {
+			commit.ActionReopen, actor, []string{"rollback"}, cur.MemoryID, "", false); err != nil {
 			return err
 		}
 		out = &CommitResult{Action: commit.ActionReopen, Actor: actor,

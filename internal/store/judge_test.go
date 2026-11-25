@@ -17,18 +17,25 @@ func TestMarkJudgeVerdictKeepsStatus(t *testing.T) {
 		t.Fatalf("InsertCandidate: %v", err)
 	}
 	id := res.Candidate.ID
+	// 提案理由先落一条：判定理由必须写在独立列，不能覆盖它（design §7 第 5 条）。
+	if _, err := s.db.Exec(`UPDATE candidates SET rationale = '提案自己的理由' WHERE id = ?`, id); err != nil {
+		t.Fatalf("seed rationale: %v", err)
+	}
 
 	if err := s.MarkJudgeVerdict(id, "reject", "ollama@judge-v2", "process_narrative"); err != nil {
 		t.Fatalf("MarkJudgeVerdict: %v", err)
 	}
-	var verdict, model, reason, status string
+	var verdict, model, reason, status, rationale string
 	if err := s.db.QueryRow(
-		`SELECT judge_verdict, judge_model, rationale, status FROM candidates WHERE id = ?`, id,
-	).Scan(&verdict, &model, &reason, &status); err != nil {
+		`SELECT judge_verdict, judge_model, judge_reason, status, rationale FROM candidates WHERE id = ?`, id,
+	).Scan(&verdict, &model, &reason, &status, &rationale); err != nil {
 		t.Fatalf("读回判定痕迹: %v", err)
 	}
 	if verdict != "reject" || model != "ollama@judge-v2" || reason != "process_narrative" {
 		t.Errorf("判定痕迹应原样落库，got verdict=%q model=%q reason=%q", verdict, model, reason)
+	}
+	if rationale != "提案自己的理由" {
+		t.Errorf("判定理由不得覆盖提案 rationale，got %q", rationale)
 	}
 	if status != "pending" {
 		t.Fatalf("MarkJudgeVerdict 不得改状态，got %q", status)
@@ -233,7 +240,7 @@ func TestListJudgeRejectsOnlyPendingRejects(t *testing.T) {
 		t.Fatalf("应只出两条未裁决的 reject，got %+v", got)
 	}
 	for _, r := range got {
-		if r.ID == first && (r.Rationale != "process_narrative" || r.Kind != "fact") {
+		if r.ID == first && (r.JudgeReason != "process_narrative" || r.Kind != "fact") {
 			t.Errorf("理由码与 kind 应带出来，got %+v", r)
 		}
 	}

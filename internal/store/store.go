@@ -149,6 +149,11 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("迁移 Evidence schema 失败: %w", err)
 	}
+	// S10a：复核状态列（schema v3）。补列的那一次顺带回填直写来源，见 ensureReviewSchema。
+	if err := ensureReviewSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移复核 schema 失败: %w", err)
+	}
 	return st, nil
 }
 
@@ -565,10 +570,21 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	}
 	defer tx.Rollback()
 
+	// 直写默认视为人工已审核（design-data-lifecycle §6.4）：这是「直接写最终记忆」的
+	// 显式通道，不该再进复核摘要。非直写来源（如测试里显式传 distill-accept）保持未审核。
+	direct := isDirectWriteSource(in.Source)
+	reviewState, reviewedAt, reviewedBy := ReviewStateNone, int64(0), ""
+	if direct {
+		reviewState, reviewedAt, reviewedBy = ReviewStateConfirmed, now, in.Source
+	}
+
 	var id string
+	var curReview, curBy string
+	var curAt int64
 	err = tx.QueryRow(
-		`SELECT id FROM memories WHERE content_hash = ? AND project = ?`, h, in.Project,
-	).Scan(&id)
+		`SELECT id, review_state, reviewed_at, reviewed_by FROM memories WHERE content_hash = ? AND project = ?`,
+		h, in.Project,
+	).Scan(&id, &curReview, &curAt, &curBy)
 
 	created := false
 	provJSON := provenanceJSON(in.Provenance)
@@ -576,14 +592,20 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	case err == nil:
 		// 相同知识覆盖：刷新时间戳、累加命中、salience 取较大值。
 		// provenance 仅当本次提供了新溯源时才覆盖，否则保留原有（COALESCE NULL）。
+		// 审核状态同理：已撤回/已修正的行保持原状——覆盖正文不等于重新审核，
+		// 默默把 withdrawn 改回 confirmed 会把人工撤回的决定擦掉。
+		if !(curReview == ReviewStateNone && direct) {
+			reviewState, reviewedAt, reviewedBy = curReview, curAt, curBy
+		}
 		if _, err = tx.Exec(
 			`UPDATE memories SET content = ?, content_idx = ?, updated_at = ?, last_seen_at = ?,
 			        access_count = access_count + 1, salience = MAX(salience, ?),
 			        expires_at = ?, origin_tool = ?, source = ?
 			        , provenance = COALESCE(?, provenance)
+			        , review_state = ?, reviewed_at = ?, reviewed_by = ?
 			 WHERE id = ?`,
 			in.Content, idx, now, now, in.Salience, expires, in.Tool, in.Source,
-			nullable(provJSON), id,
+			nullable(provJSON), reviewState, reviewedAt, reviewedBy, id,
 		); err != nil {
 			return nil, err
 		}
@@ -594,10 +616,12 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 			`INSERT INTO memories
 			   (id, content, content_idx, kind, content_hash, project, salience,
 			    created_at, updated_at, last_seen_at, expires_at,
-			    origin_device, origin_tool, source, channel, provenance, access_count)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)`,
+			    origin_device, origin_tool, source, channel, provenance, access_count,
+			    review_state, reviewed_at, reviewed_by)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)`,
 			id, in.Content, idx, in.Kind, h, in.Project, in.Salience,
 			now, now, now, expires, in.Device, in.Tool, in.Source, in.Channel, nullable(provJSON),
+			reviewState, reviewedAt, reviewedBy,
 		); err != nil {
 			return nil, err
 		}
@@ -1352,6 +1376,10 @@ func visibilityWhere() []string {
 		// 已被相似归并取代的记忆不再出现：否则用户会同时看到两条互相矛盾的答案。
 		// 它们仍留在库里（可由 export 带走、可追溯），只是不参与检索。
 		"m.superseded_by IS NULL",
+		// 人工撤回（docs/design-data-lifecycle.md §6.4）：立即退出主检索，但**不复用**
+		// superseded_by——那是「被新版本取代」，与「这条是错的」是两件事，混用会让
+		// 撤回变成不可逆的归并，恢复时找不到原状态。
+		"m.review_state <> 'withdrawn'",
 	}
 }
 

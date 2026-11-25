@@ -24,12 +24,20 @@ CREATE TABLE IF NOT EXISTS memories (
   access_count  INTEGER NOT NULL DEFAULT 0,
   scope         TEXT NOT NULL DEFAULT '', -- project|global|cross_project；空=legacy 未定
   adopted_count INTEGER NOT NULL DEFAULT 0,
-  last_adopted_at INTEGER
+  last_adopted_at INTEGER,
+  -- 人工后审核（docs/design-data-lifecycle.md §6.4）：'' 未审核 | confirmed | corrected | withdrawn。
+  -- withdrawn 必须退出检索（visibilityWhere），但行与证据保留：撤回不是删除。
+  -- 直写来源（mem add 等）写入即 confirmed；distill-accept 一律 '' 等人工看。
+  review_state  TEXT NOT NULL DEFAULT '',
+  reviewed_at   INTEGER NOT NULL DEFAULT 0,
+  reviewed_by   TEXT NOT NULL DEFAULT ''
 );
 
 -- 既有库（在此列加入前创建）没有 source 列：Open 时用 ensureColumn 幂等补上；
 -- 对应索引 ix_mem_source 在 ensureColumn 里补列成功后一并创建。
 -- provenance 为后加列：ensureColumn 幂等 ALTER，存量行保持 NULL（无溯源）。
+-- review_state/reviewed_* 是 S10a 后加列（schema v3）：ensureReviewSchema 补列并**只回填一次**；
+-- ix_mem_review_state 也由它建（旧库补列前建索引会先于 ALTER 失败）。
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_mem_hash ON memories(content_hash, project);
 CREATE INDEX IF NOT EXISTS ix_mem_project ON memories(project);
@@ -145,7 +153,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   kind          TEXT NOT NULL,
   content       TEXT NOT NULL,
   content_hash  TEXT NOT NULL,
-  status        TEXT NOT NULL,            -- pending|accepted|rejected|expired
+  status        TEXT NOT NULL,            -- pending|accepted|rejected|expired|failed|quarantined
   source        TEXT NOT NULL,            -- distill|dream|import-proposal
   channel       TEXT NOT NULL DEFAULT '', -- user|agent|tool|import；与 source 并存
   salience      REAL NOT NULL DEFAULT 0.5,
@@ -168,7 +176,13 @@ CREATE TABLE IF NOT EXISTS candidates (
   -- 准入判定的痕迹（docs/design-admission.md）：verdict 只记判定，改 status 只能走人工裁决。
   -- judge_model 带 prompt 版本（ollama:qwen2.5@judge-v1），判定标准一改，历史才能分段看。
   judge_verdict TEXT NOT NULL DEFAULT '',
-  judge_model   TEXT NOT NULL DEFAULT ''
+  judge_model   TEXT NOT NULL DEFAULT '',
+  -- S10a：判定理由必须独立成列，覆盖 rationale 会把「提案为什么这么提」抹掉（§7 第 5 条）。
+  judge_reason  TEXT NOT NULL DEFAULT '',
+  -- 失败/隔离是候选级终态的两档（§2.1）：failed 可重试、quarantined 等人工显式重放。
+  -- status_reason 记最后一次失败原因，attempt 记重试次数（两者都由 MarkCandidate* 维护）。
+  status_reason TEXT NOT NULL DEFAULT '',
+  attempt       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_cand_status ON candidates(status, created_at);
 -- 同一会话里相同内容的 pending/accepted 不双插。rejected 不占这个键，允许改写后再来。
@@ -309,15 +323,22 @@ CREATE TABLE IF NOT EXISTS commit_decisions (
   candidate_id   TEXT NOT NULL,
   revision       INTEGER NOT NULL DEFAULT 0,
   evidence_hash  TEXT NOT NULL DEFAULT '',
-  action         TEXT NOT NULL, -- auto_commit|human_accept|reject|duplicate|conflict|backlog|defer
-  actor          TEXT NOT NULL DEFAULT 'auto',
+  action         TEXT NOT NULL, -- auto_commit|human_accept|reject|duplicate|conflict|backlog|defer|reopen
+  actor          TEXT NOT NULL DEFAULT 'auto', -- auto|human|human-reviewed-llm|judge|model-auto
   reason_codes_json TEXT NOT NULL DEFAULT '[]',
   memory_id      TEXT NOT NULL DEFAULT '',
+  -- model_tag = 做出这次裁决的 model@promptver（空串=非模型裁决）。
+  -- 按版本回滚（§6.4）要能只撤某一套提示词的产物，缺了它就只能全撤。
+  model_tag      TEXT NOT NULL DEFAULT '',
+  -- created_memory = 这次裁决是否**新建**了记忆行（命中相同知识时为 0，删除就是误伤）。
+  created_memory INTEGER NOT NULL DEFAULT 0,
   idempotency_key TEXT NOT NULL,
   created_at     INTEGER NOT NULL,
   UNIQUE(idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS ix_commit_candidate ON commit_decisions(candidate_id, created_at);
+-- ix_commit_model 不写在这里：旧库还没有 model_tag 列，建在建表脚本里会先于
+-- ensureReviewSchema 的 ALTER 失败。它由 ensureReviewSchema 在补列之后创建。
 
 CREATE TABLE IF NOT EXISTS memory_evidence (
   memory_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,

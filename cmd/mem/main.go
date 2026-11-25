@@ -52,6 +52,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem migrate --summary-external   把 observations.summary / summary_idx 迁移到 content/（--dry-run 只估算）
                                     --reject-judged 批量否决影子判定为 reject 的候选（只否决、不采纳）
   mem candidates ls [选项]         列出隔离区候选
+  mem review ls [选项]             复核队列（只读四态）：pending 待判定 / summary 未审核摘要 / quarantined 隔离 / failed 失败
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
   mem harness [--json]              列出各工具的接入方式与检测结果
@@ -148,6 +149,7 @@ var knownSubcommands = []string{
 	"gc", "consolidate", "maintain", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
 	"distill", "accept", "reject", "batch", "candidates", "judge", "setup", "migrate",
+	"review",
 }
 
 func main() {
@@ -206,6 +208,8 @@ func main() {
 		err = cmdMigrate(os.Args[2:])
 	case "candidates":
 		err = cmdCandidates(os.Args[2:])
+	case "review":
+		err = cmdReview(os.Args[2:])
 	case "sync":
 		err = cmdSync(os.Args[2:])
 	case "hook":

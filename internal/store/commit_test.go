@@ -621,7 +621,7 @@ func TestCommitDecisionIdempotencyKeyUnique(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		ctx := t.Context()
 		if err := recordDecision(ctx, s.db, res.Candidate.ID, view.Revision,
-			"hash", commit.ActionDefer, commit.ActorAuto, nil, ""); err != nil {
+			"hash", commit.ActionDefer, commit.ActorAuto, nil, "", "", false); err != nil {
 			t.Fatal(err)
 		}
 	}
