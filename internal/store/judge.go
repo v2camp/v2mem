@@ -1,5 +1,13 @@
 package store
 
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+)
+
 // 准入判定（docs/design-admission.md）。
 //
 // 判定结果与「是否据此改状态」分开：MarkJudgeVerdict 只写痕迹，影子期靠它
@@ -127,4 +135,47 @@ func (s *Store) JudgeStats() ([]JudgeStat, error) {
 		out = append(out, st)
 	}
 	return out, rows.Err()
+}
+
+// JudgeInvalidRetryLimit 是模型/Judge 非法输出的可重试次数上限（B3/B4，
+// docs/design-eval-flows.md §3.3）。第 N 次（N>=上限）非法输出后转 quarantined。
+const JudgeInvalidRetryLimit = 3
+
+// MarkJudgeInvalidOutput 把一次非法模型输出落到候选状态（单事务）：
+// failed（attempt+1、status_reason）→ 达到上限转 quarantined 终态。
+//
+// 影子期「只写痕迹不改状态」的前提是输出可解析；坏输出必须留痕并进入重试/隔离，
+// 否则下一轮又抓同一批、又烧一次调用。只从 pending/failed 进入，其余状态报
+// ErrCandidateClosed（不覆盖既有裁决）。返回最终状态，供调用方写日志/断言。
+func (s *Store) MarkJudgeInvalidOutput(id, reason string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", errors.New("缺少候选 id")
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "invalid_output"
+	}
+	var final string
+	err := s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
+		var attempt int
+		err := q.QueryRowContext(ctx,
+			`SELECT attempt FROM candidates WHERE id = ? AND status IN ('pending','failed')`, id).
+			Scan(&attempt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: 候选 %s 不能在当前状态转入 failed/quarantined", ErrCandidateClosed, id)
+		}
+		if err != nil {
+			return err
+		}
+		status := "failed"
+		if attempt+1 >= JudgeInvalidRetryLimit {
+			status = "quarantined"
+		}
+		if err := s.markCandidateTerminalTx(ctx, q, id, status, reason); err != nil {
+			return err
+		}
+		final = status
+		return nil
+	})
+	return final, err
 }

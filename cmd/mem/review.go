@@ -1,11 +1,9 @@
-// mem review ls —— 一屏四态：pending（模型没跑）/ summary（模型自动写库但没人看过）
-// / quarantined / failed。
+// mem review —— 一屏四态（ls）＋人工后审核动作面（confirm/correct/withdraw/
+// restore）＋按版本回滚（rollback）＋标定统计（stats）。
 //
-// 为什么是四态而不是一张「待办清单」：例行审核队列 = 把「没人点按钮」的病换个位置复发
+// 为什么四态不是一张「待办清单」：例行审核队列 = 把「没人点按钮」的病换个位置复发
 // （docs/design-data-lifecycle.md §6.4）。默认信任自动入库，复核是出错时的保险；
-// 这一屏只回答问题找人时那一眼：**现在有什么在等我，最老的多久了**。
-//
-// 本切片只做只读视图：withdraw/restore/rollback/model-auto 的动作面在 S10b。
+// 动作面只在出事时用：撤回/修正/回滚都不删行，证据与裁决历史一律保留。
 package main
 
 import (
@@ -27,17 +25,185 @@ var reviewStateLabels = map[string]string{
 
 func cmdReview(args []string) error {
 	if len(args) == 0 {
-		return errors.New("缺少子命令，用法: mem review ls [选项]（动作面 withdraw/restore/rollback 见后续版本）")
+		return errors.New("缺少子命令，用法: mem review ls [选项]；动作面见 mem review help")
 	}
 	switch args[0] {
 	case "ls":
 		return cmdReviewLs(args[1:])
+	case store.ReviewActionConfirm, store.ReviewActionCorrect,
+		store.ReviewActionWithdraw, store.ReviewActionRestore:
+		return cmdReviewAction(args[0], args[1:])
+	case "rollback":
+		return cmdReviewRollback(args[1:])
+	case "stats":
+		return cmdReviewStats(args[1:])
 	case "help", "-h", "--help":
-		fmt.Println("用法: mem review ls [--state all|pending|summary|quarantined|failed] [--json] [--limit 50] [--db path]")
+		fmt.Println("用法: mem review <子命令> [选项]")
+		fmt.Println("  ls                                    四态复核队列（只读）")
+		fmt.Println("  confirm <memoryID>                    人工确认")
+		fmt.Println("  correct <memoryID> --content TEXT     人工修正正文（保留模型原提案）")
+		fmt.Println("  withdraw <memoryID> [--reason TEXT]  撤回（退出检索，行与证据保留）")
+		fmt.Println("  restore <memoryID>                    撤回的逆动作")
+		fmt.Println("  rollback --model-tag TAG [--dry-run]  按版本回滚自动记忆")
+		fmt.Println("  stats                                 按版本标定统计（只读，阈值只提示）")
 		return nil
 	default:
-		return fmt.Errorf("未知子命令 %q；当前只提供只读视图 mem review ls（动作面 withdraw/restore/rollback 见后续版本）", args[0])
+		return fmt.Errorf("未知子命令 %q；只读入口 mem review ls，动作面见 mem review help", args[0])
 	}
+}
+
+// splitLeadingArgs 把开头连续的位置参数摘出来，剩下的交给 flag 包。
+//
+// flag 包遇到第一个非 flag token 就停止解析，所以 `mem review confirm <id> --json`
+// 必须先把 <id> 摘走；`mem review confirm --json <id>` 则由 fs.Args() 兜住。
+// flag 的值由 flag 包自己消费，这里只动开头那几个 token。
+func splitLeadingArgs(args []string) (positional, rest []string) {
+	i := 0
+	for i < len(args) && !strings.HasPrefix(args[i], "-") {
+		positional = append(positional, args[i])
+		i++
+	}
+	return positional, args[i:]
+}
+
+// cmdReviewAction 是四个记忆级动作的共用入口。状态迁移、候选终态恢复、
+// review_action 裁决账全部在 store.ApplyMemoryReview 的单事务里完成，CLI 只做
+// 参数解析与渲染（未来 MCP 复用同一 store API，不另写一套判定）。
+func cmdReviewAction(action string, args []string) error {
+	var c common
+	fs := flag.NewFlagSet("review "+action, flag.ContinueOnError)
+	c.register(fs)
+	content := fs.String("content", "", "correct：人工修订后的正文")
+	reason := fs.String("reason", "", "withdraw：撤回原因")
+	modelTag := fs.String("model-tag", "", "归因 model@promptver（可选，默认沿用产生该记忆的版本）")
+	positional, flagArgs := splitLeadingArgs(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		return err
+	}
+	positional = append(positional, fs.Args()...)
+	id := strings.TrimSpace(strings.Join(positional, " "))
+	if id == "" {
+		return fmt.Errorf("缺少记忆 id，用法: mem review %s <memoryID> [选项]", action)
+	}
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	rep, err := st.ApplyMemoryReview(store.MemoryReviewInput{
+		MemoryID: id, Action: action, Content: *content, Reason: *reason,
+		ModelTag: *modelTag, Actor: "human",
+	})
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(rep)
+	}
+	fmt.Printf("已 %s 记忆 %s：%s → %s\n", action, shortID(rep.MemoryID),
+		reviewStateText(rep.Before.ReviewState), reviewStateText(rep.After.ReviewState))
+	if len(rep.AffectedCandidates) > 0 {
+		fmt.Printf("  受影响候选: %s\n", joinShort(rep.AffectedCandidates))
+	}
+	if rep.Reason != "" {
+		fmt.Printf("  原因: %s\n", rep.Reason)
+	}
+	return nil
+}
+
+// reviewStateText 让空状态在文本里可读（JSON 里仍保持 ""）。
+func reviewStateText(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "未审核"
+	}
+	return s
+}
+
+func joinShort(ids []string) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, shortID(id))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// cmdReviewRollback 按 model@promptver 撤回自动记忆。只撤回、不删行；跳过人工
+// 已确认/修正的记忆；dry-run 零写入；幂等由 store 侧「已是 withdrawn 计 already」保证。
+func cmdReviewRollback(args []string) error {
+	var c common
+	fs := flag.NewFlagSet("review rollback", flag.ContinueOnError)
+	c.register(fs)
+	modelTag := fs.String("model-tag", "", "要回滚的 model@promptver")
+	dryRun := fs.Bool("dry-run", false, "只报计划动作，零写入")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*modelTag) == "" {
+		return errors.New("缺少 --model-tag，用法: mem review rollback --model-tag <model@promptver>")
+	}
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	rep, err := st.RollbackModelTag(*modelTag, *dryRun, 0)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(rep)
+	}
+	dry := ""
+	if rep.DryRun {
+		dry = "（dry-run，未写库）"
+	}
+	fmt.Printf("回滚 %s%s：matched %d / withdrawn %d / skipped %d / already %d / reopened %d\n",
+		rep.ModelTag, dry, rep.Matched, rep.Withdrawn, rep.Skipped, rep.Already, rep.Reopened)
+	if len(rep.SkippedIDs) > 0 {
+		fmt.Printf("  跳过（人工已确认/修正）: %s\n", joinShort(rep.SkippedIDs))
+	}
+	if len(rep.WithdrawnIDs) > 0 {
+		fmt.Printf("  撤回: %s\n", joinShort(rep.WithdrawnIDs))
+	}
+	return nil
+}
+
+// cmdReviewStats 按 model_tag 汇总后审核标定率。阈值只提示 WARN：
+// 改提示词是人的活，stats 本身严格只读（docs/design-data-lifecycle.md §6.2）。
+func cmdReviewStats(args []string) error {
+	var c common
+	fs := flag.NewFlagSet("review stats", flag.ContinueOnError)
+	c.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	st, err := store.Open(c.db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	rows, err := st.ReviewStats()
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return printJSON(rows)
+	}
+	if len(rows) == 0 {
+		fmt.Println("（暂无按版本归因的样本）")
+		return nil
+	}
+	fmt.Println("版本                          样本  确认  修正  撤回  确认率  修正率  撤回率  回捞")
+	for _, r := range rows {
+		warn := ""
+		if r.Warn {
+			warn = "  WARN（阈值只提示：请人工复核提示词，不改提示词、不自动动作）"
+		}
+		fmt.Printf("%-30s %4d %5d %5d %5d  %5.0f%%  %5.0f%%  %5.0f%% %5d%s\n",
+			r.ModelTag, r.Samples, r.Confirmed, r.Corrected, r.Withdrawn,
+			r.ConfirmRate*100, r.CorrectRate*100, r.WithdrawRate*100, r.Recovered, warn)
+	}
+	return nil
 }
 
 func cmdReviewLs(args []string) error {

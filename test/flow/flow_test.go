@@ -302,3 +302,36 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// R8：动作面上线后，按版本回滚把 accepted 候选改到 rejected 明确终态，
+// G9（裁决闭环）与 G12（准出率账本）仍必须全绿——不得靠放宽 G 断言迁就实现。
+func TestFlowG9G12StayGreenAfterRollback(t *testing.T) {
+	e := buildFlow(t)
+	// 给一条已采纳裁决打上 model@promptver 归因，作为按版本回滚的标的。
+	if _, err := e.st.DB().Exec(`UPDATE commit_decisions
+		SET model_tag = 'm@v1', created_memory = 1
+		WHERE candidate_id = (SELECT id FROM candidates WHERE status = 'accepted' ORDER BY id LIMIT 1)`); err != nil {
+		t.Fatalf("打 model_tag: %v", err)
+	}
+	if _, err := e.st.RollbackModelTag("m@v1", false, *e.now); err != nil {
+		t.Fatalf("RollbackModelTag: %v", err)
+	}
+	snap, err := eval.LoadFlowSnapshot(e.st.DB(), *e.now)
+	if err != nil {
+		t.Fatalf("LoadFlowSnapshot: %v", err)
+	}
+	rep := eval.CheckFlow(snap, flowWindow)
+	for _, c := range rep.Checks {
+		if (c.ID == "G9" || c.ID == "G12") && !c.Pass {
+			t.Fatalf("%s 在回滚后必须仍绿: %s", c.ID, c.Detail)
+		}
+	}
+	if rep.Failed != 0 {
+		for _, c := range rep.Checks {
+			if !c.Pass {
+				t.Logf("%s FAIL: %s", c.ID, c.Detail)
+			}
+		}
+		t.Fatalf("回滚后应 13/13 全绿，got %d/%d", rep.Passed, rep.Failed)
+	}
+}

@@ -239,6 +239,14 @@ candidates: pending
   `memory_evidence` 绑定全部保留。
 - 幂等键纳入提示词版本（或独立 `prompt_hash` 维度），避免换提示词后误判重放。
 
+> **S10b 已落地（提交矩阵改造）**：`commit.Matrix` 增加可注入开关 `AllowModelAuto`
+> （默认 false，零值行为与改造前逐字一致）；打开后 manualKinds / global /
+> cross_project / project 缺失分支可模型自动 accept，**Conflict / Defer 仍提前返回
+> 优先保留**。幂等键纳入 `model_tag` 维度（`IdempotencyKeyWithModel`），换提示词后
+> 同候选同 revision 的新裁决不被旧键挡成重放；不带版本的路径键值逐字节不变。
+> 生产开关挂 `mem accept --model-auto --model-tag <model@promptver>`（默认关），
+> 裁决 actor=`model-auto`、`model_tag` 落 `commit_decisions`，记忆留未审核态供后审核。
+
 ### 6.4 人工后审核（例外式保险，不是例行工序）
 
 **默认信任自动入库**——后审核是出错时的保险，不是每条必经的工序。例行审核队列
@@ -274,6 +282,25 @@ candidates: pending
 > 回填只在补列那一次跑，不随每次 `Open` 重来。
 > 动作面（`review withdraw` / `restore` / 按 `model@promptver` 回滚）与 `model-auto`
 > 生产者留 S10b。
+
+> **S10b 已落地（复核动作面）**：
+> - **四动作** `mem review confirm|correct|withdraw|restore <memoryID>`（全部
+>   `--json`、错误如实退出码 1，二级路由在 `cmd/mem/review.go` 内 switch）。
+>   撤回恢复候选 `rejected` + `status_reason` 明确终态；每次动作记一条
+>   `commit_decisions`（action=`review_action`，actor=`human`），correct 的
+>   before/after（模型原提案与人工修订）进 `reason_codes_json`，不新增 schema 列。
+> - **按版本回滚** `mem review rollback --model-tag <model@promptver> [--dry-run]`：
+>   只命中 `created_memory=1` 且该 tag 的决策；人工已确认/修正的跳过并报告，
+>   已撤回计 already，其余撤回 + 候选回 rejected + 记一条 `reopen` 决策（保 G9
+>   裁决闭环）；**只撤回不删行**；dry-run 零写入；重跑幂等。
+> - **标定统计** `mem review stats`：按 `model_tag` 分组给样本数与
+>   confirm/correct/withdraw 率、误拒回捞（restore）数；阈值越线只提示 WARN，
+>   不自动改提示词、不自动动作（严格只读）。
+> - **复核摘要真实口径**：count 与 list 从同一查询取（修 S10a 的 JOIN 口径
+>   不一致，候选被 GC 后不再出现「计数 1、列表 0」）；摘要只含三类——低置信
+>   理由码、冲突标记、高影响确定性抽样（`hash(memory_id)%10==0`，
+>   global/cross_project/decision/preference/rule），其余 model-auto 产物默认信任。
+> - **eval flow G9/G12 在回滚后仍全绿**（`test/flow` R8 断言），不靠放宽 G 断言迁就实现。
 
 ### 6.5 shadow Judge 自动 reject、数据外发、跨设备同步
 

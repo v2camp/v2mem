@@ -127,6 +127,14 @@ func cmdJudge(args []string) error {
 	}
 	verdicts, err := parseJudgeVerdicts(raw)
 	if err != nil {
+		// B3/B4 真实链路（选在 judge 解析路径）：影子期「只写痕迹不改状态」的前提
+		// 是输出可解析；坏输出不能静默当成「判为 0 条」，否则下一轮又抓同一批、
+		// 又烧一次调用。逐条留痕：failed（attempt+1、status_reason）→ 超上限
+		// quarantined 终态（store.MarkJudgeInvalidOutput，单事务读当前 attempt）。
+		if markErr := markJudgeInvalid(st, list, err.Error()); markErr != nil {
+			return fmt.Errorf("模型输出无法解析: %w（原文前 200 字节：%s）；候选留痕失败: %v",
+				err, truncateRunes(raw, 200), markErr)
+		}
 		return fmt.Errorf("模型输出无法解析: %w（原文前 200 字节：%s）", err, truncateRunes(raw, 200))
 	}
 
@@ -281,6 +289,22 @@ func parseJudgeVerdicts(raw string) ([]judgeVerdict, error) {
 		}
 	}
 	return out, nil
+}
+
+// markJudgeInvalid 把一次非法输出落到本批全部候选：failed → 超上限 quarantined。
+//
+// attempt 的读取与状态迁移都在 store.MarkJudgeInvalidOutput 的同一事务里做，
+// 避免「CLI 读到旧 attempt、写时已被别的进程推进」的竞态；这里只做批量与聚合。
+// 留痕失败不吞：主错误已经说明输出坏了，留痕失败必须一起报出来，否则坏输出
+// 又会变成「判为 0 条」的假象。
+func markJudgeInvalid(st *store.Store, list []store.Candidate, reason string) error {
+	var errs []error
+	for i := range list {
+		if _, err := st.MarkJudgeInvalidOutput(list[i].ID, "judge_invalid_output: "+reason); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func findByPrefix(list []store.Candidate, prefix string) *store.Candidate {

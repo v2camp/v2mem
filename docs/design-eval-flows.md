@@ -134,19 +134,19 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 ### 3.3 B 类逐跳检查矩阵（S10a 数据面 / S10b 动作面）
 
 > 口径来源 `design-data-lifecycle.md` §2.1 / §6.4 与 §12.3 一屏四态。
-> B1–B5 是 S10a 已落地的数据面与只读视图；B6–B9 的动作面留 S10b。
+> B1–B5 是 S10a 已落地的数据面与只读视图；B6–B9 的动作面 S10b 已落地。
 
 | ID | 断言 | 状态 |
 |:---|:---|:---|
 | B1 | 一屏四态视图：`mem review ls` 的 pending / summary / quarantined / failed 共用同一投影，空态输出 `[]` 而非 `null`，计数不受 `--state` / `--limit` 截断 | S10a 已落地 |
 | B2 | 提交矩阵全分支：Defer / Conflict / AutoCommit 各落对应状态，不得为消灭 pending 强行写入 | S10a 已落地 |
-| B3 | 模型输出非法 → `failed`（不入库、不顶替消费），`status_reason` 留最后一次原因 | S10a 已落地 |
-| B4 | `failed` 重试超上限 → `quarantined`：`attempt` 递增、`status_reason` 记原因，quarantined 为终态（不可再隔离 / 提交 / 拒绝） | S10a 已落地 |
+| B3 | 模型输出非法 → `failed`（不入库、不顶替消费），`status_reason` 留最后一次原因 | S10a 已落地 / S10b 接通真实链路（`mem judge` 解析失败即留痕重试） |
+| B4 | `failed` 重试超上限 → `quarantined`：`attempt` 递增、`status_reason` 记原因，quarantined 为终态（不可再隔离 / 提交 / 拒绝） | S10a 已落地 / S10b 接通真实链路（上限 `JudgeInvalidRetryLimit=3`） |
 | B5 | 幂等与 CAS：同一 (candidate, revision, action) 幂等键唯一；重放不新增裁决行，revision CAS 不超前 | S10a 已落地 |
-| B6 | `withdraw`：一步撤回退出主检索，行与证据保留（可追溯） | S10b 待落地 |
-| B7 | `restore`：撤回 / 误拒可原路恢复，重新进入检索 | S10b 待落地 |
-| B8 | 按 `model@promptver` 回滚：只撤该版本自动记忆，跳过人工确认 / 修正条目并报告 | S10b 待落地 |
-| B9 | `model-auto` 默认关：模型自动采纳作为可配置档，裁决按 `model@promptver` 归因 | S10b 待落地 |
+| B6 | `withdraw`：一步撤回退出主检索，行与证据保留（可追溯） | S10b 已落地 |
+| B7 | `restore`：撤回 / 误拒可原路恢复，重新进入检索 | S10b 已落地 |
+| B8 | 按 `model@promptver` 回滚：只撤该版本自动记忆，跳过人工确认 / 修正条目并报告 | S10b 已落地 |
+| B9 | `model-auto` 默认关：模型自动采纳作为可配置档，裁决按 `model@promptver` 归因 | S10b 已落地 |
 
 ## 4. 形态与门禁
 

@@ -57,7 +57,7 @@ func seedReviewFixture(t *testing.T) (*store.Store, string) {
 	if _, err := st.DB().Exec(`INSERT INTO commit_decisions
 		(id, candidate_id, revision, evidence_hash, action, actor, reason_codes_json,
 		 memory_id, model_tag, created_memory, idempotency_key, created_at)
-		VALUES ('dec-model','cand-model',0,'','auto_commit','model-auto','[]',?,'m@v1',1,'k-model',?)`,
+		VALUES ('dec-model','cand-model',0,'','auto_commit','model-auto','["low_confidence"]',?,'m@v1',1,'k-model',?)`,
 		res.ID, time.Now().Add(-2*time.Hour).Unix()); err != nil {
 		t.Fatalf("insert decision: %v", err)
 	}
@@ -239,12 +239,13 @@ func TestReviewRequiresLsSubcommand(t *testing.T) {
 	if !strings.Contains(err.Error(), "mem review ls") {
 		t.Errorf("报错应给出可抄命令 mem review ls，got %v", err)
 	}
-	err = cmdReview([]string{"withdraw", "x"})
+	// S10b 起 withdraw/restore/rollback/stats 已落地，未知子命令仍要指向只读入口。
+	err = cmdReview([]string{"bogus", "x"})
 	if err == nil {
-		t.Fatal("动作子命令尚未落地，应报错而不是静默成功")
+		t.Fatal("未知子命令应报错而不是静默成功")
 	}
 	if !strings.Contains(err.Error(), "mem review ls") {
-		t.Errorf("动作面未落地时应指向只读入口，got %v", err)
+		t.Errorf("未知子命令应指向只读入口，got %v", err)
 	}
 }
 
