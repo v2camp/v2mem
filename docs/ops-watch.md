@@ -94,6 +94,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R13** | 注入体量 | 窗口内读侧（`session-start` / `prompt-submit` / `pre-compact`）审计记录 `inject_bytes` 的**最大值**（无样本记 `INFO`） | ≤3600 | 3601–8000 | >8000 |
 | **R14** | 归档体量 | `~/.v2mem/evidence` 下文件数与总字节（`find` / `du`，只读）；detail 附 `mem stats --json` 的 `size_bytes` 作对照 | ≤512MiB | >512MiB | —（不设 FAIL，见依据） |
 | **R15** | 候选 TTL | `mem candidates ls --json` 中 `created_at` 超过 **14 天**的 pending 条数；**只报不处置**：超期报 WARN 并给手工命令与复核提示，状态迁移/删除归维护入口或人工 | 0 条超期 | 有超期（只报不处置） | — |
+| **R16** | 维护可见性 | `mem stats --json` 顶层 `backlog` 的 `open_bundles` / `last_maintain_ok_age_seconds` / `bundles_isolated`（复用同一次 stats 调用，不额外读写）；只判级不处置 | 无积压，或有积压但 24h 内维护成功 | 有积压且（从未维护或 `last_maintain_ok_age_seconds` > **24h**），或 `bundles_isolated` > 0；detail 给 `mem maintain --catch-up` | —（不设 FAIL，维护滞后不是数据损失） |
 
 阈值依据（不凭空定）：
 
@@ -297,6 +298,23 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
     处置后下一窗口回 `PASS`。
   - 巡检没有写开关：只读是默认且唯一的行为。
 
+- **R16 的 24h 与「不设 FAIL」（2026-11-25 S8 新增）**：阈值不是新定的——S4 已经把
+  `open_bundles` / `last_maintain_ok_age_seconds` / `bundles_isolated` 暴露在
+  `mem stats --json` 的 `backlog` 里（口径见 `design-data-lifecycle.md` §3.2），
+  缺的只是一条把三者合成判级的判据。**24h = 巡检窗口 12h × 2**：一个窗口没跑完
+  （宿主休眠、维护被预算截断）属正常，连续两个窗口（24h）仍没有成功维护才是
+  「无人值守断了」。12h 是 `scripts/watch-v2mem.sh` 的默认调度间隔（§6），
+  与它对齐而不是另立一个数字。
+  - **有积压但 24h 内维护成功判 PASS**：说明维护在跟，积压只是本轮没跑完；
+    把它报成 WARN 会让「预算 20 条、队列 25 条」这种正常状态每个窗口都告警。
+  - **隔离 > 0 单独 WARN**：`quarantined` 不会自动重放（§3.1「等人工」出口），
+    积压再少也需要人修复后显式 `mem maintain --catch-up` 追账；
+    detail 必须带这条命令，否则「有问题」但「不知道做什么」。
+  - **不设 FAIL**：维护滞后是可恢复的调度事实，不是数据损失；与 R12 断链、R14
+    体量同一取舍——把「还没跑」判成 FAIL 会让告警失去区分度。真正的数据风险
+    由 §8 的引用保护与备份承接，不由巡检承接。
+  - **不随冷启动降级**：它量的是调度水位，与库里有多少条记忆无关（见 §4）。
+
 > 积压原始读数见 `mem stats --json` 顶层 `backlog`，口径见 `design-data-lifecycle.md` §3.2；巡检只判级。
 
 ---
@@ -317,9 +335,10 @@ B 工程刚起步」不会被混算成一个 FAIL。
 
 判据必须阶段化，否则「符合预期」这四个字没有定义。跨过 20 条后自动启用完整阈值。
 
-**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13、R14、R15 不降级：候选载荷残留是输入过滤失效、写侧延迟
+**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13、R14、R15、R16 不降级：候选载荷残留是输入过滤失效、写侧延迟
 是同步 hook 的耗时、WAL 高水位是文件量级、写侧决策断链是自动链路没推进、注入体量是
-单次注入的字节数、归档体量是累计落盘量、候选 TTL 是「到期未过期」的机制失效，都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
+单次注入的字节数、归档体量是累计落盘量、候选 TTL 是「到期未过期」的机制失效、维护可见性是调度水位与最后成功时间的差，
+都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
 与 R3 / R10 / R13 的「无样本」同类，**不是**本节的降级。
 
 ---
@@ -344,6 +363,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
 | R14 归档体量越线 | 归档增长快于观测保留策略 | 先分因：① **量增长**（文件数与字节同步涨）→ 按下面两步回收，再裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**回收只有一条路**：先 `mem gc --obs`（删观测行）再 `mem gc --evidence`（删已无观测引用的段与磁盘文件），两条合跑即同一轮生效；`--evidence` 有 1h 写入保护期。单跑 `--evidence` 在观测未回收时释放 0 字节——**不要**据此认为功能失效。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处。确认接受现状就上调阈值并在提交信息里写明原因 |
 | R15 候选超期 | TTL 从未被执行 | 巡检**只报不处置**。先复核 90 天前的已采纳行（`mem candidates ls --status accepted -db ~/.v2mem/mem.db`）——`gc --candidates` 会连带删除它们、不可逆；确认后再手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`（pending → expired，行仍在库）。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
+| R16 维护滞后 / 有积压且有隔离 | `mem maintain` 没被触发，或持续故障后没人追账 | 巡检**只报不处置**。先看 backlog 的 `open_bundles` 与 `bundles_isolated`：有隔离则按 §5 R12 查 `evidence_bundles` 的失败原因、修复后 `mem distill --quarantined` 查看；随后执行 `mem maintain --catch-up` 连续追账（幂等，重复跑不会重复提交），再 `mem stats --json` 确认 `last_maintain_ok_age_seconds` 回落。**不要**为了消掉 WARN 去删 Bundle 行或改 `maintain:last_ok`——前者会跳过证据，后者会把「没维护」伪装成「维护过」 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
@@ -360,6 +380,8 @@ B 工程刚起步」不会被混算成一个 FAIL。
   不写审计、不写库；该命令不可用时 R12 仍按审计独立判级。
 - R15 超期只报 `WARN` 并给手工命令：状态迁移与物理删除归 `mem maintain` 或人工，
   巡检不替人做不可逆决策；只读是默认且唯一的行为，没有需要关掉的写路径。
+- R16 同样只报：detail 里的 `mem maintain --catch-up` 是给人执行的命令，巡检不调用它；
+  积压与最后维护时间都取自同一次 `mem stats --json`，不额外开库、不写状态。
 - 告警口径：只有 `FAIL` 需要人介入；`WARN` 观察，`INFO` 忽略。
 
 ---
@@ -376,7 +398,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R15） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R16） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |

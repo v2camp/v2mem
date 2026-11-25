@@ -39,6 +39,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem lexicon init --project <X> [--terms "词A,词B"]   从该工程记忆提取同义词写入 synonyms.txt（--dry-run 预览；--auto 实验性 bigram 提取）
   mem gc     [选项]                回收：TTL 到期 + 久未命中且低重要性
   mem consolidate [选项]           相似知识归并（近重复聚簇，留 1 条）
+  mem maintain [选项]               维护门面：恢复过期租约后最老优先连续追账（--catch-up / --force / --dry-run）
   mem export [路径.jsonl]          导出为 JSONL（省略路径则写标准输出）
   mem import <路径.jsonl>          按 (content_hash, project) 归并进本地库
   mem import-transcript [选项]     从 Claude 会话 JSONL 回填观测（默认不写 memories）
@@ -105,6 +106,12 @@ gc 选项:
   --audit               回收审计账本：超期的 distill_runs / read_traces（不删 memories）
   --audit-age <dur>     与 --audit 合用：账本保留时长（默认 720h）
 
+maintain 选项:
+  --catch-up            故障恢复模式：与默认行为等价（保留给 Harness / SOP 明示）
+  --max-bundles <n>     本次最多处理几个 Bundle（默认 20）
+  --force               清零退避中 fail/partial/backlog 的 not_before，本轮立即重试（不改 attempt）
+  --dry-run             只读预演：不认领、不落候选、不写库（与 --force 互斥）
+
 consolidate 选项:
   --threshold <f>       相似度阈值 0..1（默认 0.7）
                         准确性由护栏保证（数字/否定/长度/短文本），阈值只影响召回
@@ -138,7 +145,7 @@ hook 选项:
 // 清单有两个出处就一定会漂移，所以把它抽成一处。
 var knownSubcommands = []string{
 	"add", "search", "asset", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
-	"gc", "consolidate", "export", "import", "import-transcript", "sync", "hook", "harness",
+	"gc", "consolidate", "maintain", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
 	"distill", "accept", "reject", "batch", "candidates", "judge", "setup", "migrate",
 }
@@ -177,6 +184,8 @@ func main() {
 		err = cmdGC(os.Args[2:])
 	case "consolidate":
 		err = cmdConsolidate(os.Args[2:])
+	case "maintain":
+		err = cmdMaintain(os.Args[2:])
 	case "export":
 		err = cmdExport(os.Args[2:])
 	case "import":

@@ -529,3 +529,82 @@ func TestInsertProposalCandidateValidation(t *testing.T) {
 		t.Fatalf("校验失败不应留候选: %d", n)
 	}
 }
+
+// S8：--force 只清「退避中且可重试」的 not_before，不动 attempt，
+// 也不碰终态、已可运行与租约中的窗口。attempt 是「已试过几次」的事实，
+// 清零会让超限隔离失效，并把退避中的头伪装成从未试过。
+func TestForceRetryHeadsClearsBackoffOnly(t *testing.T) {
+	s := newTestStore(t)
+	insertBacklogSource(t, s, "src-a", 1, 10, 0)
+	insertBacklogSource(t, s, "src-b", 1, 10, 0)
+	insertBacklogSource(t, s, "src-c", 1, 10, 0)
+	insertBacklogSource(t, s, "src-d", 1, 10, 0)
+	insertFairBundle(t, s, "bnd-fail", "src-a", 0, "fail", 100, 900, 0, "")
+	insertFairBundle(t, s, "bnd-backlog", "src-a", 1, "backlog", 200, 800, 0, "")
+	insertFairBundle(t, s, "bnd-partial", "src-a", 2, "partial", 300, 700, 0, "")
+	insertFairBundle(t, s, "bnd-ready", "src-b", 0, "fail", 100, 0, 0, "")
+	insertFairBundle(t, s, "bnd-leased", "src-c", 0, "leased", 100, 0, 5000, "w1")
+	insertFairBundle(t, s, "bnd-quar", "src-d", 0, "quarantined", 100, 600, 0, "")
+	if _, err := s.db.Exec(`UPDATE evidence_bundles SET attempt=4 WHERE id='bnd-fail'`); err != nil {
+		t.Fatalf("设置 attempt: %v", err)
+	}
+
+	n, err := s.ForceRetryHeads(100)
+	if err != nil {
+		t.Fatalf("ForceRetryHeads: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("应清 3 个退避中的可重试窗口（fail/backlog/partial），got %d", n)
+	}
+	for id, want := range map[string]int64{
+		"bnd-fail": 0, "bnd-backlog": 0, "bnd-partial": 0,
+		"bnd-ready": 0, "bnd-leased": 0, "bnd-quar": 600,
+	} {
+		b, err := s.LoadProposalBundle(id)
+		if err != nil {
+			t.Fatalf("LoadProposalBundle(%s): %v", id, err)
+		}
+		if b.NotBefore != want {
+			t.Fatalf("%s 的 not_before 应为 %d，got %d", id, want, b.NotBefore)
+		}
+	}
+	b, err := s.LoadProposalBundle("bnd-fail")
+	if err != nil {
+		t.Fatalf("LoadProposalBundle: %v", err)
+	}
+	if b.Attempt != 4 {
+		t.Fatalf("--force 不得改 attempt，got %d", b.Attempt)
+	}
+	if b.LeaseOwner != "" {
+		t.Fatalf("--force 不得制造租约: %+v", b)
+	}
+	if again, err := s.ForceRetryHeads(100); err != nil || again != 0 {
+		t.Fatalf("幂等：没有退避中的窗口时应清 0，got %d err=%v", again, err)
+	}
+}
+
+// S8：dry-run 的读取面——未终结窗口按 created_at 最老优先，终态不出现，limit 生效。
+func TestListOpenProposalBundlesOldestFirst(t *testing.T) {
+	s := newTestStore(t)
+	insertBacklogSource(t, s, "src-l", 1, 10, 0)
+	insertBacklogBundle(t, s, "bnd-new", "src-l", 1, 2, "pending", 3000)
+	insertBacklogBundle(t, s, "bnd-old", "src-l", 1, 0, "backlog", 1000)
+	insertBacklogBundle(t, s, "bnd-mid", "src-l", 1, 1, "leased", 2000)
+	insertBacklogBundle(t, s, "bnd-done", "src-l", 1, 3, "ok", 500)
+	insertBacklogBundle(t, s, "bnd-quar", "src-l", 1, 4, "quarantined", 400)
+
+	list, err := s.ListOpenProposalBundles(2)
+	if err != nil {
+		t.Fatalf("ListOpenProposalBundles: %v", err)
+	}
+	if len(list) != 2 || list[0].ID != "bnd-old" || list[1].ID != "bnd-mid" {
+		t.Fatalf("应按 created_at 最老优先并受 limit 约束: %+v", list)
+	}
+	all, err := s.ListOpenProposalBundles(0)
+	if err != nil {
+		t.Fatalf("ListOpenProposalBundles(0): %v", err)
+	}
+	if len(all) != 3 || all[2].ID != "bnd-new" {
+		t.Fatalf("终态（ok/quarantined）不得出现在预演列表: %+v", all)
+	}
+}
