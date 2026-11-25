@@ -201,14 +201,14 @@ A_SEG_SEARCH_N=${A_SEG_SEARCH_N:-0}
 
 # R12 写侧事件单独采集：不复用上面的 eval 字符串插值 —— 插值内部再嵌字符串字面量
 # 会触发 jq INVALID_CHARACTER。这里输出 TSV 后由 read 拆列，表达式里没有插值。
-A_DISTILL=0; A_DISTILL_PROPOSAL=0; A_DISTILL_FAIL=0
+A_DISTILL=0; A_DISTILL_RULES=0; A_DISTILL_FAIL=0
 A_DISTILL_EMPTY=0; A_DECIDE_A=0; A_DECIDE_R=0
 if [ -f "$AUDIT" ]; then
   W12=$(jq -sr --argjson c "$CUTOFF" '
     map(select(.ts >= $c)) as $e
     | [$e[] | select(.event=="distill")] as $d
     | [ ($d|length),
-        ([$d[] | select(.source=="proposal")]|length),
+        ([$d[] | select((.provider // "") == "rules")]|length),
         ([$d[] | (.failed // false) as $f | (.mode // "") as $m
                 | select($f == true or ($m | test("^(fail|partial|invalid|backlog)$")))]|length),
         ([$d[] | (.mode // "") as $m | select($m | test("^(empty|noop)$"))]|length),
@@ -216,10 +216,10 @@ if [ -f "$AUDIT" ]; then
         ([$e[] | select(.event=="reject")]|length) ]
     | @tsv' "$AUDIT" 2>/dev/null)
   if [ -n "${W12:-}" ]; then
-    IFS=$'\t' read -r A_DISTILL A_DISTILL_PROPOSAL A_DISTILL_FAIL A_DISTILL_EMPTY A_DECIDE_A A_DECIDE_R <<< "$W12"
+    IFS=$'\t' read -r A_DISTILL A_DISTILL_RULES A_DISTILL_FAIL A_DISTILL_EMPTY A_DECIDE_A A_DECIDE_R <<< "$W12"
   fi
 fi
-A_DISTILL=${A_DISTILL:-0}; A_DISTILL_PROPOSAL=${A_DISTILL_PROPOSAL:-0}
+A_DISTILL=${A_DISTILL:-0}; A_DISTILL_RULES=${A_DISTILL_RULES:-0}
 A_DISTILL_FAIL=${A_DISTILL_FAIL:-0}; A_DISTILL_EMPTY=${A_DISTILL_EMPTY:-0}
 A_DECIDE_A=${A_DECIDE_A:-0}; A_DECIDE_R=${A_DECIDE_R:-0}
 
@@ -622,15 +622,17 @@ fi
 # R12 写侧自动决策链路：观测 → 蒸馏 → 候选 → 显式裁决。
 # 判级只看「自动段」是否推进；裁决活性与 eval activity 的 verdict 只作诊断信息，
 # 零裁决由 R8 判积压，避免同一现象重复告警。阈值与依据见 docs/ops-watch.md §3 R12。
-A_DISTILL_RULES=$(( A_DISTILL - A_DISTILL_PROPOSAL ))
-D12="观测 ${A_OBS} / 蒸馏 ${A_DISTILL}（proposal ${A_DISTILL_PROPOSAL} · rules ${A_DISTILL_RULES}） / 合法空 ${A_DISTILL_EMPTY} / 失败 ${A_DISTILL_FAIL} / 裁决 accept ${A_DECIDE_A} reject ${A_DECIDE_R}"
+# 单轨后自动蒸馏都写 source=proposal，规则由链尾 executor 完成（provider=rules）；
+# 拆 rules / 其他是为了在「规则兜底是否真的在跑」与「是否误接 LLM」之间一眼分开。
+A_DISTILL_OTHER=$(( A_DISTILL - A_DISTILL_RULES ))
+D12="观测 ${A_OBS} / 蒸馏 ${A_DISTILL}（rules ${A_DISTILL_RULES} · 其他 ${A_DISTILL_OTHER}） / 合法空 ${A_DISTILL_EMPTY} / 失败 ${A_DISTILL_FAIL} / 裁决 accept ${A_DECIDE_A} reject ${A_DECIDE_R}"
 if [ -n "$ACT_VERDICT" ]; then D12="${D12}；结论: ${ACT_VERDICT}"; fi
 if [ "$A_OBS" -eq 0 ]; then
   add R12 INFO "无观测样本" "窗口内无 obs-append，无法评估写侧决策链路（无样本，非冷启动降级）；${D12}"
 elif [ "$A_DISTILL_FAIL" -gt 3 ]; then
   add R12 FAIL "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；按 §5 R12 查 distill_runs 的 error 与 attempt，不要重跑 distill 掩盖"
 elif [ "$A_DISTILL" -eq 0 ]; then
-  add R12 WARN "自动蒸馏未推进" "${D12}；有观测但窗口内 0 条 distill；按 §8.1 核对 MEM_DISTILL_SPAWN / MEM_PROPOSAL_HOOK / MEM_NO_DISTILL，确认是否按 §8.4 有意关闭"
+  add R12 WARN "自动蒸馏未推进" "${D12}；有观测但窗口内 0 条 distill；按 §5 R12 核对 MEM_DISTILL_SPAWN / MEM_NO_DISTILL（SessionStart 只受 MEM_NO_DISTILL 关断），确认是否是有意关闭"
 elif [ "$A_DISTILL_FAIL" -ge 1 ]; then
   add R12 WARN "蒸馏失败 ${A_DISTILL_FAIL} 次" "${D12}；查 distill_runs 的 error 与 evidence_bundles 是否 backlog"
 else

@@ -156,8 +156,8 @@ func cmdHook(args []string) error {
 	if isObserveHook(event) {
 		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started, *noScrub)
 		if observeEventMayDistill(event) {
-			maybeSpawnDistill(c.db, in, harnessName(*harnessFlag, in))
-			// 冷启动只挂在 SessionEnd：把首会话的规则蒸馏从下一次 SessionStart
+			maybeSpawnDistill(c.db, in)
+			// 冷启动只挂在 SessionEnd：把首会话的 proposal 蒸馏从下一次 SessionStart
 			// 前移到会话收尾，热路径不再承担这次蒸馏。
 			maybeSpawnColdStart(c.db, in, project, event)
 		}
@@ -170,7 +170,7 @@ func cmdHook(args []string) error {
 	if event == harness.EventSessionStart {
 		maintStart := time.Now()
 		drainSpoolFailOpen(c.db, *auditPath)
-		distillPendingFailOpen(c.db, *auditPath, harnessName(*harnessFlag, in))
+		distillPendingFailOpen(c.db)
 		maintMS = time.Since(maintStart).Milliseconds()
 	}
 

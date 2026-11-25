@@ -15,14 +15,17 @@ import (
 // 带 v1 版本号：以后算法升级可以换 key 重新冷启动，而不是永久锁死。
 const coldStartMetaPrefix = "coldstart:v1:"
 
-// startColdStartProc 拉起一次性规则蒸馏。测试可替换。
+// startColdStartProc 拉起一次性 proposal 蒸馏。测试可替换。
 var startColdStartProc = defaultColdStartDistill
 
-// defaultColdStartDistill 固定走 --provider none，不受 Proposal 灰度影响：
-// 首会话还没有历史证据，冷启动只做零模型的规则抽取，绝不在这里引入 LLM。
+// defaultColdStartDistill 与常规钩子共用 proposal argv：单轨后冷启动也走
+// 证据 Bundle + 链尾规则 executor，不再固定 --provider none。
 func defaultColdStartDistill(db, session string) error {
-	return startMemProc(db, []string{"distill", "--session", session, "--provider", "none"})
+	return startMemProc(db, coldStartProcArgs())
 }
+
+// coldStartProcArgs 单列一层，便于测试断言冷启动确实走 proposal。
+func coldStartProcArgs() []string { return distillProcArgs() }
 
 func coldStartMetaKey(project string) string { return coldStartMetaPrefix + project }
 
@@ -33,12 +36,12 @@ func coldStartMetaKey(project string) string { return coldStartMetaPrefix + proj
 //   - MEM_DISTILL_SPAWN 未开启（开启时常规 maybeSpawnDistill 已覆盖）；
 //   - MEM_NO_DISTILL / MEM_NO_COLDSTART 未开启；
 //   - 工程非空，有 session_id 与 transcript_path；
-//   - 该工程还没有任何已采纳记忆，且没有 coldstart 标记；
-//   - 该会话确实有未蒸馏的观测（复用 SessionsNeedingDistill 的 due 判定）。
+//   - 该工程还没有任何已采纳记忆，且没有 coldstart 标记。
 //
-// 成功 Start 后才写标记。子进程后续失败时，下一次 SessionStart 的
+// 不再做 SessionsNeedingDistill 的 due 判定：proposal 幂等，没有证据窗口时
+// 自然 skipped。成功 Start 后才写标记。子进程后续失败时，下一次 SessionStart 的
 // distillPendingFailOpen 仍是兜底；这里只负责把成本挪出热路径。
-// 不写 memories、不调 LLM。
+// 钩子本身不写 memories，候选由 detach 的子进程产出。
 func maybeSpawnColdStart(db string, in hookInput, project string, event harness.Event) {
 	if event != harness.EventSessionEnd {
 		return
@@ -79,21 +82,6 @@ func maybeSpawnColdStart(db string, in hookInput, project string, event harness.
 		return
 	}
 	if n > 0 {
-		return
-	}
-	need, err := st.SessionsNeedingDistill(50)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "v2mem hook: 冷启动检查蒸馏窗口失败，已放过:", err)
-		return
-	}
-	due := false
-	for _, id := range need {
-		if id == sid {
-			due = true
-			break
-		}
-	}
-	if !due {
 		return
 	}
 	if err := startColdStartProc(db, sid); err != nil {

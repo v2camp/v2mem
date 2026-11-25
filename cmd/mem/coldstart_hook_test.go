@@ -25,11 +25,10 @@ func coldStartInput(sid string) hookInput {
 	return hookInput{SessionID: sid, TranscriptPath: "/tmp/t.jsonl"}
 }
 
-// clearColdStartEnv 把四个开关都置空/取消，避免宿主机环境让用例假绿。
+// clearColdStartEnv 把三个开关都置空/取消，避免宿主机环境让用例假绿。
 func clearColdStartEnv(t *testing.T) {
 	t.Helper()
 	unsetGrayEnv(t, "MEM_DISTILL_SPAWN")
-	unsetGrayEnv(t, "MEM_PROPOSAL_HOOK")
 	unsetGrayEnv(t, "MEM_NO_DISTILL")
 	unsetGrayEnv(t, "MEM_NO_COLDSTART")
 }
@@ -38,7 +37,6 @@ func TestColdStartSpawnsOnFirstSessionEndOnly(t *testing.T) {
 	clearColdStartEnv(t)
 	const sid = "s-cold"
 	db := grayDB(t)
-	seedDueSession(t, db, sid)
 	calls := installColdStartProc(t, nil)
 
 	// Stop 每轮都来，不能触发冷启动。
@@ -71,7 +69,6 @@ func TestColdStartSkipsWhenProjectHasMemory(t *testing.T) {
 	clearColdStartEnv(t)
 	const sid = "s-has-memory"
 	db := grayDB(t)
-	seedDueSession(t, db, sid)
 
 	st, err := store.Open(db)
 	if err != nil {
@@ -93,7 +90,6 @@ func TestColdStartSkipsOtherProjectsMemory(t *testing.T) {
 	clearColdStartEnv(t)
 	const sid = "s-other-project"
 	db := grayDB(t)
-	seedDueSession(t, db, sid)
 
 	st, err := store.Open(db)
 	if err != nil {
@@ -116,7 +112,6 @@ func TestColdStartSkipsWhenSpawnGateEnabled(t *testing.T) {
 	t.Setenv("MEM_DISTILL_SPAWN", "1")
 	const sid = "s-spawn-on"
 	db := grayDB(t)
-	seedDueSession(t, db, sid)
 
 	calls := installColdStartProc(t, nil)
 	maybeSpawnColdStart(db, coldStartInput(sid), "demo", harness.EventSessionEnd)
@@ -138,7 +133,6 @@ func TestColdStartKillSwitches(t *testing.T) {
 			t.Setenv(tc.env, "1")
 			const sid = "s-killed"
 			db := grayDB(t)
-			seedDueSession(t, db, sid)
 
 			calls := installColdStartProc(t, nil)
 			maybeSpawnColdStart(db, coldStartInput(sid), "demo", harness.EventSessionEnd)
@@ -173,14 +167,16 @@ func TestColdStartSkipsIncompleteInput(t *testing.T) {
 	}
 }
 
-func TestColdStartSkipsSessionWithoutObservations(t *testing.T) {
+// TestColdStartSpawnsWithoutObservations：单轨后 coldstart 不再做 due 判定。
+// proposal 幂等，没有证据窗口时会 noop 消费窗口，因此无观测也照常拉起。
+func TestColdStartSpawnsWithoutObservations(t *testing.T) {
 	clearColdStartEnv(t)
 	db := grayDB(t)
 	calls := installColdStartProc(t, nil)
 
 	maybeSpawnColdStart(db, coldStartInput("s-empty"), "demo", harness.EventSessionEnd)
-	if *calls != 0 {
-		t.Fatalf("会话没有待蒸馏观测时不应冷启动，got %d", *calls)
+	if *calls != 1 {
+		t.Fatalf("无 due 判定后 coldstart 应照常拉起，got %d", *calls)
 	}
 }
 
@@ -188,7 +184,6 @@ func TestColdStartSpawnFailureDoesNotMark(t *testing.T) {
 	clearColdStartEnv(t)
 	const sid = "s-fail"
 	db := grayDB(t)
-	seedDueSession(t, db, sid)
 	calls := installColdStartProc(t, errors.New("spawn 失败"))
 
 	maybeSpawnColdStart(db, coldStartInput(sid), "demo", harness.EventSessionEnd)
@@ -217,20 +212,8 @@ func TestColdStartSpawnFailureDoesNotMark(t *testing.T) {
 func TestCmdHookSessionEndTriggersColdStart(t *testing.T) {
 	clearColdStartEnv(t)
 	db := testDB(t)
-	proj, name := hookProjectDir(t, "cold-repo")
+	proj, _ := hookProjectDir(t, "cold-repo")
 	const sid = "s-cmd-cold"
-
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.AppendObservation(store.ObsInput{
-		SessionID: sid, Project: name, Event: "post-tool-use",
-		Summary: "决策：冷启动入口接线需要一条待蒸馏观测",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
 
 	calls := installColdStartProc(t, nil)
 	raw, _ := json.Marshal(map[string]string{
