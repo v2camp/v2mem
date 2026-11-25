@@ -79,7 +79,7 @@ func setTouchMeta(t *testing.T, db, key, val string) {
 // runTouchSessionStart 跑真实钩子入口，审计固定落到 auditFile（"-" 即关闭）。
 func runTouchSessionStart(t *testing.T, db, proj, auditFile string) string {
 	t.Helper()
-	t.Setenv("MEM_NO_DISTILL", "1") // 只测注入行，不拉起子进程
+	t.Setenv("MEM_NO_AUTOMATION", "1") // 只测注入行，不拉起子进程
 	out, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
 		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", auditFile})
 	})

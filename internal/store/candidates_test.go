@@ -282,15 +282,13 @@ func TestGCCandidatesSurfacesWriteFailure(t *testing.T) {
 	}
 }
 
-func TestDistillWindowAndSessions(t *testing.T) {
+func TestDistillWindowSemantics(t *testing.T) {
 	s := newTestStore(t)
 	if _, err := s.AppendObservation(ObsInput{SessionID: "s1", Event: "stop", Summary: "决策：甲"}); err != nil {
 		t.Fatal(err)
 	}
-	need, err := s.SessionsNeedingDistill(10)
-	if err != nil || len(need) != 1 || need[0] != "s1" {
-		t.Fatalf("应待蒸馏，got %+v %v", need, err)
-	}
+	// 蒸馏游标（distill_runs 的 window_key）是审计 GC 与 R12 判据仍依赖的事实：
+	// 同窗口幂等（ErrAlreadyDistilled），失败行不占窗口。
 	if err := s.SaveDistillRun(DistillRun{
 		SessionID: "s1", Provider: "none", Status: "ok", CandCount: 1, WindowKey: "w1",
 	}); err != nil {
@@ -305,23 +303,17 @@ func TestDistillWindowAndSessions(t *testing.T) {
 	}); err != ErrAlreadyDistilled {
 		t.Fatalf("重复窗口应冲突，got %v", err)
 	}
-	need, err = s.SessionsNeedingDistill(10)
-	if err != nil {
+	if err := s.SaveDistillRun(DistillRun{
+		SessionID: "s1", Provider: "none", Status: "fail",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(need) != 0 {
-		t.Fatalf("刚蒸馏过不应再进 pending，got %+v", need)
-	}
-	if _, err := s.AppendObservation(ObsInput{SessionID: "s1", Event: "post-tool-use", Summary: "决策：乙，更新的观测"}); err != nil {
+	var key string
+	if err := s.db.QueryRow(`SELECT window_key FROM distill_runs WHERE status='fail'`).Scan(&key); err != nil {
 		t.Fatal(err)
 	}
-	// created_at 与 finished_at 可能落在同一秒。拨快观测时间，模拟稍后到来的新观测。
-	if _, err := s.db.Exec(`UPDATE observations SET created_at=? WHERE summary LIKE '%乙%'`, time.Now().Add(2*time.Second).Unix()); err != nil {
-		t.Fatal(err)
-	}
-	need, err = s.SessionsNeedingDistill(10)
-	if err != nil || len(need) != 1 {
-		t.Fatalf("新观测应重新待蒸馏，got %+v %v", need, err)
+	if key != "" {
+		t.Fatalf("失败行的 window_key 应为空，got %q", key)
 	}
 }
 
@@ -400,33 +392,6 @@ func TestFailDistillDoesNotClaimWindow(t *testing.T) {
 	}
 	if key != "" {
 		t.Fatalf("失败行的 window_key 应为空，got %q", key)
-	}
-}
-
-func TestObservationsForDistillFiltersAndOrders(t *testing.T) {
-	s := newTestStore(t)
-	for i, summary := range []string{"更早", "居中", "最新"} {
-		if _, err := s.AppendObservation(ObsInput{SessionID: "s", Event: "stop", Summary: summary}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := s.db.Exec(`UPDATE observations SET created_at=? WHERE summary=?`, int64(100+i), summary); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got, err := s.ObservationsForDistill("s", 0, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0].Summary != "居中" || got[1].Summary != "最新" {
-		t.Fatalf("应保留最新两条并按时间正序，got %+v", got)
-	}
-	got, err = s.ObservationsForDistill("s", 102, 10)
-	if err != nil || len(got) != 1 || got[0].Summary != "最新" {
-		t.Fatalf("since 过滤失败: %+v %v", got, err)
-	}
-	got, err = s.ObservationsForDistill("", 0, 0)
-	if err != nil || len(got) != 3 {
-		t.Fatalf("空会话应列出全部，got %+v %v", got, err)
 	}
 }
 

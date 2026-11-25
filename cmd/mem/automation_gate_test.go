@@ -1,10 +1,15 @@
 package main
 
-// S11：MEM_NO_AUTOMATION 唯一总闸的测试矩阵（design-data-lifecycle §12.4）。
+// S11/S12：MEM_NO_AUTOMATION 唯一总闸的测试矩阵（design-data-lifecycle §12.4）。
 //
-// 覆盖面：四个开关两两组合（含总闸 × 每个既有开关）× 三种写侧事件。
-// 断言的是**行为**：总闸=1 时三个自动 spawn 出口全部为零；既有
-// MEM_NO_DISTILL / MEM_NO_COLDSTART 语义不受影响；SessionStart 的读侧注入仍在。
+// S12 开关收敛后只剩两个口径：
+//   - 裸跑（无任何 env，即生产钩子的默认形态）：SessionStart 拉起 proposal（自动写侧
+//     唯一常规路径）、SessionEnd 一次性冷启动、Stop/SessionEnd 的 judge 按阈值触发；
+//     Stop 不再有蒸馏 spawn（MEM_DISTILL_SPAWN 已退役）。这三个出口的次数在此锁定，
+//     与收敛前的裸跑行为逐项一致 —— 退役开关不得改变 unset 语义。
+//   - 总闸 MEM_NO_AUTOMATION=1：上述自动 spawn 全部为零；SessionStart 的读侧注入仍在。
+//
+// MEM_JUDGE_* 是配置不是闸（显式开/关与阈值/冷却），由 judge_hook_test 单独覆盖；
 // 手动命令不经这些出口，另有单测证明总闸不误伤。
 
 import (
@@ -18,24 +23,17 @@ import (
 )
 
 type automationCombo struct {
-	name      string
-	noAuto    bool
-	noDistill bool
-	noCold    bool
-	spawn     bool
+	name    string
+	noAuto  bool
+	spawnOn bool // 退役的 MEM_DISTILL_SPAWN：必须被无视，不得复活 Stop spawn
 }
 
-// 四个开关两两组合：总闸与每个既有开关各配一次，另保留三个单开关基线。
 func automationCombos() []automationCombo {
 	return []automationCombo{
-		{"全关", false, false, false, false},
-		{"总闸", true, false, false, false},
-		{"总闸+NO_DISTILL", true, true, false, false},
-		{"总闸+NO_COLDSTART", true, false, true, false},
-		{"总闸+SPAWN", true, false, false, true},
-		{"仅 NO_DISTILL", false, true, false, false},
-		{"仅 NO_COLDSTART", false, false, true, false},
-		{"仅 SPAWN", false, false, false, true},
+		{"裸跑", false, false},
+		{"裸跑+退役SPAWN", false, true},
+		{"总闸", true, false},
+		{"总闸+退役SPAWN", true, true},
 	}
 }
 
@@ -81,27 +79,20 @@ func seedAutomationDB(t *testing.T, db string) {
 	seedPending(t, st, 25)
 }
 
+// expectedAutomation 锁「裸跑逐字节一致」的口径：S12 退役三个散闸后，
+// 无 env 的 spawn 次数必须与收敛前完全相同（SessionStart 1 次 distill、
+// SessionEnd 1 次冷启动、Stop/SessionEnd 各 1 次 judge、Stop 零 distill）。
 func expectedAutomation(combo automationCombo, event harness.Event) (distill, cold, judge int) {
 	if combo.noAuto {
 		return 0, 0, 0
 	}
 	switch event {
 	case harness.EventSessionStart:
-		if !combo.noDistill {
-			distill = 1
-		}
+		distill = 1
 	case harness.EventStop:
-		if combo.spawn {
-			distill = 1
-		}
 		judge = 1
 	case harness.EventSessionEnd:
-		if combo.spawn {
-			distill = 1
-		}
-		if !combo.spawn && !combo.noDistill && !combo.noCold {
-			cold = 1
-		}
+		cold = 1
 		judge = 1
 	}
 	return distill, cold, judge
@@ -115,9 +106,7 @@ func TestAutomationKillSwitchMatrix(t *testing.T) {
 				// 每个子用例独立 HOME：judge 冷却状态按文件落盘，不能串味。
 				t.Setenv("HOME", t.TempDir())
 				t.Setenv("MEM_NO_AUTOMATION", boolEnv(combo.noAuto))
-				t.Setenv("MEM_NO_DISTILL", boolEnv(combo.noDistill))
-				t.Setenv("MEM_NO_COLDSTART", boolEnv(combo.noCold))
-				t.Setenv("MEM_DISTILL_SPAWN", boolEnv(combo.spawn))
+				t.Setenv("MEM_DISTILL_SPAWN", boolEnv(combo.spawnOn))
 				// 固定打开 judge 自动触发的显式开关，让「总闸是否拦得住」可被观测。
 				t.Setenv("MEM_JUDGE_SPAWN", "1")
 

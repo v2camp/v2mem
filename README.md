@@ -150,15 +150,15 @@ mem init --dry-run           # 只看会写什么
 写出配置 ≠ 已启用：TraeCode 要开 Hooks 总开关并选「本地自动运行」，Codex 要 trust，
 CodeBuddy 要在面板审核，QoderWork 要重启；`mem init` 会打印各宿主的额外动作。
 Cursor 用 `mem init --harness cursor` 注册六个原生事件（不靠只配 MCP）。
-`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`。这些痕迹可以用 `mem search --layer observation` 查到，默认的 `mem search` 和开场注入仍然只看已定记忆。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写，并机会性用规则把未处理观测抽成候选（候选仍不进检索，要 `mem accept` 才进记忆库）。`MEM_DISTILL_SPAWN=1` 才会在 Stop 末尾再拉起一次短命蒸馏；每个工程的首次 `SessionEnd` 另有一次性冷启动蒸馏，把下一次开场的规则蒸馏前移，`MEM_NO_COLDSTART=1` 可关。默认没有常驻进程。
+`postToolUse` / `stop` / `sessionEnd` 只把有界摘要写入同库 `observations`，**不**调用 `mem add`。这些痕迹可以用 `mem search --layer observation` 查到，默认的 `mem search` 和开场注入仍然只看已定记忆。写库失败时落到 `~/.v2mem/spool`，下次会话开始再补写；`SessionStart` 会机会性拉起一次短命 proposal 蒸馏把证据抽成候选（候选仍不进检索，自动提交矩阵负责落库），每个工程的首次 `SessionEnd` 另有一次性冷启动蒸馏。自动化的唯一开关是总闸 `MEM_NO_AUTOMATION=1`（S12 已退役 `MEM_DISTILL_SPAWN` / `MEM_NO_DISTILL` / `MEM_NO_COLDSTART` 散闸）。默认没有常驻进程。
 全部卸载：`mem uninstall --all`（或 `--harness <名字>` 单个），只摘掉带 `# v2mem` 标记的条目，不动你自己的配置。
 
 ### MCP server
 
 `mem mcp` 暴露 8 个工具：`search`（检索；`layer` 为 `memory` / `observation` / `both`，默认只查已定记忆）、`add`（写入，相同内容自动覆盖）、
 `ls`（列出）、`touch`（记录命中）、`recall_context`（只读，把类码和命中拼成一段文本；`query` 必填，`layer` 与 search 相同），
-以及隔离区裁决三件：`candidates_ls`（列出候选，可用 `project` 限定工程）、`accept` / `reject`（**显式**采纳/拒绝，走 revision CAS）。
-`distill` 仍不进 MCP。裁决工具只是把执行主体从「人跑 CLI」扩到「会话内 Agent 显式调用」，没有把决策自动化。
+以及复核视图三件（S12 §12.3 统一后取代候选裁决三件）：`review_ls`（只读一屏四态复核队列）、`review_withdraw`（把已入库的可疑记忆撤回，退出检索、行与证据保留）、`maintain_wake`（无钩子 Harness 的维护兜底，唤醒一次幂等的 `mem maintain`）。
+`distill` 仍不进 MCP。撤回是人工唯一剩余的否定动作：出错撤回，而不是逐条裁决。
 MCP **不是安装脚本的一部分**：`install.sh` 只放二进制，`mem init` 只写 hooks；MCP 要完成「声明 + 宿主信任/开关」两步才算接入。
 
 ```json
@@ -203,8 +203,8 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 **Level 1 文件运维**：`mem ingest <文件.md...>`（把既有 md 机械化搬进库，幂等；写侧治理含 `--source harness-summary` 锚定"任务收尾汇总"双路径写）
 · `mem budget --file <文件> [--max-chars N]`（检查注入文件是否超预算，超限非零退出）
 · `mem notes`（先输出类码表 P/D/X/T，再输出硬规则小字条：`kind=rule`/全局高优先，一行一条、幂等；正文由 SessionStart 注入承载，每轮检索侧再去重，`MEM_NO_NOTES=1` 让检索侧也回退到原始注入）
-· `mem distill --provider none`（从观测抽候选，**不**写永久记忆）· `mem candidates ls [--project P]`（按工程就近查看）· `mem accept` / `mem reject`（顶层命令，MCP 里是 `accept` / `reject` 工具）· `mem batch --plan <file> [--dry-run]`（按 AI 产出的方案一次裁决，归档可 `--rollback`）· `mem batch --reject-judged`（把影子判定为 reject 的候选批量否决，只否决不采纳）
-· `mem import-transcript --file <claude.jsonl>`（默认只写观测；`--into both` 再跑规则蒸馏，仍须 accept）
+· `mem distill --proposal`（从证据 Bundle 抽候选，**不**写永久记忆；`--quarantined` / `--requeue` / `--gaps` 为运维出口）· `mem candidates ls [--project P]`（按工程就近查看）· `mem review ls`（一屏四态复核队列）· `mem review withdraw <memoryID>`（误入库撤回）· `mem accept` / `mem reject`（顶层命令，单条裁决）
+· `mem import-transcript --file <claude.jsonl>`（只写观测；候选由 proposal 蒸馏产出）
 · `mem gc --candidates`（pending 14 天过期，已采纳行 90 天后删除，不动记忆）
 
 **接入与钩子**：`mem harness`（列出 12 个工具入口）· `mem init`（写入钩子配置）· `mem uninstall`（反向移除，`--all` 一键）

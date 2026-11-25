@@ -63,47 +63,16 @@ func openSpawnLog() (*os.File, error) {
 	return os.OpenFile(filepath.Join(dir, "spawn.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 }
 
-// distillSpawnEnabled 是 Stop / SessionEnd 常规蒸馏子进程的总闸。
-// 单轨后它只管这两条收尾路径；SessionStart 的兜底不受此闸约束（见 distillPendingFailOpen），
-// 首会话冷启动同样是一次性例外（coldstart.go）。
-// 未设置 / 非 "1" → false，即默认不在 Stop / SessionEnd 拉起蒸馏子进程。
-func distillSpawnEnabled() bool {
-	return strings.TrimSpace(os.Getenv("MEM_DISTILL_SPAWN")) == "1"
-}
-
-// maybeSpawnDistill 在 Stop / SessionEnd 末尾可选地拉起 proposal 蒸馏。
-// 默认不拉起；只要求 session_id 非空——proposal 从证据 Bundle 读输入，
-// 不依赖 transcript_path，也不再做 SessionsNeedingDistill 的 due 判定。
-// 失败只打 stderr。
-func maybeSpawnDistill(db string, in hookInput) {
-	if automationDisabled() {
-		return
-	}
-	if !distillSpawnEnabled() {
-		return
-	}
-	if in.sessionID() == "" {
-		fmt.Fprintln(os.Stderr, "v2mem hook: 无 session_id，跳过 proposal")
-		return
-	}
-	if err := startDistillProc(db); err != nil {
-		fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 proposal 失败，已放过:", err)
-	}
-}
-
 // distillPendingFailOpen 在 SessionStart 拉起 proposal 子进程，兜住上一会话可能
-// 漏掉的写侧蒸馏。单轨后这是自动写侧的主路径：SessionStart 无条件拉起，
-// 唯一关断是 MEM_NO_DISTILL=1——若再受 MEM_DISTILL_SPAWN 约束，裸 hook 配置
-// （生产默认）会让写侧静默停摆。
+// 漏掉的写侧蒸馏。单轨后这是自动写侧的唯一常规路径：SessionStart 无条件拉起，
+// 唯一关断是 MEM_NO_AUTOMATION 总闸（S12 已退役 MEM_NO_DISTILL / MEM_DISTILL_SPAWN
+// 双轨闸——开关越多，「自动化在不在跑」越难一句话回答，见 §12.4）。
 //
 // 子进程幂等：没有待处理证据窗口时 proposal 自然 skipped。拉起失败只打 stderr，
 // 不阻断本会话的注入（fail-open）。
 func distillPendingFailOpen(db string) {
-	// 唯一总闸优先：MEM_NO_AUTOMATION=1 时 SessionStart 也不拉起写侧子进程。
+	// 唯一总闸：MEM_NO_AUTOMATION=1 时 SessionStart 也不拉起写侧子进程。
 	if automationDisabled() {
-		return
-	}
-	if strings.TrimSpace(os.Getenv("MEM_NO_DISTILL")) == "1" {
 		return
 	}
 	if err := startDistillProc(db); err != nil {
@@ -111,6 +80,7 @@ func distillPendingFailOpen(db string) {
 	}
 }
 
+// observeEventMayDistill 现在只决定冷启动挂点：Stop 每轮都来，冷启动只挂 SessionEnd。
 func observeEventMayDistill(event harness.Event) bool {
 	return event == harness.EventStop || event == harness.EventSessionEnd
 }

@@ -346,7 +346,7 @@ var registry = []Harness{
 		Notes: []string{
 			"hooks.json 是扁平 command 数组，version 必须为 1，事件名是 camelCase",
 			"sessionStart / preCompact / beforeSubmitPrompt 的注入走 stdout JSON 的 additional_context",
-			"postToolUse / stop / sessionEnd 只写 observations，不写 memories，也不启动常驻进程；MEM_DISTILL_SPAWN=1 才在 Stop/SessionEnd 拉起一次短命 distill",
+			"postToolUse / stop / sessionEnd 只写 observations，不写 memories，也不启动常驻进程；写侧蒸馏由 SessionStart 机会性拉起一次短命 proposal，首会话 SessionEnd 另有一次性冷启动；MEM_NO_AUTOMATION=1 可关全部自动化",
 		},
 	},
 }

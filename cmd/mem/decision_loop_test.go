@@ -43,7 +43,7 @@ func twoProjectSpec(self, other string) []candSpec {
 
 func sessionStartOut(t *testing.T, db, proj string, maxChars ...int) string {
 	t.Helper()
-	t.Setenv("MEM_NO_DISTILL", "1")
+	t.Setenv("MEM_NO_AUTOMATION", "1") // 只测注入，不拉起写侧子进程
 	args := []string{
 		"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-",
 	}
@@ -80,7 +80,7 @@ func TestHookSessionStartPendingLineIsProjectScoped(t *testing.T) {
 	if strings.Contains(out, "本工程 5 条") {
 		t.Error("不得把别工程候选全局累加")
 	}
-	for _, want := range []string{"candidates_ls", "accept", "reject", "mem candidates ls"} {
+	for _, want := range []string{"review_ls", "mem review ls", "mem review withdraw"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("提示应含可执行入口 %q", want)
 		}
@@ -155,7 +155,7 @@ func TestPendingCandidatesLineFailsOpen(t *testing.T) {
 	}
 }
 
-// ---------- ② MCP 裁决三工具 ----------
+// ---------- ② MCP 复核视图（§12.3 统一后的落点，端到端用例在 mcp_test.go） ----------
 
 func mcpErrCode(t *testing.T, s *mcpServer, name string, args map[string]any) int {
 	t.Helper()
@@ -175,152 +175,6 @@ func mcpJSON(t *testing.T, result map[string]any, dst any) {
 	t.Helper()
 	if err := json.Unmarshal([]byte(mcpText(result)), dst); err != nil {
 		t.Fatalf("解析工具结果失败: %v / %s", err, mcpText(result))
-	}
-}
-
-func TestMCPCandidatesLS(t *testing.T) {
-	s, _ := newMCPServer(t)
-	seedVia(t, s.st, twoProjectSpec("alpha", "beta"))
-
-	var all []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{}), &all)
-	if len(all) != 5 {
-		t.Fatalf("默认 pending 应 5 条，got %d", len(all))
-	}
-
-	var alpha []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"project": "alpha"}), &alpha)
-	if len(alpha) != 2 {
-		t.Fatalf("--project 等价过滤应 2 条，got %d", len(alpha))
-	}
-	for _, c := range alpha {
-		if c.Project != "alpha" {
-			t.Errorf("混入 %q 的候选", c.Project)
-		}
-	}
-
-	var accepted []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"status": "accepted"}), &accepted)
-	if len(accepted) != 0 {
-		t.Errorf("status 过滤失效，got %d", len(accepted))
-	}
-	var allStatus []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"status": "all"}), &allStatus)
-	if len(allStatus) != 5 {
-		t.Errorf("status=all 应列出全部 5 条，got %d", len(allStatus))
-	}
-	var limited []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"limit": 2}), &limited)
-	if len(limited) != 2 {
-		t.Errorf("limit 应生效，got %d", len(limited))
-	}
-
-	if got := mcpErrCode(t, s, "candidates_ls", map[string]any{"limit": 0}); got != -32602 {
-		t.Errorf("limit<=0 应 -32602，got %d", got)
-	}
-	if got := mcpErrCode(t, s, "candidates_ls", map[string]any{"status": "bogus"}); got != -32602 {
-		t.Errorf("非法 status 应 -32602，got %d", got)
-	}
-}
-
-func TestMCPAcceptIsExplicitAndIdempotent(t *testing.T) {
-	s, db := newMCPServer(t)
-	seedVia(t, s.st, twoProjectSpec("alpha", "beta"))
-
-	var alpha []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"project": "alpha"}), &alpha)
-	id := alpha[0].ID
-
-	// 未调用 accept 前绝不写主库：显式裁决，不是自动采纳。
-	if n := countAllMemories(t, db); n != 0 {
-		t.Fatalf("MCP 不得自动采纳，初始已有 %d 条记忆", n)
-	}
-	if got := mcpErrCode(t, s, "accept", map[string]any{}); got != -32602 {
-		t.Errorf("缺 id 应 -32602，got %d", got)
-	}
-	if got := mcpErrCode(t, s, "accept", map[string]any{"id": "deadbeef"}); got != -32603 {
-		t.Errorf("不存在的 id 应 -32603，got %d", got)
-	}
-	if got := mcpErrCode(t, s, "accept", map[string]any{"id": id[:8], "revision": 999}); got != -32603 {
-		t.Errorf("过期 revision 应 CAS 冲突 -32603，got %d", got)
-	}
-
-	var first map[string]any
-	mcpJSON(t, mcpCall(t, s, "accept", map[string]any{"id": id[:8]}), &first)
-	if first["created"] != true {
-		t.Errorf("首次采纳应落新记忆，got %v", first)
-	}
-	if n := countAllMemories(t, db); n != 1 {
-		t.Errorf("采纳后应 1 条记忆，got %d", n)
-	}
-
-	var replay map[string]any
-	mcpJSON(t, mcpCall(t, s, "accept", map[string]any{"id": id[:8]}), &replay)
-	if replay["already"] != true || countAllMemories(t, db) != 1 {
-		t.Errorf("重复采纳应幂等且不新增记忆，got %v", replay)
-	}
-
-	// auto=true 走提交矩阵分支；deferred 也是合法结果，只要求不报错且有 decision。
-	var beta []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"project": "beta"}), &beta)
-	var auto map[string]any
-	mcpJSON(t, mcpCall(t, s, "accept", map[string]any{"id": beta[0].ID[:8], "auto": true}), &auto)
-	if _, ok := auto["decision"]; !ok {
-		t.Errorf("auto 分支也应返回 decision，got %v", auto)
-	}
-
-	// 关闭审计的分支同样要能走通。
-	s.auditFile = "-"
-	var beta2 []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"project": "beta"}), &beta2)
-	var noAudit map[string]any
-	mcpJSON(t, mcpCall(t, s, "accept", map[string]any{"id": beta2[1].ID[:8]}), &noAudit)
-	if _, ok := noAudit["decision"]; !ok {
-		t.Errorf("关闭审计时应照常返回结果，got %v", noAudit)
-	}
-}
-
-func TestMCPRejectIsExplicitAndIdempotent(t *testing.T) {
-	s, db := newMCPServer(t)
-	seedVia(t, s.st, twoProjectSpec("alpha", "beta"))
-
-	var alpha []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"project": "alpha"}), &alpha)
-	id := alpha[0].ID[:8]
-
-	if got := mcpErrCode(t, s, "reject", map[string]any{}); got != -32602 {
-		t.Errorf("缺 id 应 -32602，got %d", got)
-	}
-	if got := mcpErrCode(t, s, "reject", map[string]any{"id": "deadbeef"}); got != -32603 {
-		t.Errorf("不存在的 id 应 -32603，got %d", got)
-	}
-	if got := mcpErrCode(t, s, "reject", map[string]any{"id": id, "revision": 999}); got != -32603 {
-		t.Errorf("过期 revision 应 CAS 冲突 -32603，got %d", got)
-	}
-
-	var res map[string]any
-	mcpJSON(t, mcpCall(t, s, "reject", map[string]any{"id": id, "reason": "跨工程误入"}), &res)
-	if res["status"] != "rejected" {
-		t.Errorf("拒绝后状态应为 rejected，got %v", res["status"])
-	}
-	if n := countAllMemories(t, db); n != 0 {
-		t.Errorf("reject 绝不写 memories，got %d", n)
-	}
-
-	var replay map[string]any
-	mcpJSON(t, mcpCall(t, s, "reject", map[string]any{"id": id}), &replay)
-	if replay["status"] != "rejected" {
-		t.Errorf("重复拒绝应幂等，got %v", replay["status"])
-	}
-
-	// 关闭审计分支。
-	s.auditFile = "-"
-	var alpha2 []store.Candidate
-	mcpJSON(t, mcpCall(t, s, "candidates_ls", map[string]any{"project": "alpha"}), &alpha2)
-	var noAudit map[string]any
-	mcpJSON(t, mcpCall(t, s, "reject", map[string]any{"id": alpha2[0].ID[:8]}), &noAudit)
-	if noAudit["status"] != "rejected" {
-		t.Errorf("关闭审计时也应正常拒绝，got %v", noAudit["status"])
 	}
 }
 

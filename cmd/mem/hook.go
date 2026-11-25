@@ -156,9 +156,9 @@ func cmdHook(args []string) error {
 	if isObserveHook(event) {
 		appendObservationFailOpen(c, *harnessFlag, event, project, in, *auditPath, started, *noScrub)
 		if observeEventMayDistill(event) {
-			maybeSpawnDistill(c.db, in)
-			// 冷启动只挂在 SessionEnd：把首会话的 proposal 蒸馏从下一次 SessionStart
-			// 前移到会话收尾，热路径不再承担这次蒸馏。
+			// S12 收敛后观测事件不再挂常规蒸馏 spawn（MEM_DISTILL_SPAWN 已退役，
+			// 自动写侧的唯一常规路径是 SessionStart 的 distillPendingFailOpen）；
+			// 这里只保留首会话冷启动这一次性例外（只挂 SessionEnd）。
 			maybeSpawnColdStart(c.db, in, project, event)
 		}
 		// 积压触发：pending 到阈值就拉起一次判定（默认关，见 judge_hook.go）。
@@ -342,11 +342,11 @@ func renderHookContext(c common, event harness.Event, project, prompt string, li
 
 // automationDisabled 是自动化的**唯一总闸**（design-data-lifecycle §12.4）。
 //
-// 只拦「钩子替用户做的自动决定」：proposal spawn、冷启动、judge spawn。
+// 只拦「钩子替用户做的自动决定」：SessionStart 的 proposal spawn、冷启动、judge spawn。
 // 不拦数据通路（spool drain 是证据补写，丢了就是丢证据）与任何手动命令
-// （mem maintain / distill / judge / accept …）——总闸回答的是「自动化在不在跑」，
-// 不是「记忆系统关没关」。现有 MEM_NO_DISTILL / MEM_NO_COLDSTART 语义保留（S12 再退役），
-// 总闸与它们各自独立生效，任一为真都不动作。
+// （mem maintain / distill / judge / review …）——总闸回答的是「自动化在不在跑」，
+// 不是「记忆系统关没关」。S12 已退役 MEM_NO_DISTILL / MEM_NO_COLDSTART /
+// MEM_DISTILL_SPAWN 双轨时代的散闸，总闸是唯一的自动化开关。
 func automationDisabled() bool {
 	return strings.TrimSpace(os.Getenv("MEM_NO_AUTOMATION")) == "1"
 }
@@ -692,8 +692,7 @@ func pendingCandidatesLine(st *store.Store, project string) string {
 		return ""
 	}
 	return fmt.Sprintf("[待裁决] 本工程 %d 条 pending 候选（隔离区，不进检索）："+
-		"用 MCP candidates_ls 查看，逐条 accept / reject 裁决；或跑 mem candidates ls。"+
-		"影子判定进度：mem judge --stats。\n", n)
+		"用 MCP review_ls 或 mem review ls 查看四态队列；已入库的可疑条目用 mem review withdraw 撤回。\n", n)
 }
 
 // hintBlock 是「钩子」本体：告诉模型还有 Level 2 可查，并给出可直接执行的命令。

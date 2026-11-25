@@ -56,9 +56,13 @@
 - `mem distill` / `mem reject` / `import-transcript` **禁止** `INSERT memories`。LLM 超时或 JSON 不合规：写 `distill_runs` 失败行，不写候选，默认退出码 0；`--strict` 才非零。
 - 同一会话的同一批观测只蒸馏一次（`distill_runs.window_key`）。Stop 每轮都触发时不会放大噪声。
 - 无 `transcript_path` 的 Stop 不拉起 distill，观测仍保留。
-- 可选：`MEM_DISTILL_SPAWN=1` 时 Stop / SessionEnd 末尾 `Start` 一次 `mem distill --provider none`（非常驻）。默认不拉起。
-- **冷启动前移（一次性例外）**：`SessionEnd` 时若当前工程尚无已采纳记忆、且未打过 `coldstart:v1:<project>` 标记，拉起一次 detached 的 `mem distill --session <sid> --provider none`，成功 `Start` 后写标记。它不受 `MEM_DISTILL_SPAWN` 约束（该变量仍是常规蒸馏的总闸），固定零 LLM、只写 candidates；失败不写标记，下一次 `SessionStart` 的 `distillPendingFailOpen` 兜底。`MEM_NO_COLDSTART=1` 关闭。
-- `SessionStart` 在 spool drain 之后机会性跑 `distill --pending`，**只用规则抽取**，约 200ms 上限，失败不阻断注入。`MEM_NO_DISTILL=1` 关掉这一步。
+- **冷启动前移（一次性例外）**：`SessionEnd` 时若当前工程尚无已采纳记忆、且未打过 `coldstart:v1:<project>` 标记，拉起一次 detached 的 proposal 蒸馏，成功 `Start` 后写标记；失败不写标记，下一次 `SessionStart` 的 `distillPendingFailOpen` 兜底。
+- `SessionStart` 在 spool drain 之后机会性拉起一次短命 proposal 蒸馏（`distillPendingFailOpen`），失败不阻断注入。
+
+> **S12 收敛注（design-data-lifecycle §12.4）**：上面两条 Stop / SessionEnd 的常规蒸馏
+> spawn（`MEM_DISTILL_SPAWN=1` 才拉起）与 `MEM_NO_DISTILL` / `MEM_NO_COLDSTART` 散闸已退役。
+> 自动写侧只剩 SessionStart 的 proposal spawn 这一条常规路径 + 首会话冷启动这一次性例外；
+> 唯一开关是总闸 `MEM_NO_AUTOMATION=1`（不拦 spool drain 与手动命令）。
 - `mem eval activity` 默认排除 `source∈{bench,test,distill-pending}`。观测侧另计 `obs / distill_ok / distill_fail / accept / reject`。有观测且无人采纳时结论为「有观测无采纳」。accept 计入写侧，`source=distill-accept`。
 - PreCompact 仍只重注入，不写观测、不蒸馏。见 [`design-harness.md`](./design-harness.md)。为何不照搬常驻 consolidate，见 [`design-anti-agentmemory.md`](./design-anti-agentmemory.md)。
 
@@ -142,7 +146,7 @@ MCP `add` 的 schema 声明 `required:["content"]`；写侧一律带 `source`（
 | 宿主 CLI | `/Users/wanghui/.local/bin/codebuddy` 存在，支持 `-p/--print`、`--session-id`、`--tools`、`--no-session-persistence` |
 | 历史探针 | 2026-11-02 的零额度探针证明 `codebuddy -p probe --port <n>` 在模型调用前即可触发 native hooks；HOME 隔离会使 hooks 不运行，故探针必须用配置副本 |
 | 当前 hook 配置 | `~/.workbuddy/settings.json` 的 SessionStart / UserPromptSubmit / Stop / SessionEnd 都是同一条 `mem hook --harness workbuddy`，没有 Proposal run/depth 标记 |
-| 当前 Proposal 代码 | `distill_hook.go` 只有默认关闭的 `MEM_DISTILL_SPAWN`，没有子会话 origin_run_id、深度上限或「Proposal 子会话不触发新 Proposal」判定 |
+| 当前 Proposal 代码 | `distill_hook.go` 的自动拉起只剩 SessionStart 的 proposal spawn（S12 已退役 `MEM_DISTILL_SPAWN` 散闸），没有子会话 origin_run_id、深度上限或「Proposal 子会话不触发新 Proposal」判定 |
 
 因此，**从 Stop 里拉起子 Agent 做 Proposal，会再次触发同一组 hooks，存在递归与自蒸馏风险**。在阶段 2 落地以下五项前，不得把 Host 放进自动调度：
 

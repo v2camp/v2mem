@@ -33,8 +33,7 @@ func coldStartMetaKey(project string) string { return coldStartMetaPrefix + proj
 //
 // 触发条件全部满足才动作：
 //   - 事件是 SessionEnd（Stop 每轮都会来，不能把冷启动挂在那里）；
-//   - MEM_DISTILL_SPAWN 未开启（开启时常规 maybeSpawnDistill 已覆盖）；
-//   - MEM_NO_DISTILL / MEM_NO_COLDSTART 未开启；
+//   - MEM_NO_AUTOMATION 总闸未开启（S12 后它是唯一开关，§12.4）；
 //   - 工程非空，有 session_id 与 transcript_path；
 //   - 该工程还没有任何已采纳记忆，且没有 coldstart 标记。
 //
@@ -48,13 +47,6 @@ func maybeSpawnColdStart(db string, in hookInput, project string, event harness.
 	}
 	// 唯一总闸：冷启动也是自动 spawn，总闸下必须静默让路。
 	if automationDisabled() {
-		return
-	}
-	if distillSpawnEnabled() {
-		return
-	}
-	if strings.TrimSpace(os.Getenv("MEM_NO_DISTILL")) == "1" ||
-		strings.TrimSpace(os.Getenv("MEM_NO_COLDSTART")) == "1" {
 		return
 	}
 	if project == "" || strings.TrimSpace(in.TranscriptPath) == "" {

@@ -89,9 +89,10 @@ func TestMCPToolsList(t *testing.T) {
 			t.Errorf("工具 %v 缺 inputSchema", tl["name"])
 		}
 	}
+	// §12.3 目标面：读写核心 5 件 + review_ls / review_withdraw / maintain_wake。
 	for _, want := range []string{
 		"search", "add", "ls", "touch", "recall_context",
-		"candidates_ls", "accept", "reject",
+		"review_ls", "review_withdraw", "maintain_wake",
 	} {
 		if !names[want] {
 			t.Errorf("工具清单缺 %s，got %v", want, names)
@@ -100,11 +101,10 @@ func TestMCPToolsList(t *testing.T) {
 	if len(names) != 8 {
 		t.Fatalf("工具面应为 8，got %v", names)
 	}
-	// design-write-governance.md §12：accept/reject 是会话内 Agent 的**显式**裁决，
-	// 已获准进 MCP；distill 是产出候选的批处理，仍不进工具面。
-	for _, banned := range []string{"distill"} {
+	// §12.3 收编：candidates_ls / accept / reject 被复核视图取代；distill 仍不进工具面。
+	for _, banned := range []string{"distill", "candidates_ls", "accept", "reject"} {
 		if names[banned] {
-			t.Errorf("MCP 不得暴露 %s", banned)
+			t.Errorf("MCP 不得暴露 %s（§12.3 已收编）", banned)
 		}
 	}
 }
@@ -464,5 +464,118 @@ func TestMCPReadToolsDoNotAutoAdopt(t *testing.T) {
 	d, _ = s.st.MemoryDetailByID(id)
 	if d.AdoptedCount != 1 || d.LastAdopted == nil {
 		t.Fatalf("touch 应作为 adopted 别名: %+v", d)
+	}
+}
+
+// ---------- §12.3 MCP 统一：review_ls / review_withdraw / maintain_wake ----------
+
+// review_ls 复用 store.ListReviewQueue 的一屏四态投影：pending（模型没跑）+
+// 复核摘要（例外式）+ quarantined + failed。造库 → 调用 → 断言四态。
+func TestMCPReviewLSShowsFourStates(t *testing.T) {
+	s, _ := newMCPServer(t)
+	seedVia(t, s.st, twoProjectSpec("alpha", "beta"))
+	// 终态两档：一条 failed、一条 quarantined（S13 已定稿的候选终态，直接置状态）。
+	if _, err := s.st.DB().Exec(`UPDATE candidates SET status='failed', status_reason='judge_invalid_output: bad json' WHERE project='alpha' AND id=(SELECT id FROM candidates WHERE project='alpha' LIMIT 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.st.DB().Exec(`UPDATE candidates SET status='quarantined', status_reason='attempt 超上限' WHERE project='beta' AND id=(SELECT id FROM candidates WHERE project='beta' LIMIT 1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	var q store.ReviewQueue
+	mcpJSON(t, mcpCall(t, s, "review_ls", map[string]any{}), &q)
+	if q.Counts[store.ReviewQueuePending] != 3 || q.Counts[store.ReviewQueueFailed] != 1 ||
+		q.Counts[store.ReviewQueueQuarantined] != 1 || q.Counts[store.ReviewQueueSummary] != 0 {
+		t.Fatalf("四态计数不对: %v", q.Counts)
+	}
+	for _, st := range store.ReviewQueueStates() {
+		if _, ok := q.States[st]; !ok {
+			t.Errorf("四态键 %s 缺失（空态也要是 [] 而不是 null）", st)
+		}
+	}
+
+	var pendingOnly store.ReviewQueue
+	mcpJSON(t, mcpCall(t, s, "review_ls", map[string]any{"state": "pending"}), &pendingOnly)
+	if pendingOnly.Counts[store.ReviewQueuePending] != 3 || len(pendingOnly.States[store.ReviewQueueQuarantined]) != 0 {
+		t.Fatalf("state=pending 应只给 pending 段: %v / %v", pendingOnly.Counts, pendingOnly.States)
+	}
+
+	if got := mcpErrCode(t, s, "review_ls", map[string]any{"state": "bogus"}); got != -32602 {
+		t.Errorf("非法 state 应 -32602，got %d", got)
+	}
+	if got := mcpErrCode(t, s, "review_ls", map[string]any{"limit": 0}); got != -32602 {
+		t.Errorf("limit<=0 应 -32602，got %d", got)
+	}
+}
+
+// review_withdraw 走 store.ApplyMemoryReview 单事务：撤回退出检索、行与证据保留。
+func TestMCPReviewWithdrawEndToEnd(t *testing.T) {
+	s, db := newMCPServer(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "demo", "--kind", "decision",
+		"误入库要撤回的记忆"}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := s.st.List(store.ListQuery{Scope: "all", Limit: 10})
+	if err != nil || len(hits) != 1 {
+		t.Fatalf("前置条件不成立: %d %v", len(hits), err)
+	}
+	id := hits[0].ID
+
+	if got := mcpErrCode(t, s, "review_withdraw", map[string]any{}); got != -32602 {
+		t.Errorf("缺 id 应 -32602，got %d", got)
+	}
+	if got := mcpErrCode(t, s, "review_withdraw", map[string]any{"id": "deadbeef00000000"}); got != -32603 {
+		t.Errorf("不存在的 id 应 -32603，got %d", got)
+	}
+
+	var rep store.MemoryReviewReport
+	mcpJSON(t, mcpCall(t, s, "review_withdraw", map[string]any{"id": id, "reason": "误入库"}), &rep)
+	if rep.Action != store.ReviewActionWithdraw || rep.After.ReviewState != store.ReviewStateWithdrawn {
+		t.Fatalf("撤回后应为 withdrawn: %+v", rep)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdSearch([]string{"--db", db, "误入库要撤回"})
+	})
+	if err != nil || strings.Contains(out, "误入库要撤回") {
+		t.Fatalf("撤回后必须退出检索，got %q %v", out, err)
+	}
+	d, err := s.st.MemoryDetailByID(id)
+	if err != nil || d == nil || d.Content != "误入库要撤回的记忆" {
+		t.Fatalf("撤回只退检索，行与正文必须保留: %+v %v", d, err)
+	}
+}
+
+// maintain_wake 是无钩子 Harness 的兜底（§4）：唤醒一次 mem maintain 子进程，
+// 不在 MCP 进程内联跑（maintain 会打 stdout，而 MCP 的 stdout 是协议通道）。
+func TestMCPMaintainWake(t *testing.T) {
+	s, _ := newMCPServer(t)
+	var called int
+	var gotDB string
+	var gotMax int
+	prev := startMaintainProc
+	startMaintainProc = func(db string, maxBundles int) error {
+		called++
+		gotDB, gotMax = db, maxBundles
+		return nil
+	}
+	t.Cleanup(func() { startMaintainProc = prev })
+
+	res := mcpCall(t, s, "maintain_wake", map[string]any{"max_bundles": 5})
+	if !strings.Contains(mcpText(res), `"waked":true`) {
+		t.Fatalf("应回 waked=true，got %s", mcpText(res))
+	}
+	if called != 1 || gotDB != s.st.Path() || gotMax != 5 {
+		t.Fatalf("应拉起一次 maintain（db=%s max=5），got called=%d db=%s max=%d",
+			s.st.Path(), called, gotDB, gotMax)
+	}
+
+	// 缺省走默认预算。
+	res = mcpCall(t, s, "maintain_wake", map[string]any{})
+	if !strings.Contains(mcpText(res), `"waked":true`) || called != 2 {
+		t.Fatalf("缺省参数也应唤醒，got %s called=%d", mcpText(res), called)
+	}
+
+	if got := mcpErrCode(t, s, "maintain_wake", map[string]any{"max_bundles": -1}); got != -32602 {
+		t.Errorf("负 max_bundles 应 -32602，got %d", got)
 	}
 }

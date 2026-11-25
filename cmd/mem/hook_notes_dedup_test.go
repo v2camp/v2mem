@@ -59,7 +59,7 @@ func seedNotesDedupRules(t *testing.T, db string) {
 // runHookWithSession 跑一次钩子，返回 stdout。审计显式关掉，绝不落真实日志。
 func runHookWithSession(t *testing.T, db, proj, event, prompt, session string, extra ...string) string {
 	t.Helper()
-	t.Setenv("MEM_NO_DISTILL", "1")
+	t.Setenv("MEM_NO_AUTOMATION", "1")
 	args := append([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"},
 		extra...)
 	out, err := withStdin(t, hookStdinWithSession(event, proj, prompt, session), func() error {

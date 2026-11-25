@@ -473,6 +473,13 @@ design-admission.md 取代声明、design-write-governance.md 再修订），代
 | `judge` 执行面 | 判跑内联 maintain，不再是「记得去跑」的命令 | 标定统计并入 `review stats`；`--apply` 已撤、永不恢复 |
 | `migrate` | 静态标记随旧库迁移完成退役 | — |
 
+> **S12 已落地（旧轨蒸馏单轨）**：`mem distill --session/--pending` 与 `import-transcript
+> --into candidates|both` 删除，`distillOne` / `SessionsNeedingDistill` / `ObservationsForDistill`
+> 一并退役——自动写侧只剩 proposal 单轨（SessionStart spawn + 一次性冷启动），手动入口
+> 只剩 `distill --proposal/--bundle` 与三个运维出口。`judge --stats` 退役，标定统计由
+> `mem review stats` 承接（judge 命令本体保留，判跑内联 maintain 属 §12.2 随 P2）。
+> CLI `batch` / `accept` / `reject` / `migrate` 的下线随后续切片执行（MCP 面已先行收编，见 §12.3）。
+
 ### 12.2 收编进 `mem maintain`
 
 `distill` / `gc`（含 R15 的 `gc --candidates` 手动路径）/ `consolidate` / 判跑——
@@ -485,11 +492,22 @@ pending（模型没跑）+ 复核摘要（例外式）+ quarantined + failed。
 MCP：`candidates_ls`/`accept`/`reject`（3）→ `review_ls`/`review_withdraw`（2）
 + `maintain_wake`（§4 无钩子 Harness 兜底）。
 
+> **S12 已落地（MCP 面）**：`candidates_ls` / `accept` / `reject` 三件已删除；
+> `review_ls`（复用 `store.ListReviewQueue` 一屏四态）、`review_withdraw`
+> （复用 `store.ApplyMemoryReview` 单事务撤回）、`maintain_wake`（短命 `mem maintain`
+> 子进程，幂等）已上线，工具面维持 8 件（读写核心 5 + 复核 3）。
+
 ### 12.4 开关收敛
 
-`MEM_DISTILL_SPAWN`、`MEM_JUDGE_SPAWN`/`MIN_PENDING`/`COOLDOWN_H` 退役——
+`MEM_DISTILL_SPAWN`、`MEM_NO_DISTILL`、`MEM_NO_COLDSTART` 退役——
 双轨时代各链路各自的闸。收敛为 maintain 统一预算/冷却（落 `model.json`）
 + **唯一总闸** `MEM_NO_AUTOMATION=1`。开关越多，「自动化在不在跑」越难一句话回答。
+
+> **S12 已落地**：三个散闸的代码、测试、脚本、文档出现点已一次清干净；`MEM_JUDGE_SPAWN`
+> / `MEM_JUDGE_MIN_PENDING` / `MEM_JUDGE_COOLDOWN_H` 按 S12 切片口径**保留为配置**而非闸
+> （判定器的开/关/阈值/冷却，属 `model.json` 授权语义，见 design-admission §2.5）。
+> 退役后裸跑（无任何 env）行为与退役前逐项一致，由 automation_gate_test 锁定；
+> 退役开关的残留值一律被无视。
 
 ### 12.5 保留不动
 

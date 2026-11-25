@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,8 +38,9 @@ type mcpTool struct {
 
 // mcpTools 是 mem 暴露给 MCP 的工具清单 —— 只放「记忆本身的操作」，
 // 评测/运维（audit、eval、gc、consolidate）不进工具面，保持工具语义最小。
-// candidates_ls / accept / reject 是隔离区的**显式裁决**（design-write-governance.md §12）：
-// 由会话内 Agent 明确调用，不是自动裁决；distill 仍不进 MCP。
+// S12 统一（§12.3）：candidates_ls / accept / reject 三件被复核视图取代——
+// 人工唯一剩余的否定动作是事后撤回，日常只看四态队列；maintain_wake 是
+// 无钩子 Harness 的兜底（§4）。distill 仍不进 MCP。
 var mcpTools = []mcpTool{
 	{
 		Name:        "search",
@@ -111,42 +113,36 @@ var mcpTools = []mcpTool{
 		},
 	},
 	{
-		Name:        "candidates_ls",
-		Description: "只读。列出隔离区 candidates（默认 pending，不进检索面）。用 project 限定工程即可就近裁决本会话产生的候选。",
+		Name:        "review_ls",
+		Description: "只读。一屏四态复核队列：pending（模型没跑）+ summary（未审核摘要，例外式）+ quarantined（隔离）+ failed（失败）。用 state 只看某一态。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"status":  map[string]any{"type": "string", "description": "pending|accepted|rejected|expired|all，默认 pending；all 不限状态"},
-				"session": map[string]any{"type": "string", "description": "限定会话"},
-				"project": map[string]any{"type": "string", "description": "限定工程（默认不限）"},
-				"limit":   map[string]any{"type": "number", "description": "最多列出多少条，默认 50"},
+				"state": map[string]any{"type": "string", "description": "all（默认）|pending|summary|quarantined|failed"},
+				"limit": map[string]any{"type": "number", "description": "每态最多列出多少条（计数不受影响），默认 50"},
 			},
 		},
 	},
 	{
-		Name:        "accept",
-		Description: "显式采纳一条 pending 候选，升格为 memories（source=distill-accept）。这是会话内 Agent 的明确决策，不是自动裁决。id 必填。",
+		Name:        "review_withdraw",
+		Description: "把一条已入库的可疑记忆撤回：立即退出检索，行与证据保留（可 restore）。这是人工唯一剩余的否定动作，单事务完成状态迁移与候选终态恢复。id 必填（完整记忆 id，不接受前缀）。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"id":       map[string]any{"type": "string", "description": "候选 id 或前缀（必填）"},
-				"revision": map[string]any{"type": "number", "description": "期望的候选 revision；省略或 <0 时按当前值，带值可做 CAS"},
-				"auto":     map[string]any{"type": "boolean", "description": "走提交矩阵自动裁决（默认 false，即人工/会话内显式采纳）"},
+				"id":     map[string]any{"type": "string", "description": "完整记忆 id（必填）"},
+				"reason": map[string]any{"type": "string", "description": "撤回原因（可空，写进裁决账）"},
 			},
 			"required": []string{"id"},
 		},
 	},
 	{
-		Name:        "reject",
-		Description: "显式拒绝一条 pending 候选（不写 memories）。id 必填；reject 是顶层动作，不是 candidates 的子命令。",
+		Name:        "maintain_wake",
+		Description: "无钩子 Harness 的兜底：唤醒一次 mem maintain（最老优先连续追账，幂等）。以短命子进程运行，不阻塞本次调用；无待处理窗口时自然 skipped。",
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"id":       map[string]any{"type": "string", "description": "候选 id 或前缀（必填）"},
-				"revision": map[string]any{"type": "number", "description": "期望的候选 revision；省略或 <0 时按当前值"},
-				"reason":   map[string]any{"type": "string", "description": "拒绝理由（可空）"},
+				"max_bundles": map[string]any{"type": "number", "description": "本次最多处理几个 Bundle（默认 20）"},
 			},
-			"required": []string{"id"},
 		},
 	},
 }
@@ -287,12 +283,12 @@ func (s *mcpServer) callTool(id any, name string, args map[string]any) map[strin
 		return s.toolTouch(id, args)
 	case "recall_context":
 		return s.toolRecall(id, args)
-	case "candidates_ls":
-		return s.toolCandidatesLS(id, args)
-	case "accept":
-		return s.toolAccept(id, args)
-	case "reject":
-		return s.toolReject(id, args)
+	case "review_ls":
+		return s.toolReviewLS(id, args)
+	case "review_withdraw":
+		return s.toolReviewWithdraw(id, args)
+	case "maintain_wake":
+		return s.toolMaintainWake(id, args)
 	default:
 		return mcpError(id, -32602, "unknown tool: "+name)
 	}
@@ -542,108 +538,74 @@ func recallText(st *store.Store, hits []store.Hit, budget int) string {
 	return b.String()
 }
 
-// ---------- 候选裁决工具（隔离区显式裁决，见 design-write-governance.md §12） ----------
+// ---------- 复核视图与维护兜底（S12 §12.3 统一后的工具面） ----------
 //
-// 三个 handler 都直接走 store 层，不复用 cmdAccept / cmdReject / cmdCandidates：
-// 那些 CLI 命令把结果打印到 os.Stdout，而 MCP 的 stdout 是 JSON-RPC 通道，
-// 任何打印都会破坏协议；mcpServer 也已持有自己的 st 连接。
+// 全部复用 store 层方法，不重写 SQL：四态投影与撤回事务的判定口径只在 store 有一份，
+// CLI（mem review …）与 MCP 共用同一套。maintain 走子进程而不是内联——
+// cmdMaintain 的输出走 os.Stdout，而 MCP 的 stdout 是 JSON-RPC 通道。
 
-// toolCandidatesLS 只读列出隔离区候选（默认 pending，不进检索面）。
-func (s *mcpServer) toolCandidatesLS(id any, args map[string]any) map[string]any {
+// startMaintainProc 唤醒一次 mem maintain 子进程。测试可替换。
+var startMaintainProc = defaultStartMaintain
+
+func defaultStartMaintain(db string, maxBundles int) error {
+	args := []string{"maintain"}
+	if maxBundles > 0 {
+		args = append(args, "--max-bundles", strconv.Itoa(maxBundles))
+	}
+	return startMemProc(db, args)
+}
+
+// toolReviewLS 只读四态复核队列，直接返回 store.ListReviewQueue 的投影。
+func (s *mcpServer) toolReviewLS(id any, args map[string]any) map[string]any {
 	limit := argInt(args, "limit", 50)
 	if limit <= 0 {
 		return mcpError(id, -32602, "limit 应为正数")
 	}
-	status := argString(args, "status")
-	if status == "" {
-		status = "pending"
-	}
-	switch status {
-	case "pending", "accepted", "rejected", "expired":
-	case "all":
-		status = ""
-	default:
-		return mcpError(id, -32602, fmt.Sprintf("status 可选 pending|accepted|rejected|expired|all，got %q", status))
-	}
-	list, err := s.st.ListCandidatesByProject(status,
-		argString(args, "session"), argString(args, "project"), limit)
+	state := argString(args, "state")
+	q, err := s.st.ListReviewQueue(state, limit)
 	if err != nil {
-		return mcpError(id, -32603, "candidates_ls 失败: "+err.Error())
+		return mcpError(id, -32602, err.Error())
 	}
-	if list == nil {
-		list = []store.Candidate{}
-	}
-	return toolResult(id, list, false)
+	return toolResult(id, q, false)
 }
 
-// toolAccept 显式采纳一条候选。revision 缺省时按当前值；带值则走 CAS，
-// 与 CLI `mem accept --revision N` 同一语义。auto=true 才走提交矩阵。
-func (s *mcpServer) toolAccept(id any, args map[string]any) map[string]any {
-	cid := argString(args, "id")
-	if cid == "" {
-		return mcpError(id, -32602, "accept 需要 id（候选 id 或前缀）")
+// toolReviewWithdraw 撤回一条已入库记忆：状态迁移、候选终态恢复与裁决账
+// 都在 store.ApplyMemoryReview 的单事务里。actor 记 human：MCP 是会话内
+// Agent 替用户执行的人工动作，与 CLI `mem review withdraw` 同一语义。
+func (s *mcpServer) toolReviewWithdraw(id any, args map[string]any) map[string]any {
+	mid := argString(args, "id")
+	if mid == "" {
+		return mcpError(id, -32602, "review_withdraw 需要 id（记忆 id 或前缀）")
 	}
-	view, err := s.st.CommitCandidate(cid)
+	rep, err := s.st.ApplyMemoryReview(store.MemoryReviewInput{
+		MemoryID: mid, Action: store.ReviewActionWithdraw,
+		Reason: argString(args, "reason"), Actor: "human",
+	})
 	if err != nil {
-		return mcpError(id, -32603, "accept 失败: "+err.Error())
-	}
-	rev := argInt(args, "revision", view.Revision)
-	if rev < 0 {
-		rev = view.Revision
-	}
-	var res *store.CommitResult
-	if argBool(args, "auto", false) {
-		res, err = s.st.AutoCommitCandidate(cid, rev)
-	} else {
-		res, err = s.st.CommitAccept(cid, rev, "human")
-	}
-	if err != nil {
-		return mcpError(id, -32603, "accept 失败: "+err.Error())
-	}
-	if res.Committed && s.auditFile != "-" {
-		mode := "create"
-		if res.Already {
-			mode = "overwrite"
-		}
-		s.auditAppend(audit.Record{
-			TS: time.Now().Unix(), Event: "accept", SessionID: res.Candidate.SessionID,
-			Project: res.Candidate.Project, Source: "distill-accept", Mode: mode,
-			Count: 1, Hashes: []string{res.MemoryID}, Kinds: []string{res.Candidate.Kind},
-		})
-	}
-	return toolResult(id, map[string]any{
-		"candidate": res.Candidate.ID, "memory_id": res.MemoryID,
-		"created": res.CreatedMemory, "already": res.Already,
-		"decision": decisionOf(res, rev),
-	}, false)
-}
-
-// toolReject 显式拒绝一条候选，不写 memories。
-func (s *mcpServer) toolReject(id any, args map[string]any) map[string]any {
-	cid := argString(args, "id")
-	if cid == "" {
-		return mcpError(id, -32602, "reject 需要 id（候选 id 或前缀）")
-	}
-	view, err := s.st.CommitCandidate(cid)
-	if err != nil {
-		return mcpError(id, -32603, "reject 失败: "+err.Error())
-	}
-	rev := argInt(args, "revision", view.Revision)
-	if rev < 0 {
-		rev = view.Revision
-	}
-	res, err := s.st.CommitReject(cid, rev, "human", argString(args, "reason"))
-	if err != nil {
-		return mcpError(id, -32603, "reject 失败: "+err.Error())
+		return mcpError(id, -32603, "review_withdraw 失败: "+err.Error())
 	}
 	if s.auditFile != "-" {
 		s.auditAppend(audit.Record{
-			TS: time.Now().Unix(), Event: "reject", SessionID: res.Candidate.SessionID,
-			Project: res.Candidate.Project, Source: "distill", Count: 1, Mode: "rejected",
+			TS: time.Now().Unix(), Event: "review-withdraw", Source: "mcp",
+			Mode: store.ReviewStateWithdrawn, Count: 1, Hashes: []string{rep.MemoryID},
 		})
 	}
-	return toolResult(id, rejectResultView{
-		Candidate: res.Candidate, Decision: decisionOf(res, rev),
+	return toolResult(id, rep, false)
+}
+
+// toolMaintainWake 唤醒维护：无钩子宿主（§4）里 Agent 的显式兜底动作。
+// 不受 MEM_NO_AUTOMATION 约束——总闸拦的是钩子自动动作，这里是显式调用，
+// 与手动 `mem maintain` 同级。
+func (s *mcpServer) toolMaintainWake(id any, args map[string]any) map[string]any {
+	maxBundles := argInt(args, "max_bundles", 0)
+	if maxBundles < 0 {
+		return mcpError(id, -32602, "max_bundles 不能为负")
+	}
+	if err := startMaintainProc(s.st.Path(), maxBundles); err != nil {
+		return mcpError(id, -32603, "maintain_wake 失败: "+err.Error())
+	}
+	return toolResult(id, map[string]any{
+		"waked": true, "max_bundles": maxBundles,
 	}, false)
 }
 

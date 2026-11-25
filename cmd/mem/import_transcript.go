@@ -13,8 +13,10 @@ import (
 	"github.com/v2camp/v2mem/internal/transcript"
 )
 
-// import-transcript 只写证据（observations/evidence_archives），
-// 以及（--into both|candidates 时）pending 候选。默认不写 memories。
+// import-transcript 只写证据（observations/evidence_archives），默认不写 memories。
+//
+// S12 收编（§12.1）：`--into candidates|both` 的旧规则蒸馏入口已随 distillOne
+// 一起退役——本命令回到 §12.5 的「灾备同步」定位，候选由 proposal 蒸馏产出。
 
 func cmdImportTranscript(args []string) error {
 	var c common
@@ -25,17 +27,11 @@ func cmdImportTranscript(args []string) error {
 	file := fs.String("file", "", "单个 JSONL 文件，可重复使用时请多次调用")
 	project := fs.String("project", "", "工程标记（默认取 transcript 里的目录名）")
 	since := fs.Duration("since", 0, "只导入这段时间之内的行，如 720h")
-	into := fs.String("into", "obs", "obs|candidates|both")
 	dry := fs.Bool("dry-run", false, "只统计，不写库")
 	limit := fs.Int("limit", 0, "最多导入多少行，0 表示不限")
 	noScrub := fs.Bool("no-scrub", false, "关闭密钥打码（默认打码）")
 	if err := fs.Parse(args); err != nil {
 		return err
-	}
-	switch *into {
-	case "obs", "candidates", "both":
-	default:
-		return fmt.Errorf("--into 可选 obs|candidates|both，got %q", *into)
 	}
 	if strings.TrimSpace(*cursorDir) != "" {
 		fmt.Fprintln(os.Stderr, "v2mem import-transcript: Cursor transcript 解析尚未落地，已跳过该目录")
@@ -87,20 +83,6 @@ func cmdImportTranscript(args []string) error {
 		fmt.Fprintf(os.Stderr, "v2mem import-transcript: %s 导入 %d 行\n", path, got.Written)
 	}
 
-	candN := 0
-	if (*into == "both" || *into == "candidates") && !*dry {
-		for sid := range stats.Sessions {
-			rep, err := distillOne(es.store, distillJob{
-				Session: sid, Provider: "none", Audit: "-", DB: c.db,
-				Model: "rules", Timeout: time.Second,
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "v2mem import-transcript: 会话 %s 规则蒸馏失败，已放过: %v\n", sid, err)
-				continue
-			}
-			candN += rep.Inserted
-		}
-	}
 	if c.json {
 		if err := printJSON(map[string]any{
 			// observations 保留旧字段名（= written），新字段把四类结局拆开。
@@ -111,16 +93,14 @@ func cmdImportTranscript(args []string) error {
 			"filtered":     stats.Filtered,
 			"failed":       stats.Failed,
 			"skipped":      stats.Duplicate + stats.Empty + stats.Filtered,
-			"candidates":   candN,
 			"files_failed": len(fileErrs),
-			"into":         *into,
 			"dry_run":      *dry,
 		}); err != nil {
 			return err
 		}
 	} else {
-		fmt.Printf("观测 %d 行，重复 %d，空行 %d，超出时间窗 %d，写失败 %d，候选 %d（未写 memories）\n",
-			stats.Written, stats.Duplicate, stats.Empty, stats.Filtered, stats.Failed, candN)
+		fmt.Printf("观测 %d 行，重复 %d，空行 %d，超出时间窗 %d，写失败 %d（未写 memories）\n",
+			stats.Written, stats.Duplicate, stats.Empty, stats.Filtered, stats.Failed)
 	}
 	return errors.Join(fileErrs...)
 }

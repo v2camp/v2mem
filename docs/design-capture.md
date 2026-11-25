@@ -20,7 +20,7 @@
 | **T4 adapter**：`cmd/mem/hook.go` 的 `hookInput` 补 `last_assistant_message` / `text_content`；`observationText` 不再把 `"stop"` 事件名当正文，按内容标注 `Fidelity`（有正文 full / summary，无正文 none）。 | |
 | **适配器映射表（本波 T1）**：`cmd/mem/adapters.go` 的 `adapterTable` 按宿主规范名分派字段映射（`claude` / `traecode` / `traework`，别名经 `harness.Get` 归一；未知宿主走 `defaultAdapter`）。每项只描述「去哪取字段」（`stopReply` 优先级列表、`toolInput` / `toolOutput`、`allowMetaSummary`），Fidelity 判定仍统一在 `observationText`；`cmd/mem/adapters_test.go` 提供每家分派 / 字段映射 / 新增宿主只加表项的 fixture 测试。**不新建 `CaptureEvent` 第四层契约。** | |
 | **灰度开关（本波 T2）**：`cmd/mem/distill_hook.go:69` 的 `proposalHookEnabled(host)` 让 `MEM_PROPOSAL_HOOK` 接受逗号分隔宿主名单（如 `MEM_PROPOSAL_HOOK=traecode`），宿主名两侧都经 `normalizeHarness` 归一到规范名；`1` / `all` / `on` 仍为全量。**默认值未改**：未设置 / 空 / `0` → 旧规则蒸馏。 | |
-| **spawn gate 一致化**：`distillSpawnEnabled()`（`distill_hook.go`）成为**常规**蒸馏子进程的总闸，`distillPendingFailOpen`（SessionStart）与 `maybeSpawnDistill`（Stop / SessionEnd）共用同一判定；`MEM_DISTILL_SPAWN` 未设时三条常规路径都不拉子进程，SessionStart 退回内联旧规则。**唯一例外**是每个工程首次 `SessionEnd` 的冷启动前移（`coldstart.go`，见 §13.1 与 design-write-governance §5）。 | |
+| **spawn gate 一致化**（S12 收敛后现状）：自动写侧只有一条常规路径——`distillPendingFailOpen`（SessionStart）拉起 proposal 子进程；Stop / SessionEnd 的常规蒸馏 spawn（原 `maybeSpawnDistill` + `MEM_DISTILL_SPAWN` 闸）已随 §12.4 开关收敛退役。**唯一例外**仍是每个工程首次 `SessionEnd` 的冷启动前移（`coldstart.go`，见 §13.1 与 design-write-governance §5）。唯一开关是总闸 `MEM_NO_AUTOMATION=1`。 | |
 | **工具载荷准入收窄**：`PostToolUse` 与 transcript 的 `tool-use` / `tool-result` 一律 `ProposalEligible=false`（`observe.go:296` / `:476`），`Fidelity` 不变；旧按工具名判定的 `isPipelineTool` / `memoryToolNames` 已删除。裁决见 §13.2。 | |
 
 ## 0. 关键决策（待复核）
@@ -435,24 +435,25 @@ P0 的详细修复项见本次诊断结论；本文只锁定架构边界。
 两者**都不等于任务边界**。事件类型上 `assistant.final`（Turn）与 `closeout`（Task）互不替代、互不推导。
 Trae 一次任务跨多个 Stop 是常态，不能把第 N 个 Stop 当收工。
 
-**裁决四：与 Hook 默认值的上下游关系（默认值一律不动）。**
+**裁决四：与 Hook 默认值的上下游关系。**
 
-- Hook 默认仍是**旧规则蒸馏**：`maybeSpawnDistill` 先要求 `MEM_DISTILL_SPAWN == "1"`，否则直接返回；
-  该变量**默认关闭**。开关打开后，`proposalHookEnabled(host)` 决定走 `--proposal` 还是
-  `--session <sid> --provider none`，其默认（未设置 / 空 / `0`）为 **false**，且名单灰度只影响
-  「哪些宿主进 Proposal」，不改变默认值。
-- **唯一例外**：每个工程首次 `SessionEnd` 的冷启动前移（`coldstart.go`）。它不受
-  `MEM_DISTILL_SPAWN` 约束、固定零 LLM，只把该工程首会话的规则蒸馏从下一次 `SessionStart`
-  挪到会话收尾；`MEM_NO_COLDSTART=1` 关闭。详见 [`design-write-governance.md`](./design-write-governance.md) §5。
-- `closeout` 是**独立于 Hook 开关的显式动作**：它由 MCP / CLI / skill 主动调用，不依赖
-  `MEM_DISTILL_SPAWN`，也不依赖 `MEM_PROPOSAL_HOOK`。
-- `closeout` 落地后，**也不**把 Hook 默认值改成「自动启用 Proposal」。二者的关系是单向补充，
-  不是替换：Hook 负责 Turn 级 observation，closeout 负责 Task 级候选。
+> **S12 收口注**：本节写作时的双轨语境（旧规则蒸馏 vs Proposal 灰度）已随
+> design-data-lifecycle §12.1/§12.4 收编——旧规则蒸馏单轨（`distillOne` /
+> `--session` / `--pending`）与 `MEM_DISTILL_SPAWN` / `MEM_NO_DISTILL` / `MEM_NO_COLDSTART`
+> 散闸均已退役，`proposalHookEnabled` 灰度名单不再分叉蒸馏路径。现行口径：自动写侧
+> 只剩 SessionStart 的 proposal spawn（唯一总闸 `MEM_NO_AUTOMATION`）+ 首会话冷启动
+> 一次性例外；本节其余裁决（closeout 独立于 Hook 开关、Turn 级 observation 与
+> Task 级候选单向补充）不变。
+
+- **唯一例外**：每个工程首次 `SessionEnd` 的冷启动前移（`coldstart.go`）。它把该工程
+  首会话的蒸馏从下一次 `SessionStart` 挪到会话收尾；总闸 `MEM_NO_AUTOMATION=1` 关闭。
+  详见 [`design-write-governance.md`](./design-write-governance.md) §5。
+- `closeout` 是**独立于 Hook 开关的显式动作**：它由 MCP / CLI / skill 主动调用，不受
+  总闸约束（显式动作不是自动化）。
 - 完整链路：**谁触发 closeout**（人或 Agent 在任务收尾显式调用 MCP 工具 / CLI 子命令 / skill）
   → **closeout 触发什么**（写一条 `closeout` 证据 + 一个 Task 级 candidate，不做别的）
-  → **什么情况下才会拉起 Proposal**（仅当 `MEM_DISTILL_SPAWN=1` 且 `proposalHookEnabled(host)` 为真：
-  Stop / SessionEnd 由 `maybeSpawnDistill` 按 gate 拉起，SessionStart 由 `distillPendingFailOpen`
-  按同一 gate 拉起 Proposal pending；gate 不成立时 SessionStart 退回内联旧规则，与 closeout 无因果关系）。
+  → **什么情况下自动拉起 Proposal**（SessionStart 的 `distillPendingFailOpen`，唯一关断是
+  总闸 `MEM_NO_AUTOMATION=1`；与 closeout 无因果关系）。
 
 ### 13.2 已裁决：工具载荷准入（`R9` 根因）
 
