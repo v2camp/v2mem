@@ -1,7 +1,9 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 )
@@ -29,6 +31,53 @@ func (s *Store) Backup(dest string) error {
 	}
 	if _, err := s.db.Exec("VACUUM INTO ?", dest); err != nil {
 		return fmt.Errorf("生成备份失败: %w", err)
+	}
+	return nil
+}
+
+// VerifyBackup 校验一个备份文件真的能用：文件非空 → `PRAGMA quick_check` 返回 ok →
+// `memories` 表可查（schema 在位）。design-data-lifecycle §8.1 的「删除前确认新备份有效」
+// 就落在这里：只生成了文件、读不回来，等于没备份。
+//
+// 必须**只读**打开（`mode=ro`）。不能用 Open：Open 会建表、跑迁移、写 db_meta 写者戳，
+// 那会把「快照当时的样子」改成「这次校验的样子」——备份就不再是备份。
+func VerifyBackup(path string) error {
+	if path == "" {
+		return fmt.Errorf("备份路径为空")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("备份文件不可读: %w", err)
+	}
+	if fi.IsDir() {
+		return fmt.Errorf("备份路径是目录: %s", path)
+	}
+	if fi.Size() == 0 {
+		return fmt.Errorf("备份文件为空: %s", path)
+	}
+
+	u := url.URL{Scheme: "file", Path: path}
+	q := u.Query()
+	q.Set("mode", "ro")
+	u.RawQuery = q.Encode()
+
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return fmt.Errorf("只读打开备份失败: %w", err)
+	}
+	defer db.Close()
+
+	var check string
+	if err := db.QueryRow("PRAGMA quick_check").Scan(&check); err != nil {
+		return fmt.Errorf("备份完整性校验失败: %w", err)
+	}
+	if check != "ok" {
+		return fmt.Errorf("备份完整性校验未通过: %s", check)
+	}
+
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM memories").Scan(&n); err != nil {
+		return fmt.Errorf("备份 schema 校验失败: %w", err)
 	}
 	return nil
 }

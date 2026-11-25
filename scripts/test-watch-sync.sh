@@ -69,15 +69,22 @@ if ! sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -qE '^\| R3 '; then
   fail "§5 缺 R3 处置行（R3 FAIL 时会无动作可引用）"
 fi
 
-# ⑦ R15 阈值与自主边界：TTL 14 天两侧同步；「只迁移不删除」的保护不许被删。
-# 这条判据是唯一会写库的（gc --candidates），边界退化比阈值漂移更危险：
-# 少了 ACC_OLD 检查，脚本就会替人执行 GCCandidates 里那条 DELETE。
+# ⑦ R15 阈值与只读边界：TTL 14 天两侧同步；巡检**只报不处置**。
+# 曾经的边界退化是「巡检替人执行 gc --candidates（内含删 90 天 accepted 行的 DELETE）」，
+# 所以这里既守正向文案，也用负向断言禁止再把写路径装回巡检。
 r15_row="$(grep -E '^\| \*\*R15\*\*' "$DOC" | head -1)"
 [ -n "$r15_row" ] || fail "§3 找不到 R15 行"
 printf '%s' "$r15_row" | grep -q '14 天' || fail "§3 R15 的 TTL 不是 14 天"
-grep -q 'TTL_DAYS=14'  "$SCRIPT" || fail "脚本 R15 的 TTL_DAYS 不是 14"
-grep -q 'GC_DISABLED'  "$SCRIPT" || fail "脚本 R15 缺 --no-gc 逃生开关"
-grep -q 'ACC_OLD'      "$SCRIPT" || fail "脚本 R15 缺「待删已采纳行则转人工」保护"
+grep -q 'TTL_DAYS=14' "$SCRIPT" || fail "脚本 R15 的 TTL_DAYS 不是 14"
+printf '%s' "$r15_row" | grep -q '只报不处置' || fail "§3 R15 没写明「只报不处置」"
+# 负向：巡检不许再有写开关 / 写子命令 / 替人判断连带删除。
+grep -q 'GC_DISABLED' "$SCRIPT" && fail "脚本仍保留 --no-gc 开关（GC_DISABLED）"
+grep -q -- '"$MEM_BIN" gc' "$SCRIPT" && fail "脚本仍会调用 mem gc（巡检必须只读）"
+grep -q 'ACC_OLD' "$SCRIPT" && fail "脚本仍查询待删的已采纳行（ACC_OLD）"
+# 正向：§5 必须给手工命令——处置归维护/人工。
+r15_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R15 ' || true)"
+printf '%s' "$r15_action" | grep -q 'mem gc --candidates' \
+  || fail "§5 R15 处置未给手工命令"
 
 # ⑧ R3 口径：脚本 detail 与文档依据段都必须写明「端到端」。
 # 实证：文档长期写「实测量级 9–15ms」，而 R3 量的是端到端（进程启动 + 冷缓存 + 注入渲染），
@@ -170,4 +177,4 @@ r7_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R7 ' || true)"
 printf '%s' "$r7_action" | grep -q '重试本身在失败' \
   || fail "§5 R7 处置未说明「同一文件跨会话存活即重试本身在失败」"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与转人工保护同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与「只报不处置」的只读边界同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"
