@@ -2,6 +2,10 @@ package store
 
 import "database/sql"
 
+// MetaMaintainLastOK 记录最后一次成功维护的 unix 秒（cmdGC / cmdConsolidate 成功返回后写）。
+// 从未维护时键不存在 → mem stats 显示 null，「从未维护」与「刚维护过」必须可区分。
+const MetaMaintainLastOK = "maintain:last_ok"
+
 // ProjectMemoryCount 返回某个工程已入库的记忆条数。
 // 冷启动判定只关心「这个工程还没有任何已采纳记忆」，不需要扫描全库。
 func (s *Store) ProjectMemoryCount(project string) (int, error) {

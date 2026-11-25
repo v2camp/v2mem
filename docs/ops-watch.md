@@ -295,6 +295,8 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
     处置后下一窗口回 `PASS`。
   - 巡检没有写开关：只读是默认且唯一的行为。
 
+> 积压原始读数见 `mem stats --json` 顶层 `backlog`，口径见 `design-data-lifecycle.md` §3.2；巡检只判级。
+
 ---
 
 ## 4. 冷启动期例外（重要）

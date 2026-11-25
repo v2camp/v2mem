@@ -131,6 +131,32 @@ candidates: pending
 - 指标（上一条）面向机器与告警，注入行面向人；**命令行输出不算触达**。
 - 没有这一行，删掉定时巡检后「出问题到被发现」之间无界，自动化只完成了一半。
 
+### 3.2 积压指标口径（S4）
+
+`mem stats` 的文本三行（积压 / 隔离 / 维护）与 `--json` 顶层 `backlog` 对象暴露下列原始值。
+**不判级、不设阈值**——判级仍由巡检的 R7/R8/R15 承担；这里只回答「现在积压多少、多久了」。
+
+| 指标 | 口径 | 数据源 | 空值 |
+|:---|:---|:---|:---|
+| pending | 全部 `status='pending'`，不套 R8 的 reviewable 过滤 | `candidates` | 0 |
+| 最老 pending 年龄 | `now - MIN(created_at)`，负值夹 0 | `candidates` | 无 pending → `null` |
+| 未消费证据源数 | `last_seq > cursor_seq` 的源数 | `evidence_sources` | 0 |
+| 最老未消费证据年龄 | 代际匹配（`s.generation = a.generation`）且 `a.to_seq > s.cursor_seq` 的 `MIN(a.created_at)` | `evidence_archives` ⋈ `evidence_sources` | 无匹配 → `null` |
+| open Bundle | `status IN ('pending','leased','fail','partial','backlog')`（复用 `proposalOpenStatuses`，含 partial） | `evidence_bundles` | 0 |
+| 最老 open Bundle 年龄 | 同上集合的 `MIN(created_at)` | `evidence_bundles` | 无 open → `null` |
+| spool 段 | `<db-dir>/spool/<session>/seg-*.jsonl[.processing]` 的文件数；`.tmp` 不计 | 文件系统 | `0` 段 |
+| 最老 spool 段年龄 | 上述文件的 `MIN(mtime)` | 文件系统 | `null` |
+| 隔离量 | candidates `('quarantined','failed')` + bundles `'quarantined'` 两个计数 | `candidates` / `evidence_bundles` | 0 |
+| 最后成功维护 | `db_meta['maintain:last_ok']`（unix 秒），`cmdGC` / `cmdConsolidate` 成功返回后写 | `db_meta` | 从未维护 → `null` |
+
+两条口径说明：
+
+- **隔离量当前结构性恒 0**：`quarantined` / `failed` 的写入者尚未落地（S6 引入），这里先暴露
+  计数是为了让后续切片有稳定的读数面，而不是让「没有指标」被误读成「没有隔离」。
+- **源数与年龄是两个口径，并列不合并**：源数按 `last_seq > cursor_seq`（源还有未发放的序号），
+  年龄按归档的 `to_seq > cursor_seq`（确实有未消费的字节）。二者回答的问题不同，合成的单一
+  「积压量」会掩盖「源在增长但归档未落」或反之的异常。
+
 ---
 
 ## 4. Harness 触发拓扑（唯一主触发面）
