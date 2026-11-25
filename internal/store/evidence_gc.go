@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 )
@@ -8,9 +9,9 @@ import (
 // 证据归档准出的数据面。
 //
 // 设计约束（docs/VALUE.md「证据不能被悬空」的同一根）：删除一段归档的唯一
-// 合法理由是「已经没有任何观测指向它」。观测还在、归档没了，读侧就会显示
+// 合法理由是「已经没有任何引用指向它」。引用还在、归档没了，读侧就会显示
 // 「有证据」却打不开原始记录，比没有证据更具误导性。因此这里的每一处删除
-// 都以 observations.archive_hash 的反查为前置条件，绝不做「按年龄直接删段」。
+// 都以引用图反查为前置条件，绝不做「按年龄直接删段」。
 //
 // 与 GCObservations 的配合：先回收观测（--obs），被删观测对应的归档段下一轮
 // 才成为孤儿（--evidence）。两步分开是有意的——中间态可观察，也能只跑一步。
@@ -24,22 +25,78 @@ type ArchivedSegment struct {
 	ByteSize int64  `json:"byte_size"`
 }
 
-// UnreferencedArchives 列出没有任何观测引用、且创建时间早于 cutoff 的归档段。
+// archiveRefGuard 是「全量引用保护」的红线口径（design-data-lifecycle §8.1）：
+// 对归档段 a，以下任一成立即「有引用」，绝不进回收集合。
+//
+//  1. observations.archive_hash —— canonical 观测仍指向它（现状口径，读侧
+//     「有证据」的直接依据）；
+//  2. memory_evidence.archive_hash —— 最终记忆的证据链。跨设备同步来的行本机
+//     可能没有对应观测，archive_hash 是唯一锚点；
+//  3. candidate_evidence.archive_hash —— 候选（含长期 pending）的证据链；
+//  4. Bundle 引用 —— evidence_bundle_items 引用的 evidence_id 对应观测的
+//     archive_hash；观测行已被回收时 evidence_id join 不到观测，改由 Bundle
+//     窗口序号范围 (from_seq_exclusive, to_seq_inclusive] 兜底。完成 Bundle 的
+//     保留回收是后续切片的事，本切片宁可多保护；
+//  5. 未 Bundle 化活跃序号范围 —— per-source seq ∈ (cursor_seq, last_seq] 尚未
+//     发窗。观测行可能已被 GCObservations 按年龄回收，但这些序号还没发过
+//     Bundle，段是这些事件仅存的原始字节。判定落在归档自身的 [from_seq, to_seq]
+//     与该范围相交上，观测行在不在都不漏。
+//
+// 口径是红线：放宽任何一条都等于允许自动 GC 挖断还在用的证据链。
+const archiveRefGuard = `EXISTS (SELECT 1 FROM observations o WHERE o.archive_hash = a.archive_hash)
+	OR EXISTS (SELECT 1 FROM memory_evidence m WHERE m.archive_hash = a.archive_hash)
+	OR EXISTS (SELECT 1 FROM candidate_evidence c WHERE c.archive_hash = a.archive_hash)
+	OR EXISTS (SELECT 1 FROM evidence_bundle_items i
+	            JOIN observations o ON o.id = i.evidence_id
+	            WHERE o.archive_hash = a.archive_hash)
+	OR EXISTS (SELECT 1 FROM evidence_bundles b
+	            WHERE b.source_id = a.source_id
+	              AND b.generation = a.generation
+	              AND a.from_seq <= b.to_seq_inclusive
+	              AND a.to_seq > b.from_seq_exclusive)
+	OR EXISTS (SELECT 1 FROM evidence_sources s
+	            WHERE s.id = a.source_id
+	              AND s.generation = a.generation
+	              AND a.from_seq <= s.last_seq
+	              AND a.to_seq > s.cursor_seq)`
+
+// UnreferencedArchives 列出没有任何引用指向、且创建时间早于 cutoff 的归档段。
 //
 // cutoff 是写入保护期（unix 秒）：真实捕获顺序是「先落归档文件，再写账」，
 // 中间那一瞬段还没有观测指向它。没有保护期就会误删正在提交的证据。
+// 引用判定见 archiveRefGuard（红线口径，一处收口）。
 func (s *Store) UnreferencedArchives(cutoff int64) ([]ArchivedSegment, error) {
 	rows, err := s.db.Query(`
 		SELECT a.archive_hash, a.path, a.raw_count, a.byte_size
 		  FROM evidence_archives a
 		 WHERE a.created_at < ?
-		   AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.archive_hash = a.archive_hash)
+		   AND NOT (`+archiveRefGuard+`)
 		 ORDER BY a.created_at ASC, a.archive_hash ASC`, cutoff)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	return scanArchivedSegments(rows)
+}
 
+// ReferencedArchives 列出仍被引用保护的归档段（UnreferencedArchives 的引用侧补集）。
+//
+// 不带写入保护期过滤：cutoff 只拦「回收」，不改变「是否被引用」。
+// 用途是 GCEvidence 删除前的保留集回读校验——留下的段必须先证明读得回，
+// 证明不了就整轮拒删（§8.1 顺序铁律）。
+func (s *Store) ReferencedArchives() ([]ArchivedSegment, error) {
+	rows, err := s.db.Query(`
+		SELECT a.archive_hash, a.path, a.raw_count, a.byte_size
+		  FROM evidence_archives a
+		 WHERE ` + archiveRefGuard + `
+		 ORDER BY a.created_at ASC, a.archive_hash ASC`)
+	if err != nil {
+		return nil, err
+	}
+	return scanArchivedSegments(rows)
+}
+
+func scanArchivedSegments(rows *sql.Rows) ([]ArchivedSegment, error) {
+	defer rows.Close()
 	var out []ArchivedSegment
 	for rows.Next() {
 		var seg ArchivedSegment

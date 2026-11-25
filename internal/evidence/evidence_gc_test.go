@@ -9,10 +9,12 @@ import (
 	"time"
 )
 
-// 证据归档准出：观测还在，段就必须留；观测没了，段与磁盘文件一起走。
+// 证据归档准出：观测还在（或仍在引用/活跃范围内），段就必须留；
+// 观测没了、序号已发窗、也无引用，段与磁盘文件一起走。
 // 中间那一步（只有观测被回收）正是 mem gc --obs 之后、--evidence 之前的状态。
+// 夹具把序号推到已发窗：未发窗的活跃段受保护，不在本用例口径内。
 func TestGCEvidenceRemovesSegmentsNoObservationPointsAt(t *testing.T) {
-	e, _ := newTestEngine(t)
+	e, db := newTestEngine(t)
 	hashes := make([]string, 0, 3)
 	for _, uid := range []string{"u1", "u2", "u3"} {
 		ref, err := e.Capture(rawEvent(uid))
@@ -25,10 +27,11 @@ func TestGCEvidenceRemovesSegmentsNoObservationPointsAt(t *testing.T) {
 		t.Fatalf("初始归档文件 = %d，期望 3", n)
 	}
 
-	// 观测只留 1 条，另两条的归档成为孤儿。
+	// 观测只留 1 条，另两条的归档成为孤儿；序号已发窗，孤儿段不再受活跃范围保护。
 	if _, err := e.st.GCObservations(0, 1); err != nil {
 		t.Fatalf("GCObservations: %v", err)
 	}
+	gcExecSQL(t, db, `UPDATE evidence_sources SET cursor_seq = last_seq`)
 
 	res, err := e.GCEvidence(time.Now().Unix() + 60)
 	if err != nil {
