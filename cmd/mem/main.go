@@ -855,8 +855,12 @@ func cmdGC(args []string) error {
 			}
 		}
 		if *auditOnly {
-			return cmdGCAudit(c, *auditAge)
+			if err := cmdGCAudit(c, *auditAge); err != nil {
+				return err
+			}
 		}
+		// 只有命令成功返回才写水位；任何分支出错都已提前 return，不会打点。
+		markMaintainOKPath(c.db)
 		return nil
 	}
 
@@ -871,9 +875,14 @@ func cmdGC(args []string) error {
 		return err
 	}
 	if c.json {
-		return printJSON(res)
+		if err := printJSON(res); err != nil {
+			return err
+		}
+		markMaintainOK(st)
+		return nil
 	}
 	fmt.Printf("已回收 过期=%d 衰减=%d，保留 %d\n", res.Expired, res.Decayed, res.Kept)
+	markMaintainOK(st)
 	return nil
 }
 
@@ -1110,13 +1119,18 @@ func cmdConsolidate(args []string) error {
 		return err
 	}
 	if c.json {
-		return printJSON(res)
+		if err := printJSON(res); err != nil {
+			return err
+		}
+		markMaintainOK(st)
+		return nil
 	}
 	fmt.Printf("已归并 扫描=%d 簇=%d 取代=%d\n", res.Scanned, res.Groups, res.Superseded)
 	for _, p := range res.Pairs {
 		fmt.Printf("  %s ← %s  (相似度 %.3f)\n",
 			shortID(p.Survivor), shortID(p.Superseded), p.Similarity)
 	}
+	markMaintainOK(st)
 	return nil
 }
 
@@ -1138,8 +1152,33 @@ func cmdStats(args []string) error {
 	if err != nil {
 		return err
 	}
+	now := time.Now().Unix()
+	bl, err := st.Backlog(now)
+	if err != nil {
+		return err
+	}
+	spoolRoot := filepath.Join(filepath.Dir(s.Path), "spool")
+	spoolFiles, spoolOldest, err := scanSpoolBacklog(spoolRoot)
+	if err != nil {
+		return err
+	}
+	var spoolAge *int64
+	if !spoolOldest.IsZero() {
+		age := now - spoolOldest.Unix()
+		if age < 0 {
+			age = 0
+		}
+		spoolAge = &age
+	}
 	if c.json {
-		return printJSON(s)
+		return printJSON(&statsView{
+			Stats: s,
+			Backlog: &backlogView{
+				Backlog:               bl,
+				SpoolBacklogFiles:     spoolFiles,
+				OldestSpoolBacklogAge: spoolAge,
+			},
+		})
 	}
 
 	fmt.Printf("库路径   %s\n", s.Path)
@@ -1186,5 +1225,6 @@ func cmdStats(args []string) error {
 		}
 		fmt.Printf("按工程   %s\n", strings.Join(parts, " "))
 	}
+	printBacklog(bl, spoolFiles, spoolAge)
 	return nil
 }
