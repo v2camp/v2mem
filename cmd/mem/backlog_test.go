@@ -141,7 +141,7 @@ func TestCmdStatsBacklogTextAndJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cmdStats 文本: %v", err)
 	}
-	for _, want := range []string{"积压", "隔离", "维护", "pending 1", "2天", "3小时", "5小时", "1 段"} {
+	for _, want := range []string{"积压", "隔离", "维护", "pending 1", "2天", "3小时", "5小时", "1 段", "洞 0"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("文本应含 %q，got:\n%s", want, out)
 		}
@@ -174,6 +174,7 @@ func TestCmdStatsBacklogTextAndJSON(t *testing.T) {
 		"pending_count", "oldest_pending_age_seconds", "evidence_backlog_sources",
 		"oldest_unconsumed_evidence_age_seconds", "open_bundles",
 		"oldest_open_bundle_age_seconds", "candidates_isolated", "bundles_isolated",
+		"evidence_gaps",
 		"last_maintain_ok_at", "last_maintain_ok_age_seconds", "spool_backlog_files",
 		"oldest_spool_backlog_age_seconds",
 	} {

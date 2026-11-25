@@ -472,6 +472,10 @@ func TestSpoolRestoreOnFailure(t *testing.T) {
 	if len(files) != 1 || strings.HasSuffix(files[0], ".processing") {
 		t.Fatalf("失败后应恢复原文件名: %v", files)
 	}
+	// 库不可用是瞬时故障，不是确定性坏段：绝不能进 dead-letter。
+	if _, err := os.Stat(filepath.Join(e.SpoolRoot(), "dead-letter")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("瞬时故障不得产出 dead-letter: %v", err)
+	}
 
 	e2, err := Open(db)
 	if err != nil {

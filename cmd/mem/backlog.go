@@ -119,12 +119,14 @@ func formatAge(seconds int64) string {
 
 // printBacklog 在「按工程」之后追加三行。前缀刻意避开「总条数」「按工程」——
 // 巡检脚本按这两个前缀做行解析，新行不得抢走它们。
+// S6c：洞数并入「积压」行，口径是「已跳过并记录」，不是待办积压。
 func printBacklog(b *store.Backlog, spoolFiles int, spoolOldestAge *int64) {
-	fmt.Printf("积压     pending %d%s ｜ 未消费证据 %d 源%s ｜ open Bundle %d%s ｜ spool %d 段%s\n",
+	fmt.Printf("积压     pending %d%s ｜ 未消费证据 %d 源%s ｜ open Bundle %d%s ｜ spool %d 段%s ｜ 洞 %d（序号缺失已跳过，记录在案）\n",
 		b.PendingCount, ageSuffix(b.OldestPendingAge),
 		b.EvidenceBacklogSources, ageSuffix(b.OldestUnconsumedEvidenceAge),
 		b.OpenBundles, ageSuffix(b.OldestOpenBundleAge),
 		spoolFiles, ageSuffix(spoolOldestAge),
+		b.EvidenceGaps,
 	)
 	fmt.Printf("隔离     候选 %d ｜ Bundle %d（Bundle 隔离由重试超限自动写入（S6a）；候选隔离待 S10）\n",
 		b.CandidatesIsolated, b.BundlesIsolated)

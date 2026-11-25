@@ -53,33 +53,45 @@ func cmdDistill(args []string) error {
 	bundleID := fs.String("bundle", "", "只处理指定证据 Bundle（隐含 --proposal）")
 	quarantined := fs.Bool("quarantined", false, "列出被隔离（quarantined）的 Bundle，需单独使用")
 	requeue := fs.String("requeue", "", "把指定隔离 Bundle 放回队列（attempt 归零），需单独使用")
+	gaps := fs.Bool("gaps", false, "列出已跳过并记录的序号洞，需单独使用（洞不是 Bundle，不提供回捞）")
 	executor := fs.String("executor", "auto", "Proposal executor: auto|host|local|byok|none")
 	maxBundles := fs.Int("max-bundles", 1, "--proposal 本次最多处理几个 Bundle")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	// 隔离查看/回捞是运维入口：不生成候选，也不要求 --session 等必填项；
+	// 隔离查看/回捞/序号洞是运维入口：不生成候选，也不要求 --session 等必填项；
 	// 与正常蒸馏路径互斥，避免「顺手带个 --proposal」把库写脏。
 	requeueID := strings.TrimSpace(*requeue)
-	if *quarantined && requeueID != "" {
-		return errors.New("--quarantined 与 --requeue 需单独使用，不能同时指定")
+	outlets := 0
+	for _, on := range []bool{*quarantined, requeueID != "", *gaps} {
+		if on {
+			outlets++
+		}
 	}
-	if *quarantined || requeueID != "" {
+	if outlets > 1 {
+		return errors.New("--quarantined、--requeue 与 --gaps 需单独使用，不能同时指定")
+	}
+	if outlets == 1 {
 		if *pending || strings.TrimSpace(*session) != "" || *proposalMode || strings.TrimSpace(*bundleID) != "" {
-			return errors.New("--quarantined/--requeue 需单独使用，不能与 --session/--pending/--proposal/--bundle 同用")
+			return errors.New("--quarantined/--requeue/--gaps 需单独使用，不能与 --session/--pending/--proposal/--bundle 同用")
 		}
 		st, err := store.Open(c.db)
 		if err != nil {
 			return err
 		}
 		defer st.Close()
-		if *quarantined {
+		switch {
+		case *quarantined:
 			return printQuarantinedBundles(st, c.json)
+		case *gaps:
+			// 序号洞是「已跳过并记录」的事实，不是 Bundle：没有回捞入口。
+			return printEvidenceGaps(st, c.json)
+		default:
+			return requeueProposalBundle(st, requeueID, c.json, *auditFile)
 		}
-		return requeueProposalBundle(st, requeueID, c.json, *auditFile)
 	}
 	if !*pending && strings.TrimSpace(*session) == "" && strings.TrimSpace(*bundleID) == "" && !*proposalMode {
-		return errors.New("需要 --session、--pending、--proposal 或 --bundle")
+		return errors.New("需要 --session、--pending、--proposal、--bundle 或 --gaps")
 	}
 	model, timeout := distill.LoadConfig(distill.ConfigPath())
 	// model.json 的 mode=cli 要同时接管 proposal 的 local/byok 两条来源，
@@ -368,6 +380,44 @@ func printQuarantinedBundles(st *store.Store, asJSON bool) error {
 	for _, v := range views {
 		fmt.Printf("bundle %s source=%s seq=%d..%d attempt=%d updated=%d\n",
 			shortID(v.ID), v.SourceID, v.FromSeqExclusive, v.ToSeqInclusive, v.Attempt, v.UpdatedAt)
+	}
+	return nil
+}
+
+// evidenceGapView 是 `mem distill --gaps --json` 的稳定字段面。
+// 与 quarantinedBundleView 同理：独立视图，避免把 store 内部结构直接变成 CLI 契约。
+type evidenceGapView struct {
+	ID         string `json:"id"`
+	SourceID   string `json:"source_id"`
+	Generation int    `json:"generation"`
+	FromSeq    int    `json:"from_seq"`
+	ToSeq      int    `json:"to_seq"`
+	DetectedAt int64  `json:"detected_at"`
+}
+
+// printEvidenceGaps 输出已处置的序号洞。列表只读、不写审计、不改 cursor。
+func printEvidenceGaps(st *store.Store, asJSON bool) error {
+	list, err := st.ListEvidenceGaps(0)
+	if err != nil {
+		return err
+	}
+	views := make([]evidenceGapView, 0, len(list))
+	for _, g := range list {
+		views = append(views, evidenceGapView{
+			ID: g.ID, SourceID: g.SourceID, Generation: g.Generation,
+			FromSeq: g.FromSeq, ToSeq: g.ToSeq, DetectedAt: g.DetectedAt,
+		})
+	}
+	if asJSON {
+		return printJSON(views)
+	}
+	if len(views) == 0 {
+		fmt.Println("（没有序号洞）")
+		return nil
+	}
+	for _, v := range views {
+		fmt.Printf("gap %s source=%s gen=%d seq=%d..%d detected=%d（已跳过并记录，不是 Bundle，无法回捞）\n",
+			shortID(v.ID), v.SourceID, v.Generation, v.FromSeq, v.ToSeq, v.DetectedAt)
 	}
 	return nil
 }

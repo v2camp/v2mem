@@ -501,8 +501,9 @@ func evidenceTip(prev, eventUID, archiveHash string, seq int) string {
 // 水位只认 evidence_sources.cursor_seq，绝不读 distill_runs.window_key/finished_at：
 // 后者是旧蒸馏窗口，和证据是否被消费没有关系。
 //
-// 连续性：窗口必须从 cursor_seq+1 开始逐条递增；遇到空洞立即停止并在该源上
-// 返回 nil（不去下一源“跳过空洞”），下一次调用会重新尝试同一 position。
+// 连续性：窗口必须从 cursor_seq+1 开始逐条递增；遇到序号洞时把缺失区间记入
+// evidence_gaps 并把 cursor 推到洞尾，同一次调用内继续构建下一窗（最多
+// maxEvidenceGapHops 次）。洞不跨源拼窗，也不阻塞健康源。
 //
 // 上限：limit（默认 50）与 maxBytes（默认 64KB，按 gzip segment 的 byte_size 计）
 // 先到先停；即使单条超过 maxBytes 也至少返回 1 条，避免永远卡住。
@@ -557,60 +558,189 @@ type evidenceWindowItem struct {
 	byteSize    int64
 }
 
+// maxEvidenceGapHops 是单次 NextEvidenceBundle 连续跳过洞的次数上限。
+//
+// 每个洞都对应一次写事务；若上游出现大量互不相邻的缺失行（或并发删除），
+// 不设上限会让一次取窗退化成全表扫描。超界时返回 nil，下一轮从这里继续。
+const maxEvidenceGapHops = 8
+
+// EvidenceGap 是一条已处置的序号洞：cursor 已越过 [FromSeq, ToSeq]，
+// 这段区间不会再产出证据。它不是 Bundle，不参与 Claim/重试/隔离。
+type EvidenceGap struct {
+	ID         string
+	SourceID   string
+	Generation int
+	FromSeq    int
+	ToSeq      int
+	DetectedAt int64
+}
+
+// ListEvidenceGaps 返回最近的序号洞（detected_at 倒序；同秒按 source/from 稳定排序）。
+func (s *Store) ListEvidenceGaps(limit int) ([]EvidenceGap, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT id, source_id, generation, from_seq, to_seq, detected_at
+		FROM evidence_gaps ORDER BY detected_at DESC, source_id ASC, from_seq ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EvidenceGap
+	for rows.Next() {
+		var g EvidenceGap
+		if err := rows.Scan(&g.ID, &g.SourceID, &g.Generation, &g.FromSeq, &g.ToSeq, &g.DetectedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// buildEvidenceBundle 构建窗口；若 cursor+1 处缺失，先记录序号洞并把 cursor 推到洞尾，
+// 同一次调用内继续尝试下一窗（最多 maxEvidenceGapHops 次）。
+//
+// 洞的判定：expected 缺失到「下一条已存在 seq - 1」；一条更后的行都没有时，
+// 缺失区间是 expected..last_seq（捕获水位仍大 = 行被删/丢，等待已无意义）。
+// 洞的写入与 cursor 推进必须同事务，否则「跳过但没记账」不可审计。
 func (s *Store) buildEvidenceBundle(src EvidenceSourceState, limit int, maxBytes int64) (*EvidenceBundleRecord, error) {
+	cursor := src.CursorSeq
+	for hop := 0; hop < maxEvidenceGapHops; hop++ {
+		items, err := s.evidenceItemsAfter(src, cursor, limit)
+		if err != nil {
+			return nil, err
+		}
+
+		expected := cursor + 1
+		var window []evidenceWindowItem
+		var bytes int64
+		gapFrom, gapTo := 0, 0
+		for _, it := range items {
+			if it.seq != expected {
+				// 窗口必须连续：洞落在窗口起点时先记洞跳过；落在中段时先把
+				// 已连续的部分发出去（同一次调用内不再跨越洞拼窗）。
+				if len(window) == 0 {
+					gapFrom, gapTo = expected, it.seq-1
+				}
+				break
+			}
+			if len(window) > 0 && bytes+it.byteSize > maxBytes {
+				break
+			}
+			window = append(window, it)
+			bytes += it.byteSize
+			expected++
+			if len(window) >= limit {
+				break
+			}
+		}
+		if gapFrom > 0 {
+			next, err := s.skipEvidenceGap(src, cursor, gapFrom, gapTo)
+			if err != nil {
+				return nil, err
+			}
+			cursor = next
+			continue
+		}
+		if len(window) == 0 {
+			if src.LastSeq > cursor {
+				// 一条行都没有：整段 missing 到捕获水位，cursor 直接追平。
+				next, err := s.skipEvidenceGap(src, cursor, cursor+1, src.LastSeq)
+				if err != nil {
+					return nil, err
+				}
+				cursor = next
+				continue
+			}
+			// 真正没有新证据：与旧返回语义一致。
+			return nil, nil
+		}
+		return s.commitEvidenceBundle(src, cursor, window)
+	}
+	return nil, nil
+}
+
+func (s *Store) evidenceItemsAfter(src EvidenceSourceState, cursor, limit int) ([]evidenceWindowItem, error) {
 	rows, err := s.db.Query(`SELECT o.id, o.event_uid, o.source_seq, o.archive_hash,
 			COALESCE(a.byte_size, 0)
 		FROM observations o
 		LEFT JOIN evidence_archives a ON a.archive_hash = o.archive_hash
 		WHERE o.source_id = ? AND o.source_generation = ? AND o.source_seq > ?
 		ORDER BY o.source_seq ASC LIMIT ?`,
-		src.ID, src.Generation, src.CursorSeq, limit)
+		src.ID, src.Generation, cursor, limit)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var items []evidenceWindowItem
 	for rows.Next() {
 		var it evidenceWindowItem
 		if err := rows.Scan(&it.id, &it.eventUID, &it.seq, &it.archiveHash, &it.byteSize); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		items = append(items, it)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
+	return items, rows.Err()
+}
 
-	expected := src.CursorSeq + 1
-	var window []evidenceWindowItem
-	var bytes int64
-	for _, it := range items {
-		if it.seq != expected {
-			break
-		}
-		if len(window) > 0 && bytes+it.byteSize > maxBytes {
-			break
-		}
-		window = append(window, it)
-		bytes += it.byteSize
-		expected++
-		if len(window) >= limit {
-			break
-		}
+// skipEvidenceGap 在同一事务里记录洞并推进 cursor。cursor 用 CAS 校验，
+// 与建窗共用 ErrEvidenceCursorConflict 语义。
+func (s *Store) skipEvidenceGap(src EvidenceSourceState, cursor, from, to int) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
 	}
-	if len(window) == 0 {
-		// cursor+1 缺失：不跳空洞，等写入方补齐（或在源头修复）后再取。
-		return nil, nil
-	}
+	defer tx.Rollback()
 
+	var curSeq int
+	if err := tx.QueryRow(`SELECT cursor_seq FROM evidence_sources WHERE id = ? AND generation = ?`,
+		src.ID, src.Generation).Scan(&curSeq); err != nil {
+		return 0, err
+	}
+	if curSeq != cursor {
+		return 0, ErrEvidenceCursorConflict
+	}
+	now := time.Now().Unix()
+	if err := recordEvidenceGapTx(tx, src.ID, src.Generation, from, to, now); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`UPDATE evidence_sources SET cursor_seq = ?, updated_at = ?
+		WHERE id = ? AND generation = ? AND cursor_seq = ?`,
+		to, now, src.ID, src.Generation, cursor)
+	if err != nil {
+		return 0, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return 0, err
+	} else if n == 0 {
+		return 0, ErrEvidenceCursorConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return to, nil
+}
+
+// recordEvidenceGapTx 幂等写洞：同一 (source, generation, from_seq) 只保留首条，
+// 重复检测不会因 UNIQUE 失败而阻塞建窗。
+func recordEvidenceGapTx(tx *sql.Tx, sourceID string, gen, from, to int, now int64) error {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO evidence_gaps(
+		id, source_id, generation, from_seq, to_seq, detected_at
+	) VALUES (?,?,?,?,?,?)`,
+		evidenceGapID(sourceID, gen, from), sourceID, gen, from, to, now); err != nil {
+		return fmt.Errorf("写序号洞记录失败: %w", err)
+	}
+	return nil
+}
+
+// commitEvidenceBundle 在一个事务里插 Bundle、条目并推进 cursor（fromSeq 为窗口起点前的游标）。
+func (s *Store) commitEvidenceBundle(src EvidenceSourceState, fromSeq int, window []evidenceWindowItem) (*EvidenceBundleRecord, error) {
 	toSeq := window[len(window)-1].seq
 	bundle := EvidenceBundleRecord{
-		ID:               evidenceBundleID(src.ID, src.Generation, src.CursorSeq, toSeq),
+		ID:               evidenceBundleID(src.ID, src.Generation, fromSeq, toSeq),
 		SourceID:         src.ID,
 		Generation:       src.Generation,
-		FromSeqExclusive: src.CursorSeq,
+		FromSeqExclusive: fromSeq,
 		ToSeqInclusive:   toSeq,
 		SourceTip:        src.SourceTip,
 		Status:           "pending",
@@ -631,7 +761,7 @@ func (s *Store) buildEvidenceBundle(src EvidenceSourceState, limit int, maxBytes
 		src.ID, src.Generation).Scan(&curSeq); err != nil {
 		return nil, err
 	}
-	if curSeq != src.CursorSeq {
+	if curSeq != fromSeq {
 		return nil, ErrEvidenceCursorConflict
 	}
 
@@ -641,7 +771,7 @@ func (s *Store) buildEvidenceBundle(src EvidenceSourceState, limit int, maxBytes
 		source_tip, status, attempt, not_before, lease_until, lease_owner, last_run_id,
 		created_at, updated_at
 	) VALUES (?,?,?,?,?,?,?,'pending',0,0,0,'','',?,?)`,
-		bundle.ID, src.ID, src.Generation, src.CursorSeq, toSeq, bundle.EvidenceHash,
+		bundle.ID, src.ID, src.Generation, fromSeq, toSeq, bundle.EvidenceHash,
 		src.SourceTip, now, now)
 	if err != nil {
 		return nil, err
@@ -660,7 +790,7 @@ func (s *Store) buildEvidenceBundle(src EvidenceSourceState, limit int, maxBytes
 	}
 	res, err = tx.Exec(`UPDATE evidence_sources SET cursor_seq = ?, updated_at = ?
 		WHERE id = ? AND generation = ? AND cursor_seq = ?`,
-		toSeq, now, src.ID, src.Generation, src.CursorSeq)
+		toSeq, now, src.ID, src.Generation, fromSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -673,6 +803,11 @@ func (s *Store) buildEvidenceBundle(src EvidenceSourceState, limit int, maxBytes
 		return nil, err
 	}
 	return &bundle, nil
+}
+
+func evidenceGapID(sourceID string, gen, from int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("gap|%s|%d|%d", sourceID, gen, from)))
+	return "gap_" + hex.EncodeToString(sum[:])[:24]
 }
 
 func evidenceBundleID(sourceID string, gen, from, to int) string {
