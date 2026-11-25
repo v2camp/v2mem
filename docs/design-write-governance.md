@@ -179,6 +179,9 @@ MCP `add` 的 schema 声明 `required:["content"]`；写侧一律带 `source`（
 > 不改状态；改状态入口（`--apply`）因回滚与标定门槛未落地而暂撤。权限与影子期见
 > [`design-admission.md`](./design-admission.md)。「不自动裁决」因此收敛为
 > 「不自动**授予**」：模型可以自动否决，不能自动采纳非 fact/task 的类。
+> **2026-11-25 再修订**：「不自动授予」被 [`design-data-lifecycle.md`](./design-data-lifecycle.md)
+> §6 取代——模型按可配置提示词自动授予，人工**后审核**（确认/修正/撤回），
+> 按 `model@promptver` 可整批回滚。
 
 | # | 改动 | 落点 | 边界 |
 |:--|:---|:---|:---|
