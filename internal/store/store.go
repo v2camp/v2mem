@@ -154,6 +154,13 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("迁移复核 schema 失败: %w", err)
 	}
+	// S14：大库热点索引（docs/design-storage-layering.md §9）。存量库在
+	// ensureColumn 补齐 source_id / bundle_id 等后加列之前建索引会失败，
+	// 所以全部经这里幂等补齐，schema.sql 里只放列随表原生的那部分。
+	if err := ensurePerfIndexes(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("补齐热点索引失败: %w", err)
+	}
 	return st, nil
 }
 
@@ -193,6 +200,42 @@ func ensureColumn(db *sql.DB, table, column, ddl string) error {
 	}
 	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, ddl))
 	return err
+}
+
+// ensurePerfIndexes 幂等补齐 S14 的大库热点索引（docs/design-storage-layering.md §9）。
+//
+// 每条索引都由 test/perf 的基准证明 ≥20% 提速才落地（没有测量就不加索引），
+// 红绿用例见 perf_index_test.go。ix_obs_source_seq 与 ix_distill_bundle 的列
+// （source_id / bundle_id）是后加列，存量库必须等 ensureColumn 补完列再建，
+// 因此只放这里，不进 schema.sql；其余四条两处都有，保证新旧库拿到的形状一致。
+// 存量库建索引在 Open 的独立事务里逐条执行：SQLite 的 CREATE INDEX 会短暂持写锁，
+// 大库上预计秒级（见 §9 的风险记录），busy_timeout 已有 5s 余量。
+func ensurePerfIndexes(db *sql.DB) error {
+	for _, stmt := range []string{
+		// 场景 5（复核摘要）：每条记忆取最近一条 model-auto 裁决的子查询，
+		// 20k 裁决账上逐行全表扫是 3.4s/次的元凶。
+		`CREATE INDEX IF NOT EXISTS ix_commit_memory_actor
+			ON commit_decisions(memory_id, actor, created_at)`,
+		// 场景 8（mem gc --retention）：引用保护按 evidence_id 反查候选/记忆证据。
+		`CREATE INDEX IF NOT EXISTS ix_cand_evidence_evidence
+			ON candidate_evidence(evidence_id)`,
+		`CREATE INDEX IF NOT EXISTS ix_mem_evidence_evidence
+			ON memory_evidence(evidence_id)`,
+		// 场景 8：NOT EXISTS dr.bundle_id 逐 Bundle 全表扫 distill_runs。
+		`CREATE INDEX IF NOT EXISTS ix_distill_bundle
+			ON distill_runs(bundle_id)`,
+		// 场景 4（证据出窗）：按 (source_id, generation, seq) 取连续窗口。
+		// 部分索引 ux_obs_source_seq 因 LEFT JOIN 计划不被选中，需要一份全列索引。
+		`CREATE INDEX IF NOT EXISTS ix_obs_source_seq
+			ON observations(source_id, source_generation, source_seq)`,
+		// 候而不加：ix_evbundle_status_created(evidence_bundles(status, created_at))
+		// 在 3k Bundle 规模下 S1/S3 提速 <20%（12ms→12ms / 1ms→1ms），写放大不值。
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ensureCaptureSchema 给旧库补 channel / event_id。
