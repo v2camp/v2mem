@@ -152,7 +152,7 @@ EMPTY='[]'
 # R12 夹具：造 distill 审计行与 mem eval activity --json 的返回。
 # 判级只依赖前者；后者只补诊断文案，所以要单独测「读不到也不影响判级」。
 dline() {
-  printf '{"ts":%s,"event":"distill","source":"%s","mode":"%s","failed":%s}\n' "$NOW" "$1" "$2" "$3"
+  printf '{"ts":%s,"event":"distill","source":"%s","provider":"%s","mode":"%s","failed":%s}\n' "$NOW" "$1" "$2" "$3" "$4"
 }
 decline() { printf '{"ts":%s,"event":"%s"}\n' "$NOW" "$1"; }
 activity_json() {
@@ -482,17 +482,17 @@ assert_case r8_read_fail       100 0 no 'not-json' PASS PASS WARN WARN
 # 无样本也要复述四段计数（观测/蒸馏分流/合法空/失败/裁决）：INFO 不比别的级别少信息，
 # 2026-11-15 起连续四个窗口的 INFO 分支都丢了 D12，靠人工发现。
 assert_r12 r12_no_sample        no  '' '' INFO '观测 0'
-assert_r12 r12_pass_rules       yes "$(dline distill ok false)$(dline distill empty false)" "$(activity_json '本次任务有沉淀')" PASS '蒸馏 2'
+assert_r12 r12_pass_rules       yes "$(dline proposal rules ok false)$(dline proposal rules empty false)" "$(activity_json '本次任务有沉淀')" PASS 'rules 2'
 assert_r12 r12_broken_chain     yes '' '' WARN 'MEM_DISTILL_SPAWN'
-assert_r12 r12_fail_1           yes "$(dline distill fail true)" '' WARN
-assert_r12 r12_fail_3           yes "$(dline distill fail true)$(dline distill fail true)$(dline distill fail true)" '' WARN
-assert_r12 r12_fail_4           yes "$(dline distill fail true)$(dline distill fail true)$(dline distill fail true)$(dline distill fail true)" '' FAIL
-assert_r12 r12_proposal_split   yes "$(dline proposal ok false)$(dline distill empty false)" '' PASS 'proposal 1'
-assert_r12 r12_empty_not_fail   yes "$(dline distill empty false)$(dline distill noop false)" '' PASS '合法空 2'
-assert_r12 r12_invalid_mode     yes "$(dline proposal invalid false)" '' WARN
-assert_r12 r12_activity_badjson yes "$(dline distill ok false)" 'not-json' PASS
-assert_r12 r12_activity_verdict yes "$(dline distill ok false)" "$(activity_json '有观测无采纳')" PASS '有观测无采纳'
-assert_r12 r12_decisions_shown  yes "$(dline distill ok false)$(decline accept)$(decline reject)" '' PASS 'accept 1 reject 1'
+assert_r12 r12_fail_1           yes "$(dline proposal rules fail true)" '' WARN
+assert_r12 r12_fail_3           yes "$(dline proposal rules fail true)$(dline proposal rules fail true)$(dline proposal rules fail true)" '' WARN
+assert_r12 r12_fail_4           yes "$(dline proposal rules fail true)$(dline proposal rules fail true)$(dline proposal rules fail true)$(dline proposal rules fail true)" '' FAIL
+assert_r12 r12_provider_split   yes "$(dline proposal rules ok false)$(dline proposal none empty false)" '' PASS 'rules 1 · 其他 1'
+assert_r12 r12_empty_not_fail   yes "$(dline proposal rules empty false)$(dline proposal rules noop false)" '' PASS '合法空 2'
+assert_r12 r12_invalid_mode     yes "$(dline proposal rules invalid false)" '' WARN
+assert_r12 r12_activity_badjson yes "$(dline proposal rules ok false)" 'not-json' PASS
+assert_r12 r12_activity_verdict yes "$(dline proposal rules ok false)" "$(activity_json '有观测无采纳')" PASS '有观测无采纳'
+assert_r12 r12_decisions_shown  yes "$(dline proposal rules ok false)$(decline accept)$(decline reject)" '' PASS 'accept 1 reject 1'
 
 # R13 夹具：iline 造带 inject_bytes 的读侧记录；oldline 造升级前无该字段的旧记录。
 iline()   { printf '{"ts":%s,"event":"%s","inject_bytes":%s}\n' "$NOW" "${2:-session-start}" "$1"; }

@@ -172,10 +172,10 @@ func TestHookStopDoesNotInsertMemories(t *testing.T) {
 	proj, _ := hookProjectDir(t, "demo-repo")
 	raw := `{"hook_event_name":"Stop","cwd":"` + proj + `","session_id":"s-stop","status":"completed","transcript_path":"/tmp/t.jsonl"}`
 	t.Setenv("MEM_DISTILL_SPAWN", "1")
-	var spawned []string
+	var spawned int
 	prev := startDistillProc
-	startDistillProc = func(db, session, harness string) error {
-		spawned = append(spawned, session)
+	startDistillProc = func(db string) error {
+		spawned++
 		return nil
 	}
 	t.Cleanup(func() { startDistillProc = prev })
@@ -184,8 +184,8 @@ func TestHookStopDoesNotInsertMemories(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(spawned) != 1 || spawned[0] != "s-stop" {
-		t.Fatalf("应拉起一次 distill，got %+v", spawned)
+	if spawned != 1 {
+		t.Fatalf("应拉起一次 proposal，got %d", spawned)
 	}
 	if countAllMemories(t, db) != 0 {
 		t.Fatal("Stop 钩子不得写 memories")
@@ -201,70 +201,64 @@ func TestHookStopDoesNotInsertMemories(t *testing.T) {
 	}
 }
 
-func TestHookSkipsDistillWithoutTranscript(t *testing.T) {
+// TestHookSpawnsProposalWithoutTranscript：单轨后 Stop 只要求 session_id 非空。
+// proposal 从证据 Bundle 读输入，不依赖 transcript_path，因此缺它也必须拉起。
+func TestHookSpawnsProposalWithoutTranscript(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
 	raw := `{"hook_event_name":"Stop","cwd":"` + proj + `","session_id":"s-no","status":"completed"}`
 	t.Setenv("MEM_DISTILL_SPAWN", "1")
 	called := false
 	prev := startDistillProc
-	startDistillProc = func(string, string, string) error { called = true; return nil }
+	startDistillProc = func(string) error { called = true; return nil }
 	t.Cleanup(func() { startDistillProc = prev })
 	if _, err := withStdin(t, raw, func() error {
 		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if called {
-		t.Fatal("无 transcript_path 不应拉起 distill")
+	if !called {
+		t.Fatal("proposal 不读 transcript_path，缺它也必须拉起")
 	}
 }
 
-func TestSessionStartDistillPendingDoesNotWriteMemories(t *testing.T) {
+// TestSessionStartSpawnsProposalWithoutWritingMemories：单轨后 SessionStart 只拉起
+// proposal 子进程，不再内联跑 distillOne——因此既不平白写 candidates，也不碰 memories。
+// 子进程是否拉起只受 MEM_NO_DISTILL 关断，与 MEM_DISTILL_SPAWN 无关。
+func TestSessionStartSpawnsProposalWithoutWritingMemories(t *testing.T) {
 	db := testDB(t)
 	proj, _ := hookProjectDir(t, "demo-repo")
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.AppendObservation(store.ObsInput{
-		SessionID: "pend", Project: "demo-repo", Event: "user-prompt",
-		Summary: "决策：SessionStart 只产候选",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
+	unsetGrayEnv(t, "MEM_DISTILL_SPAWN")
+	t.Setenv("MEM_NO_DISTILL", "")
+	var calls int
+	prev := startDistillProc
+	startDistillProc = func(string) error { calls++; return nil }
+	t.Cleanup(func() { startDistillProc = prev })
 	if _, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
 		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("SessionStart 应拉起 1 次 proposal 子进程，got %d", calls)
 	}
 	if countAllMemories(t, db) != 0 {
 		t.Fatal("SessionStart 蒸馏不得写 memories")
 	}
-	st, err = store.Open(db)
+	st, err := store.Open(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	list, err := st.ListCandidates("pending", "pend", 10)
-	if err != nil || len(list) == 0 {
-		t.Fatalf("应有 pending，got %+v %v", list, err)
-	}
-	hits, err := st.Search(store.SearchQuery{Query: "SessionStart", Limit: 5})
-	if err != nil || len(hits) != 0 {
-		t.Fatalf("采纳前 search 不得命中，got %+v %v", hits, err)
-	}
-	// 再来一次应去重，不新增候选。
-	n := len(list)
-	if _, err := withStdin(t, hookStdin("SessionStart", proj, ""), func() error {
-		return cmdHook([]string{"--db", db, "--harness", "claude", "--dedup-window", "0", "--audit", "-"})
-	}); err != nil {
+	list, err := st.ListCandidates("pending", "", 10)
+	if err != nil {
 		t.Fatal(err)
 	}
-	list, err = st.ListCandidates("pending", "pend", 10)
-	if err != nil || len(list) != n {
-		t.Fatalf("重复 SessionStart 不应再插候选，got %d want %d err %v", len(list), n, err)
+	if len(list) != 0 {
+		t.Fatalf("SessionStart 不再内联 distillOne，不应写候选，got %d", len(list))
+	}
+	if hits, err := st.Search(store.SearchQuery{Query: "SessionStart", Limit: 5}); err != nil || len(hits) != 0 {
+		t.Fatalf("采纳前 search 不得命中，got %+v %v", hits, err)
 	}
 }
 
@@ -369,7 +363,7 @@ func TestDistillDryRunPrintsAndSkipsEmpty(t *testing.T) {
 }
 
 func TestDefaultStartDistillRefusesTestBinary(t *testing.T) {
-	if err := defaultStartDistill(testDB(t), "s", "claude"); err == nil {
+	if err := defaultStartDistill(testDB(t)); err == nil {
 		t.Fatal("测试二进制不应真的拉起 distill")
 	}
 }

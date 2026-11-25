@@ -90,7 +90,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中载荷残留条数，两种形态都算：transcript 原始 JSON（`{"id"…}`/`{"type"…}`）与工具载荷文本（`Grep {`/`Shell {` 等工具名 + 对象字面量开头） | 0 | 1–3 | >3 |
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |
 | **R11** | WAL 高水位 | `mem.db-wal` 字节数 / 4096（无 -wal 记 0）；量的是**文件高水位**，不是积压量 | ≤1000 帧 | 1001–2000 | >2000 |
-| **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `source` 分流）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
+| **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `provider` 分流 rules / 其他）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
 | **R13** | 注入体量 | 窗口内读侧（`session-start` / `prompt-submit` / `pre-compact`）审计记录 `inject_bytes` 的**最大值**（无样本记 `INFO`） | ≤3600 | 3601–8000 | >8000 |
 | **R14** | 归档体量 | `~/.v2mem/evidence` 下文件数与总字节（`find` / `du`，只读）；detail 附 `mem stats --json` 的 `size_bytes` 作对照 | ≤512MiB | >512MiB | —（不设 FAIL，见依据） |
 | **R15** | 候选 TTL | `mem candidates ls --json` 中 `created_at` 超过 **14 天**的 pending 条数；**只报不处置**：超期报 WARN 并给手工命令与复核提示，状态迁移/删除归维护入口或人工 | 0 条超期 | 有超期（只报不处置） | — |
@@ -218,17 +218,18 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   `observations → distill_runs → candidates` 链，**不含** `accept` / `reject` —— 后者是显式裁决，
   积压由 R8 判级、动作在 §5 R8。R12 只回答「自动段有没有推进」：
   - `obs-append = 0` → `INFO`。这是**无样本**，与 R3 / R10 同类，不是 §4 的冷启动降级。
-  - `event=distill = 0` 而有观测 → `WARN`（断链）。成因按 §8.1 的三开关
-    （`MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL`）、
-    `startDistillProc` 失败（只打 stderr、不写审计，故库里看不出来）或名单静默回落（§8.3）逐项排查。
-    **不判 `FAIL`**：`MEM_NO_DISTILL=1` 完全停掉蒸馏是 §8.4 的合法配置，判 FAIL 会制造恒久误报。
+  - `event=distill = 0` 而有观测 → `WARN`（断链）。成因按 §5 R12 的两个开关
+    （`MEM_DISTILL_SPAWN` / `MEM_NO_DISTILL`）与 `startDistillProc` 失败
+    （只打 stderr、不写审计，故库里看不出来）逐项排查。
+    **不判 `FAIL`**：`MEM_NO_DISTILL=1` 完全停掉蒸馏是合法配置，判 FAIL 会制造恒久误报。
   - 失败状态沿用 R7 / R9 的「单窗口可人工处理余量」分档 `0 / 1–3 / >3`。失败集合取
     `failed=true` 或 `mode ∈ {fail, partial, invalid, backlog}`：Proposal 会写 `noop` /
     `invalid` / `backlog`，而 `audit.Summarize` 只认 `mode=ok` / `mode=fail`，
     `mem eval activity` 的 `distill_fail` 因此有盲区，R12 直接读审计补齐。
     `empty` / `noop` / `ok` 是合法结果，不计失败。
-  - `source=proposal` 为 0 **不判级**：默认安装跑旧规则蒸馏，Proposal 是 §8 的灰度项。
-    detail 展示分流，是把 §8.3 的「首日确认」从人工 grep 变成每窗口可见。
+  - `provider=rules` 为 0 **不判级**：单轨后规则由 proposal 链尾 executor 兜底，
+    远端 executor 成功时 provider 本来就不是 rules。detail 展示 rules / 其他分流，
+    用于确认规则兜底在跑、以及有没有误接 LLM，不作为判级依据。
   - 裁决活性（`accept` / `reject` 计数）与 `mem eval activity --json` 的 `verdict`
     （含「有观测无采纳」）只作 detail，不判级：零裁决已由 R8 的积压判级承接，避免重复告警。
     `eval activity` 读不到或不可解析时 R12 判级不受影响。
@@ -338,7 +339,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | R9 载荷残留 | 蒸馏输入未按准入过滤 | 先修 `distillOne` 的输入过滤（复用 `proposal.proposalEligible`），再逐条 `mem reject` 清存量；只清不修会在下个窗口复现 |
 | R10 写侧延迟越线 | 单次 `Stop` 补写 transcript 过多，每条证据各做一次归档 fsync | 先看窗口内 `stop` 条数与 transcript 增量；实测瓶颈是 `writeArchive` 的逐条 fsync（占 88%），DB 事务仅占 12%，故**批量事务不是治本手段**。治本方案见 [`design-write-batch.md`](./design-write-batch.md)（批量归档，P2 已实现）：在启动宿主的环境导出 `MEM_EVIDENCE_BATCH=1` 灰度开启，默认关；实测 N=93 由 925ms 降到 58ms。**2026-11-19 复核：批量开启后生产仍约 15ms/行（748 行 9 秒），设计验收的 0.6ms/行只在小样本上成立**，故 Stop 侧另有 8s 时间预算（`transcriptStopBudget`）：超预算停在块边界、游标只推进到该处、下一次 Stop 续传，这是 20s 硬超时下的兜底，开关只算优化。`PRAGMA wal_checkpoint(TRUNCATE)` 只回收 WAL、与延迟无因果；**不要**删除归档或观测行来降耗时。注意 `Stop` hook `timeout=20s`，接近上限会阻断宿主会话 |
 | R11 WAL 高水位越线 | 文件不缩是常态（passive checkpoint 不收缩 `-wal`），先判是否真有滞留 | 先取三元组：`sqlite3 ~/.v2mem/mem.db "PRAGMA wal_checkpoint(PASSIVE);"`（或 `PRAGMA wal_checkpoint;`）并记下 `(busy, log, checkpointed)`——`log == checkpointed` 即无滞留，帧数只是历史高水位，**不必**清。确有滞留（`busy=1` 说明有长读事务）再查各 harness 的 `mem mcp` 长连，确认后 `PRAGMA wal_checkpoint(TRUNCATE);` 回收文件。**不要**手工删除 `mem.db-wal`——里面有尚未落盘的已提交事务；也**不要**把 R11 的帧数当作 R3 延迟的证据 |
-| R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
+| R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：核对 `MEM_DISTILL_SPAWN` / `MEM_NO_DISTILL` 是否按预期导出（SessionStart 只受后者关断，Stop / SessionEnd 另需前者），查宿主 stderr 有无 `startDistillProc` 失败；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `rules=0` 但其他 provider 有量属正常（远端成功），不要据此回滚；detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
 | R14 归档体量越线 | 归档增长快于观测保留策略 | 先分因：① **量增长**（文件数与字节同步涨）→ 按下面两步回收，再裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**回收只有一条路**：先 `mem gc --obs`（删观测行）再 `mem gc --evidence`（删已无观测引用的段与磁盘文件），两条合跑即同一轮生效；`--evidence` 有 1h 写入保护期。单跑 `--evidence` 在观测未回收时释放 0 字节——**不要**据此认为功能失效。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处。确认接受现状就上调阈值并在提交信息里写明原因 |
 | R15 候选超期 | TTL 从未被执行 | 巡检**只报不处置**。先复核 90 天前的已采纳行（`mem candidates ls --status accepted -db ~/.v2mem/mem.db`）——`gc --candidates` 会连带删除它们、不可逆；确认后再手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`（pending → expired，行仍在库）。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
@@ -389,119 +390,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 
 ---
 
-## 8. Proposal Hook 观察期 SOP
+## 8. 单轨与历史 SOP
 
-> 本节只定义**灰度流程与转正判据**，不新增也不修改 §3 的判据 ID 与阈值。
-> 引用时一律用 §3 的 R1 / R2 / R4 / R5 / R8 / R9 / R12，不自造 ID。
-
-### 8.1 灰度开关
-
-`MEM_DISTILL_SPAWN=1` 是**常规**蒸馏子进程的总闸（`distillSpawnEnabled`，`cmd/mem/distill_hook.go`）；
-`MEM_PROPOSAL_HOOK` 只决定「拉起的是 Proposal 还是旧规则蒸馏」。两者**缺一不生效**：
-
-| 路径 | 入口 | 受 `MEM_DISTILL_SPAWN` 约束 | 走 Proposal 的条件 |
-|:---|:---|:---|:---|
-| Stop / SessionEnd | `maybeSpawnDistill`（`distill_hook.go`） | **是**：先判 gate，未设直接返回、什么都不做 | `MEM_DISTILL_SPAWN=1` **且** `proposalHookEnabled(host)` 为真 |
-| SessionEnd（仅首会话） | `maybeSpawnColdStart`（`coldstart.go`） | **否**：一次性例外，见下 | **不走** Proposal，固定 `--provider none` |
-| SessionStart | `distillPendingFailOpen`（`distill_hook.go`） | **是**：要求 gate 与名单同时成立 | 同上；否则**继续往下**内联跑旧规则 `--pending`（200ms 上限，受 `MEM_NO_DISTILL` 约束） |
-
-- `MEM_DISTILL_SPAWN` 未设 / 非 `1` → 常规 Stop / SessionEnd 与 SessionStart 都不拉子进程，SessionStart 退回内联旧规则——这是**默认**。
-- **冷启动例外**：每个工程首次 `SessionEnd`、且该工程还没有已采纳记忆时，拉一次 detached 规则蒸馏并把成本移出下一次 `SessionStart`；靠 `coldstart:v1:<project>` 标记保证只尝试一次。它固定零 LLM、只写 candidates，失败由 SessionStart 内联蒸馏兜底。`MEM_NO_COLDSTART=1` 可关，`MEM_NO_DISTILL=1` 同样覆盖它。
-- `MEM_PROPOSAL_HOOK` 未设 / 空 / `0` → 全部走旧规则蒸馏，取值见 8.2。
-- SessionStart 在 gate 不成立时**不是静默跳过**：内联旧规则仍会蒸馏 pending 会话，所以不会丢蒸馏。
-
-**运维结论：灰度期两个都设**（`MEM_DISTILL_SPAWN=1` + `MEM_PROPOSAL_HOOK=<宿主>`）。
-只设 `MEM_PROPOSAL_HOOK` 时三条常规路径全部不动（等于什么都没开），不会出现「半开」——
-首会话冷启动仍可能跑一次，但它固定走规则蒸馏，不产生 Proposal 数据，观察期依然白跑。
-
-> 口径变更记录：本节在 `6ed7e8b` 之前写的是「SessionStart 不受 gate 约束」。该不一致已在
-> `6ed7e8b` 修复（`distillPendingFailOpen` 纳入同一 gate），现在两个变量是真正的「缺一不生效」。
-> **升级影响**：只配了 `MEM_PROPOSAL_HOOK` 而未配 `MEM_DISTILL_SPAWN` 的宿主，SessionStart 会从
-> 「拉 Proposal 子进程」退回「内联旧规则」——Proposal 观察数据归零而不是补齐，需按上表两变量同设。
-
-### 8.2 `MEM_PROPOSAL_HOOK` 取值语义（已裁决）
-
-| 取值 | 结果 |
-|:---|:---|
-| 未设置 / 空串 / `0` | **旧规则蒸馏**（`--session <sid> --provider none`），默认未改变 |
-| `1` / `all` / `on`（大小写不敏感） | 全宿主启用 Proposal |
-| 其它 | 按**逗号分隔的 harness 名单**灰度 |
-
-名单匹配规则（`proposalHookEnabled`，`cmd/mem/distill_hook.go:69`）：
-
-- 名单项与当前宿主名**都经注册表归一化到规范名后比较**：大小写不敏感、去空格、解析别名。
-  因此 `trae` 能命中 `traecode` / `traework`；`claude-code`、`cc` 能命中 `claude`。
-- 未显式传 `--harness` 时，宿主名由宿主的 `*_PROJECT_DIR` 推导（`harnessName`，`cmd/mem/hook.go:187`）。
-  推导成功 → 灰度照常生效；推导失败（宿主名为空）→ **名单灰度保守失效、回归旧规则蒸馏**。
-  全量值（`1` / `all` / `on`）不受影响。
-
-### 8.3 配错自证（已知风险，必须先做）
-
-**名单写错会静默回落。** 写成 `claud`、`trae-code` 这类未注册别名时，归一化后匹配不上，
-`proposalHookEnabled` 返回 false，链路**不报错**、照常跑旧规则蒸馏——从「钩子正常」看不出区别。
-
-| 步骤 | 动作 | 通过标准 |
-|:---|:---|:---|
-| ① 链路自证 | 临时库上设 `MEM_PROPOSAL_HOOK=1`（跳过名单）跑一轮 Stop | 审计出现 `event=distill` + `source=proposal` |
-| ② 再改名单 | 换成目标名单，保持 `MEM_DISTILL_SPAWN=1` | 审计同样出现 `source=proposal` |
-| ③ 首日确认 | 观察期第 1 天查 R1 钩子事件 | 有 proposal 记录，而不是**只有** `--provider none` 的旧蒸馏 |
-
-```bash
-grep '"source":"proposal"' ~/.v2mem/audit.jsonl | tail -5   # 有输出 = Proposal 真的跑了
-grep '"source":"distill"'  ~/.v2mem/audit.jsonl | tail -5   # 有输出 = 旧规则蒸馏（对照用）
-```
-
-> 旧规则蒸馏的审计同理是 `event=distill`，区别在 `source`：Proposal 写 `proposal`，旧规则写 `distill`
-> 且 `provider=none`（`cmd/mem/distill.go:177` / `:562`）。**只看 `event=distill` 分不出两者。**
-
-### 8.4 秒级回退
-
-| 目标 | 动作 |
-|:---|:---|
-| 回到旧规则蒸馏 | `MEM_PROPOSAL_HOOK=0`，或直接取消该变量 |
-| 完全停掉蒸馏 | 取消 `MEM_DISTILL_SPAWN` **且**设 `MEM_NO_DISTILL=1`（缺后者时 SessionStart 仍会内联跑旧规则 `--pending`，见 8.1） |
-
-注意：只把 `MEM_PROPOSAL_HOOK` 设为 `0` 时，`MEM_DISTILL_SPAWN=1` 下**旧规则蒸馏仍会跑**——
-关掉的是 Proposal 路径，不是蒸馏本身。回退不需要重启宿主，下一次钩子即按新值生效。
-
-### 8.5 观察期与逐条判据
-
-观察期**至少 7 天 / 14 个 12h 窗口**（对齐 §6 的巡检节奏）。信号全部来自 §3，不新增指标：
-
-| ID | 看到什么算正常 |
-|:---|:---|
-| **R1** 钩子被真实触发 | 每窗口 ≥1 事件，且窗口内存在 `source=proposal` 的 distill 记录；连续两窗只有 `provider=none` → 按 8.3 查名单 |
-| **R2** 检索命中率 | ≥30%（库 ≥20 条）；<20 条时为 `INFO`，不看数值；但 `INFO` 里报出的注入次数要跟着看——非零说明规则段/观测在供给，检索侧并非「无料可给」 |
-| **R4** 写侧活动 | 库 ≥20 条时每窗口 `manual-add` ≥1；为 0 记 `WARN`，不是 FAIL |
-| **R5** 观测落库 | 每窗口 `obs-append` ≥1（归档链路未断） |
-| **R8** 候选积压 | 各 `project` 的 `pending` 计数，窗口值取最大值（§3 口径）；≤5 正常，6–15 为 `WARN`，>15 为 `FAIL` |
-| **R9** 候选载荷残留 | 恒为 **0**；出现即说明 Proposal 输入未按 `proposalEligible` / `Fidelity` 过滤 |
-| **R12** 写侧自动决策链路 | 看 detail 的 `source` 分流：灰度期应出现 `proposal>0`；连续两窗只有 `rules` → 按 8.3 查名单与 `MEM_DISTILL_SPAWN`。断链与失败态按 §5 R12 只读处置，**不改本节的转正阈值** |
-
-`R3` / `R6` / `R7` 照常巡检，但**不参与本节的转正判定**——它们衡量的是检索延迟与库、spool 健康，
-与 Proposal 路径无关。
-
-### 8.6 冷启动期例外
-
-库内记忆 **<20 条**时，R2 / R4 按 §4 降级为 `INFO`：**只有 FAIL 需要介入，INFO 不是回退**。
-冷启动期 R2 低、R4 为 0 是设计预期；把它当 Proposal 失效去回滚开关，属于误判。
-R9 **不降级**：载荷残留与库规模无关，冷启动期同样判 0。
-
-### 8.7 转正判据（可量化）
-
-全部满足才建议切默认；任一条不满足 → **继续观察**，不自动改默认值：
-
-| # | 条件 | 阈值 | 来源 |
-|:---|:---|:---|:---|
-| 1 | 观察期无 FAIL | 连续 7 天（14 个窗口）全部窗口无 `FAIL`；R8 按工程分组后**任一 `project` 越线即该窗口 FAIL** | §3 判级 |
-| 2 | R8 不积压 | **窗口值 = 该窗口各 `project` 计数的最大值**；14 个窗口中 `>5` 的窗口 ≤2 个，且末窗口最大值 ≤ 首窗口最大值（不呈单调增长） | **建议值** |
-| 3 | R9 干净 | 14 个窗口恒为 `0` | §3 R9 PASS 线 |
-| 4 | 检索无回退 | `make eval-gate` 的 Recall@5 ≥ **0.60**，且较切换前一次实测基线绝对下降 ≤ **0.03** | 0.60 出自 `eval-policy.txt` 的 `recall5_min`；0.03 为**建议值** |
-
-> `make eval-gate` 跑的是沙箱夹具（不读个人库），它守的是**代码级检索回归**，不反映 Proposal 质量——
-> Proposal 质量由条件 2 / 3 与人工抽查候选可读性共同判定。两类证据不要互相替代。
-> **口径切换**：R8 于 2026-11-09 改为按 `project` 分组取最大值，此前留存的窗口序列是**全局旧口径**，
-> 不得与新口径混算；观察期若跨该日期，条件 2 需从切换后的首个窗口重新起算 14 窗。
-
-**切默认值必须单独提一次变更并留档**（改默认 = 改所有宿主的行为），不得在观察期结束时顺手合并。
-
+单轨已生效（S5b）：SessionStart 无条件拉起 proposal，冷启动同步切换，`MEM_PROPOSAL_HOOK` 已退役。
+历史灰度 SOP（原 §8.1–8.7）参见 git 历史。
