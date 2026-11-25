@@ -975,13 +975,17 @@ func drainSpoolFailOpen(db, auditPath string) evidence.SpoolDrainResult {
 		fmt.Fprintln(os.Stderr, "v2mem hook: spool drain 未全部完成，下次继续:", derr)
 	}
 	if res.Dropped > 0 {
-		// 坏行丢掉是对的（不挡后面的），但必须让人知道丢了。
-		fmt.Fprintf(os.Stderr, "v2mem hook: spool 丢弃 %d 行无法解析的数据\n", res.Dropped)
+		// 坏行不再随段删除：原文已进 spool/dead-letter，便于人工修复。
+		fmt.Fprintf(os.Stderr, "v2mem hook: spool 有 %d 行无法解析，已存入 dead-letter\n", res.Dropped)
 	}
-	if auditPath != "-" && (res.Drained > 0 || res.Restored > 0 || res.Dropped > 0) {
+	if res.DeadLettered > 0 {
+		fmt.Fprintf(os.Stderr, "v2mem hook: spool 有 %d 个确定性坏段已转入 dead-letter\n", res.DeadLettered)
+	}
+	if auditPath != "-" && (res.Drained > 0 || res.Restored > 0 || res.Dropped > 0 || res.DeadLettered > 0) {
 		_ = audit.Append(auditPath, audit.Record{
 			TS: time.Now().Unix(), Event: "obs-append", Source: "hook-observe",
-			Mode: "spool-drain", Count: res.Drained, Failed: res.Restored + res.Dropped,
+			Mode: "spool-drain", Count: res.Drained,
+			Failed: res.Restored + res.Dropped + res.DeadLettered,
 		})
 	}
 	return res

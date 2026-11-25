@@ -2,7 +2,7 @@ package store
 
 // S4：积压五指标（design-data-lifecycle §3.2）。
 //
-// 一条 SQL 取 8 个标量，保证所有计数来自同一快照：分 8 次查询会在两次查询之间
+// 一条 SQL 取 9 个标量，保证所有计数来自同一快照：分 9 次查询会在两次查询之间
 // 被并发维护改写，出现「源还有积压、年龄却已归零」这种自相矛盾的读数。
 // MIN 列一律用 sql.NullInt64：无数据必须投影成 null（指针 nil），绝不报 0 年龄。
 
@@ -25,8 +25,11 @@ type Backlog struct {
 	OldestOpenBundleAge         *int64 `json:"oldest_open_bundle_age_seconds,omitempty"`
 	CandidatesIsolated          int    `json:"candidates_isolated"`
 	BundlesIsolated             int    `json:"bundles_isolated"`
-	LastMaintainOKAt            *int64 `json:"last_maintain_ok_at,omitempty"`
-	LastMaintainOKAge           *int64 `json:"last_maintain_ok_age_seconds,omitempty"`
+	// EvidenceGaps 是已处置的序号洞数（cursor 已越过、区间不会再产出证据）。
+	// 它不计入积压判级上限：洞是「已跳过并记录」的事实，不是待办队列。
+	EvidenceGaps      int    `json:"evidence_gaps"`
+	LastMaintainOKAt  *int64 `json:"last_maintain_ok_at,omitempty"`
+	LastMaintainOKAge *int64 `json:"last_maintain_ok_age_seconds,omitempty"`
 }
 
 // Backlog 读取当前积压。now 由调用方传入（测试用固定时钟），年龄 = now-ts，负值夹 0。
@@ -40,6 +43,7 @@ func (s *Store) Backlog(now int64) (*Backlog, error) {
 		minOpenBundle      sql.NullInt64
 		candidatesIsolated int
 		bundlesIsolated    int
+		evidenceGaps       int
 	)
 	err := s.db.QueryRow(`
 		SELECT
@@ -53,12 +57,13 @@ func (s *Store) Backlog(now int64) (*Backlog, error) {
 		  (SELECT COUNT(*) FROM evidence_bundles WHERE status IN `+proposalOpenStatuses+`),
 		  (SELECT MIN(created_at) FROM evidence_bundles WHERE status IN `+proposalOpenStatuses+`),
 		  (SELECT COUNT(*) FROM candidates WHERE status IN ('quarantined','failed')),
-		  (SELECT COUNT(*) FROM evidence_bundles WHERE status = 'quarantined')
+		  (SELECT COUNT(*) FROM evidence_bundles WHERE status = 'quarantined'),
+		  (SELECT COUNT(*) FROM evidence_gaps)
 	`).Scan(
 		&pending, &minPending,
 		&evidenceSources, &minEvidence,
 		&openBundles, &minOpenBundle,
-		&candidatesIsolated, &bundlesIsolated,
+		&candidatesIsolated, &bundlesIsolated, &evidenceGaps,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("读取积压指标: %w", err)
@@ -73,6 +78,7 @@ func (s *Store) Backlog(now int64) (*Backlog, error) {
 		OldestOpenBundleAge:         ageOrNil(now, minOpenBundle),
 		CandidatesIsolated:          candidatesIsolated,
 		BundlesIsolated:             bundlesIsolated,
+		EvidenceGaps:                evidenceGaps,
 	}
 
 	v, ok, err := s.MetaGet(MetaMaintainLastOK)

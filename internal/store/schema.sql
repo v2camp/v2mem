@@ -264,6 +264,21 @@ CREATE TABLE IF NOT EXISTS evidence_bundle_items (
 );
 CREATE INDEX IF NOT EXISTS ix_evbi_evidence ON evidence_bundle_items(evidence_id);
 
+-- S6c 序号洞台账：cursor 无法再等到的缺失区间。
+-- 洞不是 Bundle（不会被 Claim/重试），只用于「缺失已跳过」的可审计记录与 --gaps 出口。
+-- id 用 source+generation+from_seq 的稳定 hash，使同一洞在重复检测时天然幂等
+-- （与 evidence_bundles 的 id 同策略），不依赖自增/时间。
+CREATE TABLE IF NOT EXISTS evidence_gaps (
+  id          TEXT PRIMARY KEY,
+  source_id   TEXT NOT NULL REFERENCES evidence_sources(id),
+  generation  INTEGER NOT NULL,
+  from_seq    INTEGER NOT NULL,
+  to_seq      INTEGER NOT NULL,
+  detected_at INTEGER NOT NULL,
+  UNIQUE(source_id, generation, from_seq)
+);
+CREATE INDEX IF NOT EXISTS ix_evgap_detected ON evidence_gaps(detected_at);
+
 -- legacy 标记与证据物理隔离，避免被误读成伪造的 evidence 字段。
 CREATE TABLE IF NOT EXISTS migration_marks (
   entity_type TEXT NOT NULL,

@@ -85,7 +85,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R4** | 写侧活动 | 窗口内**记忆层写入**数：`manual-add` + `write` + `accept`（`accept` 是裁决闭环的落库出口，`mem batch --plan` 批量准出也记 `accept`；观测写入由 R5 单独判，不在这里双计） | ≥1 | 0（库≥20 条时） | — |
 | **R5** | 观测落库 | 窗口内 `obs-append` 数 | ≥1 | — | — |
 | **R6** | 库规模 | `mem stats` 总条数（全库各数据表之和，见「按表」行）vs 上次快照 | 未下降 | 下降 | — |
-| **R7** | spool 积压 | `spool/**/seg-*.jsonl` 数 **加上** `*.jsonl.processing` 数（后者是 drain 已认领、未读完的段，与 `evidence.isSpoolSegment` 同口径；detail 另读窗口内 `mode=spool-drain` 的 `failed` 区分「下次会补写」与「重试已跑但没消化」） | 0 | 1–3 | >3 |
+| **R7** | spool 积压 | `spool/**/seg-*.jsonl` 数 **加上** `*.jsonl.processing` 数（后者是 drain 已认领、未读完的段，与 `evidence.isSpoolSegment` 同口径；detail 另读窗口内 `mode=spool-drain` 的 `failed` 区分「下次会补写」与「重试已跑但没消化」）。坏行/坏段进 `spool/dead-letter`，不随正常段计数 | 0 | 1–3 | >3 |
 | **R8** | 候选积压 | `mem candidates ls --json --triage` 按 `project` 分组后的**单工程** `reviewable != false` 的 pending 数；**判级取各工程最大值**，标题另报可裁决议总数（两个数并列，避免「5 条散在 3 个工程」被读成 2 条）。不可裁决的（过程叙述/助手偏好）单独报数，不计入 | ≤5 | 6–15 | >15 |
 | **R9** | 候选内容质量 | pending 候选 `--json` 的 `content` 中载荷残留条数，两种形态都算：transcript 原始 JSON（`{"id"…}`/`{"type"…}`）与工具载荷文本（`Grep {`/`Shell {` 等工具名 + 对象字面量开头） | 0 | 1–3 | >3 |
 | **R10** | 写侧延迟 | 窗口内 `stop` 的 `ms` 均值（无样本记 `INFO`） | <1000ms | 1000–3000ms | >3000ms |

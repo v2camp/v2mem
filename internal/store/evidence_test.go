@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -295,14 +296,17 @@ func TestNextEvidenceBundleByteCap(t *testing.T) {
 	}
 }
 
+// S6c：序号洞不再是「永远卡在洞前」。洞记入 evidence_gaps、cursor 越过洞尾，
+// 同一次调用内继续构建下一窗；健康源不受影响。
 func TestNextEvidenceBundleStopsAtGapAndSkipsToOtherSource(t *testing.T) {
 	s := newTestStore(t)
-	mustCaptureEvidence(t, s, evidenceInput("uid-a1", 0))
-	mustCaptureEvidence(t, s, evidenceInput("uid-a2", 0))
+	for _, uid := range []string{"uid-a1", "uid-a2", "uid-a3"} {
+		mustCaptureEvidence(t, s, evidenceInput(uid, 0))
+	}
 	if _, err := s.db.Exec(`DELETE FROM observations WHERE event_uid='uid-a2'`); err != nil {
 		t.Fatal(err)
 	}
-	// A 源 cursor=0，seq 1 之后缺 2：不能跳过空洞把 3.. 发出去。
+	// 第一窗只能发到洞前：窗口必须连续，不能跨过缺失的 seq 2。
 	b, err := s.NextEvidenceBundle(10, 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -310,24 +314,131 @@ func TestNextEvidenceBundleStopsAtGapAndSkipsToOtherSource(t *testing.T) {
 	if b == nil || b.ToSeqInclusive != 1 || b.SourceID != "src-a" {
 		t.Fatalf("A 源应只发到空洞前: %+v", b)
 	}
+
+	// 另一个源没有空洞；它的存在不影响 A 源的洞处置。
+	inB := evidenceInput("uid-b1", 0)
+	inB.SourceID = "src-b"
+	mustCaptureEvidence(t, s, inB)
+	inB2 := evidenceInput("uid-b2", 0)
+	inB2.SourceID = "src-b"
+	mustCaptureEvidence(t, s, inB2)
+
+	// 第二窗：发现 seq 2 缺失 → 记录 [2,2] 并把 cursor 推到 2，
+	// 同一次调用内继续构建下一窗（从 seq 3 起）。
 	next, err := s.NextEvidenceBundle(10, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next != nil {
-		t.Fatalf("空洞未补齐前不应出窗: %+v", next)
+	if next == nil || next.SourceID != "src-a" || next.FromSeqExclusive != 2 || next.ToSeqInclusive != 3 {
+		t.Fatalf("洞后应在同一次调用内继续出窗（seq 3 起）: %+v", next)
+	}
+	gaps, err := s.ListEvidenceGaps(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gaps) != 1 {
+		t.Fatalf("应记录一个序号洞: %+v", gaps)
+	}
+	g := gaps[0]
+	if g.SourceID != "src-a" || g.Generation != 1 || g.FromSeq != 2 || g.ToSeq != 2 || g.ID == "" {
+		t.Fatalf("洞字段不对: %+v", g)
+	}
+	if !strings.HasPrefix(g.ID, "gap_") {
+		t.Fatalf("洞 id 应是稳定 hash 形态: %q", g.ID)
+	}
+	head, _, err := s.EvidenceSourceHead("src-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head.CursorSeq != 3 {
+		t.Fatalf("cursor 应越过洞尾到 3，got %d", head.CursorSeq)
+	}
+	// 洞不冒充隔离 Bundle：--quarantined 的读侧不能看到它。
+	if list, err := s.ListProposalBundles("quarantined", 0); err != nil || len(list) != 0 {
+		t.Fatalf("序号洞不应进隔离队列: %+v err=%v", list, err)
 	}
 
-	// 另一个源没有空洞，应能继续出窗（遍历多个源，但绝不跨源跳号）。
-	inB := evidenceInput("uid-b1", 0)
-	inB.SourceID = "src-b"
-	mustCaptureEvidence(t, s, inB)
+	// A 源已追平；健康源 B 继续出窗，且 B 的窗口完全不受 A 的洞影响。
 	b, err = s.NextEvidenceBundle(10, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b == nil || b.SourceID != "src-b" || b.ToSeqInclusive != 1 {
-		t.Fatalf("应轮到 B 源: %+v", b)
+	if b == nil || b.SourceID != "src-b" || b.FromSeqExclusive != 0 || b.ToSeqInclusive != 2 {
+		t.Fatalf("应轮到 B 源且从 0 起: %+v", b)
+	}
+	again, err := s.ListEvidenceGaps(10)
+	if err != nil || len(again) != 1 {
+		t.Fatalf("重复取窗不应重复记洞: %+v err=%v", again, err)
+	}
+}
+
+// S6c：整段观测都被删除时，洞覆盖 cursor+1..last_seq，cursor 直接追平，
+// 源不会因为「行没了但 last_seq 还大」而永久停摆。
+func TestEvidenceGapCoversMissingRowsUpToLastSeq(t *testing.T) {
+	s := newTestStore(t)
+	for _, uid := range []string{"uid-1", "uid-2", "uid-3"} {
+		mustCaptureEvidence(t, s, evidenceInput(uid, 0))
+	}
+	if _, err := s.db.Exec(`DELETE FROM observations`); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.NextEvidenceBundle(10, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != nil {
+		t.Fatalf("没有连续证据时不应出窗: %+v", b)
+	}
+	gaps, err := s.ListEvidenceGaps(10)
+	if err != nil || len(gaps) != 1 {
+		t.Fatalf("应记录整段洞: %+v err=%v", gaps, err)
+	}
+	if gaps[0].FromSeq != 1 || gaps[0].ToSeq != 3 {
+		t.Fatalf("洞应覆盖 1..last_seq: %+v", gaps[0])
+	}
+	head, _, err := s.EvidenceSourceHead("src-a")
+	if err != nil || head.CursorSeq != 3 {
+		t.Fatalf("cursor 应追平 last_seq: %+v err=%v", head, err)
+	}
+	// 再取一次既不重复记洞，也不会卡住。
+	if b, err := s.NextEvidenceBundle(10, 1<<20); err != nil || b != nil {
+		t.Fatalf("追平后应安静返回: %+v err=%v", b, err)
+	}
+	if gaps, err := s.ListEvidenceGaps(10); err != nil || len(gaps) != 1 {
+		t.Fatalf("洞应幂等: %+v err=%v", gaps, err)
+	}
+}
+
+// S6c：--gaps 的读侧出口按 detected_at 倒序、支持上限。
+func TestListEvidenceGapsOrderAndLimit(t *testing.T) {
+	s := newTestStore(t)
+	for _, src := range []string{"src-a", "src-b"} {
+		in := evidenceInput("uid-"+src+"-1", 0)
+		in.SourceID = src
+		mustCaptureEvidence(t, s, in)
+		in = evidenceInput("uid-"+src+"-2", 0)
+		in.SourceID = src
+		mustCaptureEvidence(t, s, in)
+		if _, err := s.db.Exec(`DELETE FROM observations WHERE event_uid = ?`, "uid-"+src+"-2"); err != nil {
+			t.Fatal(err)
+		}
+		// 第一窗发 seq1，第二窗记录洞并把 cursor 推过 last_seq。
+		for i := 0; i < 2; i++ {
+			if _, err := s.NextEvidenceBundle(10, 1<<20); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	gaps, err := s.ListEvidenceGaps(10)
+	if err != nil || len(gaps) != 2 {
+		t.Fatalf("应有两处洞: %+v err=%v", gaps, err)
+	}
+	one, err := s.ListEvidenceGaps(1)
+	if err != nil || len(one) != 1 {
+		t.Fatalf("limit 应生效: %+v err=%v", one, err)
+	}
+	if one[0].DetectedAt == 0 {
+		t.Fatalf("detected_at 必须落库: %+v", one[0])
 	}
 }
 
