@@ -182,7 +182,8 @@ CREATE VIRTUAL TABLE fts_mem USING fts5(
 | §17 | 收尾运维三件套（uninstall/备份/轮转） | [`design-maintenance.md`](./design-maintenance.md) |
 | 写侧治理 | 写必由 LLM 决策、短/跨会话记忆分配、bulk 打标 | [`design-write-governance.md`](./design-write-governance.md) |
 | 准入判定 | 判定器实现：理由码、模型/CLI 接入、批量回滚（事前门槛已由 design-data-lifecycle 取代） | [`design-admission.md`](./design-admission.md) |
-| 数据动线 | 准入→准出唯一证据流、maintain、Harness 唤醒、SLA、自动裁决 + 后审核、GC 与终态出口 | [`design-data-lifecycle.md`](./design-data-lifecycle.md) |
+| 数据动线 | 准入→准出唯一证据流、maintain、Harness 唤醒、SLA、自动裁决 + 后审核、GC 与终态出口、命令面简化 | [`design-data-lifecycle.md`](./design-data-lifecycle.md) |
+| 动线评测 | TDD 动线级 e2e：准出率 100%、严密度、用户动线 U1–U8 与逐跳流转 case | [`design-eval-flows.md`](./design-eval-flows.md) |
 | 捕获层 | 多 harness 的 `CaptureEvent` 契约、A/B/C/D 捕获阶梯、artifact 扫描边界 | [`design-capture.md`](./design-capture.md) |
 | 说话人归属 | 用户请求 / AI 产出的采集与准入、分源提炼、`attributed_to`、反回声 | [`design-speaker-attribution.md`](./design-speaker-attribution.md) |
 | 写侧性能 | 写侧延迟根因实证、批量归档（方案 B）、P0 契约核查与灰度分期 | [`design-write-batch.md`](./design-write-batch.md) |

@@ -336,7 +336,8 @@ failed 不堆积；只有降级超上限才进 §3.1 触达面。人只剩「换
 
 **P2 — 真正无人值守**：统一 `mem maintain` 由 Harness 事件持续触发（§4），
 五小时巡检退出主数据面；模型自动裁决 + 提交矩阵自动提交（§6）；
-后审核 CLI 与未审核计量上线。detach 存活性验证在此期间完成。
+后审核 CLI 与未审核计量上线；**命令面收编（§12）随本阶段同批**。
+detach 存活性验证在此期间完成。
 
 **P3 — 终态出口**：§8.2 全表落地（rejected/Bundle/commit history/plans/日志/备份/
 transcript cursor/同步审计/配置 .bak）；同步范围声明；轮转审计合并查询。
@@ -352,6 +353,8 @@ design-admission.md 取代声明、design-write-governance.md 再修订），代
 | `docs/design-admission.md` 头部 | 取代声明；§2/§3 降级为标定工具 | ✅ 本提交 |
 | `docs/design-write-governance.md` §12.2 修订注 | 「不自动授予」→「自动授予 + 后审核」 | ✅ 本提交 |
 | `internal/commit/policy.go` | §6.3 矩阵改造（含 actor 与幂等键） | 开发时 |
+| `cmd/mem` / MCP 工具面 | §12 命令面收编（随 P2）；`review` 系列替换 accept/reject/batch/candidates | 开发时 |
+| 评测门禁 | §13 动线级 e2e（`eval flow` + U1–U8 + 逐跳 case，随各 P 阶段交付） | 开发时 |
 | `docs/ops-watch.md` + `scripts/watch-v2mem.sh` | 两处同改：R15 拆分只读化；R8 增未审核/最老年龄口径 | 开发时 |
 | `docs/design-harness.md` | detach 验证结论、无 SessionEnd 降级矩阵 | 开发时 |
 
@@ -374,3 +377,61 @@ design-admission.md 取代声明、design-write-governance.md 再修订），代
 9. **人工介入率**：审计 `actor` 统计「人工动作次数 / 自动处置次数 < 1%」；
    验收场景：连续 30 天无人工干预，准入→准出全链路自动走完，需人工事件全部经
    §3.1 触达面可见、无一靠主动巡检才发现。
+
+---
+
+## 12. 命令面简化（随 P2 收编）
+
+> 判据：**每个命令都要答「自动化环里谁调它」**——答案是「用户例行去调」的即设计味，
+> 收编或退役。现状 33 个 CLI 子命令 + 8 个 MCP 工具 → 目标约 20 + 7。
+> 用户与 agent 的常规操作只剩「读写 + 出错撤回」，其余要么自动、要么一次性、
+> 要么在 §3.1 触达面里找你。
+
+### 12.1 移除
+
+| 命令 | 理由 | 去向 |
+|:---|:---|:---|
+| `batch`（--plan/--dry-run/--rollback/--reject-judged） | 「AI 出方案、人给授权」的批量清积压，是「没人点按钮」的补丁 | 归档+回滚机制内迁 `review --rollback`；`--reject-judged` 随影子判定退役 |
+| `accept` / `reject`（CLI + MCP） | 单条裁决按钮被模型裁决取代；人工唯一剩余否定动作是事后撤回 | `review withdraw`；误拒例外口 `review restore <id>`（rejected 回捞重推） |
+| `judge` 执行面 | 判跑内联 maintain，不再是「记得去跑」的命令 | 标定统计并入 `review stats`；`--apply` 已撤、永不恢复 |
+| `migrate` | 静态标记随旧库迁移完成退役 | — |
+
+### 12.2 收编进 `mem maintain`
+
+`distill` / `gc`（含 R15 的 `gc --candidates` 手动路径）/ `consolidate` / 判跑——
+都是维护阶段，降为内部步骤；保留 `maintain --stage=…`、`--no-gc` 调试口。
+
+### 12.3 合并成一个待处置视图
+
+`candidates` 系列（ls/triage/policy）+ `review` = 一屏四态 `mem review ls`：
+pending（模型没跑）+ 复核摘要（例外式）+ quarantined + failed。
+MCP：`candidates_ls`/`accept`/`reject`（3）→ `review_ls`/`review_withdraw`（2）
++ `maintain_wake`（§4 无钩子 Harness 兜底）。
+
+### 12.4 开关收敛
+
+`MEM_DISTILL_SPAWN`、`MEM_JUDGE_SPAWN`/`MIN_PENDING`/`COOLDOWN_H` 退役——
+双轨时代各链路各自的闸。收敛为 maintain 统一预算/冷却（落 `model.json`）
++ **唯一总闸** `MEM_NO_AUTOMATION=1`。开关越多，「自动化在不在跑」越难一句话回答。
+
+### 12.5 保留不动
+
+读写核心 `add`/`search`/`ls`/`touch`/`show`/`forget`/`feedback` · 一次性配置
+`init`/`setup`/`uninstall`/`harness`/`hook` · 诊断门禁 `audit`/`stats`/`eval`/
+`lexicon`/`asset`/`notes`/`ingest`/`budget` · 灾备同步 `export`/`import`/
+`import-transcript`/`sync` · `mcp`。
+
+### 12.6 已知代价
+
+模型整体失效期间无单条人工放行口（修模型后 `--catch-up`）。若确需逃生口，
+`accept` 降级为 debug override（actor=human 记账）比保留全套按钮便宜——
+默认不做，需要时单独放行。收编随 P2 落地，§11.7 护栏断言同步改命令名。
+
+---
+
+## 13. 动线级端到端评测（TDD 视角）
+
+> 完整方案（指标口径、U1–U8 用户动线矩阵、逐跳内容流转 case、账本对账形态、
+> 随 P 阶段交付节奏）见 [`design-eval-flows.md`](./design-eval-flows.md)。
+> 一句话：单元覆盖率守包内逻辑，动线 e2e 守**准出率 100%**（豁免关机等客观场景）；
+> **先写 case 后写实现**，case 不绿不算完成。

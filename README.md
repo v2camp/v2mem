@@ -281,7 +281,8 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-speaker-attribution.md`](./docs/design-speaker-attribution.md) | 所有者 / 开发者 | **说话人归属**：用户请求与 AI 产出怎么进记忆；参照应用对照、分源提炼、`attributed_to`、反回声规则与验收数据 |
 | [`docs/design-write-governance.md`](./docs/design-write-governance.md) | 所有者 / 开发者 | **写侧治理**：三态（观测/候选/采纳）、写必由 LLM 决策、channel 与来源标记；§12 候选裁决自动化闭环（触发点、MCP 显式裁决、R8 分组、采纳率前提） |
 | [`docs/design-admission.md`](./docs/design-admission.md) | 所有者 / 开发者 | **准入判定**：判定器实现（理由码、模型/CLI 接入、批量回滚）；事前门槛已由 `design-data-lifecycle` §6 取代，影子期降级为标定工具 |
-| [`docs/design-data-lifecycle.md`](./docs/design-data-lifecycle.md) | 所有者 / 开发者 | **数据动线与统一维护**：准入→准出唯一证据流、`mem maintain`、Harness 唤醒拓扑、处理 SLA、模型自动裁决 + 人工后审核、引用保护与终态出口、P0–P4 实施顺序（改生命周期/GC/提交矩阵前先读） |
+| [`docs/design-data-lifecycle.md`](./docs/design-data-lifecycle.md) | 所有者 / 开发者 | **数据动线与统一维护**：准入→准出唯一证据流、`mem maintain`、Harness 唤醒拓扑、处理 SLA、模型自动裁决 + 人工后审核、引用保护与终态出口、命令面简化、P0–P4 实施顺序（改生命周期/GC/提交矩阵/命令面前先读） |
+| [`docs/design-eval-flows.md`](./docs/design-eval-flows.md) | 开发者 | **动线级 e2e 评测（TDD）**：准出率 100% 与严密度口径、U1–U8 用户动线矩阵、逐跳内容流转 case、账本对账形态、随 P 阶段交付节奏 |
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |
 | [`docs/install.md`](./docs/install.md) | 使用者 / 所有者 | **安装与接入唯一文档**：六条原则、冲突审查、S0–S6、A–D 校验、宿主矩阵与细节、回滚、多机记录 |
 | [`docs/ops-watch.md`](./docs/ops-watch.md) | 所有者 / 未来的 agent | **运行观测**：装好之后的动线与判据表、冷启动期例外、异常处置、12h 巡检调度（改判据先读） |
