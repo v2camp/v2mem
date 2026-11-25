@@ -9,8 +9,13 @@ build:
 install:
 	CGO_ENABLED=0 go install $(PKG)
 
-test: fmt-check test-watch
+# test 含逐跳验收：G1–G13 动线检查失败会让 make test 非零（design-eval-flows §3.1）。
+test: fmt-check test-watch test-flow
 	CGO_ENABLED=0 go test ./...
+
+# 逐跳验收单独可跑：临时库真实写入路径 + eval flow 只读断言。
+test-flow:
+	CGO_ENABLED=0 go test -count=1 ./test/flow
 
 # 格式门禁：任一 .go 未 gofmt 即非零退出。挂在 test 前，避免格式漂移脱离门禁
 # 漂进 main（2026-11-14 巡检发现 16 个文件尾换行缺失）。
@@ -120,4 +125,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test test-install test-verify-install verify-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release
+.PHONY: build install test test-flow test-install test-verify-install verify-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release

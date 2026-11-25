@@ -48,13 +48,54 @@
 | 记忆 → 终态 | 撤回/修正/按版本回滚（人工修正条目跳过并报告） |
 | → GC | 引用保护全集不误删；读回校验失败拒绝扩大 GC |
 
+### 3.1 G 类逐跳自动检查（`mem eval flow`）
+
+下表由 §3 的逐跳断言拆成**可执行**检查：每条只从库表/审计账判定，
+空库或该跳无样本一律显式 FAIL（「没验证」不等于「没问题」）。
+ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval/flow_check.go`
+与 `test/flow`。运行：`mem eval flow [--db] [--json] [--window 360h]`，
+`make test` 已包含该套件（`test-flow`）。
+
+| ID | 跳 | 检查（口径） | 数据来源 | 自动检查 |
+|:---|:---|:---|:---|:---|
+| G1 | 捕获 → observations | 同一 (source, generation, seq) 只允许一行（幂等键） | observations | `eval flow` 的 G1 |
+| G2 | observations → 归档 | 非 legacy 观测必须有 archive_hash 且归档账存在 | observations、evidence_archives、migration_marks | `eval flow` 的 G2 |
+| G3 | observations → 归档 | 每个归档 raw_count = 实际观测行数 | evidence_archives、observations | `eval flow` 的 G3 |
+| G4 | observations → 归档 | 同源同代归档 from/to 首尾相接，且与观测序号边界一致 | evidence_archives、observations | `eval flow` 的 G4 |
+| G5 | 归档 → Bundle | Bundle 从 0 开始、窗口首尾相接、末窗覆盖 cursor | evidence_bundles、evidence_sources | `eval flow` 的 G5 |
+| G6 | 归档 → Bundle | noop 窗口必须有 noop/empty 运行账、attempt≥1、零候选 | evidence_bundles、distill_runs、candidates | `eval flow` 的 G6 |
+| G7 | Bundle → executor | fail/partial/backlog 必须重试（attempt 递增）或按 5 次上限隔离，不得冒充 noop | distill_runs、evidence_bundles | `eval flow` 的 G7 |
+| G8 | 候选 → 裁决 | 超过 15 天 SLA 仍 pending 的候选 = 悬空，必须为 0 | candidates（--window 可调） | `eval flow` 的 G8 |
+| G9 | 候选 → 裁决 | accepted/rejected 必须有匹配裁决；expired 必须有显式裁决（不能顶替消费） | candidates、commit_decisions | `eval flow` 的 G9 |
+| G10 | 候选 → 裁决 | (candidate, revision, action) 与幂等键唯一，决策 revision 不超前 | commit_decisions、candidates | `eval flow` 的 G10 |
+| G11 | 裁决 → 记忆 | 采纳必须落到 memories；裁决 memory_id 一致；候选证据在 memory_evidence 全绑定 | candidates、commit_decisions、candidate_evidence、memory_evidence、memories | `eval flow` 的 G11 |
+| G12 | 候选 → 裁决 | 逐 Bundle 窗口「终态数 = 准入数」，准出率 100%（复用账本对账） | candidates | `eval flow` 的 G12 |
+| G13 | 候选 → 裁决 | 同一会话同一内容不重复落库；采纳不得无证据强写 | candidates、candidate_evidence | `eval flow` 的 G13 |
+
+**无法从库表/审计自动判定的口径（需 U 类人工或独立注入 case，不在 G1–G13 内）**：
+
+- **spool 落盘后 drain 重放不丢不重**：需要文件系统故障注入与二次进程启动，
+  G1 只证明「重放后库内无重复」，不证明 spool 本身不丢。
+- **32000 rune 截断与 scrub 生效**：需要读归档原文比对，属内容级断言；
+  库表只存摘要/引用。
+- **规则 / 模型两 executor 同契约**：需要同一窗口分别跑两条链路再对比输出，
+  是运行时等价性，不是存量数据可判。
+- **revision CAS 的并发竞态**：G10 只能看最终行是否单调，无法证明并发写者被 CAS 挡住。
+- **撤回 / 修正 / 按版本回滚**：P1 尚无 withdraw 落库入口，留待对应能力落地。
+- **→ GC 引用保护**：P3 交付，本波不预判。
+- **关机 / 休眠 / 总闸等豁免**：需要 fake clock + 进程生命周期模拟显式标记，
+  G12 未把 `Exempt` 纳入自动账本。
+
+
 ## 4. 形态与门禁
 
 - 临时库 + fake clock + fake executor（确定性输出）+ 故障注入（写失败/坏段/序号洞）；
   不触碰 `~/.v2mem`，沿用 `make test-e2e` 的隔离纪律。
 - 准出率断言做成**账本对账**：`终态数 = 准入数` 逐窗口核对（复用 commit_decisions 与
   Bundle 完成账），全量对账而非抽查。
-- 并入 `make eval-gate`：新增 `eval flow`（准出率/重复率/悬空/严密度违例）与
-  黑盒 U1–U8 脚本；`make test-watch` 判据回归不变。
+- 并入 `make test`（`test-flow` 套件）：新增 `eval flow`
+  （准出率/重复率/悬空/严密度违例）；`make test-watch` 判据回归不变。
+  P1 起每次合入都跑逐跳验收，任一 G 项失败 `make test` 即非零。
+  黑盒 U1–U8 脚本与 `eval-gate` 的接入沿用后续阶段交付。
 - case 随 P 阶段交付：P1 交付 §3 证据链 case，P2 交付 U1/U2/U4/U5 与裁决→记忆 case，
   P3 交付 GC/终态 case，U3/U6/U7/U8 在对应能力落地时同批。
