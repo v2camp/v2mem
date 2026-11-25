@@ -252,13 +252,42 @@ func scanObservation(row interface{ Scan(...any) error }) (Observation, error) {
 	return o, err
 }
 
+// obsRefGuard 是 GCObservations 的引用保护口径，与归档侧 archiveRefGuard 的
+// 第 4/5 条同源（红线口径，见 evidence_gc.go）：对观测行 o，以下任一成立即
+// 「有引用」，年龄与条数两条删除路径都不许动它。
+//
+//  1. memory_evidence —— 最终记忆的证据链（evidence_id 与 event_uid 双口径：
+//     前者本机 id，后者跨设备传播后仍可解析的 canonical 身份）；
+//  2. candidate_evidence —— 候选（含长期 pending）的证据链，同双口径；
+//  3. evidence_bundle_items —— Bundle 的证据身份要能回放，同双口径；
+//  4. 未 Bundle 化活跃序号范围 —— 所在源 seq ∈ (cursor_seq, last_seq] 尚未发窗。
+//     先掏掉这些行会在发窗时制造序号洞、丢摘要层；观测行已发窗（或 legacy 无
+//     源身份）才进回收候选。
+//
+// event_uid 比较都带 <> ” 空值守卫：legacy 行 event_uid 为空，不许让空串
+// 互相「引用」把整表钉死。
+const obsRefGuard = `EXISTS (SELECT 1 FROM memory_evidence e WHERE e.evidence_id = observations.id)
+	OR EXISTS (SELECT 1 FROM memory_evidence e
+	           WHERE e.event_uid <> '' AND e.event_uid = observations.event_uid)
+	OR EXISTS (SELECT 1 FROM candidate_evidence c WHERE c.evidence_id = observations.id)
+	OR EXISTS (SELECT 1 FROM candidate_evidence c
+	           WHERE c.event_uid <> '' AND c.event_uid = observations.event_uid)
+	OR EXISTS (SELECT 1 FROM evidence_bundle_items i WHERE i.evidence_id = observations.id)
+	OR EXISTS (SELECT 1 FROM evidence_bundle_items i
+	           WHERE i.event_uid <> '' AND i.event_uid = observations.event_uid)
+	OR EXISTS (SELECT 1 FROM evidence_sources s
+	           WHERE s.id = observations.source_id
+	             AND s.generation = observations.source_generation
+	             AND observations.source_seq > s.cursor_seq
+	             AND observations.source_seq <= s.last_seq)`
+
 // GCObservations 删掉超过 maxAge 的观测，再把条数压到 maxKeep。
 //
 // 只动 observations。memories / candidates 不在这条路径上。
-// 被 memory_evidence 引用的观测永不删除：删掉它，记忆的证据链就指向空处，
-// 读侧只能显示「有证据」却打不开原始记录——比没有证据更具误导性。
-// 引用判定同时看 evidence_id 与 event_uid：前者是本机 id，后者是跨设备传播后
-// 仍可解析的 canonical 身份（sync 过来的链接可能只带 event_uid）。
+// 引用保护见 obsRefGuard（与归档侧 archiveRefGuard 红线口径同源）：
+// 被记忆/候选/Bundle 引用、或还没发窗的观测永不删除——删掉它，引用方的
+// 证据链就指向空处，读侧只能显示「有证据」却打不开原始记录，比没有证据
+// 更具误导性；未发窗的行被掏掉还会制造序号洞、丢摘要层。
 // maxAge<=0 时按 30 天；maxKeep<=0 时按 5 万条。
 func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult, error) {
 	if maxAge <= 0 {
@@ -270,9 +299,7 @@ func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult,
 	cutoff := time.Now().Add(-maxAge).Unix()
 	res, err := s.db.Exec(`DELETE FROM observations
 		WHERE created_at < ?
-		  AND NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.evidence_id = observations.id)
-		  AND NOT EXISTS (SELECT 1 FROM memory_evidence e
-		                  WHERE e.event_uid <> '' AND e.event_uid = observations.event_uid)`, cutoff)
+		  AND NOT (`+obsRefGuard+`)`, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -288,9 +315,7 @@ func (s *Store) GCObservations(maxAge time.Duration, maxKeep int) (*ObsGCResult,
 		extra := n - maxKeep
 		res, err = s.db.Exec(`DELETE FROM observations WHERE id IN (
 			SELECT id FROM observations
-			 WHERE NOT EXISTS (SELECT 1 FROM memory_evidence e WHERE e.evidence_id = observations.id)
-			   AND NOT EXISTS (SELECT 1 FROM memory_evidence e
-			                   WHERE e.event_uid <> '' AND e.event_uid = observations.event_uid)
+			 WHERE NOT (`+obsRefGuard+`)
 			 ORDER BY created_at ASC, id ASC LIMIT ?)`, extra)
 		if err != nil {
 			return nil, err

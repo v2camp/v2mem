@@ -27,11 +27,12 @@ func TestGCEvidenceRemovesSegmentsNoObservationPointsAt(t *testing.T) {
 		t.Fatalf("初始归档文件 = %d，期望 3", n)
 	}
 
-	// 观测只留 1 条，另两条的归档成为孤儿；序号已发窗，孤儿段不再受活跃范围保护。
+	// 观测只留 1 条，另两条的归档成为孤儿；先推到已发窗——未发窗的观测受
+	// 引用保护（GCObservations 不会掏它），发窗后孤儿段也不再受活跃范围保护。
+	gcExecSQL(t, db, `UPDATE evidence_sources SET cursor_seq = last_seq`)
 	if _, err := e.st.GCObservations(0, 1); err != nil {
 		t.Fatalf("GCObservations: %v", err)
 	}
-	gcExecSQL(t, db, `UPDATE evidence_sources SET cursor_seq = last_seq`)
 
 	res, err := e.GCEvidence(time.Now().Unix() + 60)
 	if err != nil {

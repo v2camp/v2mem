@@ -85,12 +85,13 @@ func TestCmdGCEvidenceReclaimsArchivesAndDiskFiles(t *testing.T) {
 	}
 	seedArchivedEvent(t, st, archDir, "u1")
 	seedArchivedEvent(t, st, archDir, "u2")
+	// 先发窗再回收观测：未发窗的观测受引用保护，GCObservations 不会掏它。
+	markDispatched(t, db)
 	// 只留一条观测，另一条的归档成为孤儿。
 	if _, err := st.GCObservations(0, 1); err != nil {
 		t.Fatalf("GCObservations: %v", err)
 	}
 	st.Close()
-	markDispatched(t, db)
 
 	// 保护期按秒比较，等一秒才进得了回收窗口。
 	time.Sleep(1100 * time.Millisecond)

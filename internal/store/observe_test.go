@@ -246,3 +246,122 @@ func TestObservationIndexBackfillsOldRows(t *testing.T) {
 		t.Fatalf("旧库痕迹应在打开后可检索，got %+v", hits)
 	}
 }
+
+// GCObservations 引用保护扩集（红线口径 archiveRefGuard 第 4/5 条同源）：
+// 被 candidate_evidence 引用（evidence_id 与 event_uid 双口径）的观测行不删——
+// 删掉它，候选的证据链就在发窗/裁决时断掉。无引用的老观测照常回收。
+func TestGCObservationsProtectsCandidateEvidence(t *testing.T) {
+	s := newTestStore(t)
+	byID := seedArchive(t, s, "u-c1", "h-c1")
+	byUID := seedArchive(t, s, "u-c2", "h-c2")
+	if _, err := s.AppendObservation(ObsInput{SessionID: "s", Event: "stop", Summary: "无引用旧观测"}); err != nil {
+		t.Fatal(err)
+	}
+	// 已发窗：把「candidate_evidence 引用」这一个口径单独拎出来验。
+	if _, err := s.db.Exec(`UPDATE evidence_sources SET cursor_seq = last_seq`); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour).Unix()
+	if _, err := s.db.Exec(`UPDATE observations SET created_at = ?`, old); err != nil {
+		t.Fatal(err)
+	}
+	cand, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Kind: "decision", Content: "决定：候选证据链钉住观测行", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// evidence_id 与 event_uid 两条口径各钉一条：后者模拟同步来的链接
+	// （evidence_id 是远端 id 对不上本机行，只有 event_uid 可解析）。
+	if _, err := s.db.Exec(`INSERT INTO candidate_evidence(
+		candidate_id, evidence_id, event_uid, source_id, source_seq, archive_hash,
+		raw_record_hash, evidence_role, quote_hash, created_at
+	) VALUES (?, ?, ?, '', 0, '', '', 'direct', '', ?)`,
+		cand.Candidate.ID, byID.ID, byID.EventUID, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO candidate_evidence(
+		candidate_id, evidence_id, event_uid, source_id, source_seq, archive_hash,
+		raw_record_hash, evidence_role, quote_hash, created_at
+	) VALUES (?, 'ev-remote', ?, '', 0, '', '', 'direct', '', ?)`,
+		cand.Candidate.ID, byUID.EventUID, old); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.GCObservations(24*time.Hour, 50000)
+	if err != nil {
+		t.Fatalf("GCObservations: %v", err)
+	}
+	var kept int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE id IN (?, ?)`,
+		byID.ID, byUID.ID).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 2 || res.Deleted != 1 {
+		t.Fatalf("被 candidate_evidence 引用的 2 条必须留下、无引用旧观测删 1 条，kept=%d %+v", kept, res)
+	}
+}
+
+// 被 evidence_bundle_items 任一行引用的观测行不删：Bundle 的证据身份要能回放，
+// 观测行没了 item 就只剩一个指不回来的 id。无引用的老观测照常回收。
+func TestGCObservationsProtectsBundleItemEvidence(t *testing.T) {
+	s := newTestStore(t)
+	byID := seedArchive(t, s, "u-b1", "h-b1")
+	byUID := seedArchive(t, s, "u-b2", "h-b2")
+	if _, err := s.AppendObservation(ObsInput{SessionID: "s", Event: "stop", Summary: "无引用旧观测"}); err != nil {
+		t.Fatal(err)
+	}
+	// 真实发窗：窗口条目（evidence_id + event_uid）钉住两条观测，cursor 推到 to_seq。
+	b, err := s.NextEvidenceBundle(0, 0)
+	if err != nil || b == nil {
+		t.Fatalf("NextEvidenceBundle: %+v %v", b, err)
+	}
+	// 把 byUID 的条目换成只有 event_uid 对得上的形态（跨设备传播后 evidence_id 是远端 id）。
+	if _, err := s.db.Exec(`UPDATE evidence_bundle_items SET evidence_id = 'ev-remote'
+		WHERE bundle_id = ? AND event_uid = ?`, b.ID, byUID.EventUID); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour).Unix()
+	if _, err := s.db.Exec(`UPDATE observations SET created_at = ?`, old); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.GCObservations(24*time.Hour, 50000)
+	if err != nil {
+		t.Fatalf("GCObservations: %v", err)
+	}
+	var kept int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations WHERE id IN (?, ?)`,
+		byID.ID, byUID.ID).Scan(&kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept != 2 || res.Deleted != 1 {
+		t.Fatalf("被 bundle item 引用（id/uid 双口径）的 2 条必须留下、无引用旧观测删 1 条，kept=%d %+v", kept, res)
+	}
+}
+
+// 尚未发窗（所在源 seq ∈ (cursor_seq, last_seq]）的观测行不删：
+// 它们还在证据队列里，先掏掉会在发窗时制造序号洞、丢摘要层。
+// 年龄与条数两条删除路径都必须遵守；无引用的老观测照常回收。
+func TestGCObservationsProtectsUnbundledRange(t *testing.T) {
+	s := newTestStore(t)
+	seedArchive(t, s, "u-a", "h-a")
+	seedArchive(t, s, "u-b", "h-b")
+	old := time.Now().Add(-48 * time.Hour).Unix()
+	if _, err := s.db.Exec(`UPDATE observations SET created_at = ?`, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// maxKeep=1 让年龄与条数两条删除路径都跑：未发窗的 2 条一条都不许动。
+	res, err := s.GCObservations(24*time.Hour, 1)
+	if err != nil {
+		t.Fatalf("GCObservations: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM observations`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || res.Deleted != 0 {
+		t.Fatalf("未发窗观测（age+cap 两路径）一条都不该删，剩 %d %+v", n, res)
+	}
+}
