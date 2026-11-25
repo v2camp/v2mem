@@ -81,9 +81,10 @@ type AcceptResult struct {
 
 // CandGCResult 是候选回收的结果。不触及 memories。
 type CandGCResult struct {
-	Expired        int `json:"expired"`
-	Deleted        int `json:"deleted"`
-	DeletedExpired int `json:"deleted_expired"`
+	Expired         int `json:"expired"`
+	Deleted         int `json:"deleted"`
+	DeletedExpired  int `json:"deleted_expired"`
+	DeletedRejected int `json:"deleted_rejected"`
 }
 
 // DistillRun 是一次蒸馏的审计行。
@@ -449,20 +450,40 @@ func (s *Store) GCCandidates(pendingAge, acceptedAge time.Duration) (*CandGCResu
 	if err != nil {
 		return nil, err
 	}
+	// S13（§2.2 终态保留表）：rejected 带理由码与证据引用保留到到期，再随候选 GC
+	// 一起回收；与 accepted/expired 共用同一个 90 天窗口，避免两套「多久算老」。
+	// quarantined / withdrawn 不在任何删除条件里：前者等人工显式重放，后者供按版本
+	// 统计提示词质量，一律不自动删。
+	deletedRejected, err := deleteCandidatesWithEdges(tx,
+		`status='rejected' AND decided_at IS NOT NULL AND decided_at < ?`,
+		now.Add(-acceptedAge).Unix())
+	if err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &CandGCResult{
 		Expired: int(expired), Deleted: int(deleted), DeletedExpired: int(deletedExpired),
+		DeletedRejected: int(deletedRejected),
 	}, nil
 }
 
-// deleteCandidatesWithEdges 先清 edges.dst、再删候选行（同事务）。
+// deleteCandidatesWithEdges 先清 edges.dst 与候选证据引用、再删候选行（同事务）。
 // where 是硬编码的删除条件片段，arg 是它的时间参数；顺序不能反——
-// 候选行先没了，dst 子查询就再也找不到要清的边。
+// 候选行先没了，子查询就再也找不到要清的边。
+//
+// candidate_evidence 虽有 ON DELETE CASCADE，但显式清有两个理由（与 GCAudit 同口径）：
+// 不依赖连接上的 foreign_keys 开关，且「删候选」与「清引用」在同一事务里可验证回滚。
+// memory_evidence 属于记忆生命周期（memory→evidence），不随候选删除：rejected /
+// accepted 候选都不拥有记忆的证据链，动它会把记忆的溯源目标挖空。
 func deleteCandidatesWithEdges(tx *sql.Tx, where string, arg any) (int64, error) {
 	if _, err := tx.Exec(
 		`DELETE FROM edges WHERE dst IN (SELECT id FROM candidates WHERE `+where+`)`, arg); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM candidate_evidence WHERE candidate_id IN (SELECT id FROM candidates WHERE `+where+`)`, arg); err != nil {
 		return 0, err
 	}
 	res, err := tx.Exec(`DELETE FROM candidates WHERE `+where, arg)

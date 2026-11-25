@@ -86,6 +86,15 @@ r15_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R15 ' || true)
 printf '%s' "$r15_action" | grep -q 'mem gc --candidates' \
   || fail "§5 R15 处置未给手工命令"
 
+# ⑦b S13 终态出口（2026-11-26）：物理删除与状态迁移是两条路，脚本 detail 与 §5
+# 处置都要提 mem gc --retention（rejected 90 天 / 完成 Bundle 30 天 / 孤立决策账，
+# 默认关）。只提命令、不执行——巡检只读边界不变，TTL_DAYS=14 定值不漂移。
+printf '%s' "$r15_action" | grep -q 'mem gc --retention' \
+  || fail "§5 R15 处置缺 S13 终态物理删除出口 mem gc --retention"
+printf '%s' "$(grep 'add R15 WARN' "$SCRIPT" | grep '候选超期' || true)" | grep -q 'mem gc --retention' \
+  || fail "脚本 R15 WARN detail 缺 S13 终态出口 mem gc --retention"
+grep -q 'TTL_DAYS=14' "$SCRIPT" || fail "S13 之后脚本 R15 的 TTL_DAYS 仍必须是 14"
+
 # ⑧ R3 口径：脚本 detail 与文档依据段都必须写明「端到端」。
 # 实证：文档长期写「实测量级 9–15ms」，而 R3 量的是端到端（进程启动 + 冷缓存 + 注入渲染），
 # 2026-11-19 复核端到端按日中位数已到 45.5ms、长尾 167ms，纯检索仍 10ms。
@@ -196,4 +205,4 @@ printf '%s' "$r16_action" | grep -q 'mem maintain --catch-up' \
 sed -n '/^## 4\./,/^## 5\./p' "$DOC" | grep -q 'R16' \
   || fail "§4 冷启动例外未把 R16 列入「不降级」"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与「只报不处置」的只读边界同步；R16 维护可见性 24h 阈值与处置命令同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与「只报不处置」的只读边界同步；R15 S13 终态出口（mem gc --retention）两处同步且 TTL_DAYS 定值不漂移；R16 维护可见性 24h 阈值与处置命令同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"

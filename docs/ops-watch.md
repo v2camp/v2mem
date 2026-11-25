@@ -93,7 +93,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `provider` 分流 rules / 其他）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
 | **R13** | 注入体量 | 窗口内读侧（`session-start` / `prompt-submit` / `pre-compact`）审计记录 `inject_bytes` 的**最大值**（无样本记 `INFO`） | ≤3600 | 3601–8000 | >8000 |
 | **R14** | 归档体量 | `~/.v2mem/evidence` 下文件数与总字节（`find` / `du`，只读）；detail 附 `mem stats --json` 的 `size_bytes` 作对照 | ≤512MiB | >512MiB | —（不设 FAIL，见依据） |
-| **R15** | 候选 TTL | `mem candidates ls --json` 中 `created_at` 超过 **14 天**的 pending 条数；**只报不处置**：超期报 WARN 并给手工命令与复核提示，状态迁移/删除归维护入口或人工 | 0 条超期 | 有超期（只报不处置） | — |
+| **R15** | 候选 TTL | `mem candidates ls --json` 中 `created_at` 超过 **14 天**的 pending 条数；**只报不处置**：超期报 WARN 并给手工命令与复核提示，状态迁移/删除归维护入口或人工（终态物理删除走 `mem gc --retention`，S13） | 0 条超期 | 有超期（只报不处置） | — |
 | **R16** | 维护可见性 | `mem stats --json` 顶层 `backlog` 的 `open_bundles` / `last_maintain_ok_age_seconds` / `bundles_isolated`（复用同一次 stats 调用，不额外读写）；只判级不处置 | 无积压，或有积压但 24h 内维护成功 | 有积压且（从未维护或 `last_maintain_ok_age_seconds` > **24h**），或 `bundles_isolated` > 0；detail 给 `mem maintain --catch-up` | —（不设 FAIL，维护滞后不是数据损失） |
 
 阈值依据（不凭空定）：
@@ -281,7 +281,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
     判据只量落盘量，不量语义。主库 `size_bytes` 仅作对照——主库与归档通常同源增长（观测行），
     但主库会因 freelist 复用而平台化，归档不会。
   - **不随冷启动降级**：它是累计量，与库里有几条记忆无关。（R15 同样不写库，只报不处置，见下条。）
-- **R15 的 14 天与「只报不处置」（2026-11-17 新增，2026-11-25 S3 收口）**：TTL 阈值不是新定的，
+- **R15 的 14 天与「只报不处置」（2026-11-17 新增，2026-11-25 S3 收口；2026-11-26 S13 补终态出口口径）**：TTL 阈值不是新定的，
   是照抄 `GCCandidates` 的默认值（`internal/store/candidates.go:380`，`cmd/mem/main.go`
   传入 `14*24h` / `90*24h`）。加这条判据的原因是**机制存在但没人执行**：
   2026-11-17 实测本机 2 条 11-02 候选已超期 14.8 天仍是 `pending`，`crontab` 与
@@ -292,6 +292,12 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
     的 `DELETE`，不可逆，属 §12.5 要人判的那一类——让一个自称只读的定时脚本执行它，
     等于把不可逆决策藏进 cron。故 R15 超期时只报 `WARN`，detail 给手工命令与
     「先复核 90 天前的已采纳行」的静态提示，**不查 accepted、不调 gc**。
+  - **S13 终态出口与 R15 的分工（2026-11-26）**：`mem gc --retention`（默认关）是
+    rejected 90 天 / 完成 Bundle 30 天 / 孤立决策账的**物理删除**出口，与
+    `gc --candidates` 的 pending→expired **状态迁移**是两条路——先迁移、复核后再物理删。
+    R15 的 TTL_DAYS=14 定值不漂移：它只量「过期机制有没有被跑」，detail 里只**提示**
+    这条命令，巡检本身仍不执行任何写操作。注意它对 R14 零影响：`--retention` 只清库内
+    完成账行（evidence_bundles），不删归档文件，归档落盘量照旧只增不减。
   - 为什么不在 hook 里自动处置：`design-write-governance.md` §12.5 已否决「挂 `SessionStart`
     自动过期」——撞 hooks 只读护栏、污染 R3 读侧延迟口径、且用户看不见。
   - 判级无 `FAIL` 档：`WARN` 的含义是「有超期候选待人处置」，需要人知道一次；
@@ -362,7 +368,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：核对 `MEM_DISTILL_SPAWN` / `MEM_NO_DISTILL` 是否按预期导出（SessionStart 只受后者关断，Stop / SessionEnd 另需前者），查宿主 stderr 有无 `startDistillProc` 失败；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `rules=0` 但其他 provider 有量属正常（远端成功），不要据此回滚；detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决。quarantined 是人工出口，不计失败率；用 mem distill --quarantined 查看、--requeue 回捞 |
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
 | R14 归档体量越线 | 归档增长快于观测保留策略 | 先分因：① **量增长**（文件数与字节同步涨）→ 按下面两步回收，再裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**回收只有一条路**：先 `mem gc --obs`（删观测行）再 `mem gc --evidence`（删已无观测引用的段与磁盘文件），两条合跑即同一轮生效；`--evidence` 有 1h 写入保护期。单跑 `--evidence` 在观测未回收时释放 0 字节——**不要**据此认为功能失效。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处。确认接受现状就上调阈值并在提交信息里写明原因 |
-| R15 候选超期 | TTL 从未被执行 | 巡检**只报不处置**。先复核 90 天前的已采纳行（`mem candidates ls --status accepted -db ~/.v2mem/mem.db`）——`gc --candidates` 会连带删除它们、不可逆；确认后再手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`（pending → expired，行仍在库）。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
+| R15 候选超期 | TTL 从未被执行 | 巡检**只报不处置**。先复核 90 天前的已采纳行（`mem candidates ls --status accepted -db ~/.v2mem/mem.db`）——`gc --candidates` 会连带删除它们、不可逆；确认后再手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`（pending → expired，行仍在库）。终态**物理删除**是另一条路：`mem gc --retention`（S13，默认关；rejected 90 天 / 完成 Bundle 30 天 / 孤立决策账 / 超龄 plans，删前自动备份）。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
 | R16 维护滞后 / 有积压且有隔离 | `mem maintain` 没被触发，或持续故障后没人追账 | 巡检**只报不处置**。先看 backlog 的 `open_bundles` 与 `bundles_isolated`：有隔离则按 §5 R12 查 `evidence_bundles` 的失败原因、修复后 `mem distill --quarantined` 查看；随后执行 `mem maintain --catch-up` 连续追账（幂等，重复跑不会重复提交），再 `mem stats --json` 确认 `last_maintain_ok_age_seconds` 回落。**不要**为了消掉 WARN 去删 Bundle 行或改 `maintain:last_ok`——前者会跳过证据，后者会把「没维护」伪装成「维护过」 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。

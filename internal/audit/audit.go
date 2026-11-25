@@ -104,10 +104,11 @@ func Path() string {
 // Append 追加一条记录。
 //
 // 在写之前做体量轮转（超过 MaxArchiveBytes 即归档当前日志），避免文件无限膨胀。
-// 轮转失败会被吞掉：审计写失败绝不能影响记忆注入或宿主会话。
 //
-// 返回错误是为了可测；**调用方必须忽略它** —— 这条路径在宿主会话的关键链上，
-// 审计写失败绝不能影响记忆注入，更不能让会话收到错误。
+// 返回错误是为了可测与可观测；**调用方必须忽略它** —— 这条路径在宿主会话的
+// 关键链上，审计/轮转失败绝不能影响记忆注入，更不能让会话收到错误。轮转失败
+// 另走 warnRotate 明确告警（stderr），不再像过去那样被 `_ =` 静默吞掉：否则
+// .1–.3 会悄悄停更，历史合并查询读到过期归档也无人知晓（§8.2）。
 func Append(path string, r Record) error {
 	if path == "" {
 		path = Path()
@@ -115,7 +116,10 @@ func Append(path string, r Record) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	_ = MaybeRotate(path, MaxArchiveBytes)
+	if err := MaybeRotate(path, MaxArchiveBytes); err != nil {
+		warnRotate(err)
+		return fmt.Errorf("审计日志轮转失败: %w", err)
+	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -151,7 +155,9 @@ func MaybeRotate(path string, maxBytes int64) error {
 
 // rotate 把当前日志归档为 .1，其余归档依次后移，删除超出保留数的旧档。
 func rotate(path string) error {
-	// 先删最旧，腾出 .N 位置，避免覆盖
+	// 先删最旧，腾出 .N 位置，避免覆盖。这里不单开错误分支：删不掉的非空/只读
+	// 旧档会让紧随的 Rename 同样失败，错误统一从 MaybeRotate 冒泡到 Append 的
+	// warnRotate 告警出口（§8.2「轮转失败不静默」），保持单一失败出口。
 	oldest := fmt.Sprintf("%s.%d", path, MaxArchives)
 	_ = os.Remove(oldest)
 	// 从旧往新移位（先 .2→.3，再 .1→.2，最后 .0→.1）

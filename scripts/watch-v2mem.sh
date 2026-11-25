@@ -668,6 +668,8 @@ fi
 # 准出路径是 mem gc --obs 之后再 mem gc --evidence（只删已无观测引用的段与文件）；
 # 本脚本只读，不做回收。故只量落盘量（文件数 + 字节），不折算成「多少条观测」：
 # gc 之后行数降而文件数不降，两者本就会脱钩。
+# S13 补的 mem gc --retention 只清库内完成账行（evidence_bundles），不删归档文件，
+# 对 R14 的落盘量**零影响**——别把它当成归档 WARN 的处置命令。
 # 阈值与「为何不设 FAIL」见 docs/ops-watch.md §3 R14。
 EV_DIR="$V2MEM_DIR/evidence"
 EV_FILES=0; EV_BYTES=0
@@ -701,6 +703,9 @@ fi
 # （mem maintain）或人工——GCCandidates 还带一条「删 90 天以上 accepted 行」的 DELETE，
 # 不可逆，不能让「只读巡检」替人做这个决定。故这里不查 accepted、不调 gc，
 # 只在 detail 里给手工命令与执行前的静态复核提示（先复核 90 天前的已采纳行）。
+# 终态物理删除出口（S13）：mem gc --retention（默认关）负责 rejected 90 天 /
+# 完成 Bundle 30 天 / 孤立决策账的物理删，与 gc --candidates 的状态迁移是两条路；
+# TTL_DAYS=14 定值不漂移——R15 只管「过期机制有没有被跑」，不管物理删。
 TTL_DAYS=14
 TTL_ACCEPTED_DAYS=90
 STALE_PENDING=$(printf '%s' "$CAND_PENDING" | jq -r --argjson now "$NOW" --argjson ttl $(( TTL_DAYS * 86400 )) '
@@ -712,7 +717,7 @@ if [ "$CAND_READ_FAIL" -eq 1 ]; then
 elif [ "$STALE_PENDING" -eq 0 ]; then
   add R15 PASS "候选 TTL 无超期" "无超过 ${TTL_DAYS} 天的 pending（与 GCCandidates 默认阈值同源）"
 else
-  add R15 WARN "候选超期 ${STALE_PENDING} 条·只报不处置" "已超 ${TTL_DAYS} 天仍 pending；巡检只报不处置（只读），按 §5 手工执行 mem gc --candidates；执行前先复核 ${TTL_ACCEPTED_DAYS} 天前的已采纳行（gc --candidates 会连带删除）"
+  add R15 WARN "候选超期 ${STALE_PENDING} 条·只报不处置" "已超 ${TTL_DAYS} 天仍 pending；巡检只报不处置（只读），按 §5 手工执行 mem gc --candidates；执行前先复核 ${TTL_ACCEPTED_DAYS} 天前的已采纳行（gc --candidates 会连带删除）；终态物理删除另走 mem gc --retention（rejected 90 天 / 完成 Bundle 30 天 / 孤立决策账，默认关）"
 fi
 
 # R16 维护可见性：积压 + 最后成功维护 + 隔离量。
