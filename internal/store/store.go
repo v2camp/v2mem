@@ -156,6 +156,12 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) Path() string { return s.path }
 
+// DB 返回底层连接，仅供只读评测/诊断做纯查询（eval flow、巡检）。
+//
+// 写路径必须经 Store 的方法：事务、证据链、幂等键都在那里，绕过它会破坏口径。
+// 需要写入的场景一律不走这个入口。
+func (s *Store) DB() *sql.DB { return s.db }
+
 // ensureColumn 幂等地给表补列：列已存在则不动，否则 ALTER 加上。
 // 用途：后加的列（如 source）不能影响既有库的打开。
 func ensureColumn(db *sql.DB, table, column, ddl string) error {

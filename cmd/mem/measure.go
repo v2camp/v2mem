@@ -222,13 +222,15 @@ func cmdEval(args []string) error {
 		return cmdEvalWrite(args[1:])
 	case "activity":
 		return cmdEvalActivity(args[1:])
+	case "flow":
+		return cmdEvalFlow(args[1:])
 	}
 	// 第一个 token 是 flag（以 - 开头）而非子命令 → 把它当成在默认 activity 上加参数，
 	// 例如 `mem eval --db X` / `mem eval --since 2h`。
 	if strings.HasPrefix(args[0], "-") {
 		return cmdEvalActivity(args)
 	}
-	return fmt.Errorf("未知子命令 %q；可选 recall | write | activity（不带子命令时默认跑 activity 24h）", args[0])
+	return fmt.Errorf("未知子命令 %q；可选 recall | write | activity | flow（不带子命令时默认跑 activity 24h）", args[0])
 }
 
 // defaultAutoSample 是 `--auto` 裸用时的默认抽样条数。
