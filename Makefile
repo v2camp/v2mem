@@ -17,6 +17,11 @@ test: fmt-check test-watch test-flow
 test-flow:
 	CGO_ENABLED=0 go test -count=1 ./test/flow
 
+# 故障注入套件：六类故障 × hook/gc/distill（真实二进制 + 临时 HOME + SIGKILL/只读目录）。
+# 独立门禁，不进默认 test：用例故意杀进程、等 SQLITE_BUSY，跑得慢且依赖 unix。
+test-faults:
+	CGO_ENABLED=0 go test -tags=faults -count=1 -timeout 300s ./test/faults
+
 # 格式门禁：任一 .go 未 gofmt 即非零退出。挂在 test 前，避免格式漂移脱离门禁
 # 漂进 main（2026-11-14 巡检发现 16 个文件尾换行缺失）。
 fmt-check:
@@ -125,4 +130,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test test-flow test-install test-verify-install verify-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release
+.PHONY: build install test test-flow test-faults test-install test-verify-install verify-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release

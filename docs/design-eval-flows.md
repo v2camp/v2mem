@@ -72,12 +72,31 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 | G12 | 候选 → 裁决 | 逐 Bundle 窗口「终态数 = 准入数」，准出率 100%（复用账本对账） | candidates | `eval flow` 的 G12 |
 | G13 | 候选 → 裁决 | 同一会话同一内容不重复落库；采纳不得无证据强写 | candidates、candidate_evidence | `eval flow` 的 G13 |
 
+### 3.2 故障矩阵（S9a：hook / gc / distill）
+
+> 判据不是「命令返回 0」，而是**不丢数据、不静默、重启幂等、退出码如实**。
+> 单元格写的是注入手法与期望终态；`—` 表示该入口无此故障面（如 gc 不读外部输入）。
+> 自动注入：`test/faults`（`make test-faults`）；maintain 入口见 S9b。
+
+| ID | 故障 | hook | gc | distill |
+|:---|:---|:---|:---|:---|
+| F1 | 部分写（表写入失败） | `FailWrites(observations)` → 退出 0，事件落 spool；撤销后 drain 补回，重放不重复 | `FailWritesOn(candidates, DELETE)` → 非 0；UPDATE 标过期与删行同事务回滚，无半提交 | 第二条候选 INSERT 失败 → `partial` 不消费窗口；重试补齐，按内容去重 |
+| F2 | kill -9 中途 | Stop 处理 transcript 时 SIGKILL → 重启补写，`(source_id,source_seq)` 无重复；`*.jsonl.processing` 可重放 | — | 同 F1：partial 后重跑即崩溃恢复口径（进程内事务已回滚） |
+| F3 | 只读/磁盘不可写 | 归档目录 0555 → 退出 0（钩子不阻断宿主），事件转 spool；恢复后补回 | 库目录 0555 → 非 0，stderr 可诊断，库内状态不变 | 库目录 0555 + `--strict` → 非 0，不 panic |
+| F4 | 库被占用（SQLITE_BUSY） | fail-open：写失败进 spool（同 F1 路径） | 外部连接持 `BEGIN IMMEDIATE` → 拿不到写锁即如实非 0（`busy_timeout` 内不重试成功），状态不变 | 同 gc（共用 `store.Open` 的 `busy_timeout=5000`） |
+| F5 | 坏输入 | spool 坏 JSON → 退出 0，原文进 `spool/dead-letter`，正常段继续 | — | executor 输出非法 → `invalid`，0 候选，窗口不消费；`--strict` 非 0 |
+| F6 | 超大负载 | prompt > 32000 rune → 归档按上限截断（现行实现保留前 32000 + 省略号），不丢整条 | — | 64KB ByteCap 切窗，不丢证据；单条超限至少出 1 条 |
+
+**dry-run / force 列**：`distill --dry-run --bundle` 在候选写入被全面注入失败时仍须
+退出 0、0 写入、不消费窗口；`gc --no-backup` 是破坏性路径的 force 开关，故障用例
+一律显式带上，避免备份目录干扰注入点。hook 无 dry-run/force 面。
+
 **无法从库表/审计自动判定的口径（需 U 类人工或独立注入 case，不在 G1–G13 内）**：
 
 - **spool 落盘后 drain 重放不丢不重**：需要文件系统故障注入与二次进程启动，
-  G1 只证明「重放后库内无重复」，不证明 spool 本身不丢。
+  G1 只证明「重放后库内无重复」，不证明 spool 本身不丢（已由 §3.2 F2 覆盖）。
 - **32000 rune 截断与 scrub 生效**：需要读归档原文比对，属内容级断言；
-  库表只存摘要/引用。
+  库表只存摘要/引用（截断边界已由 §3.2 F6 覆盖；scrub 仍属内容级）。
 - **规则 / 模型两 executor 同契约**：需要同一窗口分别跑两条链路再对比输出，
   是运行时等价性，不是存量数据可判。
 - **revision CAS 的并发竞态**：G10 只能看最终行是否单调，无法证明并发写者被 CAS 挡住。
@@ -91,6 +110,8 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 
 - 临时库 + fake clock + fake executor（确定性输出）+ 故障注入（写失败/坏段/序号洞）；
   不触碰 `~/.v2mem`，沿用 `make test-e2e` 的隔离纪律。
+- 故障注入单独门禁 `make test-faults`（`test/faults`，build tag `faults`）：
+  要 SIGKILL、等 SQLITE_BUSY、改目录权限，故意不进默认 `make test`。
 - 准出率断言做成**账本对账**：`终态数 = 准入数` 逐窗口核对（复用 commit_decisions 与
   Bundle 完成账），全量对账而非抽查。
 - 并入 `make test`（`test-flow` 套件）：新增 `eval flow`

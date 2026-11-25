@@ -265,7 +265,18 @@ func (e *Engine) capture(ev RawEvent, allowSpool bool) (Ref, error) {
 	summary := eventSummary(ev)
 	seg, err := e.writeArchive(ev)
 	if err != nil {
-		return Ref{}, fmt.Errorf("归档原始证据失败: %w", err)
+		// 归档目录不可写（只读挂载/权限/磁盘满）同样不能丢事件：与「写账失败」
+		// 一样落到 spool，等故障恢复后由 DrainSpool 重新归档 + 入库。
+		// 此时 DB 还没写，spool 是唯一副本，重放不会产生重复。
+		werr := fmt.Errorf("归档原始证据失败: %w", err)
+		if !allowSpool {
+			return Ref{}, werr
+		}
+		spoolPath, spoolErr := e.writeSpool(ev)
+		if spoolErr != nil {
+			return Ref{}, errors.Join(werr, fmt.Errorf("落 spool segment 失败: %w", spoolErr))
+		}
+		return Ref{}, fmt.Errorf("%w（已落 spool：%s）", werr, spoolPath)
 	}
 
 	channel, err := store.DefaultObsChannel(ev.EventType, "")

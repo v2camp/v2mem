@@ -417,22 +417,24 @@ func (s *Store) GCCandidates(pendingAge, acceptedAge time.Duration) (*CandGCResu
 		acceptedAge = 90 * 24 * time.Hour
 	}
 	now := time.Now()
-	res, err := s.db.Exec(
+	// 「标过期」与两条删除必须同事务：此前 UPDATE 独立提交，DELETE 失败时
+	// 会留下「已标 expired 但没删」的半提交，重跑也不会再把它当 pending。
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	upd, err := tx.Exec(
 		`UPDATE candidates SET status='expired', decided_at=?
 		  WHERE status='pending' AND created_at < ?`,
 		now.Unix(), now.Add(-pendingAge).Unix())
 	if err != nil {
 		return nil, err
 	}
-	expired, err := res.RowsAffected()
+	expired, err := upd.RowsAffected()
 	if err != nil {
 		return nil, err
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
 	deleted, err := deleteCandidatesWithEdges(tx,
 		`status='accepted' AND decided_at IS NOT NULL AND decided_at < ?`,
 		now.Add(-acceptedAge).Unix())
