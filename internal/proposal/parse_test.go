@@ -111,18 +111,20 @@ func TestBuildChainModes(t *testing.T) {
 	host := FuncGenerator{Label: "host"}
 	local := FuncGenerator{Label: "local"}
 	byok := FuncGenerator{Label: "byok"}
-	deps := Deps{Host: host, Local: local, BYOK: byok}
+	// Rules 是模型不可用时的兜底，非 nil 即恒在链尾；none 不受影响。
+	rules := NewRulesGenerator()
+	deps := Deps{Host: host, Local: local, BYOK: byok, Rules: rules}
 
 	cases := []struct {
 		mode string
 		want string
 		err  bool
 	}{
-		{"", "local", false},
-		{"auto", "local", false},
-		{"local", "local", false},
-		{"host", "host,local", false},
-		{"byok", "byok,local", false},
+		{"", "local,rules", false},
+		{"auto", "local,rules", false},
+		{"local", "local,rules", false},
+		{"host", "host,local,rules", false},
+		{"byok", "byok,local,rules", false},
 		{"none", "", false},
 		{"nope", "", true},
 	}

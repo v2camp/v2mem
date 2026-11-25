@@ -84,6 +84,9 @@ func cmdDistill(args []string) error {
 			return errors.New("--dry-run 需要配合 --bundle：dry-run 不得推进连续游标")
 		}
 		var deps proposal.Deps
+		// 规则兜底恒挂链尾：模型全部不可用时仍能把决策/踩坑类证据落成候选，
+		// 而不是让窗口停在 backlog。none 模式 BuildChain 不消费它，语义不变。
+		deps.Rules = proposal.NewRulesGenerator()
 		unavailable := func(label string, cause error) proposal.Generator {
 			return proposal.UnavailableGenerator(label, cause)
 		}
