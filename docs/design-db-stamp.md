@@ -51,6 +51,31 @@ DDL 写在 Go 里（`EnsureWriterStamp`），**不写进 `schema.sql`**：`schem
 拆表/合表、改变已有字段的单位或取值域。只加新表 / 新索引（旧二进制读不到也不受影响的）
 可不加。判断标准只有一条：**旧二进制读到迁移后的库，会不会静默错读**。会，就必须 +1。
 
+## 版本史：v2 → v3（S10a 复核数据面）
+
+`CurrentSchemaVersion` 从 2 升到 3。变化的是「读出来的数据形状」——新代码依赖这些列
+（`visibilityWhere` 看 `memories.review_state`、复核视图看 `candidates.attempt`），
+旧二进制读到迁移后的库会按旧形状解释新数据，故必须 +1。
+
+| 表 | 新列 |
+|:---|:---|
+| `memories` | `review_state` / `reviewed_at` / `reviewed_by` |
+| `candidates` | `status_reason` / `judge_reason` / `attempt` |
+| `commit_decisions` | `model_tag` / `created_memory` |
+
+**幂等 ALTER**：列与索引不写进 `schema.sql`（它只对新建库生效，且索引写在建表脚本里会
+先于 ALTER 执行、旧库还没有列时直接让 `Open` 失败）。`Open` 里由 `ensureReviewSchema`
+用 `ensureColumn` / `ensureColumnAdded` 逐列补，补完才建 `ix_mem_review_state` 与
+`ix_commit_model`（`CREATE INDEX IF NOT EXISTS`，新建库与存量库走同一条路径）。
+二次 `Open` 全部命中「列已存在」，不重跑任何 DDL。
+
+**回填规则**：`backfillDirectWriteReviews` 只在 `review_state` 这一列**这次刚加上**时跑一次，
+把 `review_state = ''` 且 `source IN ('human','llm','ingest','harness-summary','bench','test')`
+的行标成 `confirmed`（`reviewed_at = created_at`、`reviewed_by = 'direct-write'`）。
+只认可证明的直写来源：`distill-accept` 与空 `source` 的 legacy 行一律留未审核——
+全库历史一律标已审核会让复核摘要永远看不到模型写入的行。挂在「刚加上」而不是每次
+`Open`，是为了不让人工撤回过的行在下次打开时被悄悄改回 `confirmed`。
+
 ## `BinVersion()` 的口径
 
 用 `runtime/debug.ReadBuildInfo()`：`Main.Version` 有值（release tag 或 Go 1.24+ 的

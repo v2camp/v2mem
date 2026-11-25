@@ -66,11 +66,21 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 | G6 | 归档 → Bundle | noop 窗口必须有 noop/empty 运行账、attempt≥1、零候选 | evidence_bundles、distill_runs、candidates | `eval flow` 的 G6 |
 | G7 | Bundle → executor | fail/partial/backlog 必须重试（attempt 递增）或按 5 次上限隔离，不得冒充 noop | distill_runs、evidence_bundles | `eval flow` 的 G7 |
 | G8 | 候选 → 裁决 | 超过 15 天 SLA 仍 pending 的候选 = 悬空，必须为 0 | candidates（--window 可调） | `eval flow` 的 G8 |
-| G9 | 候选 → 裁决 | accepted/rejected 必须有匹配裁决；expired 必须有显式裁决（不能顶替消费） | candidates、commit_decisions | `eval flow` 的 G9 |
+| G9 | 候选 → 裁决 | accepted/rejected/expired 必须有匹配裁决；failed/quarantined/withdrawn 不要求裁决；pending 只看最近一次 reopen 之后的终态裁决 | candidates、commit_decisions | `eval flow` 的 G9 |
 | G10 | 候选 → 裁决 | (candidate, revision, action) 与幂等键唯一，决策 revision 不超前 | commit_decisions、candidates | `eval flow` 的 G10 |
 | G11 | 裁决 → 记忆 | 采纳必须落到 memories；裁决 memory_id 一致；候选证据在 memory_evidence 全绑定 | candidates、commit_decisions、candidate_evidence、memory_evidence、memories | `eval flow` 的 G11 |
-| G12 | 候选 → 裁决 | 逐 Bundle 窗口「终态数 = 准入数」，准出率 100%（复用账本对账） | candidates | `eval flow` 的 G12 |
+| G12 | 候选 → 裁决 | 逐 Bundle 窗口「终态数 = 准入数」，准出率 100%（终态 = accepted/rejected/expired/quarantined/withdrawn；failed 非终态，复用账本对账） | candidates | `eval flow` 的 G12 |
 | G13 | 候选 → 裁决 | 同一会话同一内容不重复落库；采纳不得无证据强写 | candidates、candidate_evidence | `eval flow` 的 G13 |
+
+> **S10a 口径变更（G9 / G12）**：
+> - **G9**：`failed` / `quarantined` / `withdrawn` 不是裁决驱动的状态（`failed` 在重试队列、
+>   `quarantined` / `withdrawn` 是明确终态），要求它们也配 accept/reject 裁决只会逼实现
+>   为过闸伪造一条裁决；`pending` 的「已有终态裁决」只看**最近一次 `reopen` 之后**——
+>   `mem batch --rollback` 退回 pending 时历史裁决合法留账，旧口径会把每个回滚过的候选判红。
+> - **G12**：终态集合补 `quarantined` / `withdrawn`；`failed` **不**计终态（还在重试队列里，
+>   算成终态会让准出率虚高，与 §3「失败→failed 不算 noop」是同一句话）。
+> - 实现见 `internal/eval/flow_check.go`；用例 `TestCheckFlowG9AdmitsFailedQuarantinedWithdrawn`、
+>   `TestCheckFlowG9PendingIgnoresDecisionsBeforeReopen`、`TestCheckFlowG12TerminalSet`。
 
 ### 3.2 故障矩阵（S9a/S9b：hook / gc / distill / maintain）
 
@@ -120,6 +130,23 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 - **关机 / 休眠 / 总闸等豁免**：需要 fake clock + 进程生命周期模拟显式标记，
   G12 未把 `Exempt` 纳入自动账本。
 
+
+### 3.3 B 类逐跳检查矩阵（S10a 数据面 / S10b 动作面）
+
+> 口径来源 `design-data-lifecycle.md` §2.1 / §6.4 与 §12.3 一屏四态。
+> B1–B5 是 S10a 已落地的数据面与只读视图；B6–B9 的动作面留 S10b。
+
+| ID | 断言 | 状态 |
+|:---|:---|:---|
+| B1 | 一屏四态视图：`mem review ls` 的 pending / summary / quarantined / failed 共用同一投影，空态输出 `[]` 而非 `null`，计数不受 `--state` / `--limit` 截断 | S10a 已落地 |
+| B2 | 提交矩阵全分支：Defer / Conflict / AutoCommit 各落对应状态，不得为消灭 pending 强行写入 | S10a 已落地 |
+| B3 | 模型输出非法 → `failed`（不入库、不顶替消费），`status_reason` 留最后一次原因 | S10a 已落地 |
+| B4 | `failed` 重试超上限 → `quarantined`：`attempt` 递增、`status_reason` 记原因，quarantined 为终态（不可再隔离 / 提交 / 拒绝） | S10a 已落地 |
+| B5 | 幂等与 CAS：同一 (candidate, revision, action) 幂等键唯一；重放不新增裁决行，revision CAS 不超前 | S10a 已落地 |
+| B6 | `withdraw`：一步撤回退出主检索，行与证据保留（可追溯） | S10b 待落地 |
+| B7 | `restore`：撤回 / 误拒可原路恢复，重新进入检索 | S10b 待落地 |
+| B8 | 按 `model@promptver` 回滚：只撤该版本自动记忆，跳过人工确认 / 修正条目并报告 | S10b 待落地 |
+| B9 | `model-auto` 默认关：模型自动采纳作为可配置档，裁决按 `model@promptver` 归因 | S10b 待落地 |
 
 ## 4. 形态与门禁
 

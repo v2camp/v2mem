@@ -10,9 +10,13 @@ package store
 //
 // 重复判定会覆盖上一次的 verdict（同一个候选可能换模型重判），judge_model 一起覆盖，
 // 否则「谁判的」与「判成什么」会分属两个模型，事后无法归因。
+//
+// 理由写进独立的 judge_reason，**不覆盖 rationale**：后者是提案自己给的理由，
+// 是「模型为什么这么提」的唯一记录，覆盖掉就再也无法比较判定与提案的分歧
+// （docs/design-data-lifecycle.md §7 第 5 条）。
 func (s *Store) MarkJudgeVerdict(id, verdict, model, reason string) error {
 	_, err := s.db.Exec(`UPDATE candidates
-		SET judge_verdict = ?, judge_model = ?, rationale = ?
+		SET judge_verdict = ?, judge_model = ?, judge_reason = ?
 		WHERE id = ?`, verdict, model, reason, id)
 	return err
 }
@@ -32,11 +36,11 @@ func (s *Store) CountPending() (int, error) {
 
 // JudgedReject 是「模型判了否决、但还没人裁决」的候选，供批量清积压用。
 type JudgedReject struct {
-	ID        string `json:"id"`
-	Project   string `json:"project"`
-	Kind      string `json:"kind"`
-	Content   string `json:"content"`
-	Rationale string `json:"rationale"`
+	ID          string `json:"id"`
+	Project     string `json:"project"`
+	Kind        string `json:"kind"`
+	Content     string `json:"content"`
+	JudgeReason string `json:"judge_reason"`
 }
 
 // ListJudgeRejects 取出影子判定为 reject 且仍 pending 的候选（最老的在前）。
@@ -44,11 +48,14 @@ type JudgedReject struct {
 // 只出 reject，不出 accept：模型可以自动否决，不能自动授予。采纳仍必须走
 // 人给的方案（design-admission §3.2）——否则「批量准出」就成了换名的 --apply。
 // 判定痕迹不清空：退回 pending 的行不会被再判一遍（judge 只取 judge_verdict=”）。
+//
+// 理由取 judge_reason 而不是 rationale：后者是提案自己的话，把它当成模型的
+// 理由码写进裁决，等于给否决编造依据。
 func (s *Store) ListJudgeRejects(project string, limit int) ([]JudgedReject, error) {
 	if limit <= 0 {
 		limit = 500
 	}
-	q := `SELECT id, COALESCE(project, ''), kind, content, COALESCE(rationale, '')
+	q := `SELECT id, COALESCE(project, ''), kind, content, COALESCE(judge_reason, '')
 		FROM candidates WHERE status = 'pending' AND judge_verdict = 'reject'`
 	args := []any{}
 	if project != "" {
@@ -66,7 +73,7 @@ func (s *Store) ListJudgeRejects(project string, limit int) ([]JudgedReject, err
 	var out []JudgedReject
 	for rows.Next() {
 		var r JudgedReject
-		if err := rows.Scan(&r.ID, &r.Project, &r.Kind, &r.Content, &r.Rationale); err != nil {
+		if err := rows.Scan(&r.ID, &r.Project, &r.Kind, &r.Content, &r.JudgeReason); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

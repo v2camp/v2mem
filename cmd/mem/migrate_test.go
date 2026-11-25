@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -68,8 +69,9 @@ func TestCmdMigrateSummaryExternal(t *testing.T) {
 		t.Fatalf("迁移后列不对: empty=%d ref=%d", emptyRows, refRows)
 	}
 	var version, marker string
-	if err := raw.QueryRow(`SELECT v FROM db_meta WHERE k='schema_version'`).Scan(&version); err != nil || version != "2" {
-		t.Fatalf("schema_version 应为 2: %q %v", version, err)
+	want := strconv.Itoa(store.CurrentSchemaVersion)
+	if err := raw.QueryRow(`SELECT v FROM db_meta WHERE k='schema_version'`).Scan(&version); err != nil || version != want {
+		t.Fatalf("schema_version 应为 %s: %q %v", want, version, err)
 	}
 	if err := raw.QueryRow(`SELECT v FROM db_meta WHERE k='summary_external_version'`).Scan(&marker); err != nil || marker != "1" {
 		t.Fatalf("迁移标记缺失: %q %v", marker, err)

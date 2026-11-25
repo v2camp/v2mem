@@ -263,6 +263,18 @@ candidates: pending
 - 直写治理口径一并明确：显式 `mem add`、MCP `add`、`ingest`/`import` 仍可直接写最终记忆
   （`source` 已区分）；直写默认视为人工已审核，不进复核摘要。
 
+> **S10a 已落地（schema v3 复核数据面）**：`memories.review_state` / `reviewed_at` /
+> `reviewed_by` 与候选的 `status_reason` / `judge_reason` / `attempt`、裁决账的
+> `model_tag` / `created_memory` 已由 `store.Open` 幂等补列迁移；`mem add` 等直写
+> 写入即标 `confirmed`，`SetMemoryReviewState` 收敛状态取值，`withdrawn` 经
+> `visibilityWhere` 退出 Search/List（行与证据保留，可 restore），`mem review ls`
+> 提供一屏四态只读视图（pending / summary / quarantined / failed）。
+> **`review_state` 回填只认可证明的直写来源**（白名单 `human|llm|ingest|harness-summary|bench|test`），
+> `distill-accept` 与空 `source` 的 legacy 行一律留未审核，不得把全库一律标 `confirmed`；
+> 回填只在补列那一次跑，不随每次 `Open` 重来。
+> 动作面（`review withdraw` / `restore` / 按 `model@promptver` 回滚）与 `model-auto`
+> 生产者留 S10b。
+
 ### 6.5 shadow Judge 自动 reject、数据外发、跨设备同步
 
 三者**分别授权，不捆绑开启**：shadow Judge 自动 reject（可回捞，风险低）可单独开；

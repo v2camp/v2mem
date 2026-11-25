@@ -159,7 +159,7 @@ func planFromJudged(st *store.Store, project string) ([]batchPlanItem, error) {
 	}
 	out := make([]batchPlanItem, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, batchPlanItem{ID: r.ID, Action: "reject", Reason: derivedRejectReason(r.Rationale)})
+		out = append(out, batchPlanItem{ID: r.ID, Action: "reject", Reason: derivedRejectReason(r.JudgeReason)})
 	}
 	return out, nil
 }

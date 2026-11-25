@@ -437,6 +437,13 @@ func flowG8(cands []FlowCandidate, now int64, window time.Duration) FlowCheck {
 }
 
 // G9 裁决闭环：终态候选必须有匹配裁决；expired 不能顶替消费。
+//
+// S10a 起两处口径变化（docs/design-eval-flows.md §3.1）：
+//   - failed / quarantined / withdrawn 不是裁决驱动的状态：failed 在重试队列里，
+//     quarantined/withdrawn 是明确终态。要求它们也配 accept/reject 裁决，只会逼实现
+//     为了过闸去伪造一条裁决。
+//   - pending 的「已有终态裁决」只看**最近一次 reopen 之后**：`mem batch --rollback`
+//     把候选退回 pending 时历史裁决合法地留在账上，旧口径会把每个回滚过的候选判红。
 func flowG9(cands []FlowCandidate, idx *flowIndex) FlowCheck {
 	const id, name = "G9", "候选裁决闭环"
 	if len(cands) == 0 {
@@ -458,8 +465,10 @@ func flowG9(cands []FlowCandidate, idx *flowIndex) FlowCheck {
 			if len(ds) == 0 {
 				bad = append(bad, c.ID+" expired 无裁决（顶替消费）")
 			}
+		case "failed", "quarantined", "withdrawn":
+			// 非裁决驱动的中间/终态：不要求匹配裁决，合法性由 G12/G7 与状态迁移守。
 		case "pending":
-			if flowHasAction(ds, "auto_commit", "human_accept", "reject") {
+			if flowHasAction(flowDecisionsSinceReopen(ds), "auto_commit", "human_accept", "reject") {
 				bad = append(bad, c.ID+" pending 已有终态裁决")
 			}
 		default:
@@ -470,6 +479,29 @@ func flowG9(cands []FlowCandidate, idx *flowIndex) FlowCheck {
 		return flowFail(id, name, fmt.Sprintf("%d 条候选与裁决不一致：%s", len(bad), flowIDs(bad)))
 	}
 	return flowPass(id, name, fmt.Sprintf("%d 条候选均有匹配裁决", len(cands)))
+}
+
+// flowDecisionsSinceReopen 只保留最近一次 reopen（含）之后的裁决。
+//
+// 没有 reopen 时返回原切片：绝大多数候选从没被回滚过，不必复制。
+// 用 revision 而不是时间：裁决账的时间只到秒，回滚与前一次裁决常在同一个秒里。
+func flowDecisionsSinceReopen(ds []FlowDecision) []FlowDecision {
+	reopenRev, reopened := 0, false
+	for _, d := range ds {
+		if d.Action == "reopen" && (!reopened || d.Revision >= reopenRev) {
+			reopenRev, reopened = d.Revision, true
+		}
+	}
+	if !reopened {
+		return ds
+	}
+	out := make([]FlowDecision, 0, len(ds))
+	for _, d := range ds {
+		if d.Revision >= reopenRev {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 func flowHasAction(ds []FlowDecision, actions ...string) bool {
@@ -558,7 +590,11 @@ func flowG11(cands []FlowCandidate, idx *flowIndex) FlowCheck {
 }
 
 // G12 准出率账本：逐 Bundle 窗口「终态数 = 准入数」，复用 S0 的 Reconcile/Pass。
+//
+// 终态集合 = accepted / rejected / expired / quarantined / withdrawn。
 // expired 计终态（它确实到了显式状态）；合法性由 G9 守，不在这里重复判。
+// failed **不**计终态：它还在重试队列里，算成终态会让准出率虚高——这正是「失败不算 noop」
+// 在准出率上的同一句话。
 func flowG12(cands []FlowCandidate) FlowCheck {
 	const id, name = "G12", "准出率对账"
 	if len(cands) == 0 {
@@ -577,7 +613,7 @@ func flowG12(cands []FlowCandidate) FlowCheck {
 		}
 		l.Admitted++
 		switch c.Status {
-		case "accepted", "rejected", "expired":
+		case "accepted", "rejected", "expired", "quarantined", "withdrawn":
 			l.Terminal++
 		}
 	}
