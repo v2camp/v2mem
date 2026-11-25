@@ -21,6 +21,7 @@ import (
 
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/eval"
+	"github.com/v2camp/v2mem/internal/evidence"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -43,8 +44,26 @@ func cmdAudit(args []string) error {
 	statsOnly := fs.Bool("stats", false, "只打印汇总")
 	tail := fs.Int("tail", 10, "列出最近多少条（0=不列）")
 	showHits := fs.Bool("hits", true, "列出每条记录实际涉及的记忆内容（可用 --hits=false 关闭）")
+	readRef := fs.String("read-ref", "", "归档回读证明：按 raw_ref（path#seq）读回并校验 --hash")
+	refHash := fs.String("hash", "", "与 --read-ref 配套的 archive_hash")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *readRef != "" {
+		ev, err := evidence.VerifyRef(*readRef, *refHash)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			return printJSON(map[string]any{
+				"locator": *readRef, "verified": true,
+				"event_uid": ev.EventUID, "seq": ev.Seq, "raw_bytes": len(ev.Raw),
+			})
+		}
+		fmt.Printf("归档回读  : %s\n", *readRef)
+		fmt.Printf("事件      : %s（seq %d，原始字节 %d）\n", ev.EventUID, ev.Seq, len(ev.Raw))
+		fmt.Println("校验通过  : archive_hash 与记录读回一致")
+		return nil
 	}
 	p := *path
 	if p == "" {
