@@ -182,6 +182,7 @@ type Deps struct {
 	Host  Generator
 	Local Generator
 	BYOK  Generator
+	Rules Generator
 }
 
 // BuildChain 按「Host → Local → backlog」的固定顺序组装链路。
@@ -189,6 +190,10 @@ type Deps struct {
 // 两条硬约束：
 //   - auto/local 绝不包含 Host：Host 会从 Stop 拉起子 Agent，递归风险未清（host_safe=false）；
 //   - auto 绝不包含 BYOK：把证据发到远端必须是显式选择，不能默认外发。
+//
+// Rules 是模型不可用时的兜底：非 nil 就恒挂链尾，且只在前面各级都报「不可用」
+// 时才会跑到（execute 遇到不可用才降级）。none 是显式的「没有 provider」，
+// 保持空链 → backlog，不拿规则兜底改写这个语义。
 func BuildChain(mode string, reader evidence.Reader, deps Deps) ([]Executor, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
@@ -213,8 +218,9 @@ func BuildChain(mode string, reader evidence.Reader, deps Deps) ([]Executor, err
 		chain = add(chain, deps.Local)
 	case "none":
 		// 显式 none = 没有 provider，终端状态是 backlog。
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("未知 executor: %s（auto|host|local|byok|none）", mode)
 	}
-	return chain, nil
+	return add(chain, deps.Rules), nil
 }
