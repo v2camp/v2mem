@@ -23,6 +23,9 @@
 # R14 只量 evidence 归档目录的落盘量（文件数 + 字节），不折算成观测条数：gc 之后
 # 行数会降而文件数不降，两者本就会脱钩。归档的准出路径是 mem gc --obs → --evidence
 # （后者只删「已无观测引用」的段），脚本侧仍只读不回收。
+# R16 把 stats --json 的 backlog（open_bundles / last_maintain_ok_age_seconds /
+# bundles_isolated）合成「维护可见性」判级：有积压不等于有故障，但积压 + 24h 没成功
+# 维护、或有隔离，就需要人跑 mem maintain --catch-up。巡检只报不执行。
 # 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
@@ -40,7 +43,7 @@ while [ $# -gt 0 ]; do
     --window) WINDOW="${2:-12h}"; shift 2 ;;
     --json)   JSON_OUT=1; shift ;;
     --quiet)  QUIET=1; shift ;;
-    -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -93,6 +96,11 @@ proj_total() {
     *)           printf '%s' "$n" ;;
   esac
 }
+
+# stats --json 只取一次：R14 读 size_bytes、R16 读 backlog，共用同一份读数。
+# 与上面 STATS_RAW 分开是刻意的：文本行是既有解析契约（总条数/按工程），
+# 不能为了省一次调用把巡检的行解析改成 JSON——旧二进制与既有护栏都按行读。
+STATS_JSON=$( "$MEM_BIN" stats --json 2>/dev/null )
 
 # I2 hooks 四个事件
 HOOK_EVENTS=0
@@ -670,7 +678,7 @@ if [ -d "$EV_DIR" ]; then
 fi
 EV_FILES=${EV_FILES:-0}; EV_BYTES=${EV_BYTES:-0}
 EV_MIB=$(( EV_BYTES / 1048576 ))
-DB_BYTES=$( "$MEM_BIN" stats --json 2>/dev/null | jq -r '.size_bytes // 0' 2>/dev/null )
+DB_BYTES=$(printf '%s' "$STATS_JSON" | jq -r '.size_bytes // 0' 2>/dev/null)
 DB_BYTES=${DB_BYTES:-0}
 DB_MIB=$(( ${DB_BYTES:-0} / 1048576 ))
 if [ ! -d "$EV_DIR" ]; then
@@ -705,6 +713,40 @@ elif [ "$STALE_PENDING" -eq 0 ]; then
   add R15 PASS "候选 TTL 无超期" "无超过 ${TTL_DAYS} 天的 pending（与 GCCandidates 默认阈值同源）"
 else
   add R15 WARN "候选超期 ${STALE_PENDING} 条·只报不处置" "已超 ${TTL_DAYS} 天仍 pending；巡检只报不处置（只读），按 §5 手工执行 mem gc --candidates；执行前先复核 ${TTL_ACCEPTED_DAYS} 天前的已采纳行（gc --candidates 会连带删除）"
+fi
+
+# R16 维护可见性：积压 + 最后成功维护 + 隔离量。
+# 阈值依据见 docs/ops-watch.md §3 R16：24h = 12h 巡检窗口 ×2。
+# 分支顺序固定：不可读 → 无积压 → 有隔离 → 维护滞后 → 正常。
+# 只报不处置：detail 里的 mem maintain --catch-up 是给人跑的命令。
+R16_MAINTAIN_MAX_AGE_H=24
+R16_OPEN=0; R16_ISO=0; R16_AGE=""; R16_READ_FAIL=1
+if printf '%s' "$STATS_JSON" | jq -e '.backlog | type == "object"' >/dev/null 2>&1; then
+  R16_READ_FAIL=0
+  R16_OPEN=$(printf '%s' "$STATS_JSON" | jq -r '.backlog.open_bundles // 0' 2>/dev/null)
+  R16_ISO=$(printf '%s' "$STATS_JSON" | jq -r '.backlog.bundles_isolated // 0' 2>/dev/null)
+  R16_AGE=$(printf '%s' "$STATS_JSON" | jq -r '.backlog.last_maintain_ok_age_seconds // empty' 2>/dev/null)
+fi
+case "$R16_OPEN" in ''|*[!0-9]*) R16_OPEN=0 ;; esac
+case "$R16_ISO" in ''|*[!0-9]*) R16_ISO=0 ;; esac
+# 空串 = 从未维护（backlog 里该键省略，不是 0）：绝不能当「刚维护过」。
+case "$R16_AGE" in ''|*[!0-9]*) R16_AGE="" ;; esac
+if [ -n "$R16_AGE" ]; then
+  R16_MAINT_TXT="最后成功维护 $(( R16_AGE / 3600 )) 小时前"
+else
+  R16_MAINT_TXT="从未成功维护（无 maintain:last_ok）"
+fi
+
+if [ "$R16_READ_FAIL" -eq 1 ]; then
+  add R16 WARN "维护可见性未核查" "维护可见性未核查：mem stats --json 无 backlog 对象（旧二进制或读取失败）；按 WARN 观察，勿据此判 PASS"
+elif [ "$R16_OPEN" -eq 0 ]; then
+  add R16 PASS "无维护积压" "无维护积压：open_bundles 0；${R16_MAINT_TXT}；Bundle 隔离 ${R16_ISO}"
+elif [ "$R16_ISO" -gt 0 ]; then
+  add R16 WARN "维护积压 ${R16_OPEN} 且隔离 ${R16_ISO}" "open_bundles ${R16_OPEN}，Bundle 隔离 ${R16_ISO}，${R16_MAINT_TXT}；隔离不会自动重放，人工修复后执行 mem maintain --catch-up 追账（巡检只报）"
+elif [ -z "$R16_AGE" ] || [ "$R16_AGE" -gt $(( R16_MAINTAIN_MAX_AGE_H * 3600 )) ]; then
+  add R16 WARN "维护滞后（积压 ${R16_OPEN}）" "open_bundles ${R16_OPEN}，${R16_MAINT_TXT}，已超 ${R16_MAINTAIN_MAX_AGE_H}h 阈值；执行 mem maintain --catch-up 追账（巡检只报，不执行）"
+else
+  add R16 PASS "维护正常（积压 ${R16_OPEN}）" "open_bundles ${R16_OPEN}，${R16_MAINT_TXT}，未超 ${R16_MAINTAIN_MAX_AGE_H}h"
 fi
 
 # ---------- 输出 ----------

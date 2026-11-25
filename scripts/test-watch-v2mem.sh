@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # 回归：R3 越线文案与分段变量边界 / R8 候选积压 / R9 载荷残留 / R10 写侧延迟 /
-# R11 WAL 堆积 / R12 写侧自动决策链路 / R13 注入体量 / R14 归档体量 / R15 候选 TTL
-# 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
+# R11 WAL 堆积 / R12 写侧自动决策链路 / R13 注入体量 / R14 归档体量 / R15 候选 TTL /
+# R16 维护可见性 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
 # 用临时 V2MEM_DIR + mem stub，不触碰生产库；只断言 --json 输出的级别。
 # 重点守住四条口径：R8 按工程分组取最大值（跨工程不相加）、R10 只取 stop
 # （不与 obs-append 双计）、无样本记 INFO 而非 PASS、R12 判级只依赖 audit
@@ -46,8 +46,17 @@ build_fixture() {
 printf '%s\n' "$*" >> "${STUB_ARGV_LOG:-/dev/null}"
 case "${1:-}" in
   stats)
-    echo "总条数 ${STUB_TOTAL:-10}"
-    if [ -n "${STUB_PROJ_STATS:-}" ]; then printf '按工程   %s\n' "$STUB_PROJ_STATS"; fi
+    # R14/R16 读 --json：size_bytes 与 backlog 共用同一份读数（脚本只调一次）。
+    # 夹具不提供 STUB_STATS_JSON 时给「空库 + 无积压」，让默认 R16 判 PASS。
+    if [ "${2:-}" = "--json" ]; then
+      # 不把 JSON 直接塞进 ${VAR:-...}：嵌套花括号会被参数展开提前截断。
+      STUB_SJ="${STUB_STATS_JSON:-}"
+      [ -n "$STUB_SJ" ] || STUB_SJ='{"size_bytes":0,"backlog":{"open_bundles":0,"bundles_isolated":0}}'
+      printf '%s\n' "$STUB_SJ"
+    else
+      echo "总条数 ${STUB_TOTAL:-10}"
+      if [ -n "${STUB_PROJ_STATS:-}" ]; then printf '按工程   %s\n' "$STUB_PROJ_STATS"; fi
+    fi
     ;;
   candidates) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
   eval) printf '%s\n' "${STUB_ACTIVITY_JSON:-}" ;;
@@ -98,9 +107,10 @@ SETTINGS
   fi
 }
 
-# run_watch <dir> [candidates_json] [activity_json] [proj_stats] [total]
+# run_watch <dir> [candidates_json] [activity_json] [proj_stats] [total] [stats_json]
 run_watch() {
   local d="$1" cands="${2:-[]}" activity="${3:-}" proj_stats="${4:-}" total="${5:-}"
+  local stats_json="${6:-}"
   V2MEM_DIR="$d/v2mem" \
   WORKBUDDY_CONFIG_DIR="$d/wb" \
   HOME="$d/home" \
@@ -109,20 +119,21 @@ run_watch() {
   STUB_ACTIVITY_JSON="$activity" \
   STUB_PROJ_STATS="$proj_stats" \
   STUB_TOTAL="$total" \
+  STUB_STATS_JSON="$stats_json" \
   STUB_ARGV_LOG="$ARGV_LOG" \
   STUB_WRITE_MARK="$d/v2mem/write-mark.db" \
     bash "$WATCH" --json 2>/dev/null || true
 }
 
 # run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json>
-#          [audit_extra] [activity_json] [audit_lines] [prompts_json] [proj_stats] [total]
+#          [audit_extra] [activity_json] [audit_lines] [prompts_json] [proj_stats] [total] [stats_json]
 run_case() {
   local name="$1" stop_ms="$2" frames="$3" with_obs="$4" cands="$5"
   local extra_audit="${6:-}" activity="${7:-}" audit_lines="${8:-}"
-  local prompts="${9:-}" proj_stats="${10:-}" total="${11:-}"
+  local prompts="${9:-}" proj_stats="${10:-}" total="${11:-}" stats_json="${12:-}"
   local d="$TMP/$name"
   build_fixture "$d" "$stop_ms" "$frames" "$with_obs" "$extra_audit" "$audit_lines" "$prompts"
-  run_watch "$d" "$cands" "$activity" "$proj_stats" "$total"
+  run_watch "$d" "$cands" "$activity" "$proj_stats" "$total" "$stats_json"
 }
 
 # assert_case <名称> <stop_ms|none> <wal_frames> <obs> <cands> <R10> <R11> [R8] [R9]
@@ -423,6 +434,51 @@ if [ "$R15_FAILS" -ne 0 ]; then
   echo "R15 组失败 ${R15_FAILS} 例（巡检必须全程只读）" >&2
   exit 1
 fi
+
+# ---------- R16 维护可见性：积压 + 最后维护 + 隔离量 ----------
+# 判级口径（docs/ops-watch.md §3 R16）：
+#   无积压 → PASS；有积压且（从未维护或 last_ok > 24h）→ WARN；有积压且隔离 >0 → WARN。
+# 巡检只报不处置：WARN 的 detail 给 mem maintain --catch-up，但脚本绝不执行它
+# （R15 组的 argv 断言会兜住写子命令，这里只钉住判级与文案）。
+r16_stats() { # <open_bundles> <last_ok_age|空串=从未维护> [bundles_isolated]
+  jq -nc --argjson o "$1" --argjson i "${3:-0}" --arg a "$2" '
+    {size_bytes:0,
+     backlog:({open_bundles:$o, bundles_isolated:$i}
+              + (if $a == "" then {} else {last_maintain_ok_age_seconds:($a|tonumber)} end))}'
+}
+
+assert_r16() { # <名称> <stats_json> <want_level> [detail 子串]
+  local name="$1" stats="$2" want="$3" needle="${4:-}"
+  local d="$TMP/$name" out got detail
+  build_fixture "$d" 100 0 no
+  out="$(run_watch "$d" "$EMPTY" '' '' '' "$stats")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R16") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R16") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R16 want=$want got=$got" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R16 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R16=%-4s\n' "$name" "$want"
+}
+
+# 无积压 → PASS（即使从未维护，也不该报「维护滞后」：没有待维护的窗口）。
+assert_r16 r16_no_backlog      "$(r16_stats 0 '')"                  PASS '无维护积压'
+# 有积压但 1h 前刚成功维护 → PASS：维护在跟，积压不是滞后。
+assert_r16 r16_backlog_fresh   "$(r16_stats 3 3600)"                PASS '未超 24h'
+# 有积压且从未维护 → WARN，并给处置命令（巡检本身不执行）。
+assert_r16 r16_backlog_never   "$(r16_stats 3 '')"                  WARN 'mem maintain --catch-up'
+# 有积压且 last_ok 超过 24h → WARN，detail 必须写明阈值来源。
+assert_r16 r16_backlog_stale   "$(r16_stats 3 90000)"               WARN '24h'
+# 有积压且有隔离 → WARN：隔离不会自动重放，必须人工修复后追账。
+assert_r16 r16_isolated        "$(r16_stats 3 3600 2)"              WARN '隔离 2'
+# backlog 不可读（旧二进制 / 非 JSON）→ WARN，不许静默判 PASS。
+assert_r16 r16_unreadable      'not-json'                           WARN '未核查'
 
 # R2 按工程口径：只有「该工程库内 ≥20 条」的样本才进命中率分母。
 # 旧实现用全局 empty/A_PROMPT 算，窗口内提问全落在空库工程上时会稳定误判 FAIL。

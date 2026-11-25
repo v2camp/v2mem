@@ -177,4 +177,23 @@ r7_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R7 ' || true)"
 printf '%s' "$r7_action" | grep -q '重试本身在失败' \
   || fail "§5 R7 处置未说明「同一文件跨会话存活即重试本身在失败」"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与「只报不处置」的只读边界同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"
+# ⑫ R16 维护可见性：24h 阈值两侧同步；巡检只报，处置命令只出现在文案里。
+# 实证动机：S4 已有 backlog 读数，但没有任何判据回答「积压是没人看还是维护没跑」——
+# 24h = 12h 巡检窗口 ×2，连续两个窗口没成功维护才算无人值守断了。
+r16_row="$(grep -E '^\| \*\*R16\*\*' "$DOC" | head -1 || true)"
+[ -n "$r16_row" ] || fail "§3 找不到 R16 行"
+printf '%s' "$r16_row" | grep -q '24h' || fail "§3 R16 的维护滞后阈值不是 24h"
+printf '%s' "$r16_row" | grep -q 'open_bundles' || fail "§3 R16 未写明读 backlog.open_bundles"
+printf '%s' "$r16_row" | grep -q 'bundles_isolated' || fail "§3 R16 未写明读 backlog.bundles_isolated"
+grep -q 'R16_MAINTAIN_MAX_AGE_H=24' "$SCRIPT" || fail "脚本 R16 的阈值常量不是 24（小时）"
+grep -q 'mem maintain --catch-up' "$SCRIPT" || fail "脚本 R16 未给处置命令 mem maintain --catch-up"
+# 负向：巡检本身仍然只读，不得调用 maintain 本体。
+grep -q -- '"$MEM_BIN" maintain' "$SCRIPT" && fail "脚本调用了 mem maintain（巡检必须只读）"
+r16_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R16 ' || true)"
+printf '%s' "$r16_action" | grep -q 'mem maintain --catch-up' \
+  || fail "§5 R16 处置未给 mem maintain --catch-up"
+# §4 不降级清单必须点名 R16：维护滞后与库里有多少条记忆无关。
+sed -n '/^## 4\./,/^## 5\./p' "$DOC" | grep -q 'R16' \
+  || fail "§4 冷启动例外未把 R16 列入「不降级」"
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与「只报不处置」的只读边界同步；R16 维护可见性 24h 阈值与处置命令同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"

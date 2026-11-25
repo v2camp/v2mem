@@ -315,6 +315,62 @@ func (s *Store) ListProposalBundles(status string, limit int) ([]ProposalBundle,
 	return out, rows.Err()
 }
 
+// ListOpenProposalBundles 按最老优先列出未终结的 Bundle（dry-run 预演用）。
+//
+// 与 NextRunnableProposalBundle 的差别：不套退避/租约闸门，也不按源头选头——
+// dry-run 要回答的是「现在队列里有哪些待处理窗口、最老的是谁」，
+// 不是「现在调度器会挑哪一个」。终态（ok/noop/quarantined）不出现。
+// limit<=0 取默认 100。
+func (s *Store) ListOpenProposalBundles(limit int) ([]ProposalBundle, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT `+proposalBundleColumns+`
+		FROM evidence_bundles WHERE status IN `+proposalOpenStatuses+`
+		ORDER BY created_at ASC, id ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProposalBundle
+	for rows.Next() {
+		b, err := scanProposalBundle(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *b)
+	}
+	return out, rows.Err()
+}
+
+// ForceRetryHeads 把「退避中且可重试」的 Bundle 的 not_before 清零，让本轮立即重试。
+//
+// 只改调度字段，两条都不动：
+//   - attempt：它是「已经试过几次」的事实；清零会让超限隔离失效，
+//     也会把退避中的头伪装成从未试过（下一次失败就重新从最短退避开始）；
+//   - status：fail/partial 仍是 fail/partial，退避解除不等于结论改变。
+//
+// 不清 leased：租约是短时事实，过期后 Claim/NextRunnable 本就能重认领，
+// 提前抢会与正在跑的 worker 制造重复执行。not_before 已为 0 的窗口不计入返回值。
+// 非「头」的窗口一并清零不改变调度（同源更老的头未终结前它本就排不上），
+// 所以一条 SQL 即可，不需要逐源找头。
+func (s *Store) ForceRetryHeads(now int64) (int, error) {
+	if now <= 0 {
+		now = time.Now().Unix()
+	}
+	res, err := s.db.Exec(`UPDATE evidence_bundles
+		SET not_before=0, updated_at=?
+		WHERE status IN ('fail','partial','backlog') AND not_before > ?`, now, now)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
 // ProposalRunRecord 是一次 Proposal 运行（distill_runs 的扩展列）。
 type ProposalRunRecord struct {
 	ID                string
