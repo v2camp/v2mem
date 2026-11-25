@@ -322,6 +322,9 @@ func Summarize(rs []Record) Summary {
 			}
 		case isObserveEvent(r.Event):
 			s.Observations++
+		case r.Event == "bundle-quarantine", r.Event == "bundle-requeue":
+			// Bundle 隔离/回捞是运维事件，不是检索样本；次数留在 ByEvent。
+			// 显式识别它们，避免落进 default 被计入 Retrievals。
 		case isObserveTrigger(r.Event):
 			// 触发事件与随后的 obs-append 成对出现，次数只记在 obs-append 上。
 		default:

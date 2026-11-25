@@ -224,6 +224,22 @@ func TestDistillAcceptRejectCounters(t *testing.T) {
 	}
 }
 
+// Q8：Bundle 隔离/回捞是运维事件，必须显式识别为「已知」，
+// 不能落进 default 被当成一次检索样本。
+func TestBundleQuarantineAndRequeueNotRetrievals(t *testing.T) {
+	s := Summarize([]Record{
+		{Event: "bundle-quarantine", Source: "proposal"},
+		{Event: "bundle-requeue", Source: "proposal"},
+		{Event: "prompt-submit", Query: "q"},
+	})
+	if s.Retrievals != 1 {
+		t.Fatalf("bundle-quarantine/requeue 不得计入 Retrievals，got %d", s.Retrievals)
+	}
+	if s.ByEvent["bundle-quarantine"] != 1 || s.ByEvent["bundle-requeue"] != 1 {
+		t.Fatalf("按事件仍应看见这两类运维事件: %+v", s.ByEvent)
+	}
+}
+
 func TestObserveAppendCountedOnceNotWithTrigger(t *testing.T) {
 	s := Summarize([]Record{
 		{Event: "prompt-submit", Query: "q"},

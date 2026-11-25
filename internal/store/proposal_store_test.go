@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -164,6 +165,157 @@ func TestProposalRunSaveAndList(t *testing.T) {
 	}
 	if runs[1].StartedAt == runs[0].StartedAt {
 		t.Fatalf("冲突时应自增 started_at: %d vs %d", runs[0].StartedAt, runs[1].StartedAt)
+	}
+}
+
+// Q1：quarantined 是合法完成状态，写完必须离开 open 集合。
+// 隔离不是失败重试的变体：它要求人工处置，不能再被队列自动认领。
+func TestProposalBundleQuarantineLeavesOpenSet(t *testing.T) {
+	s := newTestStore(t)
+	b := mustBundle(t, s, "uid-q-", 1)
+	if _, err := s.ClaimProposalBundle(b.ID, "w1", 1000, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishProposalBundle(b.ID, "w1", "quarantined", 0, "run-q"); err != nil {
+		t.Fatalf("quarantined 应是合法完成状态: %v", err)
+	}
+	got, err := s.LoadProposalBundle(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "quarantined" || got.NotBefore != 0 || got.LeaseOwner != "" || got.LeaseUntil != 0 {
+		t.Fatalf("隔离后应释放租约且不设 not_before: %+v", got)
+	}
+	// 同一 run 重复完成仍幂等。
+	if err := s.FinishProposalBundle(b.ID, "w1", "quarantined", 0, "run-q"); err != nil {
+		t.Fatalf("重复完成应幂等: %v", err)
+	}
+	if _, ok, err := s.NextOpenProposalBundle(); err != nil || ok {
+		t.Fatalf("隔离窗口不得留在 open 集合: ok=%v err=%v", ok, err)
+	}
+	if _, err := s.ClaimProposalBundle(b.ID, "w2", 2000, time.Minute); err == nil {
+		t.Fatal("隔离窗口不得再被认领")
+	}
+}
+
+// Q2：回捞只重置调度字段，绝不动 cursor 与 Bundle 条目。
+func TestProposalRequeueResetsSchedulingNotCursor(t *testing.T) {
+	s := newTestStore(t)
+	b := mustBundle(t, s, "uid-r-", 2)
+	if _, err := s.ClaimProposalBundle(b.ID, "w1", 1000, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishProposalBundle(b.ID, "w1", "quarantined", 0, "run-q"); err != nil {
+		t.Fatal(err)
+	}
+	var cursorBefore int
+	if err := s.db.QueryRow(`SELECT cursor_seq FROM evidence_sources WHERE id = ?`, b.SourceID).Scan(&cursorBefore); err != nil {
+		t.Fatal(err)
+	}
+	itemsBefore, err := s.proposalBundleEvidenceIDs(b.ID)
+	if err != nil || len(itemsBefore) != 2 {
+		t.Fatalf("隔离前应有 2 条条目: %+v err=%v", itemsBefore, err)
+	}
+
+	got, err := s.RequeueProposalBundle(b.ID, 1234)
+	if err != nil {
+		t.Fatalf("quarantined 应可回捞: %v", err)
+	}
+	if got.Status != "pending" || got.Attempt != 0 || got.NotBefore != 0 ||
+		got.LeaseUntil != 0 || got.LeaseOwner != "" || got.LastRunID != "" {
+		t.Fatalf("回捞应重置调度字段: %+v", got)
+	}
+	if got.UpdatedAt != 1234 {
+		t.Fatalf("updated_at 应取传入 now，got %d", got.UpdatedAt)
+	}
+	var cursorAfter int
+	if err := s.db.QueryRow(`SELECT cursor_seq FROM evidence_sources WHERE id = ?`, b.SourceID).Scan(&cursorAfter); err != nil {
+		t.Fatal(err)
+	}
+	if cursorAfter != cursorBefore {
+		t.Fatalf("回捞不得改 cursor: before=%d after=%d", cursorBefore, cursorAfter)
+	}
+	itemsAfter, err := s.proposalBundleEvidenceIDs(b.ID)
+	if err != nil || len(itemsAfter) != 2 {
+		t.Fatalf("回捞不得动 Bundle 条目: %+v err=%v", itemsAfter, err)
+	}
+	// attempt 归零后才不会认领即再次触发隔离。
+	claimed, err := s.ClaimProposalBundle(b.ID, "w2", 1234, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.Attempt != 1 {
+		t.Fatalf("回捞后 attempt 应从 1 重新计数，got %d", claimed.Attempt)
+	}
+
+	// 状态不符时必须报出当前状态，便于排障。
+	if _, err := s.RequeueProposalBundle(b.ID, 2000); err == nil || !strings.Contains(err.Error(), "leased") {
+		t.Fatalf("非隔离项应报错并带当前状态: %v", err)
+	}
+	if _, err := s.RequeueProposalBundle("bnd-missing", 2000); !errors.Is(err, ErrEvidenceBundleNotFound) {
+		t.Fatalf("未知 Bundle 应 NotFound: %v", err)
+	}
+
+	// ok 是已消费终态，不允许回捞。
+	okBundle := mustBundle(t, s, "uid-s-", 1)
+	if _, err := s.ClaimProposalBundle(okBundle.ID, "w1", 2000, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishProposalBundle(okBundle.ID, "w1", "ok", 0, "run-ok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequeueProposalBundle(okBundle.ID, 3000); err == nil || !strings.Contains(err.Error(), "ok") {
+		t.Fatalf("已消费窗口不得回捞: %v", err)
+	}
+
+	// fail 保留为排障口：确认修复后可手工放回队列。
+	failBundle := mustBundle(t, s, "uid-t-", 1)
+	if _, err := s.RequeueProposalBundle(failBundle.ID, 3000); err == nil || !strings.Contains(err.Error(), "pending") {
+		t.Fatalf("pending 窗口不该回捞，报错需带当前状态: %v", err)
+	}
+	if _, err := s.ClaimProposalBundle(failBundle.ID, "w1", 3000, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishProposalBundle(failBundle.ID, "w1", "fail", 9999, "run-f"); err != nil {
+		t.Fatal(err)
+	}
+	back, err := s.RequeueProposalBundle(failBundle.ID, 4000)
+	if err != nil {
+		t.Fatalf("fail 应可回捞: %v", err)
+	}
+	if back.Status != "pending" || back.Attempt != 0 || back.NotBefore != 0 {
+		t.Fatalf("fail 回捞后应清空退避: %+v", back)
+	}
+}
+
+// Q3：列表按状态过滤，created_at 升序、同秒按 id 升序。
+func TestListProposalBundlesFiltersAndOrders(t *testing.T) {
+	s := newTestStore(t)
+	insertBacklogSource(t, s, "src-l", 1, 10, 0)
+	insertBacklogBundle(t, s, "bnd-c", "src-l", 1, 2, "quarantined", 3000)
+	insertBacklogBundle(t, s, "bnd-a", "src-l", 1, 0, "quarantined", 1000)
+	insertBacklogBundle(t, s, "bnd-b", "src-l", 1, 1, "ok", 2000)
+	insertBacklogBundle(t, s, "bnd-d", "src-l", 1, 3, "quarantined", 1000)
+
+	list, err := s.ListProposalBundles("quarantined", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("应只返回 quarantined，got %+v", list)
+	}
+	want := []string{"bnd-a", "bnd-d", "bnd-c"}
+	for i, id := range want {
+		if list[i].ID != id {
+			t.Fatalf("顺序应为 created_at ASC,id ASC：位置 %d 期望 %s，got %+v", i, id, list)
+		}
+	}
+	all, err := s.ListProposalBundles("", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all[0].ID != "bnd-a" || all[1].ID != "bnd-d" {
+		t.Fatalf("空状态应返回全部且受 limit 约束: %+v", all)
 	}
 }
 

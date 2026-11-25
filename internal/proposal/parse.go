@@ -23,6 +23,7 @@ var ErrBadOutput = errors.New("Proposal 输出不是约定的 JSON")
 //   - invalid：输出坏 JSON 且一次 repair 后仍不可解析，不消费窗口
 //   - backlog：没有任何 provider 可用，不消费窗口
 //   - fail：provider 跑了但失败（超时/HTTP 错误/落库全败），不消费窗口
+//   - quarantined：内容类失败累计到 MaxAttempts 的终态，等人工确认后回捞
 //   - would_generate：dry-run 专用，只报告会生成什么，不写任何状态
 const (
 	StatusOK            = "ok"
@@ -31,6 +32,7 @@ const (
 	StatusInvalid       = "invalid"
 	StatusBacklog       = "backlog"
 	StatusFail          = "fail"
+	StatusQuarantined   = "quarantined"
 	StatusWouldGenerate = "would_generate"
 )
 

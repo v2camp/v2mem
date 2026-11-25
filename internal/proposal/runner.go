@@ -55,6 +55,16 @@ func (r *Runner) now() time.Time {
 	return time.Now()
 }
 
+// MaxAttempts 是内容类失败（fail/partial）允许的最大尝试次数。
+//
+// 只约束「模型跑起来了但结果不可用」：backlog 表示模型全局不可用，
+// 那不是这一窗的错，累计次数再高也不能把整条队列隔离。
+const MaxAttempts = 5
+
+// retryDelay 是指数退避：base=1m 时 1/2/3/4 次为 1/2/4/8m，之后封顶 16×base。
+//
+// 线性退避在反复坏输出时很快退到「每分钟重试一次」，既浪费调用也刷不出新结论；
+// 指数退避让第 5 次隔离前的总等待落在半小时量级，配合 MaxAttempts 收敛。
 func (r *Runner) retryDelay(attempt int) time.Duration {
 	base := r.RetryDelay
 	if base <= 0 {
@@ -63,10 +73,11 @@ func (r *Runner) retryDelay(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
-	if attempt > 8 {
-		attempt = 8
+	shift := attempt - 1
+	if shift > 4 {
+		shift = 4
 	}
-	return base * time.Duration(attempt)
+	return base * time.Duration(1<<shift)
 }
 
 func (r *Runner) backlogDelay() time.Duration {
@@ -321,7 +332,15 @@ func (r *Runner) candidateInput(b *store.ProposalBundle, refs []evidence.Ref, d 
 
 // finish 统一收口：写运行账 → 释放租约。顺序不能反：
 // 先落 run 才能让 Bundle 的 last_run_id 指向一条真实账目。
+//
+// 隔离判定放在这里而不是 classifyOutcome：所有 fail/partial 出口（含
+// 证据不一致这类早退）都必须经过同一道超限闸门，避免某个分支绕过它。
 func (r *Runner) finish(b *store.ProposalBundle, out *Outcome, bundleStatus string, delay time.Duration) (*Outcome, error) {
+	if (bundleStatus == "fail" || bundleStatus == "partial") && b.Attempt >= MaxAttempts {
+		bundleStatus = "quarantined"
+		out.Status = StatusQuarantined
+		delay = 0
+	}
 	now := r.now()
 	notBefore := int64(0)
 	if delay > 0 {
@@ -361,6 +380,7 @@ func (r *Runner) owner() string {
 // classifyOutcome 把执行器状态与落库结果合成最终语义。
 //
 // 关键：invalid/fail/partial/backlog 都不是终态；只有 ok/noop 消费窗口。
+// 超限的 fail/partial 由 finish 统一改写成 quarantined 终态。
 func classifyOutcome(execStatus string, inserted, insertErrCount int) (string, string) {
 	switch execStatus {
 	case StatusNoop:

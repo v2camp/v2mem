@@ -46,18 +46,19 @@ type ProposalBundle struct {
 	LeaseUntil       int64
 	LeaseOwner       string
 	LastRunID        string
+	UpdatedAt        int64
 	EvidenceIDs      []string
 }
 
 const proposalBundleColumns = `id, source_id, generation, from_seq_exclusive,
 	to_seq_inclusive, evidence_hash, source_tip, status, attempt, not_before,
-	lease_until, lease_owner, last_run_id`
+	lease_until, lease_owner, last_run_id, updated_at`
 
 func scanProposalBundle(row rowScanner) (*ProposalBundle, error) {
 	var b ProposalBundle
 	err := row.Scan(&b.ID, &b.SourceID, &b.Generation, &b.FromSeqExclusive,
 		&b.ToSeqInclusive, &b.EvidenceHash, &b.SourceTip, &b.Status, &b.Attempt,
-		&b.NotBefore, &b.LeaseUntil, &b.LeaseOwner, &b.LastRunID)
+		&b.NotBefore, &b.LeaseUntil, &b.LeaseOwner, &b.LastRunID, &b.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -158,11 +159,11 @@ func (s *Store) ClaimProposalBundle(id, owner string, now int64, ttl time.Durati
 
 // FinishProposalBundle 落完成状态并释放租约。
 //
-// ok/noop 是终态，notBefore 传 0；fail/partial/backlog 保留重试资格，
+// ok/noop/quarantined 是终态，notBefore 传 0；fail/partial/backlog 保留重试资格，
 // notBefore 由调用方按 attempt 退避。重复完成同一 run 是幂等的。
 func (s *Store) FinishProposalBundle(id, owner, status string, notBefore int64, runID string) error {
 	switch status {
-	case "ok", "noop", "fail", "partial", "backlog":
+	case "ok", "noop", "fail", "partial", "backlog", "quarantined":
 	default:
 		return fmt.Errorf("非法的 Bundle 完成状态: %q", status)
 	}
@@ -195,6 +196,76 @@ func (s *Store) FinishProposalBundle(id, owner, status string, notBefore int64, 
 		return fmt.Errorf("%w: %s", ErrProposalBundleLeaseLost, id)
 	}
 	return nil
+}
+
+// RequeueProposalBundle 把隔离窗口放回队列（fail 作为排障口同样允许）。
+//
+// 只重置调度字段，绝不回退 evidence_sources.cursor_seq 或改动 Bundle 条目：
+// cursor 是「证据已发放到哪」的全局水位，回退会让同一批证据被别的窗口再发一次；
+// 条目则是这一窗的身份，重放必须复用它。
+//
+// attempt 必须归零：认领时 attempt 会 +1，若保留原值，重放一次内容失败就会
+// 立即二次隔离，人工回捞等于没发生。
+func (s *Store) RequeueProposalBundle(id string, now int64) (*ProposalBundle, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, errors.New("bundle id 不能为空")
+	}
+	if now <= 0 {
+		now = time.Now().Unix()
+	}
+	res, err := s.db.Exec(`UPDATE evidence_bundles
+		SET status='pending', attempt=0, not_before=0, lease_until=0, lease_owner='',
+		    last_run_id='', updated_at=?
+		WHERE id = ? AND status IN ('quarantined','fail')`, now, id)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		// 区分「不存在」与「状态不允许」：调用方需要知道是 id 写错还是状态不符。
+		cur, lerr := s.LoadProposalBundle(id)
+		if lerr != nil {
+			return nil, lerr
+		}
+		return nil, fmt.Errorf("Bundle %s 当前状态为 %s，不可回捞（只允许 quarantined/fail）", id, cur.Status)
+	}
+	return s.LoadProposalBundle(id)
+}
+
+// ListProposalBundles 按状态列出 Bundle（轻量，不带条目 id）。
+//
+// 顺序固定 created_at ASC, id ASC：同秒创建时用 id 兜底，保证 CLI 输出稳定可测。
+// status 为空表示不过滤；limit<=0 取默认 100。
+func (s *Store) ListProposalBundles(status string, limit int) ([]ProposalBundle, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	q := `SELECT ` + proposalBundleColumns + ` FROM evidence_bundles`
+	args := make([]any, 0, 2)
+	if st := strings.TrimSpace(status); st != "" {
+		q += ` WHERE status = ?`
+		args = append(args, st)
+	}
+	q += ` ORDER BY created_at ASC, id ASC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProposalBundle
+	for rows.Next() {
+		b, err := scanProposalBundle(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *b)
+	}
+	return out, rows.Err()
 }
 
 // ProposalRunRecord 是一次 Proposal 运行（distill_runs 的扩展列）。
