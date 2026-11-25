@@ -11,6 +11,8 @@ import (
 
 	"github.com/v2camp/v2mem/internal/audit"
 	"github.com/v2camp/v2mem/internal/distill"
+	"github.com/v2camp/v2mem/internal/evidence"
+	"github.com/v2camp/v2mem/internal/proposal"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -671,5 +673,192 @@ func TestProposalOptionsOffIsNone(t *testing.T) {
 	}
 	if got := proposalOptions(distill.ModelConfig{Mode: "api", Provider: "deepseek"}, "ollama", "m", time.Second); got.Provider != "ollama" || got.Model != "m" {
 		t.Errorf("mode=api 应保持原来的 local 硬编码 provider，got %+v", got)
+	}
+}
+
+// ---------- S6a: Bundle 隔离查看与回捞 ----------
+
+// quarantineForTest 把一个已生成的 Bundle 走完认领→隔离，模拟 runner 超限后的库状态。
+func quarantineForTest(t *testing.T, db, bundleID string) {
+	t.Helper()
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.ClaimProposalBundle(bundleID, "test", time.Now().Unix(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinishProposalBundle(bundleID, "test", "quarantined", 0, "run-q"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedExtraBundle 用唯一 uid 追加一段证据并取窗，供需要第二个 Bundle 的用例使用。
+func seedExtraBundle(t *testing.T, db, uid string) string {
+	t.Helper()
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, _, err := st.CaptureEvidence(store.EvidenceCaptureInput{
+		EventUID: uid, SourceID: "src-cmd", SourceKind: "hook", Generation: 1,
+		OccurredAtNS: 1700000000000000000, SessionID: "sess-cmd", Project: "demo",
+		Harness: "workbuddy", EventType: "stop", ParserVersion: "evidence/v1",
+		ProposalEligible: true, Summary: "决定：第二条隔离窗口",
+		ArchiveHash: "ah-" + uid, ArchivePath: "/tmp/" + uid + ".gz",
+		RawRecordHash: "rh-" + uid, ByteSize: 16, RawCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := evidence.New(st).NextBundle(50, 1<<20)
+	if err != nil || b == nil {
+		t.Fatalf("应生成第二个 Bundle: %+v err=%v", b, err)
+	}
+	return b.ID
+}
+
+// Q7：--quarantined 文本/JSON、--requeue 重置与错误透传。
+func TestDistillQuarantinedListAndRequeue(t *testing.T) {
+	db := testDB(t)
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+
+	// 空库先验证「没有」也说得清楚。
+	empty, err := captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--quarantined", "--audit-file", "-"})
+	})
+	if err != nil || !strings.Contains(empty, "没有隔离") {
+		t.Fatalf("空库应说明没有隔离 Bundle，got %q %v", empty, err)
+	}
+
+	bundleID := seedEvidenceBundle(t, db, 1)
+	quarantineForTest(t, db, bundleID)
+
+	text, err := captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--quarantined", "--audit-file", "-"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"bundle " + shortID(bundleID), "source=src-cmd", "seq=0..1", "attempt=1", "updated=",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("文本应含 %q，got %s", want, text)
+		}
+	}
+
+	jsonOut, err := captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--quarantined", "--json", "--audit-file", "-"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list []map[string]any
+	if err := json.Unmarshal([]byte(jsonOut), &list); err != nil {
+		t.Fatalf("JSON 不可解析: %v\n%s", err, jsonOut)
+	}
+	if len(list) != 1 {
+		t.Fatalf("应有 1 条隔离记录，got %+v", list)
+	}
+	got := list[0]
+	if got["id"] != bundleID || got["source_id"] != "src-cmd" || num(got, "generation") != 1 ||
+		num(got, "from_seq_exclusive") != 0 || num(got, "to_seq_inclusive") != 1 ||
+		num(got, "attempt") != 1 || num(got, "updated_at") <= 0 {
+		t.Fatalf("隔离 JSON 字段不对: %+v", got)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--requeue", bundleID, "--audit-file", ap})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "已重新入队") || !strings.Contains(out, "attempt 归零") {
+		t.Fatalf("回捞提示不对: %s", out)
+	}
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := st.LoadProposalBundle(bundleID)
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Status != "pending" || back.Attempt != 0 || back.NotBefore != 0 {
+		t.Fatalf("回捞后应为 pending/attempt=0: %+v", back)
+	}
+	rs, err := audit.Read(ap, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawRequeue bool
+	for _, r := range rs {
+		if r.Event == "bundle-requeue" {
+			sawRequeue = true
+		}
+	}
+	if !sawRequeue {
+		t.Fatalf("回捞必须写 bundle-requeue 审计，got %+v", rs)
+	}
+
+	// 非隔离项报错并透传当前状态。
+	if err := cmdDistill([]string{"--db", db, "--requeue", bundleID, "--audit-file", "-"}); err == nil ||
+		!strings.Contains(err.Error(), "pending") {
+		t.Fatalf("pending 不应可回捞: %v", err)
+	}
+	if err := cmdDistill([]string{"--db", db, "--requeue", "bnd-missing", "--audit-file", "-"}); err == nil {
+		t.Fatal("未知 Bundle 应报错")
+	}
+
+	// 回捞 JSON 分支。
+	b2 := seedExtraBundle(t, db, "cmd-uid-z")
+	quarantineForTest(t, db, b2)
+	rj, err := captureStdout(t, func() error {
+		return cmdDistill([]string{"--db", db, "--requeue", b2, "--json", "--audit-file", "-"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeJSONOut(t, rj); got["status"] != "pending" || got["id"] != b2 {
+		t.Fatalf("回捞 JSON 不对: %v", got)
+	}
+
+	// 互斥：隔离查看/回捞必须单独使用，不要求 --session 等必填项。
+	for _, args := range [][]string{
+		{"--db", db, "--quarantined", "--proposal"},
+		{"--db", db, "--requeue", bundleID, "--bundle", bundleID},
+		{"--db", db, "--quarantined", "--requeue", bundleID},
+	} {
+		if err := cmdDistill(append(args, "--audit-file", "-")); err == nil || !strings.Contains(err.Error(), "单独") {
+			t.Fatalf("%v 应被互斥校验拒绝: %v", args, err)
+		}
+	}
+}
+
+// 隔离发生时由 CLI 写 bundle-quarantine 审计；runner 是纯逻辑，不依赖 audit 包。
+func TestProposalQuarantineAuditRecord(t *testing.T) {
+	ap := filepath.Join(t.TempDir(), "audit.jsonl")
+	writeProposalAudit(ap, &proposal.Outcome{
+		BundleID: "bnd-q", SessionID: "sess-q", BundleStatus: "quarantined",
+		Status: proposal.StatusQuarantined,
+	})
+	rs, err := audit.Read(ap, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawQuarantine, sawDistill bool
+	for _, r := range rs {
+		if r.Event == "bundle-quarantine" {
+			sawQuarantine = true
+		}
+		if r.Event == "distill" {
+			sawDistill = true
+		}
+	}
+	if !sawQuarantine || !sawDistill {
+		t.Fatalf("隔离应写 bundle-quarantine 且照旧写 distill，got %+v", rs)
 	}
 }

@@ -151,8 +151,11 @@ candidates: pending
 
 两条口径说明：
 
-- **隔离量当前结构性恒 0**：`quarantined` / `failed` 的写入者尚未落地（S6 引入），这里先暴露
-  计数是为了让后续切片有稳定的读数面，而不是让「没有指标」被误读成「没有隔离」。
+- **Bundle 隔离由重试超限自动写入（S6a）；候选隔离待 S10**：`fail` / `partial` 累计到最大 attempt 后由
+  runner 自动写 `quarantined`，可用 `mem distill --quarantined` 查看、`--requeue` 回捞
+  （重置 attempt，不动 cursor 与 Bundle 条目）。候选侧 `quarantined` / `failed` 的写入者仍未
+  落地（S10 引入）；先暴露计数是为了让后续切片有稳定读数面，而不是让「没有指标」被误读成
+  「没有隔离」。
 - **源数与年龄是两个口径，并列不合并**：源数按 `last_seq > cursor_seq`（源还有未发放的序号），
   年龄按归档的 `to_seq > cursor_seq`（确实有未消费的字节）。二者回答的问题不同，合成的单一
   「积压量」会掩盖「源在增长但归档未落」或反之的异常。

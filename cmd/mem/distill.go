@@ -51,10 +51,32 @@ func cmdDistill(args []string) error {
 	noScrub := fs.Bool("no-scrub", false, "关闭密钥打码（仅本地调试）")
 	proposalMode := fs.Bool("proposal", false, "从证据账本取连续 Bundle 生成候选（T2）")
 	bundleID := fs.String("bundle", "", "只处理指定证据 Bundle（隐含 --proposal）")
+	quarantined := fs.Bool("quarantined", false, "列出被隔离（quarantined）的 Bundle，需单独使用")
+	requeue := fs.String("requeue", "", "把指定隔离 Bundle 放回队列（attempt 归零），需单独使用")
 	executor := fs.String("executor", "auto", "Proposal executor: auto|host|local|byok|none")
 	maxBundles := fs.Int("max-bundles", 1, "--proposal 本次最多处理几个 Bundle")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	// 隔离查看/回捞是运维入口：不生成候选，也不要求 --session 等必填项；
+	// 与正常蒸馏路径互斥，避免「顺手带个 --proposal」把库写脏。
+	requeueID := strings.TrimSpace(*requeue)
+	if *quarantined && requeueID != "" {
+		return errors.New("--quarantined 与 --requeue 需单独使用，不能同时指定")
+	}
+	if *quarantined || requeueID != "" {
+		if *pending || strings.TrimSpace(*session) != "" || *proposalMode || strings.TrimSpace(*bundleID) != "" {
+			return errors.New("--quarantined/--requeue 需单独使用，不能与 --session/--pending/--proposal/--bundle 同用")
+		}
+		st, err := store.Open(c.db)
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		if *quarantined {
+			return printQuarantinedBundles(st, c.json)
+		}
+		return requeueProposalBundle(st, requeueID, c.json, *auditFile)
 	}
 	if !*pending && strings.TrimSpace(*session) == "" && strings.TrimSpace(*bundleID) == "" && !*proposalMode {
 		return errors.New("需要 --session、--pending、--proposal 或 --bundle")
@@ -173,7 +195,8 @@ func cmdDistill(args []string) error {
 		}
 
 		rank := map[string]int{
-			proposal.StatusFail: 6, proposal.StatusInvalid: 5, proposal.StatusPartial: 4,
+			proposal.StatusQuarantined: 7,
+			proposal.StatusFail:        6, proposal.StatusInvalid: 5, proposal.StatusPartial: 4,
 			proposal.StatusBacklog: 3, proposal.StatusOK: 2, proposal.StatusNoop: 1,
 			proposal.StatusWouldGenerate: 0, "skipped": -1,
 		}
@@ -198,12 +221,7 @@ func cmdDistill(args []string) error {
 				"blocked": o.Blocked, "error": o.Error, "attempt": o.Attempt,
 			})
 			if *auditFile != "-" {
-				_ = audit.Append(auditPath(*auditFile), audit.Record{
-					TS: time.Now().Unix(), Event: "distill", SessionID: o.SessionID,
-					Provider: o.Executor, Mode: o.Status, Count: o.Inserted,
-					Failed: o.Invalid, Source: "proposal",
-					Empty: o.Status == proposal.StatusNoop,
-				})
+				writeProposalAudit(*auditFile, o)
 			}
 			if o.Error != "" {
 				fmt.Fprintf(os.Stderr, "v2mem distill: %s\n", o.Error)
@@ -308,6 +326,94 @@ func cmdDistill(args []string) error {
 		return errors.Join(failures...)
 	}
 	return nil
+}
+
+// quarantinedBundleView 是 `mem distill --quarantined --json` 的稳定字段面。
+// 用独立视图而不是直接序列化 store.ProposalBundle：后者带 EvidenceIDs 等内部字段，
+// 且没有 json tag，改库结构会意外改变 CLI 契约。
+type quarantinedBundleView struct {
+	ID               string `json:"id"`
+	SourceID         string `json:"source_id"`
+	Generation       int    `json:"generation"`
+	FromSeqExclusive int    `json:"from_seq_exclusive"`
+	ToSeqInclusive   int    `json:"to_seq_inclusive"`
+	Attempt          int    `json:"attempt"`
+	NotBefore        int64  `json:"not_before"`
+	LastRunID        string `json:"last_run_id"`
+	UpdatedAt        int64  `json:"updated_at"`
+}
+
+// printQuarantinedBundles 输出隔离队列。列表只读，不写审计、不改状态。
+func printQuarantinedBundles(st *store.Store, asJSON bool) error {
+	list, err := st.ListProposalBundles("quarantined", 0)
+	if err != nil {
+		return err
+	}
+	views := make([]quarantinedBundleView, 0, len(list))
+	for _, b := range list {
+		views = append(views, quarantinedBundleView{
+			ID: b.ID, SourceID: b.SourceID, Generation: b.Generation,
+			FromSeqExclusive: b.FromSeqExclusive, ToSeqInclusive: b.ToSeqInclusive,
+			Attempt: b.Attempt, NotBefore: b.NotBefore, LastRunID: b.LastRunID,
+			UpdatedAt: b.UpdatedAt,
+		})
+	}
+	if asJSON {
+		return printJSON(views)
+	}
+	if len(views) == 0 {
+		fmt.Println("（没有隔离 Bundle）")
+		return nil
+	}
+	for _, v := range views {
+		fmt.Printf("bundle %s source=%s seq=%d..%d attempt=%d updated=%d\n",
+			shortID(v.ID), v.SourceID, v.FromSeqExclusive, v.ToSeqInclusive, v.Attempt, v.UpdatedAt)
+	}
+	return nil
+}
+
+// requeueProposalBundle 把隔离窗口放回 pending 并写 bundle-requeue 审计。
+// 回捞本身不自动重跑：新退避从 0 重新计，是否立即重放由用户显式 --bundle 决定。
+func requeueProposalBundle(st *store.Store, id string, asJSON bool, auditFile string) error {
+	b, err := st.RequeueProposalBundle(id, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+	if auditFile != "-" {
+		_ = audit.Append(auditPath(auditFile), audit.Record{
+			TS: time.Now().Unix(), Event: "bundle-requeue", Mode: "requeue",
+			Source: "proposal", Count: 1,
+		})
+	}
+	if asJSON {
+		return printJSON(map[string]any{
+			"status": b.Status, "id": b.ID, "attempt": b.Attempt,
+		})
+	}
+	fmt.Printf("已重新入队 %s（attempt 归零）；用 --bundle 立即重放\n", b.ID)
+	return nil
+}
+
+// writeProposalAudit 写一次 Proposal 结果的审计。
+//
+// 隔离事件由 CLI 写而不是 runner 写：internal/proposal 是纯逻辑包，
+// 引入 audit 依赖会把「执行器可单测」的边界破坏掉。
+func writeProposalAudit(auditFile string, o *proposal.Outcome) {
+	if auditFile == "-" {
+		return
+	}
+	_ = audit.Append(auditPath(auditFile), audit.Record{
+		TS: time.Now().Unix(), Event: "distill", SessionID: o.SessionID,
+		Provider: o.Executor, Mode: o.Status, Count: o.Inserted,
+		Failed: o.Invalid, Source: "proposal",
+		Empty: o.Status == proposal.StatusNoop,
+	})
+	if o.BundleStatus == proposal.StatusQuarantined {
+		_ = audit.Append(auditPath(auditFile), audit.Record{
+			TS: time.Now().Unix(), Event: "bundle-quarantine", SessionID: o.SessionID,
+			Provider: o.Executor, Mode: o.BundleStatus, Source: "proposal",
+		})
+	}
 }
 
 // distillReport 是一次蒸馏的完整账目。

@@ -126,7 +126,7 @@ func printBacklog(b *store.Backlog, spoolFiles int, spoolOldestAge *int64) {
 		b.OpenBundles, ageSuffix(b.OldestOpenBundleAge),
 		spoolFiles, ageSuffix(spoolOldestAge),
 	)
-	fmt.Printf("隔离     候选 %d ｜ Bundle %d（当前无写入者，S6 引入）\n",
+	fmt.Printf("隔离     候选 %d ｜ Bundle %d（Bundle 隔离由重试超限自动写入（S6a）；候选隔离待 S10）\n",
 		b.CandidatesIsolated, b.BundlesIsolated)
 	if b.LastMaintainOKAt == nil {
 		fmt.Printf("维护     从未维护（无 %s 记录）\n", store.MetaMaintainLastOK)

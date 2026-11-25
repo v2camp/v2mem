@@ -347,6 +347,119 @@ func TestRunnerNoProviderIsBacklogNotNoop(t *testing.T) {
 	}
 }
 
+// Q4：内容类失败（fail/partial）累计到 MaxAttempts 才隔离；
+// 第 4 次仍是可重试的 fail，第 5 次转终态并离开 open 队列。
+func TestRunnerQuarantinesAfterMaxAttempts(t *testing.T) {
+	e := newEnv(t)
+	e.capture(t, "u1", "s1", "决定：甲", true)
+	b := e.bundle(t)
+	var now int64 = 1000
+	boom, _ := gen("broken", func(GenerateRequest, int) (string, error) {
+		return "", errors.New("boom")
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, boom)}, &now)
+
+	var out *Outcome
+	for i := 1; i <= MaxAttempts; i++ {
+		var err error
+		out, err = r.Step(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Attempt != i {
+			t.Fatalf("第 %d 次认领 attempt 应为 %d，got %d", i, i, out.Attempt)
+		}
+		if i < MaxAttempts {
+			if out.Status != StatusFail || out.BundleStatus != "fail" {
+				t.Fatalf("第 %d 次应仍可重试: %+v", i, out)
+			}
+			if out.NotBefore <= now {
+				t.Fatalf("第 %d 次应设置未来退避: %d <= %d", i, out.NotBefore, now)
+			}
+			now = out.NotBefore
+			continue
+		}
+		if out.Status != StatusQuarantined || out.BundleStatus != "quarantined" {
+			t.Fatalf("第 %d 次应隔离: %+v", i, out)
+		}
+		if out.NotBefore != 0 {
+			t.Fatalf("隔离不应设置 not_before: %d", out.NotBefore)
+		}
+	}
+	if out.Attempt != MaxAttempts {
+		t.Fatalf("隔离时应保留末次 attempt: %d", out.Attempt)
+	}
+	got, err := e.st.LoadProposalBundle(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "quarantined" {
+		t.Fatalf("Bundle 应落 quarantined: %+v", got)
+	}
+	if _, ok, err := e.st.NextOpenProposalBundle(); err != nil || ok {
+		t.Fatalf("隔离窗口不得留在 open 队列: ok=%v err=%v", ok, err)
+	}
+}
+
+// Q5：指数退避 base=1m，1/2/3/4 次为 1/2/4/8m，之后封顶 16m。
+func TestRunnerRetryDelayExponentialCapped(t *testing.T) {
+	r := &Runner{}
+	cases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{1, time.Minute},
+		{2, 2 * time.Minute},
+		{3, 4 * time.Minute},
+		{4, 8 * time.Minute},
+		{99, 16 * time.Minute},
+	}
+	for _, tc := range cases {
+		if got := r.retryDelay(tc.attempt); got != tc.want {
+			t.Errorf("retryDelay(%d) = %v，want %v", tc.attempt, got, tc.want)
+		}
+	}
+	// 可注入的 base 同样按指数放大。
+	custom := &Runner{RetryDelay: 10 * time.Second}
+	if got := custom.retryDelay(3); got != 40*time.Second {
+		t.Errorf("注入 base=10s 时 retryDelay(3) 应为 40s，got %v", got)
+	}
+}
+
+// Q6：backlog 是「模型全局不可用」，不是内容失败——attempt 再高也不得隔离，
+// 否则一次 provider 故障会把整条队列关掉。
+func TestRunnerBacklogNeverQuarantines(t *testing.T) {
+	e := newEnv(t)
+	e.capture(t, "u1", "s1", "决定：甲", true)
+	b := e.bundle(t)
+	var now int64 = 1000
+	r := newRunner(e, nil, &now)
+	for i := 1; i <= 10; i++ {
+		out, err := r.Step(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Attempt != i {
+			t.Fatalf("第 %d 次 attempt 应为 %d，got %d", i, i, out.Attempt)
+		}
+		if out.Status != StatusBacklog || out.BundleStatus != "backlog" {
+			t.Fatalf("第 %d 次仍应是 backlog（超过 MaxAttempts=%d 也不隔离）: %+v", i, MaxAttempts, out)
+		}
+		now = out.NotBefore
+	}
+	got, err := e.st.LoadProposalBundle(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "backlog" || got.Attempt != 10 {
+		t.Fatalf("backlog 应保持可重试: %+v", got)
+	}
+	head, ok, err := e.st.NextOpenProposalBundle()
+	if err != nil || !ok || head.ID != b.ID {
+		t.Fatalf("backlog 必须留在 open 队列: %+v ok=%v err=%v", head, ok, err)
+	}
+}
+
 func TestRunnerHostUnavailableFallsBackToLocal(t *testing.T) {
 	e := newEnv(t)
 	e.capture(t, "u1", "s1", "决定：甲", true)
@@ -554,8 +667,8 @@ func TestRunnerDefaultsAndClassify(t *testing.T) {
 	if r.retryDelay(0) != time.Minute {
 		t.Fatalf("默认退避应为 1m，got %v", r.retryDelay(0))
 	}
-	if r.retryDelay(99) != 8*time.Minute {
-		t.Fatalf("退避应封顶 8 倍，got %v", r.retryDelay(99))
+	if r.retryDelay(99) != 16*time.Minute {
+		t.Fatalf("退避应封顶 16 倍 base，got %v", r.retryDelay(99))
 	}
 	if r.backlogDelay() != 10*time.Minute {
 		t.Fatalf("默认 backlog 退避应为 10m，got %v", r.backlogDelay())
