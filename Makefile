@@ -22,6 +22,12 @@ test-flow:
 test-faults:
 	CGO_ENABLED=0 go test -tags=faults -count=1 -timeout 300s ./test/faults
 
+# 大库性能基准（S14）：8 场景 × 合成大库（临时目录，测完即删）。
+# 可选跑，不挂进 test：CI 不做性能断言；数字口径与基线对比见
+# docs/design-storage-layering.md §9。
+perf:
+	CGO_ENABLED=0 go test -tags=perf ./test/perf -count=1 -v
+
 # 格式门禁：任一 .go 未 gofmt 即非零退出。挂在 test 前，避免格式漂移脱离门禁
 # 漂进 main（2026-11-14 巡检发现 16 个文件尾换行缺失）。
 fmt-check:
@@ -130,4 +136,4 @@ smoke: build
 clean:
 	rm -rf bin
 
-.PHONY: build install test test-flow test-faults test-install test-verify-install verify-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release
+.PHONY: build install test test-flow test-faults perf test-install test-verify-install verify-install test-watch cover cover-gate cover-update build-linux build-win release-assets smoke clean eval-gate eval-hook-ab release-dry release

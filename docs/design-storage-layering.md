@@ -142,3 +142,42 @@ v2mem 已经在做这件事，本文是收敛与补全，不是另起一套：
 | `read_traces` | **诊断字段 P2 再拆** | 拆前先核对 `ops-watch.md` 判据依赖 |
 
 > 五项已对齐，P0 按 AGENTS.md 在独立 worktree 实施；契约正文见 `contracts/storage-layering.md`。
+
+## 9. 大库基准与热点索引（S14，2026-11-26）
+
+> 口径：**没有测量就不加索引**。用 `test/perf` 的合成数据生成器（临时目录，测完即删）造大库，
+> 逐一测 8 个场景的基线耗时，`EXPLAIN QUERY PLAN` 确认计划后只把提速 ≥20% 的索引落库。
+> 数字是同一次运行内的前后对比（Apple Silicon 本机，绝对值受机器负载影响，只看相对变化）。
+> 运行：`make perf`（= `go test -tags=perf ./test/perf -count=1 -v`），CI 不跑。
+
+数据规模：memories 20,000（10% withdrawn）、observations 99,000（165 源 × 600 seq、每源 2 个序号洞）、
+evidence_sources 165、evidence_archives 825、evidence_bundles 3,135（七成终态/含退避与租约）、
+candidates 10,000（复核四态分布）、commit_decisions 20,000、distill_runs 500、审计日志 37.6 MB（当前档 + .1–.3）。
+大库生成约 4s。
+
+| # | 场景 | 基线 | 优化后 | 索引 | EXPLAIN |
+|:---|:---|---:|---:|:---|:---|
+| 1 | `mem stats --json`（Stats+Backlog 积压单快照） | 12ms | 12ms | 无 | 全程走既有索引，提速 <20% 不加 |
+| 2 | `mem search`（memory 层三路召回） | 4–8ms | 4ms | 无 | FTS/bm25 已走 fts_mem |
+| 3 | proposal 调度（NextRunnable/Open） | 1ms | 1ms | 无 | autoindex(source_id,generation) 已覆盖头查找 |
+| 4 | `NextEvidenceBundle` 出窗（含越洞） | 8–9ms/次 | ≤1ms/次 | `ix_obs_source_seq` | `SCAN o` → SEARCH ix_obs_source_seq |
+| 5 | `mem review ls` 四态 | **3,340ms** | **14ms** | `ix_commit_memory_actor` | `SCAN d2`（逐行全表扫裁决账）→ SEARCH |
+| 6 | `mem eval flow`（13 检查全表拉取） | ~98ms | ~94ms | 无 | 全表拉取无 WHERE，索引帮不上 |
+| 7 | audit `ReadHistory`（37.6 MB 四档合并） | ~600ms | ~550ms | 无 | 纯文件 I/O，不涉库 |
+| 8 | `mem gc --retention` 库侧（Bundle 回收为主） | 163ms | 23ms | `ix_cand_evidence_evidence` + `ix_mem_evidence_evidence` + `ix_distill_bundle` | 引用保护三处 `SCAN` → SEARCH；GCCandidates 17ms / 决策账 1ms 不变 |
+
+落地 5 条索引：`ix_commit_memory_actor`（commit_decisions）、`ix_cand_evidence_evidence`（candidate_evidence）、
+`ix_mem_evidence_evidence`（memory_evidence）、`ix_distill_bundle`（distill_runs）、`ix_obs_source_seq`（observations）。
+新库由 schema.sql 建（列随表原生的四条）；`ix_obs_source_seq` / `ix_distill_bundle` 的列是后加列，
+只经 `ensurePerfIndexes`（store.go Open 时幂等补齐），存量库重开即得、二次 Open 幂等（用例 `TestPerfIndexesSurviveLegacyReopen`）。
+
+**候而不加**：`ix_evbundle_status_created`（evidence_bundles(status, created_at)）在 3k Bundle 规模下
+场景 1/3 提速 <20%（12ms→12ms / 1ms→1ms），写放大不值；Bundle 数涨两个数量级后再测。
+
+**建议**（不在本片改，产品查询语句冻结）：
+- 场景 5 的摘要外层仍要全量扫 `commit_decisions`（actor 无前导索引，子查询走新索引后只剩这一次 O(N) 扫描，14ms 可接受）；
+  若将来裁决账到百万行，可考虑 `(actor, memory_id)` 前导索引或查询改写。
+- 场景 7 是 JSONL 逐行解析的文件 I/O，索引无关；若嫌慢应改流式聚合，不是加索引。
+
+**存量库风险**：`CREATE INDEX` 在 Open 时逐条执行，SQLite 短暂持写锁；按本机 10 万行观测建
+`ix_obs_source_seq` 实测 <100ms，busy_timeout 5s 足够。并发打开的旧进程不受影响（WAL 读写不互斥）。

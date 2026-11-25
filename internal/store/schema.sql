@@ -317,6 +317,9 @@ CREATE TABLE IF NOT EXISTS candidate_evidence (
   PRIMARY KEY (candidate_id, evidence_id, evidence_role)
 );
 CREATE INDEX IF NOT EXISTS ix_cand_evidence_event ON candidate_evidence(event_uid);
+-- S14：完成 Bundle 回收（mem gc --retention）的引用保护按 evidence_id 反查候选，
+-- 没有它每个受检 item 都要全表扫 candidate_evidence。event_uid 索引不覆盖这一列。
+CREATE INDEX IF NOT EXISTS ix_cand_evidence_evidence ON candidate_evidence(evidence_id);
 
 CREATE TABLE IF NOT EXISTS commit_decisions (
   id             TEXT PRIMARY KEY,
@@ -337,6 +340,11 @@ CREATE TABLE IF NOT EXISTS commit_decisions (
   UNIQUE(idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS ix_commit_candidate ON commit_decisions(candidate_id, created_at);
+-- S14（docs/design-storage-layering.md §9）：复核摘要按「每条记忆取最近一条
+-- model-auto 裁决」，子查询以 (memory_id, actor) 定位、按 created_at 排序；
+-- 没有它在数万条裁决账上逐行全表扫（实测 3.4s/次）。ix_commit_model 由
+-- ensureReviewSchema 建，不要在这里重复。
+CREATE INDEX IF NOT EXISTS ix_commit_memory_actor ON commit_decisions(memory_id, actor, created_at);
 -- ix_commit_model 不写在这里：旧库还没有 model_tag 列，建在建表脚本里会先于
 -- ensureReviewSchema 的 ALTER 失败。它由 ensureReviewSchema 在补列之后创建。
 
@@ -353,6 +361,8 @@ CREATE TABLE IF NOT EXISTS memory_evidence (
   PRIMARY KEY (memory_id, evidence_id)
 );
 CREATE INDEX IF NOT EXISTS ix_mem_evidence_event ON memory_evidence(event_uid);
+-- S14：同 ix_cand_evidence_evidence，引用保护的另一半。
+CREATE INDEX IF NOT EXISTS ix_mem_evidence_evidence ON memory_evidence(evidence_id);
 
 CREATE TABLE IF NOT EXISTS read_traces (
   id            TEXT PRIMARY KEY,
