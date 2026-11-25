@@ -181,8 +181,14 @@ func cmdHook(args []string) error {
 		}
 	}
 
+	// 触达面要读「最近一次 distill 是否因无 provider 停在 backlog」：这里把本次
+	// 审计目标解析成真实路径（空值＝默认位置），"-" 保持关闭语义。
+	auditFile := *auditPath
+	if auditFile == "" {
+		auditFile = audit.Path()
+	}
 	out := renderHookContext(c, event, project, in.Prompt, *limit, budget,
-		hookMeta{SessionID: in.sessionID(), Harness: harnessName(*harnessFlag, in)})
+		hookMeta{SessionID: in.sessionID(), Harness: harnessName(*harnessFlag, in), AuditPath: auditFile})
 	writeHookStdout(*harnessFlag, event, out.Text)
 
 	// 审计：为「用户会话 → mem 查询」沉淀真实样本。写失败必须静默 ——
@@ -282,6 +288,10 @@ type hookMeta struct {
 	SessionID string
 	Harness   string
 	Event     string
+	// AuditPath 是本次钩子写入的审计文件，供触达面读取「最近一次 distill 是否因
+	// 无 provider 停在 backlog」。空串＝直接调用渲染函数（单测/基准）不做该判定；
+	// "-"＝审计关闭，同样不做。cmdHook 总会传入解析后的真实路径。
+	AuditPath string
 }
 
 // hookRender 是一次钩子渲染的结果。Gate 单列是为了让审计区分
@@ -328,6 +338,17 @@ func renderHookContext(c common, event harness.Event, project, prompt string, li
 		return hookRender{Text: text, Injected: injected, Gate: gate, OpenMS: openMS, SearchMS: time.Since(searchStart).Milliseconds()}
 	}
 	return hookRender{OpenMS: openMS}
+}
+
+// automationDisabled 是自动化的**唯一总闸**（design-data-lifecycle §12.4）。
+//
+// 只拦「钩子替用户做的自动决定」：proposal spawn、冷启动、judge spawn。
+// 不拦数据通路（spool drain 是证据补写，丢了就是丢证据）与任何手动命令
+// （mem maintain / distill / judge / accept …）——总闸回答的是「自动化在不在跑」，
+// 不是「记忆系统关没关」。现有 MEM_NO_DISTILL / MEM_NO_COLDSTART 语义保留（S12 再退役），
+// 总闸与它们各自独立生效，任一为真都不动作。
+func automationDisabled() bool {
+	return strings.TrimSpace(os.Getenv("MEM_NO_AUTOMATION")) == "1"
 }
 
 // notesEnabled 由 MEM_NO_NOTES 控制：置位时读侧回到「仅 v2mem 原始注入」，
@@ -486,17 +507,12 @@ func sessionStartContext(st *store.Store, project string, limit, maxChars int, m
 	codes := renderKindCodes()
 	head := fmt.Sprintf("[v2mem] 本机有跨会话的本地记忆库（Level 2，正文不进上下文）。当前工程：%s\n",
 		orGlobal(project))
-	// 待裁决提示与 head/codes/hint 同属固定开销：先预留，绝不进 sections 被预算裁掉。
-	// 只在当前工程确有 pending 候选时出现，长度与库规模无关（一个计数 + 固定文案）。
-	pending := pendingCandidatesLine(st, project)
+	// 触达面与 head/codes/hint 同属固定开销：先预留，绝不进 sections 被预算裁掉。
+	// 只在确有「等人工」项时出现，长度与库规模无关（几项计数 + 固定文案）；
+	// 它把原来的 [待裁决] 计数与指引合并进同一行，不新增第二条注入。
 	fixed := runeLen(head) + runeLen(hint) + runeLen(codes)
-	// 固定开销放不下提示时，宁可不提示也不挤掉类码表与 hint（钩子本体）。
-	// 默认预算 1200 永远够；只有外部把 --max-chars 压得很小时才走这里。
-	if fixed+runeLen(pending) > maxChars {
-		pending = ""
-	}
-
-	budget := maxChars - fixed - runeLen(pending)
+	touch := sessionStartTouchLine(st, project, time.Now(), meta.AuditPath, maxChars-fixed)
+	budget := maxChars - fixed - runeLen(touch)
 	if budget < 0 {
 		budget = 0
 	}
@@ -552,7 +568,7 @@ func sessionStartContext(st *store.Store, project string, limit, maxChars int, m
 	var sb strings.Builder
 	sb.WriteString(head)
 	sb.WriteString(codes)
-	sb.WriteString(pending)
+	sb.WriteString(touch)
 	var injected []store.Hit
 	var items []store.ReadTraceItem
 	rank := 0

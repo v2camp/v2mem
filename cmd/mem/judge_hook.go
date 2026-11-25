@@ -56,6 +56,10 @@ func maybeSpawnJudge(db string, event harness.Event) {
 	if event != harness.EventStop && event != harness.EventSessionEnd {
 		return
 	}
+	// 唯一总闸：判定会自动烧模型调用，总闸下必须连配置都不读。
+	if automationDisabled() {
+		return
+	}
 	if !judgeAutoSpawnEnabled() {
 		return
 	}

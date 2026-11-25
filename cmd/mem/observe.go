@@ -962,6 +962,10 @@ func syncDirectory(dir string) error {
 // drainSpoolFailOpen 把库不可用期间落下的段补进证据账。
 // 只在 SessionStart 调用。认领/恢复/删除全部交给 evidence.Engine：
 // 它按 .processing 原子认领，成功删除、失败恢复，从不重写整个文件。
+//
+// 刻意**不受 MEM_NO_AUTOMATION 约束**：这是数据通路（把已捕获的证据补进账），
+// 不是「替用户做决定」的自动化。总闸关掉它等于让 spool 段永久积压甚至丢证据，
+// 与「关掉自动化」的语义相反。
 func drainSpoolFailOpen(db, auditPath string) evidence.SpoolDrainResult {
 	e, err := evidence.Open(db)
 	if err != nil {
