@@ -167,6 +167,9 @@ func TestArchiveFailureDoesNotAdvanceCursor(t *testing.T) {
 	if _, err := e.Capture(rawEvent("uid-1")); err == nil {
 		t.Fatal("归档失败应报错")
 	}
+	if segs := spoolSegments(t, e.SpoolRoot()); len(segs) != 1 {
+		t.Fatalf("归档失败必须把事件落 spool 保命，got %d 段", len(segs))
+	}
 	b, err := e.NextBundle(10, 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -174,20 +177,21 @@ func TestArchiveFailureDoesNotAdvanceCursor(t *testing.T) {
 	if b != nil {
 		t.Fatalf("归档失败不能推进游标: %+v", b)
 	}
-	if _, err := os.Stat(e.SpoolRoot()); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("archive 失败不应落 spool: %v", err)
-	}
 
-	// 修好目录后同一条事件应从 seq 1 重新开始（水位没被推进）。
+	// 修好目录后 spool 重放：同一条事件从 seq 1 开始，没有半提交。
 	if err := os.Remove(e.ArchiveDir()); err != nil {
 		t.Fatal(err)
 	}
-	ref, err := e.Capture(rawEvent("uid-1"))
+	res, err := e.DrainSpool(10)
+	if err != nil || res.Drained != 1 {
+		t.Fatalf("修复后 spool 应重放 1 条: %+v err=%v", res, err)
+	}
+	ref, err := e.Capture(rawEvent("uid-2"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ref.Seq != 1 {
-		t.Fatalf("水位应仍是 0，got seq=%d", ref.Seq)
+	if ref.Seq != 2 {
+		t.Fatalf("重放占住 seq 1，下一条应为 2，got %d", ref.Seq)
 	}
 }
 
