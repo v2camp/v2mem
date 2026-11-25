@@ -26,12 +26,15 @@ type EvidenceGCResult struct {
 	Failed    int   `json:"failed"`
 }
 
-// GCEvidence 回收「已经没有任何观测指向」的证据归档，返回本次释放的量。
+// GCEvidence 回收「已经没有任何引用指向」的证据归档，返回本次释放的量。
 //
 // cutoff 是写入保护期（unix 秒，只回收 created_at/modtime 早于它的东西）。
 // 调用方传 time.Now().Add(-grace).Unix()；保护期的存在理由见 UnreferencedArchives。
 //
-// 三件事，顺序不可换：
+// 四件事，顺序不可换：
+//  0. 保留集回读校验（§8.1 顺序铁律）：仍被引用保留的段必须先用 VerifyRef 证明
+//     读得回。任一读回失败 → 整体拒绝删除（返回错误且一个文件都不删）——
+//     坏的保留集意味着库况已超出自动 GC 的理解范围，删除只会让损失扩大。
 //  1. 账本内孤儿段：先删磁盘文件，再删账本行。反过来的话文件删失败就会留下
 //     「账本说没有、磁盘还在」的残渣，而账本恰恰是找残渣的唯一线索。
 //  2. 账本外残文件：进程在「落盘」与「写账」之间退出留下的段，以及写归档时的
@@ -45,6 +48,15 @@ func (e *Engine) GCEvidence(cutoff int64) (*EvidenceGCResult, error) {
 	segs, err := e.st.UnreferencedArchives(cutoff)
 	if err != nil {
 		return res, fmt.Errorf("查孤儿归档段失败: %w", err)
+	}
+	keep, err := e.st.ReferencedArchives()
+	if err != nil {
+		return res, fmt.Errorf("查保留归档段失败: %w", err)
+	}
+	for _, seg := range keep {
+		if _, vErr := VerifyRef(seg.Path, seg.Hash); vErr != nil {
+			return res, fmt.Errorf("保留集回读校验失败，拒绝删除（%s）: %w", seg.Hash, vErr)
+		}
 	}
 	removed := make([]string, 0, len(segs))
 	for _, seg := range segs {

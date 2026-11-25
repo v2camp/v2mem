@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/v2camp/v2mem/internal/testkit"
 )
 
 func TestCandidateNotSearchableUntilAccept(t *testing.T) {
@@ -178,6 +180,105 @@ func TestGCCandidatesDeletesOldExpired(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatal("超期 expired 行应已删除")
+	}
+}
+
+// 清边失败必须整轮回滚：半删（边没了候选还在）比不删更糟——
+// 读者会以为证据链断了，而实际只是 GC 撞上了写故障。
+func TestGCCandidatesRollsBackWhenEdgeCleanupFails(t *testing.T) {
+	s := newTestStore(t)
+	accepted, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Kind: "decision", Content: "决定：清边失败要回滚", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcceptCandidate(accepted.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-100 * 24 * time.Hour).Unix()
+	if _, err := s.db.Exec(`UPDATE candidates SET decided_at=? WHERE id=?`, old, accepted.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	undo, err := testkit.FailWrites(s.db, "edges")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer undo()
+	if _, err := s.GCCandidates(14*24*time.Hour, 90*24*time.Hour); err == nil {
+		t.Fatal("清边写失败应报错")
+	}
+	var candLeft, edgeLeft int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM candidates WHERE id=?`, accepted.Candidate.ID).Scan(&candLeft); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM edges WHERE dst=?`, accepted.Candidate.ID).Scan(&edgeLeft); err != nil {
+		t.Fatal(err)
+	}
+	if candLeft != 1 || edgeLeft != 1 {
+		t.Fatalf("失败必须整轮回滚：候选剩 %d、边剩 %d（期望 1/1）", candLeft, edgeLeft)
+	}
+}
+
+// 删候选行失败同样整轮回滚：过期行清理路径先删掉的边不许留下。
+func TestGCCandidatesRollsBackWhenCandidateDeleteFails(t *testing.T) {
+	s := newTestStore(t)
+	memID := mustAdd(t, s, "派生记忆")
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Kind: "task", Content: "过期行清理撞写故障", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-100 * 24 * time.Hour).Unix()
+	if _, err := s.db.Exec(`UPDATE candidates SET status='expired', decided_at=? WHERE id=?`,
+		old, res.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
+		memID, res.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	undo, err := testkit.FailWrites(s.db, "candidates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer undo()
+	if _, err := s.GCCandidates(14*24*time.Hour, 90*24*time.Hour); err == nil {
+		t.Fatal("删候选行写失败应报错")
+	}
+	var candLeft, edgeLeft int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM candidates WHERE id=?`, res.Candidate.ID).Scan(&candLeft); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM edges WHERE dst=?`, res.Candidate.ID).Scan(&edgeLeft); err != nil {
+		t.Fatal(err)
+	}
+	if candLeft != 1 || edgeLeft != 1 {
+		t.Fatalf("失败必须整轮回滚：候选剩 %d、边剩 %d（期望 1/1）", candLeft, edgeLeft)
+	}
+}
+
+// 标过期的写失败直接冒泡：装了写失败注入的表上跑 GC 必须报错，不许静默少删。
+func TestGCCandidatesSurfacesWriteFailure(t *testing.T) {
+	s := newTestStore(t)
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Kind: "task", Content: "标过期撞写故障", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-40 * 24 * time.Hour).Unix()
+	if _, err := s.db.Exec(`UPDATE candidates SET created_at=? WHERE id=?`, old, res.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	undo, err := testkit.FailWrites(s.db, "candidates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer undo()
+	if _, err := s.GCCandidates(14*24*time.Hour, 90*24*time.Hour); err == nil {
+		t.Fatal("写失败应冒泡")
 	}
 }
 

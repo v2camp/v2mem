@@ -407,6 +407,8 @@ func (s *Store) RejectCandidate(idOrPrefix string) (*Candidate, error) {
 // GCCandidates 把超过 pendingAge 的 pending 标为 expired，并删掉超过 acceptedAge 的已采纳行。
 //
 // 不删 memories。默认 pending 14 天、accepted 保留 90 天。
+// 删行与清边同事务：edges.dst 没有外键（relaxEdgeDstFK 拆掉了 dst→memories），
+// 候选删后 dst 指向它的边就成孤边——对端回收在这里一并做掉。
 func (s *Store) GCCandidates(pendingAge, acceptedAge time.Duration) (*CandGCResult, error) {
 	if pendingAge <= 0 {
 		pendingAge = 14 * 24 * time.Hour
@@ -426,33 +428,46 @@ func (s *Store) GCCandidates(pendingAge, acceptedAge time.Duration) (*CandGCResu
 	if err != nil {
 		return nil, err
 	}
-	res, err = s.db.Exec(
-		`DELETE FROM candidates
-		  WHERE status='accepted' AND decided_at IS NOT NULL AND decided_at < ?`,
-		now.Add(-acceptedAge).Unix())
+	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	deleted, err := res.RowsAffected()
+	defer tx.Rollback()
+	deleted, err := deleteCandidatesWithEdges(tx,
+		`status='accepted' AND decided_at IS NOT NULL AND decided_at < ?`,
+		now.Add(-acceptedAge).Unix())
 	if err != nil {
 		return nil, err
 	}
 	// 过期行也要有出口：它们从未被判过，不参与一致率，留着只会让候选表只增不减。
 	// 与 accepted 用同一个保留期，避免两套「多久算老」的口径。
-	res, err = s.db.Exec(
-		`DELETE FROM candidates
-		  WHERE status='expired' AND decided_at IS NOT NULL AND decided_at < ?`,
+	deletedExpired, err := deleteCandidatesWithEdges(tx,
+		`status='expired' AND decided_at IS NOT NULL AND decided_at < ?`,
 		now.Add(-acceptedAge).Unix())
 	if err != nil {
 		return nil, err
 	}
-	deletedExpired, err := res.RowsAffected()
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &CandGCResult{
 		Expired: int(expired), Deleted: int(deleted), DeletedExpired: int(deletedExpired),
 	}, nil
+}
+
+// deleteCandidatesWithEdges 先清 edges.dst、再删候选行（同事务）。
+// where 是硬编码的删除条件片段，arg 是它的时间参数；顺序不能反——
+// 候选行先没了，dst 子查询就再也找不到要清的边。
+func deleteCandidatesWithEdges(tx *sql.Tx, where string, arg any) (int64, error) {
+	if _, err := tx.Exec(
+		`DELETE FROM edges WHERE dst IN (SELECT id FROM candidates WHERE `+where+`)`, arg); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`DELETE FROM candidates WHERE `+where, arg)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // DistillWindowDone 报告这个会话的观测窗口是否已经成功蒸馏过。

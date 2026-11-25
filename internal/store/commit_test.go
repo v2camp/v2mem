@@ -413,6 +413,11 @@ func TestGCObservationsKeepsEvidenceReferenced(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 已发窗：本用例验 memory_evidence 口径；未发窗保护另有用例
+	// （TestGCObservationsProtectsUnbundledRange），这里不混口径。
+	if _, err := s.db.Exec(`UPDATE evidence_sources SET cursor_seq = last_seq`); err != nil {
+		t.Fatal(err)
+	}
 	res, err := s.GCObservations(24*time.Hour, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -448,6 +453,9 @@ func TestGCObservationsKeepsEvidenceReferenced(t *testing.T) {
 		memory_id, evidence_id, event_uid, archive_hash, raw_locator, grade, seq, occurred_at_ns, created_at
 	) VALUES (?,?,?,?,?,?,?,?,?)`,
 		mem2.ID, "remote-id", byUID.EventUID, byUID.ArchiveHash, "", "B", 1, 0, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.db.Exec(`UPDATE evidence_sources SET cursor_seq = last_seq`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s2.GCObservations(24*time.Hour, 1); err != nil {
