@@ -624,7 +624,7 @@ func seedModelAutoDecision(t *testing.T, s *Store, candidateID, memoryID string,
 	if _, err := s.db.Exec(`INSERT INTO commit_decisions
 		(id, candidate_id, revision, evidence_hash, action, actor, reason_codes_json,
 		 memory_id, model_tag, created_memory, idempotency_key, created_at)
-		VALUES (?,?,0,'','auto_commit','model-auto','[]',?,'m@v1',0,?,?)`,
+		VALUES (?,?,0,'','auto_commit','model-auto','["low_confidence"]',?,'m@v1',0,?,?)`,
 		"dec-"+candidateID, candidateID, memoryID, "key-"+candidateID, at); err != nil {
 		t.Fatalf("insert decision: %v", err)
 	}

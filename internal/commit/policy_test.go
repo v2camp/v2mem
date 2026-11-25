@@ -343,3 +343,50 @@ func TestHashEvidenceTieBreakers(t *testing.T) {
 		t.Fatal("同字段证据换序仍应稳定")
 	}
 }
+
+// S10b：AllowModelAuto 开关只抬 human 分支，Conflict/Defer 不放宽；
+// 幂等键纳入 model_tag 维度，空 tag 与旧键逐字节相同（§6.3）。
+func TestMatrixAllowModelAutoSwitch(t *testing.T) {
+	m := Matrix{AllowModelAuto: true}
+	for _, tc := range []struct {
+		c    Candidate
+		want Action
+	}{
+		{cand("decision", "project", "p", "", ""), ActionAutoCommit},
+		{cand("fact", "global", "p", "", ""), ActionAutoCommit},
+		{cand("fact", "cross_project", "p", "", ""), ActionAutoCommit},
+		{cand("fact", "project", "", "", ""), ActionAutoCommit}, // project 缺失分支
+		{cand("mystery", "project", "p", "", ""), ActionAutoCommit},
+		{cand("fact", "conflict", "p", "", ""), ActionConflict},
+		{cand("fact", "project", "p", "", "conflict"), ActionConflict},
+		{cand("fact", "project", "p", "", ""), ActionDefer}, // 无证据仍 Defer
+	} {
+		d, err := m.DecideItems(tc.c, evidenceFor(tc.c))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Action != tc.want {
+			t.Errorf("kind=%s scope=%s project=%q: want %s got %s", tc.c.Kind, tc.c.Scope,
+				tc.c.Project, tc.want, d.Action)
+		}
+	}
+
+	// 幂等键：model_tag 参与维度；空 tag 与旧 IdempotencyKey 一致。
+	old := IdempotencyKey("c1", 0, ActionAutoCommit, "h")
+	if got := IdempotencyKeyWithModel("c1", 0, ActionAutoCommit, "h", ""); got != old {
+		t.Fatalf("空 model_tag 必须与旧键逐字节相同: %s vs %s", got, old)
+	}
+	new1 := IdempotencyKeyWithModel("c1", 0, ActionAutoCommit, "h", "m@v1")
+	new2 := IdempotencyKeyWithModel("c1", 0, ActionAutoCommit, "h", "m@v2")
+	if new1 == old || new2 == old || new1 == new2 {
+		t.Fatalf("model_tag 必须进幂等键: old=%s v1=%s v2=%s", old, new1, new2)
+	}
+}
+
+// evidenceFor 给 conflict / fact-project 判断提供最小证据集（与上面用例对齐）。
+func evidenceFor(c Candidate) []Item {
+	if c.Scope == "project" && c.Project != "" && c.Kind == "fact" {
+		return nil // 无证据：走 Defer 而不是 AutoCommit
+	}
+	return []Item{item(RoleDirect, "u", GradeA)}
+}

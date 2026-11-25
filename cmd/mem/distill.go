@@ -777,6 +777,8 @@ func cmdAccept(args []string) error {
 	all := fs.Bool("all-pending", false, "采纳当前筛选下的全部 pending")
 	session := fs.String("session", "", "配合 --all-pending，只采纳这个会话")
 	auto := fs.Bool("auto", false, "按提交矩阵自动裁决：只有 auto_commit 才落库，人工类型保持 pending")
+	modelAuto := fs.Bool("model-auto", false, "允许模型自动采纳（默认关；Conflict/Defer 仍保留，裁决 actor=model-auto）")
+	modelTag := fs.String("model-tag", "", "归因 model@promptver（--model-auto 时写入 commit_decisions，供按版本回滚）")
 	revision := fs.Int("revision", -1, "期望的候选 revision（默认按当前 revision；并发下用过期的值会冲突）")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
 	if err := fs.Parse(args); err != nil {
@@ -837,9 +839,15 @@ func cmdAccept(args []string) error {
 			rev = view.Revision
 		}
 		var res *store.CommitResult
-		if *auto {
+		switch {
+		case *modelAuto:
+			// S10b 生产开关：默认关，不改既有 accept 行为。开启后仍走提交矩阵
+			// （Conflict/Defer 保留）与 CommitAccept 的 CAS/幂等路径，只是 actor
+			// 记 model-auto、model_tag 落裁决账（§6.3 / §7 第 7 条）。
+			res, err = st.ModelAutoCommit(id, rev, *modelTag)
+		case *auto:
 			res, err = st.AutoCommitCandidate(id, rev)
-		} else {
+		default:
 			res, err = st.CommitAccept(id, rev, "human")
 		}
 		if err != nil {

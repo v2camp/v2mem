@@ -9,11 +9,17 @@ package store
 //   - 直写默认视为人工已审核，只有**可证明的直写来源**在迁移时回填 confirmed。
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/v2camp/v2mem/internal/commit"
 )
 
 // 记忆的人工后审核状态。” 表示未审核（直写来源之外的默认值）。
@@ -208,13 +214,19 @@ func (s *Store) MarkCandidateQuarantined(id, reason string) error {
 }
 
 func (s *Store) markCandidateTerminal(id, status, reason string) error {
+	return s.markCandidateTerminalTx(context.Background(), s.db, id, status, reason)
+}
+
+// markCandidateTerminalTx 是事务版，供复核动作面在单事务里复用（judge 非法输出链路、
+// 撤回候选恢复等）。逻辑与 markCandidateTerminal 完全一致，只是执行者换成事务连接。
+func (s *Store) markCandidateTerminalTx(ctx context.Context, q sqlQuerier, id, status, reason string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return errors.New("缺少候选 id")
 	}
 	// 只允许 pending/failed 进入：其余状态都有明确结论，被改写成 failed/quarantined
 	// 等于把已有裁决抹平（accepted 的记忆还在库里，状态却说它没成）。
-	res, err := s.db.Exec(`UPDATE candidates
+	res, err := q.ExecContext(ctx, `UPDATE candidates
 		SET status = ?, status_reason = ?, attempt = attempt + 1, decided_at = ?
 		WHERE id = ? AND status IN ('pending', 'failed')`,
 		status, strings.TrimSpace(reason), time.Now().Unix(), id)
@@ -249,6 +261,7 @@ func (s *Store) ListReviewQueue(state string, limit int) (*ReviewQueue, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	now := time.Now().Unix()
 	q := &ReviewQueue{
 		States: make(map[string][]ReviewItem, 4),
 		Counts: make(map[string]int, 4),
@@ -259,6 +272,24 @@ func (s *Store) ListReviewQueue(state string, limit int) (*ReviewQueue, error) {
 	}
 
 	for _, st := range ReviewQueueStates() {
+		if st == ReviewQueueSummary {
+			// count 与 list 必须同源：一次取全量，计数就是 len，列表取前 limit 条。
+			// S10a 的遗留是 count 只 JOIN memories、list 还 INNER JOIN candidates，
+			// 候选被 GC 后出现「计数 1、列表 0」。这里从根上消除第二套口径。
+			items, err := s.reviewSummaryItems(now)
+			if err != nil {
+				return nil, err
+			}
+			q.Counts[st] = len(items)
+			if state != ReviewQueueAll && state != st {
+				continue
+			}
+			if len(items) > limit {
+				items = items[:limit]
+			}
+			q.States[st] = items
+			continue
+		}
 		n, err := s.countReviewState(st)
 		if err != nil {
 			return nil, err
@@ -267,7 +298,7 @@ func (s *Store) ListReviewQueue(state string, limit int) (*ReviewQueue, error) {
 		if state != ReviewQueueAll && state != st {
 			continue
 		}
-		items, err := s.listReviewState(st, limit)
+		items, err := s.listReviewState(st, limit, now)
 		if err != nil {
 			return nil, err
 		}
@@ -285,13 +316,6 @@ func (s *Store) countReviewState(state string) (int, error) {
 		q = `SELECT COUNT(*) FROM candidates WHERE status = 'quarantined'`
 	case ReviewQueueFailed:
 		q = `SELECT COUNT(*) FROM candidates WHERE status = 'failed'`
-	case ReviewQueueSummary:
-		// 按记忆去重：同一条知识被多次自动裁决只算一条待复核。
-		q = `SELECT COUNT(*) FROM (
-			SELECT d.memory_id FROM commit_decisions d
-			JOIN memories m ON m.id = d.memory_id
-			WHERE d.actor = '` + modelAutoActor + `' AND m.review_state = '' AND d.memory_id <> ''
-			GROUP BY d.memory_id)`
 	default:
 		return 0, fmt.Errorf("未知复核状态: %s", state)
 	}
@@ -306,13 +330,10 @@ func (s *Store) countReviewState(state string) (int, error) {
 // 只是为了避免把 SQL 字符串拼成变量；两处一致性由 cmd/mem 的测试守卫。
 const modelAutoActor = "model-auto"
 
-func (s *Store) listReviewState(state string, limit int) ([]ReviewItem, error) {
-	now := time.Now().Unix()
+func (s *Store) listReviewState(state string, limit int, now int64) ([]ReviewItem, error) {
 	switch state {
 	case ReviewQueuePending, ReviewQueueQuarantined, ReviewQueueFailed:
 		return s.listReviewCandidates(state, limit, now)
-	case ReviewQueueSummary:
-		return s.listReviewSummaries(limit, now)
 	}
 	return nil, fmt.Errorf("未知复核状态: %s", state)
 }
@@ -352,23 +373,31 @@ func (s *Store) listReviewCandidates(state string, limit int, now int64) ([]Revi
 	return out, rows.Err()
 }
 
-// listReviewSummaries 按记忆投影「模型自动写库、还没人看过」的行。
+// reviewSummaryItems 是复核摘要的**唯一**查询口径：count 与 list 都从这里取。
 //
-// 一个记忆可能被多次 model-auto 裁决（重放、多个候选收敛到同一条知识），
-// 这里取每个记忆最近的一条裁决，保证一条记忆只出现一次。
-func (s *Store) listReviewSummaries(limit int, now int64) ([]ReviewItem, error) {
-	rows, err := s.db.Query(`SELECT d.memory_id, c.kind, c.scope, c.status, c.attempt, d.created_at,
-			d.actor, d.action
+// 只 JOIN memories，不 JOIN candidates：候选是终态账，会被 GC 清掉；摘要关心的是
+// 「哪条记忆还没人看过」，记忆行与裁决账才是真源。kind/scope 也从 memories 取。
+// 这从根上修掉 S10a 的「count 1、list 0」：两处不再有各自的 JOIN 集合。
+//
+// 摘要只放三类（docs/design-data-lifecycle.md §6.4，默认信任其余 model-auto 产物）：
+//  1. 低置信：理由码含糊 / self-score 低（low_confidence / unsure / vague_reason / self_score_low）；
+//  2. 冲突标记：action=conflict 或理由码含 conflict；
+//  3. 高影响抽样：global/cross_project/decision/preference/rule，按 hash(memory_id)%10==0
+//     确定性抽约 10%，不引状态列（同一 id 在任何机器、任何重跑结论一致）。
+//
+// 一个记忆可能被多次 model-auto 裁决（重放、多候选收敛），取每个记忆最近一条裁决。
+func (s *Store) reviewSummaryItems(now int64) ([]ReviewItem, error) {
+	rows, err := s.db.Query(`SELECT d.memory_id, m.kind, m.scope, d.action,
+			d.reason_codes_json, d.actor, d.created_at
 		FROM commit_decisions d
 		JOIN memories m ON m.id = d.memory_id
-		JOIN candidates c ON c.id = d.candidate_id
 		WHERE d.actor = ? AND m.review_state = '' AND d.memory_id <> ''
 		  AND d.id = (
 			SELECT d2.id FROM commit_decisions d2
 			WHERE d2.memory_id = d.memory_id AND d2.actor = ?
 			ORDER BY d2.created_at DESC, d2.revision DESC, d2.id DESC LIMIT 1)
-		ORDER BY d.created_at ASC, d.memory_id ASC LIMIT ?`,
-		modelAutoActor, modelAutoActor, limit)
+		ORDER BY d.created_at ASC, d.memory_id ASC`,
+		modelAutoActor, modelAutoActor)
 	if err != nil {
 		return nil, err
 	}
@@ -376,16 +405,79 @@ func (s *Store) listReviewSummaries(limit int, now int64) ([]ReviewItem, error) 
 	out := []ReviewItem{}
 	for rows.Next() {
 		var it ReviewItem
+		var action, reasonsJSON string
 		var at int64
-		if err := rows.Scan(&it.MemoryID, &it.Kind, &it.Scope, &it.Status, &it.Attempt,
-			&at, &it.Actor, &it.Action); err != nil {
+		if err := rows.Scan(&it.MemoryID, &it.Kind, &it.Scope, &action,
+			&reasonsJSON, &it.Actor, &at); err != nil {
 			return nil, err
 		}
+		var reasons []string
+		_ = json.Unmarshal([]byte(reasonsJSON), &reasons)
+		if !reviewSummaryEligible(it.MemoryID, reasons, action, it.Kind, it.Scope) {
+			continue
+		}
 		it.ID = it.MemoryID
+		it.Status = "accepted"
+		it.Action = action
 		it.AgeSeconds = ageSeconds(now, at)
 		out = append(out, it)
 	}
 	return out, rows.Err()
+}
+
+// lowConfidenceReasons 是「模型自己没把握」的闭集理由码，命中即必进摘要。
+var lowConfidenceReasons = map[string]bool{
+	"low_confidence": true, "unsure": true, "vague_reason": true, "self_score_low": true,
+}
+
+// reviewSummaryEligible 是三类判定的唯一入口（纯函数，count 与 list 共用）。
+func reviewSummaryEligible(memoryID string, reasons []string, action, kind, scope string) bool {
+	// 冲突标记优先，必进。
+	if strings.EqualFold(strings.TrimSpace(action), "conflict") || hasReason(reasons, "conflict") {
+		return true
+	}
+	// 低置信，必进。
+	for _, r := range reasons {
+		if lowConfidenceReasons[strings.ToLower(strings.TrimSpace(r))] {
+			return true
+		}
+	}
+	// 高影响抽样：确定性约 10%。
+	if highImpactKindOrScope(kind, scope) {
+		return sampleHighImpact(memoryID)
+	}
+	// 其余 model-auto 产物默认信任，不进摘要（例行审核队列是反模式）。
+	return false
+}
+
+func hasReason(reasons []string, want string) bool {
+	for _, r := range reasons {
+		if strings.EqualFold(strings.TrimSpace(r), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func highImpactKindOrScope(kind, scope string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "decision", "preference", "rule":
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(scope)) {
+	case "global", "cross_project":
+		return true
+	}
+	return false
+}
+
+// sampleHighImpact 按 hash(memory_id)%10==0 确定性抽约 10%（§6.4）。
+//
+// 用 sha256 首字节而不是随机数：同一 id 在任何机器、任何重跑都得到同一结论，
+// 且不需要额外状态列、不会因 limit/--state 漂移。256 个取值里约 26 个命中 ≈ 10%。
+func sampleHighImpact(memoryID string) bool {
+	sum := sha256.Sum256([]byte(memoryID))
+	return sum[0]%10 == 0
 }
 
 // ageSeconds 让「年龄」永不为负：客户机时钟回拨不该显示成「-3 天」。
@@ -394,4 +486,480 @@ func ageSeconds(now, at int64) int64 {
 		return 0
 	}
 	return now - at
+}
+
+// ---------- S10b 复核动作面（§6.4 / §11.1） ----------
+
+// 人工后审核动作的闭集字面值。动作本身写进 commit_decisions.reason_codes_json，
+// 不新增 schema 列，也不改 audit.go 的 Summarize。
+const (
+	ReviewActionConfirm  = "confirm"
+	ReviewActionCorrect  = "correct"
+	ReviewActionWithdraw = "withdraw"
+	ReviewActionRestore  = "restore"
+)
+
+// reviewActionAudit 是承载人工后审核动作的裁决账 action 值。
+// 一律配 actor=human（任务口径：新增审计事件用 commit_decisions 承载，不改 Summarize）。
+const reviewActionAudit = "review_action"
+
+// MemoryReviewInput 是一次人工后审核动作的输入。
+type MemoryReviewInput struct {
+	MemoryID string
+	Action   string
+	Content  string // correct：人工修订后的正文
+	Reason   string // withdraw：撤回原因
+	Actor    string // 默认 human
+	Now      int64  // <=0 由 store 取当前时间
+	ModelTag string // 可选：写进裁决账，供 stats 按版本归因
+}
+
+// MemoryReviewState 是动作前后的一行快照，供 --json 与审计比较。
+type MemoryReviewState struct {
+	ReviewState string `json:"review_state"`
+	ReviewedAt  int64  `json:"reviewed_at"`
+	ReviewedBy  string `json:"reviewed_by"`
+	Content     string `json:"content,omitempty"`
+}
+
+// MemoryReviewReport 是一次动作的完整回报（--json 直接输出）。
+type MemoryReviewReport struct {
+	Action             string            `json:"action"`
+	MemoryID           string            `json:"memory_id"`
+	Before             MemoryReviewState `json:"before"`
+	After              MemoryReviewState `json:"after"`
+	AffectedCandidates []string          `json:"affected_candidates"`
+	Reason             string            `json:"reason,omitempty"`
+}
+
+type memoryReviewRow struct {
+	content, state, by string
+	at                 int64
+}
+
+func (s *Store) memoryReviewByID(ctx context.Context, q sqlQuerier, id string) (memoryReviewRow, error) {
+	var r memoryReviewRow
+	err := q.QueryRowContext(ctx,
+		`SELECT content, review_state, reviewed_at, reviewed_by FROM memories WHERE id = ?`, id).
+		Scan(&r.content, &r.state, &r.at, &r.by)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r, fmt.Errorf("未找到记忆: %s", id)
+	}
+	return r, err
+}
+
+// ApplyMemoryReview 在单事务里完成一次人工后审核动作：状态迁移 +（withdraw）候选
+// 恢复明确终态 + 一条 review_action 裁决账。全部校验在事务内读到的当前行上做，
+// 避免并发下「读到旧状态、覆写别人的决定」。
+func (s *Store) ApplyMemoryReview(in MemoryReviewInput) (*MemoryReviewReport, error) {
+	in.MemoryID = strings.TrimSpace(in.MemoryID)
+	if in.MemoryID == "" {
+		return nil, errors.New("缺少记忆 id")
+	}
+	switch in.Action {
+	case ReviewActionConfirm, ReviewActionCorrect, ReviewActionWithdraw, ReviewActionRestore:
+	default:
+		return nil, fmt.Errorf("非法复核动作 %q（可选：confirm|correct|withdraw|restore）", in.Action)
+	}
+	if in.Action == ReviewActionCorrect && strings.TrimSpace(in.Content) == "" {
+		return nil, errors.New("correct 需要 --content 人工修订正文")
+	}
+	if in.Actor == "" {
+		in.Actor = "human"
+	}
+	if in.Now <= 0 {
+		in.Now = time.Now().Unix()
+	}
+
+	var rep *MemoryReviewReport
+	err := s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
+		cur, err := s.memoryReviewByID(ctx, q, in.MemoryID)
+		if err != nil {
+			return err
+		}
+		before := MemoryReviewState{
+			ReviewState: cur.state, ReviewedAt: cur.at, ReviewedBy: cur.by, Content: cur.content,
+		}
+		after := before
+		switch in.Action {
+		case ReviewActionRestore:
+			if cur.state != ReviewStateWithdrawn {
+				return fmt.Errorf("记忆 %s 当前 review_state=%q，restore 只能用于已撤回的记忆", in.MemoryID, cur.state)
+			}
+			// 撤回的逆动作：回到未审核并清掉 reviewed_*。
+			after = MemoryReviewState{Content: cur.content}
+		case ReviewActionWithdraw:
+			if cur.state == ReviewStateWithdrawn {
+				return fmt.Errorf("记忆 %s 已撤回，不得重复撤回", in.MemoryID)
+			}
+			after.ReviewState, after.ReviewedAt, after.ReviewedBy = ReviewStateWithdrawn, in.Now, in.Actor
+		case ReviewActionConfirm:
+			if cur.state == ReviewStateWithdrawn {
+				return fmt.Errorf("记忆 %s 已撤回，请先 restore 再确认", in.MemoryID)
+			}
+			after.ReviewState, after.ReviewedAt, after.ReviewedBy = ReviewStateConfirmed, in.Now, in.Actor
+		case ReviewActionCorrect:
+			if cur.state == ReviewStateWithdrawn {
+				return fmt.Errorf("记忆 %s 已撤回，请先 restore 再修正", in.MemoryID)
+			}
+			after.ReviewState, after.ReviewedAt, after.ReviewedBy = ReviewStateCorrected, in.Now, in.Actor
+			after.Content = strings.TrimSpace(in.Content)
+		}
+
+		if in.Action == ReviewActionCorrect {
+			// 人工修订正文：content_idx 必须同步，FTS 触发器据此重建索引。
+			if _, err := q.ExecContext(ctx, `UPDATE memories
+				SET content = ?, content_idx = ?, review_state = ?, reviewed_at = ?, reviewed_by = ?, updated_at = ?
+				WHERE id = ?`, after.Content, indexText(after.Content), after.ReviewState,
+				after.ReviewedAt, after.ReviewedBy, in.Now, in.MemoryID); err != nil {
+				return err
+			}
+		} else if _, err := q.ExecContext(ctx, `UPDATE memories
+			SET review_state = ?, reviewed_at = ?, reviewed_by = ? WHERE id = ?`,
+			after.ReviewState, after.ReviewedAt, after.ReviewedBy, in.MemoryID); err != nil {
+			return err
+		}
+
+		affected := []string{}
+		if in.Action == ReviewActionWithdraw {
+			ids, err := s.recoverCandidatesForMemory(ctx, q, in.MemoryID, in.Reason, in.Now)
+			if err != nil {
+				return err
+			}
+			affected = ids
+		}
+
+		// 归因：未显式带 model_tag 时沿用产生该记忆的 model@promptver，
+		// 让 restore（误拒回捞）等动作也能按版本计入标定统计。
+		if strings.TrimSpace(in.ModelTag) == "" {
+			var tag string
+			_ = q.QueryRowContext(ctx, `SELECT model_tag FROM commit_decisions
+				WHERE memory_id = ? AND model_tag <> '' ORDER BY created_at DESC, id DESC LIMIT 1`,
+				in.MemoryID).Scan(&tag)
+			in.ModelTag = tag
+		}
+
+		// 人工动作记一条 review_action：动作、前后状态、原提案（correct 的 before/after）、
+		// 撤回原因都进 reason_codes_json，不新增 schema 列。
+		reasons := []string{"review_action=" + in.Action,
+			"before_state=" + before.ReviewState, "after_state=" + after.ReviewState}
+		if in.Action == ReviewActionCorrect {
+			reasons = append(reasons, "before="+truncateForAudit(before.Content),
+				"after="+truncateForAudit(after.Content))
+		}
+		if r := strings.TrimSpace(in.Reason); r != "" {
+			reasons = append(reasons, "reason="+r)
+		}
+		if err := s.recordReviewAction(ctx, q, in, reasons); err != nil {
+			return err
+		}
+
+		rep = &MemoryReviewReport{
+			Action: in.Action, MemoryID: in.MemoryID,
+			Before: before, After: after,
+			AffectedCandidates: affected, Reason: strings.TrimSpace(in.Reason),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rep, nil
+}
+
+// recordReviewAction 写一条 action=review_action 的裁决账。
+//
+// candidate_id 用 "review:<newID>" 而不是真实候选 id：这是**记忆级**动作而不是
+// 候选裁决，挂到任何候选上都会让 eval flow 的 G9/G10 把它误读成一次裁决。
+// memory_id 保留关联，按版本统计靠 model_tag；每次动作一条唯一 idempotency_key。
+func (s *Store) recordReviewAction(ctx context.Context, q sqlQuerier, in MemoryReviewInput, reasons []string) error {
+	raw, err := json.Marshal(reasons)
+	if err != nil {
+		return err
+	}
+	_, err = q.ExecContext(ctx, `INSERT OR IGNORE INTO commit_decisions(
+		id, candidate_id, revision, evidence_hash, action, actor, reason_codes_json,
+		memory_id, model_tag, created_memory, idempotency_key, created_at
+	) VALUES (?,?,0,'',?,?,?,?,?,0,?,?)`,
+		"dec_"+newID(), "review:"+newID(), reviewActionAudit, in.Actor,
+		string(raw), in.MemoryID, strings.TrimSpace(in.ModelTag), "ra_"+newID(), in.Now)
+	return err
+}
+
+// truncateForAudit 把正文收成有界片段：原提案/修订正文只用于比较，不该把整篇
+// 记忆塞进 reason_codes_json。
+func truncateForAudit(s string) string {
+	r := []rune(s)
+	if len(r) > 200 {
+		return string(r[:200]) + "…"
+	}
+	return s
+}
+
+// recoverCandidatesForMemory 把产生该记忆的候选恢复 rejected 明确终态（withdraw /
+// 按版本回滚共用）。放 review.go 而不是 candidates.go：这是复核动作面的专属迁移。
+//
+// 同时写一条 reject 终态裁决：eval flow 的 G9 要求 rejected 候选必须有匹配裁决，
+// 这里不放宽 G 断言，也不用「为了过闸伪造裁决」——撤回记忆本就是人工否决了那条候选。
+func (s *Store) recoverCandidatesForMemory(ctx context.Context, q sqlQuerier,
+	memoryID, reason string, now int64) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id, status FROM candidates WHERE memory_id = ?`, memoryID)
+	if err != nil {
+		return nil, err
+	}
+	type candRow struct{ id, status string }
+	var cands []candRow
+	for rows.Next() {
+		var c candRow
+		if err := rows.Scan(&c.id, &c.status); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		cands = append(cands, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	statusReason := "review_withdraw"
+	if r := strings.TrimSpace(reason); r != "" {
+		statusReason = r
+	}
+	out := []string{}
+	for _, c := range cands {
+		if c.status == "quarantined" {
+			continue // 隔离是明确终态，撤回不得覆盖它
+		}
+		if _, err := q.ExecContext(ctx, `UPDATE candidates
+			SET status = 'rejected', status_reason = ?, decided_at = ? WHERE id = ?`,
+			statusReason, now, c.id); err != nil {
+			return nil, err
+		}
+		// revision 用 0：不推进 CAS，也不与历史采纳裁决的 revision 混淆。
+		if err := recordDecision(ctx, q, c.id, 0, "", commit.ActionReject, "human",
+			[]string{"review_withdraw"}, memoryID, "", false); err != nil {
+			return nil, err
+		}
+		out = append(out, c.id)
+	}
+	return out, nil
+}
+
+// ---------- 按版本回滚（§6.4 / §11.1） ----------
+
+// RollbackReport 是按 model@promptver 回滚的完整回报（--json 直接输出）。
+// 计数是数字，明细在 *_ids；matched = withdrawn + skipped + already。
+type RollbackReport struct {
+	ModelTag     string   `json:"model_tag"`
+	Matched      int      `json:"matched"`
+	Withdrawn    int      `json:"withdrawn"`
+	Skipped      int      `json:"skipped"`
+	Already      int      `json:"already"`
+	Reopened     int      `json:"reopened"`
+	DryRun       bool     `json:"dry_run"`
+	WithdrawnIDs []string `json:"withdrawn_ids"`
+	SkippedIDs   []string `json:"skipped_ids"`
+	AlreadyIDs   []string `json:"already_ids"`
+	ReopenedIDs  []string `json:"reopened_ids"`
+}
+
+// RollbackModelTag 撤回某个 model@promptver 新建的自动记忆（只撤回、不删行）。
+//
+// 单事务；只命中 created_memory=1 且 model_tag 精确相等的行，不碰别的版本。
+// 人工已确认/修正的跳过并报告（不得盲目删除），已撤回的计入 already；
+// 其余标 withdrawn + 候选回 rejected + 写一条 reopen 决策（保 G9 口径）。
+// dryRun 时只算报告、零业务写入；重跑因状态已是 withdrawn 而天然幂等。
+func (s *Store) RollbackModelTag(modelTag string, dryRun bool, now int64) (*RollbackReport, error) {
+	modelTag = strings.TrimSpace(modelTag)
+	if modelTag == "" {
+		return nil, errors.New("缺少 --model-tag")
+	}
+	if now <= 0 {
+		now = time.Now().Unix()
+	}
+	rep := &RollbackReport{
+		ModelTag: modelTag, DryRun: dryRun,
+		WithdrawnIDs: []string{}, SkippedIDs: []string{}, AlreadyIDs: []string{}, ReopenedIDs: []string{},
+	}
+	err := s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
+		rows, err := q.QueryContext(ctx, `SELECT d.memory_id, d.candidate_id
+			FROM commit_decisions d
+			JOIN memories m ON m.id = d.memory_id
+			WHERE d.model_tag = ? AND d.created_memory = 1 AND d.memory_id <> ''
+			ORDER BY d.memory_id, d.created_at`, modelTag)
+		if err != nil {
+			return err
+		}
+		type hit struct{ memID, candID string }
+		var hits []hit
+		for rows.Next() {
+			var h hit
+			if err := rows.Scan(&h.memID, &h.candID); err != nil {
+				rows.Close()
+				return err
+			}
+			hits = append(hits, h)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+
+		seen := map[string]bool{}
+		for _, h := range hits {
+			if seen[h.memID] {
+				continue // 同一记忆被多条裁决命中只处理一次
+			}
+			seen[h.memID] = true
+			var state string
+			if err := q.QueryRowContext(ctx,
+				`SELECT review_state FROM memories WHERE id = ?`, h.memID).Scan(&state); err != nil {
+				return err
+			}
+			rep.Matched++
+			switch state {
+			case ReviewStateConfirmed, ReviewStateCorrected:
+				rep.Skipped++
+				rep.SkippedIDs = append(rep.SkippedIDs, h.memID)
+				continue // 人工决定不得被批量回滚覆盖
+			case ReviewStateWithdrawn:
+				rep.Already++
+				rep.AlreadyIDs = append(rep.AlreadyIDs, h.memID)
+				continue
+			}
+			rep.Withdrawn++
+			rep.WithdrawnIDs = append(rep.WithdrawnIDs, h.memID)
+			if dryRun {
+				continue // 零写入：只报计划动作
+			}
+			if _, err := q.ExecContext(ctx, `UPDATE memories
+				SET review_state = ?, reviewed_at = ?, reviewed_by = ? WHERE id = ?`,
+				ReviewStateWithdrawn, now, "human", h.memID); err != nil {
+				return err
+			}
+			ids, err := s.recoverCandidatesForMemory(ctx, q, h.memID, "review_rollback:"+modelTag, now)
+			if err != nil {
+				return err
+			}
+			for _, cid := range ids {
+				// reopen 决策：把「这条按版本被重开/撤回」留在裁决历史里（保 G9 口径）。
+				if err := recordDecision(ctx, q, cid, 0, "", commit.ActionReopen, "human",
+					[]string{"review_rollback", modelTag}, h.memID, modelTag, false); err != nil {
+					return err
+				}
+				rep.Reopened++
+				rep.ReopenedIDs = append(rep.ReopenedIDs, cid)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rep, nil
+}
+
+// ---------- 标定统计（§6.2 / §7 第 1 条） ----------
+
+// ReviewStatsRow 是按 judge_model/model_tag 分组的标定统计。
+// 阈值只置 Warn 提示：不改提示词、不自动动作、stats 本身只读（§6.2）。
+type ReviewStatsRow struct {
+	ModelTag     string  `json:"model_tag"`
+	Samples      int     `json:"samples"`
+	Confirmed    int     `json:"confirmed"`
+	Corrected    int     `json:"corrected"`
+	Withdrawn    int     `json:"withdrawn"`
+	ConfirmRate  float64 `json:"confirm_rate"`
+	CorrectRate  float64 `json:"correct_rate"`
+	WithdrawRate float64 `json:"withdraw_rate"`
+	Recovered    int     `json:"recovered"` // 误拒回捞（restore）数
+	Warn         bool    `json:"warn"`
+}
+
+const (
+	reviewWarnWithdrawRate = 0.20
+	reviewWarnCorrectRate  = 0.30
+)
+
+// ReviewStats 按 model_tag 分组汇总样本与三种后审核率。
+//
+// 分组维度取 commit_decisions.model_tag（model-auto 采纳时落的 provider:model@promptver）；
+// candidates.judge_model 是同一条归因链在判定器侧的写法，二者按版本可比。
+// 只读单次聚合：JudgeStats 的口径保留给影子判定，这里专供后审核标定。
+func (s *Store) ReviewStats() ([]ReviewStatsRow, error) {
+	counts := map[string]map[string]int{}
+	rows, err := s.db.Query(`SELECT d.model_tag, m.review_state, COUNT(DISTINCT d.memory_id)
+		FROM commit_decisions d
+		JOIN memories m ON m.id = d.memory_id
+		WHERE d.model_tag <> '' AND d.created_memory = 1 AND d.memory_id <> ''
+		GROUP BY d.model_tag, m.review_state`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var tag, state string
+		var n int
+		if err := rows.Scan(&tag, &state, &n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if counts[tag] == nil {
+			counts[tag] = map[string]int{}
+		}
+		counts[tag][state] += n
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	recovered := map[string]int{}
+	rrows, err := s.db.Query(`SELECT model_tag, COUNT(*) FROM commit_decisions
+		WHERE action = ? AND reason_codes_json LIKE '%review_action=restore%'
+		GROUP BY model_tag`, reviewActionAudit)
+	if err != nil {
+		return nil, err
+	}
+	for rrows.Next() {
+		var tag string
+		var n int
+		if err := rrows.Scan(&tag, &n); err != nil {
+			rrows.Close()
+			return nil, err
+		}
+		recovered[tag] = n
+	}
+	if err := rrows.Err(); err != nil {
+		rrows.Close()
+		return nil, err
+	}
+	rrows.Close()
+
+	tags := make([]string, 0, len(counts))
+	for tag := range counts {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	out := make([]ReviewStatsRow, 0, len(tags))
+	for _, tag := range tags {
+		c := counts[tag]
+		samples := c[ReviewStateNone] + c[ReviewStateConfirmed] + c[ReviewStateCorrected] + c[ReviewStateWithdrawn]
+		row := ReviewStatsRow{
+			ModelTag: tag, Samples: samples,
+			Confirmed: c[ReviewStateConfirmed], Corrected: c[ReviewStateCorrected],
+			Withdrawn: c[ReviewStateWithdrawn], Recovered: recovered[tag],
+		}
+		if samples > 0 {
+			row.ConfirmRate = float64(row.Confirmed) / float64(samples)
+			row.CorrectRate = float64(row.Corrected) / float64(samples)
+			row.WithdrawRate = float64(row.Withdrawn) / float64(samples)
+		}
+		row.Warn = row.WithdrawRate > reviewWarnWithdrawRate || row.CorrectRate > reviewWarnCorrectRate
+		out = append(out, row)
+	}
+	return out, nil
 }

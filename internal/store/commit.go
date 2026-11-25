@@ -420,6 +420,57 @@ func (s *Store) AutoCommitCandidate(idOrPrefix string, expectedRevision int) (*C
 	return res, nil
 }
 
+// ModelAutoCommit 是 `mem accept --model-auto` 的真实生产者（S10b，§6.3）。
+//
+// 与 AutoCommitCandidate 用同一套提交矩阵语义，差别只有两处：
+//   - 矩阵开 AllowModelAuto：manualKinds / global / cross_project 可由模型自动 accept；
+//     但 ActionConflict / ActionDefer 仍提前返回，绝不因开关放宽。
+//   - 裁决 actor 写 commit.ActorModelAuto、modelTag 落 commit_decisions，
+//     记忆留未审核态（upsertAcceptedMemory 默认 review_state=”），复核摘要从此有真实数据。
+//
+// 自动 accept 一律走 commitAcceptView：revision CAS、幂等键、edges.derived_from、
+// memory_evidence 绑定全部保留；Judge accept 不得绕过提交矩阵（§7 第 7 条）。
+// 非 auto_commit 的动作只记一条裁决（同样带 modelTag），不写记忆、不推进候选状态。
+func (s *Store) ModelAutoCommit(idOrPrefix string, expectedRevision int, modelTag string) (*CommitResult, error) {
+	c, err := s.CommitCandidate(idOrPrefix)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.loadCandidateEvidence(context.Background(), s.db, c.ID)
+	if err != nil {
+		return nil, err
+	}
+	items := evidenceItems(rows)
+	d, err := (commit.Matrix{AllowModelAuto: true}).DecideItems(c.Proposal(), items)
+	if err != nil {
+		return nil, err
+	}
+	if d.Action == commit.ActionAutoCommit {
+		return s.commitAcceptView(c, expectedRevision, commit.ActorModelAuto, d.Action, d.ReasonCodes, modelTag)
+	}
+	res := &CommitResult{
+		Action: d.Action, Actor: commit.ActorModelAuto, EvidenceHash: d.EvidenceHash,
+		EvidenceCount: len(rows), ReasonCodes: d.ReasonCodes, IdempotencyKey: d.IdempotencyKey,
+	}
+	err = s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
+		cur, err := s.commitCandidateByID(ctx, q, c.ID)
+		if err != nil {
+			return err
+		}
+		return recordDecision(ctx, q, cur.ID, cur.Revision, d.EvidenceHash, d.Action,
+			commit.ActorModelAuto, d.ReasonCodes, cur.MemoryID, modelTag, false)
+	})
+	if err != nil {
+		return nil, err
+	}
+	updated, err := s.candidateByID(c.ID)
+	if err != nil {
+		return nil, err
+	}
+	res.Candidate = *updated
+	return res, nil
+}
+
 // modelTag 是做出这次采纳的 model@promptver；人工裁决传空串。
 func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, actor string,
 	action commit.Action, reasons []string, modelTag string) (*CommitResult, error) {
@@ -443,7 +494,9 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 		}
 		items := evidenceItems(rows)
 		evidenceHash := commit.HashEvidence(items)
-		key := commit.IdempotencyKey(cur.ID, cur.Revision, action, evidenceHash)
+		// model_tag 纳入幂等维度：换提示词后同候选的新裁决不被旧键挡成重放（§6.3）。
+		// 与 recordDecision 用同一函数，保证 CommitResult 报的键与库里存的键一致。
+		key := commit.IdempotencyKeyWithModel(cur.ID, cur.Revision, action, evidenceHash, modelTag)
 
 		if cur.Status == "accepted" {
 			if expectedRevision >= 0 && expectedRevision != cur.Revision {
@@ -665,7 +718,9 @@ func recordDecision(ctx context.Context, q sqlQuerier, candidateID string, revis
 	if createdMemory {
 		created = 1
 	}
-	key := commit.IdempotencyKey(candidateID, revision, action, evidenceHash)
+	// model_tag 纳入幂等维度：换提示词后同候选的新裁决不被旧键挡成重放（§6.3）。
+	// 非模型裁决 modelTag 为空，键值与旧版逐字节相同。
+	key := commit.IdempotencyKeyWithModel(candidateID, revision, action, evidenceHash, modelTag)
 	_, err = q.ExecContext(ctx, `INSERT OR IGNORE INTO commit_decisions(
 		id, candidate_id, revision, evidence_hash, action, actor, reason_codes_json,
 		memory_id, model_tag, created_memory, idempotency_key, created_at

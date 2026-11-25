@@ -118,8 +118,17 @@ var manualKinds = map[string]bool{
 	"rule":       true,
 }
 
-// Matrix 是默认提交策略。零值可用。
-type Matrix struct{}
+// Matrix 是默认提交策略。零值可用（AllowModelAuto=false）。
+//
+// AllowModelAuto 是 S10b 的可注入生产开关（docs/design-data-lifecycle.md §6.3）：
+// 默认 false 时 manualKinds / global / cross_project 一律 ActionHumanAccept，
+// 与 S10a 逐字一致；打开后这些类可由模型按提示词自动 accept（ActionAutoCommit），
+// 但 ActionConflict / ActionDefer 仍优先保留——「冲突优先于一切」与「不得为消灭
+// pending 强行写入」不因开关放宽。自动 accept 仍走 CommitAccept 的 revision CAS
+// 与幂等键，Judge accept 不得绕过矩阵（§7 第 7 条）。
+type Matrix struct {
+	AllowModelAuto bool
+}
 
 // Decide 实现冻结的 Policy 接口。没有角色信息的调用方按 direct 处理：
 // 这样 fact 的「A 级直接证据」判据仍然成立，而 pitfall 会因缺少 error/resolution
@@ -157,20 +166,20 @@ func (m Matrix) judge(candidate Candidate, evidence []Item) (Action, []string) {
 		return ActionConflict, []string{ReasonConflict}
 	}
 	if manualKinds[strings.ToLower(strings.TrimSpace(candidate.Kind))] {
-		return ActionHumanAccept, []string{ReasonManualKind}
+		return m.humanOrAuto([]string{ReasonManualKind})
 	}
 	switch strings.ToLower(strings.TrimSpace(candidate.Scope)) {
 	case "global":
-		return ActionHumanAccept, []string{ReasonGlobalScope}
+		return m.humanOrAuto([]string{ReasonGlobalScope})
 	case "cross_project":
-		return ActionHumanAccept, []string{ReasonCrossProjectScope}
+		return m.humanOrAuto([]string{ReasonCrossProjectScope})
 	}
 
 	switch strings.ToLower(strings.TrimSpace(candidate.Kind)) {
 	case "fact":
 		if strings.TrimSpace(candidate.Project) == "" {
-			// 无工程归属的 fact 是全局知识，按矩阵一律人工。
-			return ActionHumanAccept, []string{ReasonProjectMissing}
+			// 无工程归属的 fact 是全局知识，按矩阵一律人工（开关打开后可自动采纳）。
+			return m.humanOrAuto([]string{ReasonProjectMissing})
 		}
 		if !hasDirectA(evidence) {
 			if len(evidence) == 0 {
@@ -206,7 +215,19 @@ func (m Matrix) judge(candidate Candidate, evidence []Item) (Action, []string) {
 		return ActionAutoCommit, []string{ReasonAutoEligible}
 	}
 
-	return ActionHumanAccept, []string{ReasonManualKind, ReasonUnknownKind}
+	return m.humanOrAuto([]string{ReasonManualKind, ReasonUnknownKind})
+}
+
+// humanOrAuto 是「原本要人工」这类分支的唯一开关点。
+//
+// 只在开关打开时把 human_accept 抬成 auto_commit；理由码原样保留（manual_kind /
+// global_scope 等），后审核摘要与按版本归因仍靠它们区分高影响类。Conflict 与
+// Defer 不经过这里：它们在 judge 里各自提前返回，任何开关下都不放宽。
+func (m Matrix) humanOrAuto(reasons []string) (Action, []string) {
+	if m.AllowModelAuto {
+		return ActionAutoCommit, reasons
+	}
+	return ActionHumanAccept, reasons
 }
 
 func isConflict(c Candidate) bool {
@@ -290,9 +311,21 @@ func HashEvidence(items []Item) string {
 // 为什么把 revision 也放进去：同一候选被人工改过（内容/证据变化）后 revision 会推进，
 // 新的裁决必须能落一条新 decision，而不是被旧键挡成重放。
 func IdempotencyKey(candidateID string, revision int, action Action, evidenceHash string) string {
-	sum := sha256.Sum256([]byte(strings.Join([]string{
-		candidateID, strconv.Itoa(revision), string(action), evidenceHash,
-	}, "|")))
+	return IdempotencyKeyWithModel(candidateID, revision, action, evidenceHash, "")
+}
+
+// IdempotencyKeyWithModel 在幂等键里纳入 model@promptver 维度（§6.3）。
+//
+// 换提示词后同一候选、同一 revision、同一证据必须能落一条**新**裁决，否则会被
+// 旧键误判成重放而静默跳过，按版本回滚也就分不出新旧提示词的产物。
+// modelTag 为空时维度不参与拼接，返回值与旧 IdempotencyKey 逐字节相同——
+// 人工裁决、规则 executor 等不带版本的路径行为零变化。
+func IdempotencyKeyWithModel(candidateID string, revision int, action Action, evidenceHash, modelTag string) string {
+	parts := []string{candidateID, strconv.Itoa(revision), string(action), evidenceHash}
+	if modelTag != "" {
+		parts = append(parts, modelTag)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
 	return hex.EncodeToString(sum[:])
 }
 
