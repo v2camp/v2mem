@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -44,5 +45,55 @@ func TestBackupRefusesEmptyDest(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.Backup(""); err == nil {
 		t.Fatal("空备份路径应报错")
+	}
+}
+
+// 备份校验（S3）：删除前必须确认新备份有效，否则备份只是「多了一个文件」。
+// 三道闸口依次是「文件非空 → quick_check 返回 ok → memories 表可查」。
+func TestVerifyBackupAcceptsGoodSnapshot(t *testing.T) {
+	s := newTestStore(t)
+	mustAdd(t, s, "校验用的记忆")
+	dest := filepath.Join(t.TempDir(), "snap.db")
+	if err := s.Backup(dest); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	before, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyBackup(dest); err != nil {
+		t.Fatalf("真快照应校验通过: %v", err)
+	}
+	// 校验必须只读打开：备份被「验证」一次就变字节（例如写 db_meta 戳），
+	// 说明用的是 store.Open 这类读写路径，备份不再是快照当时的样子。
+	after, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("校验不应改动备份文件（必须 mode=ro 只读打开）")
+	}
+}
+
+// 截断文件是「看起来有、实际不能用」的典型：大小非零能骗过 Stat，
+// 只有真读一遍页才发现坏。校验必须拦住它。
+func TestVerifyBackupRejectsTruncatedSnapshot(t *testing.T) {
+	s := newTestStore(t)
+	mustAdd(t, s, "截断校验用的记忆")
+	dest := filepath.Join(t.TempDir(), "snap.db")
+	if err := s.Backup(dest); err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+	if err := os.Truncate(dest, 512); err != nil {
+		t.Fatalf("截断快照: %v", err)
+	}
+	if err := VerifyBackup(dest); err == nil {
+		t.Fatal("截断的快照必须校验失败")
+	}
+}
+
+func TestVerifyBackupRejectsMissingFile(t *testing.T) {
+	if err := VerifyBackup(filepath.Join(t.TempDir(), "nope.db")); err == nil {
+		t.Fatal("不存在的备份路径必须报错")
 	}
 }

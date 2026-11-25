@@ -93,7 +93,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R12** | 写侧自动决策链路 | 窗口内 `obs-append` → `event=distill`（按 `source` 分流）→ 失败状态数 → `accept` / `reject` 计数；只读 `audit.jsonl` + `mem eval activity --json` | 有蒸馏且失败 0 | 断链或失败 1–3 | 失败 >3 |
 | **R13** | 注入体量 | 窗口内读侧（`session-start` / `prompt-submit` / `pre-compact`）审计记录 `inject_bytes` 的**最大值**（无样本记 `INFO`） | ≤3600 | 3601–8000 | >8000 |
 | **R14** | 归档体量 | `~/.v2mem/evidence` 下文件数与总字节（`find` / `du`，只读）；detail 附 `mem stats --json` 的 `size_bytes` 作对照 | ≤512MiB | >512MiB | —（不设 FAIL，见依据） |
-| **R15** | 候选 TTL 执行 | `mem candidates ls --json` 中 `created_at` 超过 **14 天**的 pending 条数；超期时执行 `mem gc --candidates` 做 pending → expired（存在 90 天前的已采纳行时**不执行**，转人工） | 0 条超期 | 有超期（已自动过期，或转人工未执行） | — |
+| **R15** | 候选 TTL | `mem candidates ls --json` 中 `created_at` 超过 **14 天**的 pending 条数；**只报不处置**：超期报 WARN 并给手工命令与复核提示，状态迁移/删除归维护入口或人工 | 0 条超期 | 有超期（只报不处置） | — |
 
 阈值依据（不凭空定）：
 
@@ -277,26 +277,23 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
     加文件数。**不做「折算成多少条观测」的推算**：`gc` 之后行数会降而文件数不降，两者本就会脱钩，
     判据只量落盘量，不量语义。主库 `size_bytes` 仅作对照——主库与归档通常同源增长（观测行），
     但主库会因 freelist 复用而平台化，归档不会。
-  - **不随冷启动降级**：它是累计量，与库里有几条记忆无关。
-    （R15 的 `gc --candidates` 是**唯一例外**，且只做状态迁移，见下条。）
-- **R15 的 14 天与「单侧自主」（2026-11-17 新增）**：TTL 阈值不是新定的，是照抄
-  `GCCandidates` 的默认值（`internal/store/candidates.go:380`，`cmd/mem/main.go:849`
+  - **不随冷启动降级**：它是累计量，与库里有几条记忆无关。（R15 同样不写库，只报不处置，见下条。）
+- **R15 的 14 天与「只报不处置」（2026-11-17 新增，2026-11-25 S3 收口）**：TTL 阈值不是新定的，
+  是照抄 `GCCandidates` 的默认值（`internal/store/candidates.go:380`，`cmd/mem/main.go`
   传入 `14*24h` / `90*24h`）。加这条判据的原因是**机制存在但没人执行**：
   2026-11-17 实测本机 2 条 11-02 候选已超期 14.8 天仍是 `pending`，`crontab` 与
   `LaunchAgents` 均无调度，而 `mem gc --candidates` 只有手工入口——TTL 形同虚设，
   且失效是**静默的**（不报错，只是永不生效），表现为 pending 只增不减、R8 长期 FAIL。
-  - 为什么不在 hook 里做：`design-write-governance.md` §12.5 已否决「挂 `SessionStart`
-    自动过期」——撞 §5 hooks 只读护栏、污染 R3 读侧延迟口径、且用户看不见。
-    巡检是宿主侧运维动作（§6），不在这三条理由的适用范围内，故只在此处落地。
-  - **只做状态迁移，不做行删除**：`pending → expired` 行仍在库、`--status expired` 可查、
-    不删 `memories`、不影响 R6。`GCCandidates` 还含一条「删 90 天以上 accepted 行」的
-    `DELETE`，不可逆，属 §12.5 要人判的那一类：脚本先查是否存在待删的已采纳行，
-    **有就不执行**，只报 `WARN` 并给出命令。
-  - 判级无 `FAIL` 档：自动过期后即自愈，下一窗口回 `PASS`；`WARN` 的含义是「本窗口发生了
-    过期处置」或「该处置被转人工」，都需要人知道一次。
-  - **顺序约束**：R15 必须排在 R8 / R9 之后。先按过期前的实际状态判积压，再处置，
-    否则会把自己刚清空的结果误读成「本来就没积压」。detail 会注明「R8 本窗口仍按过期前计数」。
-  - `--no-gc` 关掉处置（只判级不动库），供排障与只读复现使用。
+  - **巡检只读，处置归维护**：`design-data-lifecycle.md` §3 把状态迁移与物理删除划给
+    `mem maintain`（或人工），巡检只判级。`GCCandidates` 还含一条「删 90 天以上 accepted 行」
+    的 `DELETE`，不可逆，属 §12.5 要人判的那一类——让一个自称只读的定时脚本执行它，
+    等于把不可逆决策藏进 cron。故 R15 超期时只报 `WARN`，detail 给手工命令与
+    「先复核 90 天前的已采纳行」的静态提示，**不查 accepted、不调 gc**。
+  - 为什么不在 hook 里自动处置：`design-write-governance.md` §12.5 已否决「挂 `SessionStart`
+    自动过期」——撞 hooks 只读护栏、污染 R3 读侧延迟口径、且用户看不见。
+  - 判级无 `FAIL` 档：`WARN` 的含义是「有超期候选待人处置」，需要人知道一次；
+    处置后下一窗口回 `PASS`。
+  - 巡检没有写开关：只读是默认且唯一的行为。
 
 ---
 
@@ -342,7 +339,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | R12 写侧决策断链 / 失败 | 自动蒸馏没推进，或蒸馏落了失败状态 | **只读诊断，不要重跑 `mem distill` 掩盖问题**。断链（`obs-append` 有量但 `event=distill=0`）：按 §8.1 核对 `MEM_DISTILL_SPAWN` / `MEM_PROPOSAL_HOOK` / `MEM_NO_DISTILL` 是否按预期导出，查宿主 stderr 有无 `startDistillProc` 失败，确认是否按 §8.4 有意关闭；再跑 `sqlite3 -readonly ~/.v2mem/mem.db "SELECT status,error,attempt,started_at FROM distill_runs ORDER BY started_at DESC LIMIT 20;"` 看是否真的没落 run。失败态：查 `distill_runs` 的 `error` / `attempt` 与 `evidence_bundles` 是否 `backlog` / `quarantined` 挡住后续窗口。detail 里 `proposal=0` 且已开灰度 → 按 §8.3 做名单自证，**不要只看「钩子正常」**。detail 里零裁决 → 按 §5 R8 在对应工程会话就近裁决 |
 | R13 注入体量越线 | 预算被调高，或 `session-start` 类码表膨胀 | 先查是否有人把 `MEM_PRECOMPACT_BUDGET` 或其他预算变量调高（`pre-compact` 单独读这个环境变量，见 `cmd/mem/hook.go:156-161` 的 `positiveEnvInt` 分支）；再查 `session-start` 的类码表是否膨胀——它恒定注入、不随库增长，是体积主项。确认是有意为之就调阈值并留记录，**不要**靠删记忆来降体积 |
 | R14 归档体量越线 | 归档增长快于观测保留策略 | 先分因：① **量增长**（文件数与字节同步涨）→ 按下面两步回收，再裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**回收只有一条路**：先 `mem gc --obs`（删观测行）再 `mem gc --evidence`（删已无观测引用的段与磁盘文件），两条合跑即同一轮生效；`--evidence` 有 1h 写入保护期。单跑 `--evidence` 在观测未回收时释放 0 字节——**不要**据此认为功能失效。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处。确认接受现状就上调阈值并在提交信息里写明原因 |
-| R15 候选超期 / 转人工 | TTL 从未被执行，或存在待删的已采纳行 | 看 detail 区分两种情形：①「已过期 N 条」= 本轮已执行迁移，无需动作，下个窗口应回 `PASS`；②「未执行」= 有 90 天前的已采纳行会被连带删除，确认后手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`，或先 `mem candidates ls --status accepted` 复核。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
+| R15 候选超期 | TTL 从未被执行 | 巡检**只报不处置**。先复核 90 天前的已采纳行（`mem candidates ls --status accepted -db ~/.v2mem/mem.db`）——`gc --candidates` 会连带删除它们、不可逆；确认后再手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`（pending → expired，行仍在库）。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
@@ -352,13 +349,13 @@ B 工程刚起步」不会被混算成一个 FAIL。
 
 - 定时任务：每 12 小时跑 `scripts/watch-v2mem.sh --window 12h`。
 - 基线快照：`~/.v2mem/watch-state.json`（`{ts,total,window}`），供 R6 对比；首次跑记为 `INFO`。
-- 脚本**只读**库与配置，唯一写入是上述快照。`--quiet` 只输出非 PASS 项，`--json` 供机器消费。
+- 脚本**全程只读**：不写库、不改配置、不执行任何写子命令（`gc` / `maintain` / `accept` /
+  `reject` / `consolidate` / `import` / `ingest`）。唯一写入是上述快照 `watch-state.json`。
+  `--quiet` 只输出非 PASS 项，`--json` 供机器消费。
   R12 额外调用的 `mem eval activity --json` 只读 `audit.jsonl`（`cmdEvalActivity` 不打开数据库），
   不写审计、不写库；该命令不可用时 R12 仍按审计独立判级。
-- **R15 是「只读」的唯一例外**：候选超期时脚本会执行一次 `mem gc --candidates`（只做
-  `pending → expired`，不删 `memories`；存在待删已采纳行时转人工不执行）。这是有意的：
-  TTL 机制在代码里，执行者若只有「用户记得跑 CLI」，它就永远不会生效。`--no-gc` 可关掉
-  这一步，使脚本回到纯只读。
+- R15 超期只报 `WARN` 并给手工命令：状态迁移与物理删除归 `mem maintain` 或人工，
+  巡检不替人做不可逆决策；只读是默认且唯一的行为，没有需要关掉的写路径。
 - 告警口径：只有 `FAIL` 需要人介入；`WARN` 观察，`INFO` 忽略。
 
 ---

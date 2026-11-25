@@ -15,10 +15,9 @@ trap 'rm -rf "$TMP"' EXIT
 NOW="$(date +%s)"
 N=0
 
-# R15 默认关掉自动过期：本测试整体保持只读，只有 R15 组显式打开。
-R15_FLAGS="--no-gc"
-GC_LOG="$TMP/gc-calls.log"
-: > "$GC_LOG"
+# R15 只读断言靠 stub 落盘的完整 argv（空写集 / 无 --status accepted 额外查询）。
+ARGV_LOG="$TMP/argv.log"
+: > "$ARGV_LOG"
 
 # cand_json <project> <n> [content] [created_at]：造 n 条 pending 候选。
 # content 可塞 transcript 载荷用于 R9；默认是可读的原子事实。
@@ -43,20 +42,18 @@ build_fixture() {
 
   cat > "$d/mem-stub" <<'STUB'
 #!/usr/bin/env bash
+# 记录完整 argv：R15 的「只读」断言就靠它——写子命令一个都不许出现。
+printf '%s\n' "$*" >> "${STUB_ARGV_LOG:-/dev/null}"
 case "${1:-}" in
   stats)
     echo "总条数 ${STUB_TOTAL:-10}"
     if [ -n "${STUB_PROJ_STATS:-}" ]; then printf '按工程   %s\n' "$STUB_PROJ_STATS"; fi
     ;;
-  candidates)
-    # R15 要用 --status accepted 单独查已采纳行（判断是否有 90 天前待删行）。
-    case " $* " in
-      *" --status accepted "*) printf '%s\n' "${STUB_ACC_JSON:-[]}" ;;
-      *) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
-    esac
-    ;;
+  candidates) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
   eval) printf '%s\n' "${STUB_ACTIVITY_JSON:-}" ;;
-  gc) printf 'gc\n' >> "${STUB_GC_LOG:-/dev/null}" ;;
+  # 任何写子命令都会落一个标记文件：⑥ 的「除 watch-state.json 外无写入」才有牙。
+  gc|maintain|accept|reject|consolidate|import|ingest)
+    : > "${STUB_WRITE_MARK:-/dev/null}" ;;
 esac
 exit 0
 STUB
@@ -109,12 +106,12 @@ run_watch() {
   HOME="$d/home" \
   MEM_BIN="$d/mem-stub" \
   STUB_CAND_JSON="$cands" \
-  STUB_ACC_JSON="${STUB_ACC_JSON:-[]}" \
   STUB_ACTIVITY_JSON="$activity" \
   STUB_PROJ_STATS="$proj_stats" \
   STUB_TOTAL="$total" \
-  STUB_GC_LOG="$GC_LOG" \
-    bash "$WATCH" --json $R15_FLAGS 2>/dev/null || true
+  STUB_ARGV_LOG="$ARGV_LOG" \
+  STUB_WRITE_MARK="$d/v2mem/write-mark.db" \
+    bash "$WATCH" --json 2>/dev/null || true
 }
 
 # run_case <名称> <stop_ms|none> <wal_frames> <obs_append> <candidates_json>
@@ -336,54 +333,96 @@ assert_r9_detail r9_mixed_counts_fresh \
 # >3 且全为存量：判 FAIL，但结论落在「先清理、再复查」，不诬指准入逻辑。
 assert_r9_detail r9_legacy_fail "$(cand_json A 4 'Shell {"command":"ls"}' "$OLD")" "全为存量（最早 14 天前），非本窗口新增"
 
-# ---------- R15 候选 TTL 执行 ----------
-# 口径：pending 超 14 天 → WARN 并执行 mem gc --candidates（只做 pending → expired）；
-# 存在 90 天前的已采纳行时转人工不执行（GCCandidates 那一步是 DELETE，不可逆）；
-# --no-gc 只判级不动库。R15 必须排在 R8/R9 之后，故 detail 声明「R8 仍按过期前计数」。
-STALE=$(( NOW - 15*86400 ))      # 越过 14 天阈值
-FRESH_ACC=$(( NOW - 10*86400 ))  # 已采纳但未满 90 天：不触发删除分支
-OLD_ACC=$(( NOW - 100*86400 ))   # 已采纳且超 90 天：必须转人工
+# ---------- R15 候选 TTL：只报不处置（巡检只读） ----------
+# 口径：pending 超 14 天 → WARN，detail 说明「只报不处置」并给手工命令与静态复核提示。
+# 断言的核心不是文案而是**行为**：stub 记完整 argv，写子命令（gc / maintain / accept /
+# reject / consolidate / import / ingest）一个都不许出现；除 watch-state.json 外无文件被写。
+STALE=$(( NOW - 15*86400 ))     # 越过 14 天阈值
+OLD_ACC=$(( NOW - 100*86400 ))  # 90 天前的已采纳行：只作静态提示，不查、不处置
 
-assert_r15() { # <名称> <pending_json> <accepted_json> <no_gc 0|1> <want_level> <detail 子串> <gc 次数>
-  local name="$1" cands="$2" acc="$3" nogc="$4" want="$5" needle="$6" want_gc="$7"
-  local out got detail before after calls
-  before="$(wc -l < "$GC_LOG" | tr -d ' ')"
-  if [ "$nogc" -eq 1 ]; then R15_FLAGS="--no-gc"; else R15_FLAGS=""; fi
-  out="$(STUB_ACC_JSON="$acc" run_case "$name" 100 0 no "$cands")"
-  R15_FLAGS="--no-gc"
-  after="$(wc -l < "$GC_LOG" | tr -d ' ')"
-  calls=$(( after - before ))
-  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R15") | .level')"
-  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R15") | .detail')"
-  if [ "$got" != "$want" ]; then
-    echo "FAIL $name: R15 want=$want got=${got}（${detail}）" >&2
-    printf '%s\n' "$out" >&2
-    exit 1
-  fi
-  if [[ "$detail" != *"$needle"* ]]; then
-    echo "FAIL $name: R15 detail 缺 '${needle}'，got: ${detail}" >&2
-    exit 1
-  fi
-  if [ "$calls" != "$want_gc" ]; then
-    echo "FAIL $name: gc 调用 ${calls} 次，期望 ${want_gc} 次" >&2
-    exit 1
-  fi
-  N=$((N+1))
-  printf 'ok  %-26s R15=%-4s gc=%s\n' "$name" "$got" "$calls"
+R15_FAILS=0
+r15_fail() { echo "FAIL $1: $2" >&2; R15_FAILS=$((R15_FAILS+1)); }
+r15_level()  { printf '%s' "$R15_OUT" | jq -r '.items[] | select(.id=="R15") | .level' 2>/dev/null || true; }
+r15_detail() { printf '%s' "$R15_OUT" | jq -r '.items[] | select(.id=="R15") | .detail' 2>/dev/null || true; }
+r15_ok() { N=$((N+1)); printf 'ok  %-26s R15=%s\n' "$1" "$(r15_level)"; }
+
+# r15_run <名称> <pending_json>：fixture + 清 argv 日志 + 前后文件哈希基线
+r15_run() {
+  local name="$1" cands="$2"
+  R15_DIR="$TMP/$name"
+  build_fixture "$R15_DIR" 100 0 no
+  : > "$ARGV_LOG"
+  R15_BEFORE="$(find "$R15_DIR" -type f ! -name watch-state.json -exec shasum {} + | sort)"
+  R15_OUT="$(run_watch "$R15_DIR" "$cands")"
+  R15_AFTER="$(find "$R15_DIR" -type f ! -name watch-state.json -exec shasum {} + | sort)"
+  R15_ARGV="$(cat "$ARGV_LOG")"
 }
 
-# 无超期：PASS，且绝不动库。
-assert_r15 r15_no_stale "$(cand_json A 2)" '[]' 0 PASS "无超过 14 天的 pending" 0
-# 有超期：WARN + 执行一次状态迁移。
-assert_r15 r15_stale_gc "$(cand_json A 2 'ok' "$STALE")" '[]' 0 WARN "已执行 mem gc --candidates" 1
-# --no-gc：判级照旧，但不执行（排障与只读复现用）。
-assert_r15 r15_no_gc_flag "$(cand_json A 2 'ok' "$STALE")" '[]' 1 WARN "--no-gc 下不自动过期" 0
-# 有 90 天前已采纳行：DELETE 分支不可逆，转人工，绝不自动执行。
-assert_r15 r15_accepted_guard \
-  "$(cand_json A 2 'ok' "$STALE")" "$(cand_json A 1 'ok' "$OLD_ACC")" 0 WARN "会被连带删除" 0
-# 已采纳但未满 90 天：删除分支不会命中，正常执行迁移。
-assert_r15 r15_accepted_fresh \
-  "$(cand_json A 2 'ok' "$STALE")" "$(cand_json A 1 'ok' "$FRESH_ACC")" 0 WARN "已执行 mem gc --candidates" 1
+# ① 有超期：WARN + 「只报不处置」。
+r15_run r15_stale_warn_only "$(cand_json A 2 'ok' "$STALE")"
+if [ "$(r15_level)" != WARN ]; then
+  r15_fail r15_stale_warn_only "want=WARN got=$(r15_level)（$(r15_detail)）"
+elif [[ "$(r15_detail)" != *"只报不处置"* ]]; then
+  r15_fail r15_stale_warn_only "detail 缺「只报不处置」，got: $(r15_detail)"
+else
+  r15_ok r15_stale_warn_only
+fi
+
+# ② 无超期：PASS，且 detail 复述与 GCCandidates 同源的 14 天。
+r15_run r15_no_stale "$(cand_json A 2)"
+if [ "$(r15_level)" != PASS ]; then
+  r15_fail r15_no_stale "want=PASS got=$(r15_level)（$(r15_detail)）"
+elif [[ "$(r15_detail)" != *"无超过 14 天的 pending"* ]]; then
+  r15_fail r15_no_stale "detail 缺「无超过 14 天的 pending」，got: $(r15_detail)"
+else
+  r15_ok r15_no_stale
+fi
+
+# ③ 写子命令全集为空：巡检不许调 gc / maintain / accept / reject / consolidate / import / ingest。
+r15_run r15_argv_no_write "$(cand_json A 2 'ok' "$STALE")"
+WRITE_HITS="$(printf '%s\n' "$R15_ARGV" | awk 'NF {print $1}' \
+  | grep -Ex 'gc|maintain|accept|reject|consolidate|import|ingest' || true)"
+if [ -z "$R15_ARGV" ]; then
+  r15_fail r15_argv_no_write "stub 没记录到任何 argv，断言无法成立"
+elif [ -n "$WRITE_HITS" ]; then
+  r15_fail r15_argv_no_write "巡检调了写子命令: $(printf '%s' "$WRITE_HITS" | tr '\n' ' ')"
+else
+  r15_ok r15_argv_no_write
+fi
+
+# ④ 有 90 天前已采纳行：只在 detail 里静态提示「先复核」，不再多做一次 accepted 查询。
+r15_run r15_accepted_static \
+  "$(merge_json "$(cand_json A 2 'ok' "$STALE")" "$(cand_json B 1 'ok' "$OLD_ACC")")"
+if [[ "$(r15_detail)" != *"先复核 90 天前"* ]]; then
+  r15_fail r15_accepted_static "detail 缺「先复核 90 天前」静态提示，got: $(r15_detail)"
+elif printf '%s\n' "$R15_ARGV" | grep -q -- '--status accepted'; then
+  r15_fail r15_accepted_static "巡检仍额外查询 accepted（巡检不该替人判断连带删除）"
+else
+  r15_ok r15_accepted_static
+fi
+
+# ⑤ --no-gc 已删除：参数解析必须报未知参数（退出码以 main 实际行为为准，只要求非 0）。
+NOGC_ERR="$TMP/nogc.err"
+if bash "$WATCH" --no-gc >/dev/null 2>"$NOGC_ERR"; then
+  r15_fail r15_no_gc_flag "已删除的 --no-gc 仍被接受（退出码 0）"
+elif ! grep -q '未知参数' "$NOGC_ERR"; then
+  r15_fail r15_no_gc_flag "--no-gc 应以「未知参数」失败，stderr: $(tr '\n' ' ' < "$NOGC_ERR")"
+else
+  N=$((N+1)); printf 'ok  %-26s --no-gc 被拒\n' r15_no_gc_flag
+fi
+
+# ⑥ 唯一写入是 watch-state.json：其余文件哈希前后必须完全一致。
+r15_run r15_only_state_file "$(cand_json A 2 'ok' "$STALE")"
+if [ "$R15_BEFORE" != "$R15_AFTER" ]; then
+  r15_fail r15_only_state_file "除 watch-state.json 外还有文件被写"
+else
+  r15_ok r15_only_state_file
+fi
+
+if [ "$R15_FAILS" -ne 0 ]; then
+  echo "R15 组失败 ${R15_FAILS} 例（巡检必须全程只读）" >&2
+  exit 1
+fi
 
 # R2 按工程口径：只有「该工程库内 ≥20 条」的样本才进命中率分母。
 # 旧实现用全局 empty/A_PROMPT 算，窗口内提问全落在空库工程上时会稳定误判 FAIL。
@@ -593,9 +632,9 @@ TOT_DIR="$TMP/tot_annotated"
 build_fixture "$TOT_DIR" none 0 no
 TOT_ERR="$TMP/tot.err"
 tot_out="$(V2MEM_DIR="$TOT_DIR/v2mem" WORKBUDDY_CONFIG_DIR="$TOT_DIR/wb" HOME="$TOT_DIR/home" \
-  MEM_BIN="$TOT_DIR/mem-stub" STUB_CAND_JSON="$EMPTY" STUB_ACC_JSON="$EMPTY" \
+  MEM_BIN="$TOT_DIR/mem-stub" STUB_CAND_JSON="$EMPTY" \
   STUB_TOTAL='20527（全库各数据表之和）' \
-  bash "$WATCH" --json $R15_FLAGS 2>"$TOT_ERR" || true)"
+  bash "$WATCH" --json 2>"$TOT_ERR" || true)"
 if grep -qi 'integer expression' "$TOT_ERR"; then
   echo "FAIL tot_annotated: 仍把 stats 注解当数字: $(tr '\n' ' ' < "$TOT_ERR")" >&2
   exit 1

@@ -95,12 +95,12 @@ search 选项:
 gc 选项:
   --max-idle <dur>      久未命中阈值（默认 720h，即 30 天）
   --min-salience <f>    低于此重要性才淘汰（默认 0.2）
-  --no-backup           跳过 gc 前的库备份
-  --backup-dir <dir>    备份目录（默认 <库目录>/backup）
+  --no-backup           危险：跳过 gc 前的库备份，并连同归档文件级备份一起跳过（逃生口）
+  --backup-dir <dir>    备份根（默认 <库目录>/backup）；归档备份落在其 evidence-gc-<时间戳>/
   --obs                 只回收 observations（不删 memories）
   --max-age <dur>       与 --obs 合用：观测保留时长（默认 720h）
   --candidates          只回收候选：pending 超 14 天标过期，accepted 超 90 天删除（不删 memories）
-  --evidence            回收无观测引用的证据归档段与磁盘文件（可与 --obs 合用，先观测后归档）
+  --evidence            回收无观测引用的证据归档段（先移入备份根，再删账本；可与 --obs 合用，先观测后归档）
   --evidence-grace <dur> 与 --evidence 合用：写入保护期（默认 1h，刚写入的段不回收）
   --audit               回收审计账本：超期的 distill_runs / read_traces（不删 memories）
   --audit-age <dur>     与 --audit 合用：账本保留时长（默认 720h）
@@ -818,6 +818,23 @@ func cmdGC(args []string) error {
 	if *obsOnly && *candOnly {
 		return errors.New("--obs 与 --candidates 不能同时使用")
 	}
+
+	// 备份前置到分支派发**之前**：一次快照覆盖默认分支、四个子分支与合跑。
+	// 放在分支之后会让 --obs / --candidates / --evidence / --audit 完全不备份——
+	// 它们删的字节同样不可逆，正是 S3 要堵的口子。备份/校验失败直接返回，业务零执行。
+	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
+	if err != nil {
+		return err
+	}
+	if bak != "" && !c.json {
+		fmt.Printf("已备份 → %s\n", bak)
+	}
+	// 归档段的文件级备份与库快照共用备份根；--no-backup 是逃生口，连归档备份一起跳过。
+	backupRoot := ""
+	if !*noBackup {
+		backupRoot = backupDirFor(c.db, *backupDir)
+	}
+
 	// --obs / --evidence / --audit 允许合并且顺序固定：先回收观测，被删观测对应的
 	// 归档段这一轮才成为孤儿；账本排在最后，因为「会话是否还在写观测」正是它判断
 	// 「这条轨迹能不能删」的依据——观测没先清掉，活跃会话的轨迹就不会被回收。
@@ -833,7 +850,7 @@ func cmdGC(args []string) error {
 			}
 		}
 		if *evOnly {
-			if err := cmdGCEvidence(c, *evGrace); err != nil {
+			if err := cmdGCEvidence(c, *evGrace, backupRoot); err != nil {
 				return err
 			}
 		}
@@ -841,14 +858,6 @@ func cmdGC(args []string) error {
 			return cmdGCAudit(c, *auditAge)
 		}
 		return nil
-	}
-
-	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
-	if err != nil {
-		return err
-	}
-	if bak != "" && !c.json {
-		fmt.Printf("已备份 → %s\n", bak)
 	}
 
 	st, err := store.Open(c.db)
@@ -890,19 +899,24 @@ func cmdGCObservations(c common, maxAge time.Duration) error {
 //
 // 破坏性（删磁盘字节）且不进 --obs 的默认路径：必须显式 --evidence。
 // 写入保护期默认 1h，避免把「已落文件、还没写账」的段当成孤儿删掉。
-func cmdGCEvidence(c common, grace time.Duration) error {
+// backupRoot 非空时先做文件级备份（移入 evidence-gc-<时间戳>/ + manifest），
+// 全部落位后才删账本；只有 --no-backup 才传空串（逃生口，直接删）。
+func cmdGCEvidence(c common, grace time.Duration, backupRoot string) error {
 	es, err := openEvidenceSession(c.db)
 	if err != nil {
 		return err
 	}
 	defer es.Close()
 
-	res, err := es.engine.GCEvidence(time.Now().Add(-grace).Unix())
+	res, err := es.engine.GCEvidenceBackup(time.Now().Add(-grace).Unix(), backupRoot)
 	if err != nil {
 		return err
 	}
 	if c.json {
 		return printJSON(res)
+	}
+	if res.BackupDir != "" {
+		fmt.Printf("归档备份 → %s（%d 个文件）\n", res.BackupDir, res.BackedUp)
 	}
 	fmt.Printf("已回收归档段 %d（%d 条原始事件，释放 %.1f MB），账本外残文件 %d，临时文件 %d，空转证据源 %d\n",
 		res.Segments, res.RawEvents, float64(res.Bytes)/1024/1024,
