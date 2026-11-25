@@ -87,6 +87,53 @@ func (s *Store) NextOpenProposalBundle() (*ProposalBundle, bool, error) {
 	return b, true, nil
 }
 
+// NextRunnableProposalBundle 按「源头调度」返回下一个可运行的 Bundle。
+//
+// 与 NextOpenProposalBundle 只差一件事：排队单位从「全局最老的一条」变成
+// 「每个源的最老头」。每个 (source_id, generation) 只看自己最老的 open
+// Bundle——头在退避（not_before > now）或被租约占着，整个源就让位，绝不越过它
+// 去跑同源后面的窗口。两条理由：
+//   - 防打穿连续水位：失败窗口一旦被同源新窗口越过，§8.1「连续窗口不得越过
+//     失败窗」的顺序铁律就没了，证据会被永久跳过；
+//   - 防全局阻塞：单源最坏退避 16 分钟，若按全局最老排队，一个坏头就能把全部
+//     源一起冻住（§10 P1「最老优先 + 按源公平调度」）。
+//
+// 可运行的头之间仍取 created_at ASC, id ASC 最老的一条：不引入轮转状态也不
+// 饿死谁——被挡住的源只是暂时让位，退避结束就凭年龄重新排队。
+// now<=0 取当前时间；没有任何可运行头时返回 (nil,false,nil)。
+func (s *Store) NextRunnableProposalBundle(now int64) (*ProposalBundle, bool, error) {
+	if now <= 0 {
+		now = time.Now().Unix()
+	}
+	// 单条 SQL：外层筛「自身可运行」，NOT EXISTS 保证自己是本源最老的 open 窗口。
+	b, err := scanProposalBundle(s.db.QueryRow(`SELECT `+proposalBundleColumns+`
+		FROM evidence_bundles b
+		WHERE b.status IN `+proposalOpenStatuses+`
+		  AND b.not_before <= ?
+		  AND (b.lease_until <= ? OR b.lease_owner = '')
+		  AND NOT EXISTS (
+			SELECT 1 FROM evidence_bundles h
+			WHERE h.source_id = b.source_id
+			  AND h.generation = b.generation
+			  AND h.status IN `+proposalOpenStatuses+`
+			  AND (h.created_at < b.created_at
+			       OR (h.created_at = b.created_at AND h.id < b.id))
+		  )
+		ORDER BY b.created_at ASC, b.id ASC LIMIT 1`, now, now))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	ids, err := s.proposalBundleEvidenceIDs(b.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	b.EvidenceIDs = ids
+	return b, true, nil
+}
+
 // LoadProposalBundle 按 id 读 Bundle（含条目 id）。
 func (s *Store) LoadProposalBundle(id string) (*ProposalBundle, error) {
 	b, err := scanProposalBundle(s.db.QueryRow(`SELECT `+proposalBundleColumns+`

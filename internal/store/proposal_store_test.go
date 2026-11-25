@@ -135,6 +135,124 @@ func TestProposalBundleOldestBlocksLaterWindows(t *testing.T) {
 	}
 }
 
+// S6b：按源公平调度的定点构造——直接写调度字段，避免依赖真实时钟。
+// evidence_bundle_items 留空：本组用例只关心「谁的头可运行」，
+// 条目内容由 proposal 包的真实流程覆盖。
+func insertFairBundle(t *testing.T, s *Store, id, sourceID string, fromSeq int64,
+	status string, createdAt, notBefore, leaseUntil int64, leaseOwner string) {
+	t.Helper()
+	if _, err := s.db.Exec(`INSERT INTO evidence_bundles(id, source_id, generation,
+		from_seq_exclusive, to_seq_inclusive, evidence_hash, status, attempt,
+		not_before, lease_until, lease_owner, created_at, updated_at)
+		VALUES(?,?,1,?,?,?,?,0,?,?,?,?,?)`,
+		id, sourceID, fromSeq, fromSeq+1, "h-"+id, status,
+		notBefore, leaseUntil, leaseOwner, createdAt, createdAt); err != nil {
+		t.Fatalf("插入 Bundle %s: %v", id, err)
+	}
+}
+
+// F1：A 的头在退避（not_before 未来），B 的头可运行 → 返回 B。
+//
+// 对照组同时钉住：NextOpenProposalBundle 仍是全局最老（A 的头），
+// 公平调度是新口径，不是把旧语义改掉。
+func TestNextRunnableSkipsSourceWhoseHeadBacksOff(t *testing.T) {
+	s := newTestStore(t)
+	insertBacklogSource(t, s, "src-a", 1, 10, 0)
+	insertBacklogSource(t, s, "src-b", 1, 10, 0)
+	insertFairBundle(t, s, "bnd-a1", "src-a", 0, "fail", 100, 5000, 0, "")
+	insertFairBundle(t, s, "bnd-b1", "src-b", 0, "pending", 200, 0, 0, "")
+
+	got, ok, err := s.NextRunnableProposalBundle(1000)
+	if err != nil {
+		t.Fatalf("NextRunnableProposalBundle: %v", err)
+	}
+	if !ok || got.ID != "bnd-b1" {
+		t.Fatalf("退避中的 A 头应整源让位，返回 B: %+v ok=%v", got, ok)
+	}
+	if len(got.EvidenceIDs) != 0 {
+		t.Fatalf("无条目的 Bundle 应返回空证据集: %+v", got.EvidenceIDs)
+	}
+
+	head, ok, err := s.NextOpenProposalBundle()
+	if err != nil || !ok || head.ID != "bnd-a1" {
+		t.Fatalf("NextOpenProposalBundle 必须保持全局最老语义: %+v ok=%v err=%v", head, ok, err)
+	}
+}
+
+// F2：多个源的头都可运行 → 取 created_at 最老；同秒按 id 升序兜底。
+// now<=0 走当前时间分支：这些夹具的时间戳都远早于当下，仍应选中同一条。
+func TestNextRunnablePicksOldestRunnableHead(t *testing.T) {
+	s := newTestStore(t)
+	insertBacklogSource(t, s, "src-a", 1, 10, 0)
+	insertBacklogSource(t, s, "src-b", 1, 10, 0)
+	insertBacklogSource(t, s, "src-c", 1, 10, 0)
+	insertFairBundle(t, s, "bnd-a1", "src-a", 0, "pending", 300, 0, 0, "")
+	insertFairBundle(t, s, "bnd-c1", "src-c", 0, "pending", 100, 0, 0, "")
+	insertFairBundle(t, s, "bnd-b1", "src-b", 0, "pending", 100, 0, 0, "")
+
+	got, ok, err := s.NextRunnableProposalBundle(1000)
+	if err != nil || !ok || got.ID != "bnd-b1" {
+		t.Fatalf("应取 created_at 最老、同秒 id 最小者: %+v ok=%v err=%v", got, ok, err)
+	}
+	got, ok, err = s.NextRunnableProposalBundle(0)
+	if err != nil || !ok || got.ID != "bnd-b1" {
+		t.Fatalf("now<=0 应取当前时间并返回同一条: %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
+// F3：A 的头被挡住时，A 的第二窗绝不能顶上来；只有 A 有积压 → 无候选。
+func TestNextRunnableNeverSkipsBlockedSourceHead(t *testing.T) {
+	s := newTestStore(t)
+	insertBacklogSource(t, s, "src-a", 1, 10, 0)
+	insertFairBundle(t, s, "bnd-a1", "src-a", 0, "fail", 100, 5000, 0, "")
+	insertFairBundle(t, s, "bnd-a2", "src-a", 1, "pending", 200, 0, 0, "")
+
+	got, ok, err := s.NextRunnableProposalBundle(1000)
+	if err != nil {
+		t.Fatalf("NextRunnableProposalBundle: %v", err)
+	}
+	if ok {
+		t.Fatalf("头被挡住时整源让位，不得返回第二窗: %+v", got)
+	}
+
+	// 头恢复可运行后，返回的仍是头而不是更晚的第二窗。
+	if _, err := s.db.Exec(`UPDATE evidence_bundles SET not_before=0 WHERE id='bnd-a1'`); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err = s.NextRunnableProposalBundle(1000)
+	if err != nil || !ok || got.ID != "bnd-a1" {
+		t.Fatalf("头可运行时应先跑头: %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
+// F4：头被他人租约占住 → 整源让位；租约过期后恢复候选。
+func TestNextRunnableYieldsLeasedHeadUntilExpiry(t *testing.T) {
+	s := newTestStore(t)
+	insertBacklogSource(t, s, "src-a", 1, 10, 0)
+	insertBacklogSource(t, s, "src-b", 1, 10, 0)
+	insertFairBundle(t, s, "bnd-a1", "src-a", 0, "leased", 100, 0, 2000, "other")
+	insertFairBundle(t, s, "bnd-a2", "src-a", 1, "pending", 200, 0, 0, "")
+	insertFairBundle(t, s, "bnd-b1", "src-b", 0, "pending", 300, 0, 0, "")
+
+	got, ok, err := s.NextRunnableProposalBundle(1000)
+	if err != nil || !ok || got.ID != "bnd-b1" {
+		t.Fatalf("租约中的 A 头应整源让位: %+v ok=%v err=%v", got, ok, err)
+	}
+
+	// lease_until == now 视为已过期（边界取闭区间）。
+	got, ok, err = s.NextRunnableProposalBundle(2000)
+	if err != nil || !ok || got.ID != "bnd-a1" {
+		t.Fatalf("租约过期后应恢复 A 的头（不是第二窗）: %+v ok=%v err=%v", got, ok, err)
+	}
+
+	// owner 为空时，即使 lease_until 在未来也不算占用。
+	insertBacklogSource(t, s, "src-c", 1, 10, 0)
+	insertFairBundle(t, s, "bnd-c1", "src-c", 0, "pending", 50, 0, 9999, "")
+	if got, ok, err := s.NextRunnableProposalBundle(1000); err != nil || !ok || got.ID != "bnd-c1" {
+		t.Fatalf("owner 为空的租约不应挡住候选: %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
 func TestProposalRunSaveAndList(t *testing.T) {
 	s := newTestStore(t)
 	b := mustBundle(t, s, "uid-b-", 1)
