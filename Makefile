@@ -17,7 +17,7 @@ test: fmt-check test-watch test-flow
 test-flow:
 	CGO_ENABLED=0 go test -count=1 ./test/flow
 
-# 故障注入套件：六类故障 × hook/gc/distill（真实二进制 + 临时 HOME + SIGKILL/只读目录）。
+# 故障注入套件：F1–F12 × hook/gc/distill/maintain（真实二进制 + 临时 HOME + SIGKILL/只读目录）。
 # 独立门禁，不进默认 test：用例故意杀进程、等 SQLITE_BUSY，跑得慢且依赖 unix。
 test-faults:
 	CGO_ENABLED=0 go test -tags=faults -count=1 -timeout 300s ./test/faults
