@@ -256,33 +256,45 @@ func TestNextRunnableYieldsLeasedHeadUntilExpiry(t *testing.T) {
 func TestProposalRunSaveAndList(t *testing.T) {
 	s := newTestStore(t)
 	b := mustBundle(t, s, "uid-b-", 1)
-	rec := ProposalRunRecord{
-		SessionID: "sess-1", Provider: "local", Status: "ok", CandCount: 2,
-		StartedAt: 100, FinishedAt: 120, BundleID: b.ID, Executor: "local",
-		SchemaVersion: 1, GeneratedCount: 3, ValidCount: 2, InvalidCount: 1,
-		DuplicateCount: 1, Attempt: 2, SourceFingerprint: b.EvidenceHash,
-	}
-	if err := s.SaveProposalRun(rec); err != nil {
-		t.Fatal(err)
-	}
-	// 同 session + 同一秒：唯一约束冲突要自增 started_at 而不是丢账。
-	rec2 := rec
-	rec2.Status = "partial"
-	if err := s.SaveProposalRun(rec2); err != nil {
-		t.Fatalf("同秒运行账应重试: %v", err)
+	// 同 session 同一秒连续追账是合法形态（maintain 一次处理多个窗口）：
+	// v4 去掉了旧的表级 UNIQUE(session_id, started_at)，写入方不得再篡改时间戳。
+	const n = 5
+	for i := 0; i < n; i++ {
+		rec := ProposalRunRecord{
+			SessionID: "sess-1", Provider: "local", Status: "ok", CandCount: 2,
+			StartedAt: 100, FinishedAt: 120, BundleID: b.ID, Executor: "local",
+			SchemaVersion: 1, GeneratedCount: 3, ValidCount: 2, InvalidCount: 1,
+			DuplicateCount: 1, Attempt: i + 1, SourceFingerprint: b.EvidenceHash,
+		}
+		if i == 1 {
+			rec.Status = "partial"
+		}
+		if err := s.SaveProposalRun(rec); err != nil {
+			t.Fatalf("第 %d 条同秒运行账应落库: %v", i+1, err)
+		}
 	}
 	runs, err := s.ProposalRuns(b.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runs) != 2 {
-		t.Fatalf("应有 2 条运行账，got %d", len(runs))
+	if len(runs) != n {
+		t.Fatalf("应有 %d 条运行账，got %d", n, len(runs))
 	}
-	if runs[0].GeneratedCount != 3 || runs[0].Attempt != 2 || runs[0].SourceFingerprint == "" {
-		t.Fatalf("扩展列未写入: %+v", runs[0])
+	// 同一秒的运行账按 (started_at, id) 排序，行间无序：逐条核对列值，不假设首行。
+	seen := map[int]bool{}
+	for i, r := range runs {
+		if r.GeneratedCount != 3 || r.SourceFingerprint == "" {
+			t.Fatalf("第 %d 条扩展列未写入: %+v", i+1, r)
+		}
+		if r.StartedAt != 100 || r.FinishedAt != 120 {
+			t.Fatalf("第 %d 条时间戳被篡改: started=%d finished=%d", i+1, r.StartedAt, r.FinishedAt)
+		}
+		seen[r.Attempt] = true
 	}
-	if runs[1].StartedAt == runs[0].StartedAt {
-		t.Fatalf("冲突时应自增 started_at: %d vs %d", runs[0].StartedAt, runs[1].StartedAt)
+	for i := 1; i <= n; i++ {
+		if !seen[i] {
+			t.Fatalf("缺少 attempt=%d 的运行账", i)
+		}
 	}
 }
 

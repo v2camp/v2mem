@@ -211,9 +211,11 @@ CREATE TABLE IF NOT EXISTS distill_runs (
   invalid_count INTEGER NOT NULL DEFAULT 0,
   duplicate_count INTEGER NOT NULL DEFAULT 0,
   attempt       INTEGER NOT NULL DEFAULT 0,
-  source_fingerprint TEXT NOT NULL DEFAULT '',
-  UNIQUE(session_id, started_at)
+  source_fingerprint TEXT NOT NULL DEFAULT ''
 );
+-- 不再建 UNIQUE(session_id, started_at)：同 session 同一秒多条运行账是合法形态
+-- （maintain 一次追账处理多个窗口）。窗口幂等由部分索引 ux_distill_window 保护，
+-- 该索引在 Open 里等 ensureColumn 补完 window_key 之后再建。
 -- ux_distill_window 不放在这里：旧库的 distill_runs 还没有 window_key，
 -- 索引要等 Open 里 ensureColumn 之后再建。
 

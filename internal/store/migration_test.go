@@ -293,6 +293,223 @@ func TestMigrationAllowsFactCandidate(t *testing.T) {
 	}
 }
 
+// createV3DistillRunsDB 手工建一个带旧窗口唯一键的 v3 库：
+// 复现生产库「distill_runs 表内 UNIQUE(session_id, started_at)」的形态，
+// 并带上当时已有的两个索引，证明迁移会保留它们。
+func createV3DistillRunsDB(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open v3 db: %v", err)
+	}
+	defer db.Close()
+	stmts := []string{
+		`CREATE TABLE distill_runs (
+			id TEXT PRIMARY KEY, session_id TEXT NOT NULL, provider TEXT NOT NULL,
+			status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', cand_count INTEGER NOT NULL DEFAULT 0,
+			started_at INTEGER NOT NULL, finished_at INTEGER NOT NULL,
+			window_key TEXT NOT NULL DEFAULT '',
+			bundle_id TEXT NOT NULL DEFAULT '', executor TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '', model_version TEXT NOT NULL DEFAULT '',
+			prompt_version TEXT NOT NULL DEFAULT '', schema_version INTEGER NOT NULL DEFAULT 0,
+			generated_count INTEGER NOT NULL DEFAULT 0, valid_count INTEGER NOT NULL DEFAULT 0,
+			invalid_count INTEGER NOT NULL DEFAULT 0, duplicate_count INTEGER NOT NULL DEFAULT 0,
+			attempt INTEGER NOT NULL DEFAULT 0, source_fingerprint TEXT NOT NULL DEFAULT '',
+			UNIQUE(session_id, started_at))`,
+		`CREATE UNIQUE INDEX ux_distill_window
+			ON distill_runs(session_id, window_key) WHERE window_key <> ''`,
+		`CREATE INDEX ix_distill_bundle ON distill_runs(bundle_id)`,
+	}
+	for _, q := range stmts {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("v3 DDL: %v", err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		window := ""
+		if i == 0 {
+			window = "w-keep"
+		}
+		if _, err := db.Exec(`INSERT INTO distill_runs
+			(id, session_id, provider, status, started_at, finished_at, window_key)
+			VALUES (?,?,?,?,?,?,?)`,
+			fmt.Sprintf("v3-run-%d", i), "s-v3", "none", "ok", 100+i, 100+i, window); err != nil {
+			t.Fatalf("insert v3 run: %v", err)
+		}
+	}
+}
+
+// distillRunUniqueColumns 返回 distill_runs 上所有唯一索引的列组合。
+// 旧窗口唯一键在 SQLite 里是表级 UNIQUE 生成的自增索引（origin='u'），
+// 直接看索引比解析 DDL 文本更抗格式差异。
+func distillRunUniqueColumns(t *testing.T, st *Store) [][]string {
+	t.Helper()
+	rows, err := st.db.Query(`SELECT name, "unique" FROM pragma_index_list('distill_runs')`)
+	if err != nil {
+		t.Fatalf("pragma_index_list: %v", err)
+	}
+	defer rows.Close()
+	var out [][]string
+	for rows.Next() {
+		var name string
+		var unique int
+		if err := rows.Scan(&name, &unique); err != nil {
+			t.Fatalf("scan index_list: %v", err)
+		}
+		if unique != 1 {
+			continue
+		}
+		info, err := st.db.Query(`SELECT name FROM pragma_index_info(?) ORDER BY seqno`, name)
+		if err != nil {
+			t.Fatalf("pragma_index_info(%s): %v", name, err)
+		}
+		var cols []string
+		for info.Next() {
+			var col string
+			if err := info.Scan(&col); err != nil {
+				info.Close()
+				t.Fatalf("scan index_info: %v", err)
+			}
+			cols = append(cols, col)
+		}
+		info.Close()
+		out = append(out, cols)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("index_list rows: %v", err)
+	}
+	return out
+}
+
+func hasColumnPair(cols []string, a, b string) bool {
+	return len(cols) == 2 && cols[0] == a && cols[1] == b
+}
+
+// U5 真实缺陷回归：v3 库里的 distill_runs 旧窗口唯一键必须被 v4 迁移移除。
+// 同 session 同一秒的多条运行账是 maintain 连续追账的合法形态，不是冲突。
+func TestMigrationRemovesDistillRunsLegacyUniqueKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v3.db")
+	createV3DistillRunsDB(t, path)
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open v3: %v", err)
+	}
+	for _, cols := range distillRunUniqueColumns(t, st) {
+		if hasColumnPair(cols, "session_id", "started_at") {
+			t.Fatalf("迁移后仍存在 UNIQUE(session_id, started_at): %v", cols)
+		}
+	}
+	if n := migrationCount(t, st, "distill_runs"); n != 3 {
+		t.Fatalf("迁移后运行账行数 = %d，want 3", n)
+	}
+	var window string
+	if err := st.db.QueryRow(`SELECT window_key FROM distill_runs WHERE id='v3-run-0'`).Scan(&window); err != nil {
+		t.Fatalf("读迁移后窗口键: %v", err)
+	}
+	if window != "w-keep" {
+		t.Fatalf("迁移丢窗口键: %q", window)
+	}
+	for _, idx := range []string{"ux_distill_window", "ix_distill_bundle"} {
+		if migrationIndexSQL(t, st, idx) == "" {
+			t.Errorf("迁移后缺索引 %s", idx)
+		}
+	}
+	var version string
+	if err := st.db.QueryRow(`SELECT v FROM db_meta WHERE k='schema_version'`).Scan(&version); err != nil {
+		t.Fatalf("读 schema_version: %v", err)
+	}
+	if version != fmt.Sprint(CurrentSchemaVersion) {
+		t.Fatalf("schema_version = %q，want %d", version, CurrentSchemaVersion)
+	}
+
+	// 迁移后的表必须允许同 session 同秒连续写运行账，且时间戳原样保留。
+	for i := 0; i < 5; i++ {
+		if err := st.SaveProposalRun(ProposalRunRecord{
+			SessionID: "s-v3", Provider: "none", Status: "ok",
+			StartedAt: 200, FinishedAt: 200, Attempt: i + 1,
+		}); err != nil {
+			t.Fatalf("第 %d 条同秒运行账应落库: %v", i+1, err)
+		}
+	}
+	if n := migrationCount(t, st, "distill_runs"); n != 8 {
+		t.Fatalf("同秒追加后行数 = %d，want 8", n)
+	}
+	st.Close()
+
+	// 二次 Open 幂等：不再重建、行数与版本不变。
+	st, err = Open(path)
+	if err != nil {
+		t.Fatalf("二次 Open: %v", err)
+	}
+	defer st.Close()
+	if n := migrationCount(t, st, "distill_runs"); n != 8 {
+		t.Fatalf("二次 Open 后行数 = %d，want 8", n)
+	}
+	for _, cols := range distillRunUniqueColumns(t, st) {
+		if hasColumnPair(cols, "session_id", "started_at") {
+			t.Fatalf("二次 Open 又出现旧唯一键: %v", cols)
+		}
+	}
+	if err := st.SaveProposalRun(ProposalRunRecord{
+		SessionID: "s-v3", Provider: "none", Status: "ok", StartedAt: 200, FinishedAt: 200,
+	}); err != nil {
+		t.Fatalf("二次 Open 后同秒写入应继续可用: %v", err)
+	}
+}
+
+// 新库不得再带旧唯一键：schema.sql 与迁移路径必须收敛到同一形状。
+func TestFreshDistillRunsHasNoLegacyUniqueKey(t *testing.T) {
+	st := newTestStore(t)
+	for _, cols := range distillRunUniqueColumns(t, st) {
+		if hasColumnPair(cols, "session_id", "started_at") {
+			t.Fatalf("fresh DB 仍建了旧唯一键: %v", cols)
+		}
+	}
+}
+
+// 迁移失败路径：旧库异常时必须报错而不是留下半重建的表。
+func TestDistillRunsMigrationErrorPaths(t *testing.T) {
+	closed, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "closed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	if _, err := hasLegacyDistillRunUnique(closed); err == nil {
+		t.Fatal("关闭的库应报读索引错误")
+	}
+	if err := ensureDistillRunsSchema(closed); err == nil {
+		t.Fatal("关闭的库应报迁移错误")
+	}
+
+	// 重建目标表名已被占用：第一句 CREATE 就失败，事务回滚。
+	path := filepath.Join(t.TempDir(), "conflict.db")
+	createV3DistillRunsDB(t, path)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TABLE distill_runs_v4 (x TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDistillRunsSchema(raw); err == nil {
+		t.Fatal("目标表名冲突时应报错")
+	}
+	if n := migrationCountRaw(t, raw, "distill_runs"); n != 3 {
+		t.Fatalf("失败后旧表行数应保持 3，got %d", n)
+	}
+}
+
+func migrationCountRaw(t *testing.T, db *sql.DB, table string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
 func TestMigrationDistillRunCountersDefaultZero(t *testing.T) {
 	st := newTestStore(t)
 	if err := st.SaveDistillRun(DistillRun{
