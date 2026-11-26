@@ -410,7 +410,7 @@ func maintainRetentionStage(st *store.Store, dbPath string, dryRun bool, counts 
 		counts["backups"] = res.Files.Backups
 		counts["spawn_rotated"] = res.Files.SpawnRotated
 		counts["spool_tmp"] = res.Files.SpoolTmp
-		counts["cursors"] = res.Files.Cursors
+		counts["cursors_deleted"] = res.Files.CursorsDeleted
 		counts["cursors_listed"] = res.Files.CursorsListed
 	}
 	if res.DB != nil {
