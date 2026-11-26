@@ -111,9 +111,11 @@ proposal ok(processed=1) → adjudicate ok(committed=1) → consolidate ok(0) �
 - 结论：父正常退出/单 PID SIGKILL 下子进程存活并按租约恢复；重复触发只消费一次。
 - 已知限制：未设 `Setpgid`，`killpg`/Ctrl-C 会带走子进程；真实整机睡眠未测；
   子进程 stdout 丢弃。
-- **附带发现（未修）**：`candidates.run_id` 与 `evidence_bundles.last_run_id` 恒空。
-  `internal/proposal/runner.go:226` 赋值后被 `:239 out.Result = res` 覆盖，
-  `:257/:405` 按空值落库，`FinishProposalBundle` 幂等分支失效。下一轮修复。
+- **附带发现（已修复）**：`candidates.run_id` 与 `evidence_bundles.last_run_id` 曾恒空。
+  `internal/proposal/runner.go` 先给 `out.RunID` 赋值，随后 `out.Result = res` 又把它覆盖成空串；
+  修复后 RunID 在 `runClaimed` 入口生成、执行结果保留同一值，并作为 `distill_runs.id` 写入，
+  让候选/Bundle 的 run_id 指向真实运行账；回归用例
+  `TestRunnerRunIDLinksCandidateLedgerAndBundle` / `TestRunnerNoopRunIDLinksLedger`。
 
 ### 3.3 H：transcript cursor 终态回收（`2d00fb2` → merge `daf7bf9`）
 
@@ -168,12 +170,14 @@ proposal ok(processed=1) → adjudicate ok(committed=1) → consolidate ok(0) �
 
 ## 7. 未决 / 下一轮
 
-1. **run_id 修复**（G 发现）：`internal/proposal/runner.go:226/239`，影响候选—运行账关联与幂等分支。
-2. **吞吐/SLA**（D 发现）：钩子预算 1 窗、transcript 队头饥饿、BUSY 早停；需要单独任务，
+> 已关闭：run_id 联动（见 §3.2）——`candidates.run_id` /
+> `evidence_bundles.last_run_id` 现在指向真实 `distill_runs` 行。
+
+1. **吞吐/SLA**（D 发现）：钩子预算 1 窗、transcript 队头饥饿、BUSY 早停；需要单独任务，
    建议优先于继续扩大自动裁决。
-3. **生产启用**：`maintain --model-auto` 默认仍关；先在单项目灰度，观察
+2. **生产启用**：`maintain --model-auto` 默认仍关；先在单项目灰度，观察
    auto_commit/withdraw/correct 与 manual_rate，再开 hooks 默认。
-4. **accept/reject 最终删除**：等生产灰度签字；本轮仅标记 deprecated。
-5. **P4 Judge 扩权**：未启动；需先补标定样本、CAS、输入输出完整性与上下文。
-6. **已知限制**：真实整机睡眠未测；进程组信号会带走子进程；consolidate dry-run 无预览；
+3. **accept/reject 最终删除**：等生产灰度签字；本轮仅标记 deprecated。
+4. **P4 Judge 扩权**：未启动；需先补标定样本、CAS、输入输出完整性与上下文。
+5. **已知限制**：真实整机睡眠未测；进程组信号会带走子进程；consolidate dry-run 无预览；
    历史 memories.scope 未回填；`cursors` JSON 字段改名需外部脚本同步。
