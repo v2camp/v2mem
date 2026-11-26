@@ -356,12 +356,12 @@ ok  	github.com/v2camp/v2mem/test/e2e	7.348s
    「cursor 报数 0（删除 0，终态不可判定，波 5 遗留）」——cursor 只报数不处置的
    只读边界是本波刻意口径，终态回收留待后续波次（见 `cmd/mem/retention.go`
    CursorAge 注释）。
-3. **U 类演练偏离**（本环境无法真实演练的条目）：
-   - U1/U4 的**真实模型调用**（真实 key 失效→换 key）以假 CLI 等价验证到
-     invalid→fail→重试→ok 链路；网络层故障未演练。
-   - U6 需要真实 MCP 客户端配合，未演练。
-   - U7 真实机器睡眠唤醒未演练（用退避等待等价覆盖了接管与追赶路径）。
-   - U8 抽样复核需要 ≥10 条含高影响类型的记忆样本，临时库样本量不足，未演练。
+3. **U 类演练偏离**（2026-11-26 续跑已补做 U6/U8，详见 §7）：
+   - U1/U4 的真实 key 失效→换 key 仍未演练（codebuddy CLI 实测可用，无法制造真实
+     失效；以坏输出假 CLI 等价验证 invalid→fail→重试→ok）。
+   - U7 真实机器睡眠唤醒仍未演练（用退避窗口 + `--force` 等价覆盖接管与追赶）。
+   - 真实模型对自指验收文本连续返回合法空结果（noop），自动裁决的候选→记忆链路
+     由假 CLI 全链演练（§7.3 U1）。
 4. **F9 的 `maintain:last_fail_at` 未落地**（design-eval-flows §3.2.1 注）：失败
    可见性目前靠 `maintain --json` 与 R16 巡检，`maintain:last_fail_at` 键留待
    S11/后续补齐。
@@ -371,3 +371,74 @@ ok  	github.com/v2camp/v2mem/test/e2e	7.348s
 6. **G 类无法覆盖的内容级断言**（design-eval-flows §3.2 末尾清单）：spool 落盘
    重放、32000 rune 截断与 scrub 内容级、双 executor 等价性、revision CAS 并发
    竞态——已分别由故障注入（F2/F6）与单元用例覆盖或显式留待，不在 G1–G13 口径内。
+7. **真实环境新发现**（2026-11-26，详见 §7.5）：`memories.scope` 在采纳时未写入，
+   global/cross_project 的 scope 抽样分支实际永不命中；G7「无失败样本」判红、
+   G11/G13 对 legacy accepted 无证据强写未分桶——均为判据口径或历史数据问题。
+
+## 7. 真实环境走查记录（2026-11-26 续跑）
+
+> WorkBuddy 任务在 U5 发现真实缺陷后因额度耗尽中断（修复子代理未启动）。本轮在
+> `.worktree/fix-run-ledger` 接续：先修缺陷（提交 `1306860`），再装到本机、迁移
+> 生产库、复跑 U5 并补做 U1–U8。生产库操作前后均有 `.backup` 快照。
+
+### 7.1 安装、宿主与 v3→v4 迁移
+
+- `make install` 落 `~/go/bin/mem`；PATH 上的 `~/.local/bin/mem` 用「先删后拷」
+  替换。前序已复现真实坑：旧文件残留 `com.apple.provenance`，`cp` 覆盖后签名失配、
+  macOS 直接 SIGKILL（rc=137）。
+- 宿主三处（WorkBuddy 4 钩子、WorkBuddy MCP、Trae 3 钩子）均为绝对路径指向
+  `~/.local/bin/mem`，无 `MEM_*` 环境变量 → 换二进制即生效，零配置改动。
+- 生产库 v3→v4：迁移前备份 31,531,008 字节；首次 `mem stats` 触发迁移，**0.031s**
+  完成；279 条 `distill_runs` 行保留，旧唯一键消失，`ux_distill_window` /
+  `ix_distill_bundle` 重建，`schema_version=4`。
+- 前序失误留痕：SQLite `.backup` 里 `~` 不展开曾导致备份先失败、迁移已先跑
+  （幂等加列，无数据风险）；本轮改用绝对路径并在迁移前确认备份成功。
+
+### 7.2 U5 修复验证（生产库，真实数据）
+
+- 修复前（WorkBuddy 实测）：`mem maintain --catch-up --max-bundles 5` 报
+  「写 Proposal 运行账失败：started_at 冲突重试耗尽」；库内同 session
+  `74/75/76` 连续秒且 `finished_at=started_at`，正是撞键后 +1s 顶出的产物。
+- 修复后：一次追账处理 5 个 Bundle、耗时 0.066s，**5 条运行账同一 `started_at=
+  1795659507` 全部落库**，时间戳未被篡改；紧接着第二次追账继续处理 5 个新窗口，
+  逐 Bundle 运行账仍各 1 条（多运行账 Bundle = 0）。
+- 门禁：红 case 旧代码第 4 条即报同一错误；修复后 `make test`、`make cover-gate`
+  （store 82.0%，下限 82%）、`make test-faults`、`make test-e2e`、`perf` 全绿。
+- 人的视角：夹具通常「一个测试一个窗口」，永远碰不到同秒第 4 条；只有真实库连续
+  追账才暴露。这类缺陷是 U 类走查不可替代的价值。
+
+### 7.3 U1–U8 逐条结果
+
+| 条目 | 结果 | 真实 Case / 证据 | 人的视角与遗留 |
+|:---|:---|:---|:---|
+| U1 | ◐ | `codebuddy` CLI 真实链路可用（3 次均 `executor=cli:codebuddy@2.185.0+tpl2`，合法 noop、0 候选）；假 CLI 全链跑通 ok→候选→accept→search，临时库 `eval flow` **13/13**。真实钩子审计今日 session-start 10 / prompt-submit 13 / stop 11。 | 模型对自指验收文本连续判「无事实」，自动裁决链路需夹具等价；未重跑 `mem init`，避免改写宿主配置。 |
+| U2 | ◐ | 3 个会话各 prompt+stop → 每会话 2 条观测；SessionStart 注入含「待人工 1 项（未审核最老 3 天）」+「本工程 1 条 pending 候选」。生产 `eval flow` 8/13。 | 触达面可用；红项见 §7.4，全部为历史数据，不是多会话动线回归。 |
+| U3 | ✅ | `c63c5550` withdraw：检索 8→7 条；restore：7→8 条。动作账落 `commit_decisions(action=review_action)`，含 `before_state=confirmed/after_state=withdrawn`。`rollback --dry-run` matched 0（无版本归因样本）；`review stats` 无样本。 | restore 后回到「未审核」而非原 `confirmed`，会重新进待审队列——与「误拒回捞」定位一致，但验收文案「原路恢复」易误读。 |
+| U4 | ✅（等价） | 真实 `codebuddy -y -p ...` 探测 rc=0（可用），无法制造真实 key 失效；坏输出假 CLI：invalid→bundle fail attempt=1→退避期内 maintain blocked→`--force` attempt=2→换好输出 attempt=3 ok 并补 1 条候选。 | 失败不冒充 noop、重试账齐全；真实网络故障仍未演练。 |
+| U5 | ✅ | 见 §7.2；临时库连跑两次 `--catch-up` 均 `processed=0`，G10/G13 绿。 | 生产库「第二次仍有剩余源」是积压未清空，不是重复提交；幂等按逐 Bundle 运行账验证。 |
+| U6 | ✅ | 真实 stdio JSON-RPC：`initialize`（v2mem 0.1.0）、`tools/list` 8 个工具、`review_ls` summary 计数=2 且 `limit=1` 不截断计数、`search` 命中、`maintain_wake` 返回 `waked=true`。 | 无钩子宿主走 MCP 可推进维护，但无自动捕获——与能力上限标注一致。 |
+| U7 | ◐ | 退避窗内 maintain 返回 `backlog=1`「所有源的头都在退避或租约中」，未偷跑；`--force` 立即接管、attempt+1、旧 run 不被改写。 | 真实睡眠唤醒未演练；行为等价覆盖。 |
+| U8 | ◐ | 40 条 decision/project 自动采纳（actor=model-auto、40 条 auto_commit）→ summary 命中 2 条，两条均满足 `sha256(id)[0]%10==0`；`--limit 1` 时 `counts.summary=2` 不截断。 | **新发现**：`memories.scope` 采纳时未写入（全库为空），global/cross_project 的 scope 抽样永不命中；kind 抽样正常。 |
+
+### 7.4 生产库 eval flow 8/13 的解释
+
+G1–G6、G8、G10 绿；G7/G9/G11/G12/G13 红，逐条归因：
+
+- **G7**：无失败窗口样本被判红——判据把「缺样本」当失败，健康库会恒红；建议缺样本
+  降为 INFO/PASS-with-note，而不是让人造一次失败。
+- **G9**：2 条 `expired` 无裁决（10 月旧数据，旧过期处置路径）。
+- **G11/G13**：6 条 `accepted` 无证据绑定（单轨切换前 unbundled 老候选），
+  被同时计为「已采纳均无证据」「无证据强写 6」。
+- **G12**：准出率 91%、悬空 6，即上述 unbundled 老候选，不是新窗口漏账。
+
+结论：红项全部是历史数据/判据口径，不是本轮动线回归；新窗口动线在临时库 13/13 绿。
+建议给 legacy accepted/expired 建显式豁免桶，避免把历史数据误报成当前故障。
+
+### 7.5 待决与建议
+
+1. 采纳时写入 `memories.scope`（U8 发现），否则 scope 抽样形同虚设。
+2. G7 缺样本口径、G11/G13 legacy 豁免分桶（§7.4）。
+3. U3 restore 文案与状态语义对齐（「回到未审核」而非「原路恢复」）。
+4. 只拷 `mem.db` 不足以复现证据链：`content/` 必须一起搬，否则 maintain 会报
+   「打开外置内容失败」（本轮 U2 副本已复现）；建议写进验收操作手册。
+
