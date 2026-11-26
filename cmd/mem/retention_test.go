@@ -5,6 +5,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,7 +53,11 @@ func newSweepFixture(t *testing.T, now time.Time) string {
 	writeAt(t, filepath.Join(root, "spool", "sess", "seg-old.tmp"), 10*testDay, now, "半截段")
 	writeAt(t, filepath.Join(root, "spool", "sess", "seg-old.jsonl"), 10*testDay, now, "完整段")
 	writeAt(t, filepath.Join(root, "spool", "sess", "seg-new.tmp"), time.Hour, now, "刚写的半截段")
-	writeAt(t, filepath.Join(root, "evidence", "transcripts", "sess.cursor"), 100*testDay, now, "{\"offset\":1}")
+	// 超龄但仍有未读余量的 cursor：终态未达成，必须保留。
+	transcript := filepath.Join(root, "transcripts", "sess.jsonl")
+	writeAt(t, transcript, 0, now, "尚未消费的转录字节")
+	writeAt(t, filepath.Join(root, "evidence", "transcripts", "sess.cursor"), 100*testDay, now,
+		cursorJSON(t, transcript, 0))
 	return root
 }
 
@@ -128,12 +133,12 @@ func TestP4FileSweepReclaimsEachExit(t *testing.T) {
 		!exists(filepath.Join(root, "spool", "sess", "seg-new.tmp")) {
 		t.Error("P4: 完整段与保护期内的 .tmp 不许动")
 	}
-	// transcript cursor 现状无从判定「会话终态」：只报不删（波 5 遗留）。
+	// transcript cursor 有未读余量（Size > Offset）：会话未消费完，必须保留。
 	if !exists(filepath.Join(root, "evidence", "transcripts", "sess.cursor")) {
-		t.Error("P4: cursor 终态不可判定，宁可不删")
+		t.Error("P4: 有未读余量的 cursor 必须保留")
 	}
-	if got.CursorsListed < 1 || got.Cursors != 0 {
-		t.Errorf("P4: cursor 应只报数不删除，got %+v", got)
+	if got.CursorsListed < 1 || got.CursorsDeleted != 0 {
+		t.Errorf("P4: 有未读余量的 cursor 应只报数不删除，got %+v", got)
 	}
 }
 
@@ -288,5 +293,128 @@ func TestP6GCRetentionActuallyReclaims(t *testing.T) {
 	}
 	if n != 0 {
 		t.Error("P6: --retention 实删应回收 91 天前的 rejected 候选")
+	}
+}
+
+// cursorJSON 生成一份合法游标内容。offset 为已消费到 transcript 的字节位置。
+func cursorJSON(t *testing.T, transcript string, offset int64) string {
+	t.Helper()
+	b, err := json.Marshal(transcriptCursor{Path: transcript, Offset: offset})
+	if err != nil {
+		t.Fatalf("marshal cursor: %v", err)
+	}
+	return string(b)
+}
+
+// newCursorFixture 造一个只有 cursor 的最小根目录，返回 cursor 路径。
+func newCursorFixture(t *testing.T, now time.Time, age time.Duration, content string) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	cursor := filepath.Join(root, "evidence", "transcripts", "sess.cursor")
+	writeAt(t, cursor, age, now, content)
+	return root, cursor
+}
+
+// Task H：旧 cursor + transcript 已不存在 → 终态回收。
+func TestCursorReclaimWhenTranscriptMissing(t *testing.T) {
+	now := time.Now()
+	root, cursor := newCursorFixture(t, now, 100*testDay, cursorJSON(t, filepath.Join(t.TempDir(), "gone.jsonl"), 0))
+	got, err := sweepRetentionFiles(root, now, sweepCfg(), false, true)
+	if err != nil {
+		t.Fatalf("sweepRetentionFiles: %v", err)
+	}
+	if exists(cursor) {
+		t.Error("transcript 缺失的超龄 cursor 应删除")
+	}
+	if got.CursorsDeleted != 1 || got.CursorsListed != 1 {
+		t.Errorf("transcript 缺失应计 1 删 1 报，got %+v", got)
+	}
+}
+
+// Task H：旧 cursor + transcript 已完全消费（Size <= Offset）→ 终态回收。
+func TestCursorReclaimWhenFullyConsumed(t *testing.T) {
+	now := time.Now()
+	root := t.TempDir()
+	transcript := filepath.Join(root, "transcripts", "sess.jsonl")
+	writeAt(t, transcript, 0, now, strings.Repeat("x", 64))
+	cursor := filepath.Join(root, "evidence", "transcripts", "sess.cursor")
+	writeAt(t, cursor, 100*testDay, now, cursorJSON(t, transcript, 64))
+	got, err := sweepRetentionFiles(root, now, sweepCfg(), false, true)
+	if err != nil {
+		t.Fatalf("sweepRetentionFiles: %v", err)
+	}
+	if exists(cursor) {
+		t.Error("已完全消费的超龄 cursor 应删除")
+	}
+	if got.CursorsDeleted != 1 {
+		t.Errorf("已完全消费应计 1 删，got %+v", got)
+	}
+}
+
+// Task H：旧 cursor + 仍有未读余量（Size > Offset）→ 保留。
+func TestCursorReclaimKeepsUnreadRemainder(t *testing.T) {
+	now := time.Now()
+	root := t.TempDir()
+	transcript := filepath.Join(root, "transcripts", "sess.jsonl")
+	writeAt(t, transcript, 0, now, strings.Repeat("x", 128))
+	cursor := filepath.Join(root, "evidence", "transcripts", "sess.cursor")
+	writeAt(t, cursor, 100*testDay, now, cursorJSON(t, transcript, 64))
+	got, err := sweepRetentionFiles(root, now, sweepCfg(), false, true)
+	if err != nil {
+		t.Fatalf("sweepRetentionFiles: %v", err)
+	}
+	if !exists(cursor) {
+		t.Error("有未读余量的 cursor 必须保留")
+	}
+	if got.CursorsDeleted != 0 || got.CursorsListed != 1 {
+		t.Errorf("有未读余量应 0 删 1 报，got %+v", got)
+	}
+}
+
+// Task H：未到 30 天的 cursor 一律保留，即使 transcript 缺失。
+func TestCursorReclaimKeepsFresh(t *testing.T) {
+	now := time.Now()
+	root, cursor := newCursorFixture(t, now, 1*testDay, cursorJSON(t, filepath.Join(t.TempDir(), "gone.jsonl"), 0))
+	got, err := sweepRetentionFiles(root, now, sweepCfg(), false, true)
+	if err != nil {
+		t.Fatalf("sweepRetentionFiles: %v", err)
+	}
+	if !exists(cursor) {
+		t.Error("未超龄 cursor 必须保留")
+	}
+	if got.CursorsDeleted != 0 || got.CursorsListed != 0 {
+		t.Errorf("未超龄 cursor 不应进入报数/删除，got %+v", got)
+	}
+}
+
+// Task H：dry-run 只计数不删除。
+func TestCursorReclaimDryRunCountsOnly(t *testing.T) {
+	now := time.Now()
+	root, cursor := newCursorFixture(t, now, 100*testDay, cursorJSON(t, filepath.Join(t.TempDir(), "gone.jsonl"), 0))
+	got, err := sweepRetentionFiles(root, now, sweepCfg(), true, false)
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	if !exists(cursor) {
+		t.Error("dry-run 不许删除 cursor")
+	}
+	if got.CursorsDeleted != 1 {
+		t.Errorf("dry-run 应预览 1 个待删 cursor，got %+v", got)
+	}
+}
+
+// Task H：坏 cursor JSON 无法判定消费状态 → 保留并计入 listed。
+func TestCursorReclaimKeepsCorruptJSON(t *testing.T) {
+	now := time.Now()
+	root, cursor := newCursorFixture(t, now, 100*testDay, "{not json")
+	got, err := sweepRetentionFiles(root, now, sweepCfg(), false, true)
+	if err != nil {
+		t.Fatalf("sweepRetentionFiles: %v", err)
+	}
+	if !exists(cursor) {
+		t.Error("坏 cursor JSON 应保留")
+	}
+	if got.CursorsDeleted != 0 || got.CursorsListed != 1 {
+		t.Errorf("坏 cursor 应 0 删 1 报，got %+v", got)
 	}
 }

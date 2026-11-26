@@ -361,7 +361,7 @@ failed 不堆积；只有降级超上限才进 §3.1 触达面。人只剩「换
 | `spool/*.jsonl` | 按段隔离、坏行 dead-letter、完成状态持久化、公平调度（S6c 已落地：坏行/确定性坏段进 `spool/dead-letter`，`.drain-cursor` 轮转会话） |
 | 序号洞（`evidence_gaps`） | 遇缺失区间记洞并把 cursor 越过，同轮继续出窗；`mem distill --gaps` 只读出口，不可回捞（S6c 已落地） |
 | `spool/seg-*.tmp` | 安全恢复或年龄回收（现状不被 drain 匹配，无出口） |
-| `evidence/transcripts/*.cursor` | 会话终态回收；余量由维护入口续传 |
+| `evidence/transcripts/*.cursor` | 30 天 + 完全消费后删除（transcript 已不存在或 `Size <= Offset`）；有未读余量/不可读时保留 |
 | 审计 `audit.jsonl` | 现有 5MiB 轮盘保留；**补 `.1–.3` 合并查询**（现状只查当前文件，历史断点）；轮转失败可观测 |
 | `spawn.log` | 复用有界日志策略（现状无轮转） |
 | `edges` | 接入 provenance/export 消费，或明确标记内部审计数据并设保留期 |
