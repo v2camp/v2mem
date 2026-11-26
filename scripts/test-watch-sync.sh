@@ -30,11 +30,14 @@ printf '%s' "$r8_row" | grep -q '≤5'  || fail "§3 R8 的 PASS 线不是 ≤5"
 printf '%s' "$r8_row" | grep -q '>15' || fail "§3 R8 的 FAIL 线不是 >15"
 grep -q 'CAND_MAX" -le 5'  "$SCRIPT" || fail "脚本 R8 的 PASS 线不是 ≤5"
 grep -q 'CAND_MAX" -le 15' "$SCRIPT" || fail "脚本 R8 的 WARN 上界不是 15"
-# ②b R8 计量对象（2026-11-20 起「只数可裁决」）：文档写了 reviewable 口径，
-# 脚本就必须真的带 --triage 并按 reviewable 过滤；单侧改会退回「数 pending 行数」。
+# ②b R8 计量对象（2026-11-20 起「只数可裁决」，2026-11-26 候选命令并入 review）：
+# 文档写了 reviewable 口径，脚本就必须从 review ls 取数并按 reviewable 过滤；
+# 单侧改会退回「数 pending 行数」。
+printf '%s' "$r8_row" | grep -q 'review ls --state all' \
+  || fail "§3 R8 未写明从 review ls --state all 取数（命令面已收编）"
 printf '%s' "$r8_row" | grep -q 'reviewable' \
   || fail "§3 R8 未写明只数 reviewable（口径与脚本脱钩）"
-grep -q -- '--triage' "$SCRIPT" || fail "脚本 R8 未带 --triage"
+grep -q -- 'review ls --state all --json' "$SCRIPT" || fail "脚本 R8 未从 review ls --state all --json 取数"
 grep -q 'select(.reviewable != false)' "$SCRIPT" || fail "脚本 R8 未按 reviewable 过滤"
 grep -q '另有 \${CAND_EXHAUST} 条' "$SCRIPT" || fail "脚本 R8 未报出不可裁决条数"
 

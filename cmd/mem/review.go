@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/v2camp/v2mem/internal/distill"
 	"github.com/v2camp/v2mem/internal/store"
 )
 
@@ -229,6 +230,13 @@ func cmdReviewLs(args []string) error {
 	q, err := st.ListReviewQueue(*state, *limit)
 	if err != nil {
 		return err
+	}
+	// 候选态补算 reviewable：巡检 R8 的「现行判据下仍值得裁决」口径与写侧同源。
+	// store 不 import distill（循环依赖），由命令层补这一层只读投影。
+	for i := range q.States[store.ReviewQueuePending] {
+		it := &q.States[store.ReviewQueuePending][i]
+		ok := distill.Reviewable(it.Content, it.AttributedTo, it.Kind)
+		it.Reviewable = &ok
 	}
 	if c.json {
 		return printJSON(q)

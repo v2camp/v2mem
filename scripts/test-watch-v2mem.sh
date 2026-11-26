@@ -58,7 +58,12 @@ case "${1:-}" in
       if [ -n "${STUB_PROJ_STATS:-}" ]; then printf '按工程   %s\n' "$STUB_PROJ_STATS"; fi
     fi
     ;;
-  candidates) printf '%s\n' "${STUB_CAND_JSON:-[]}" ;;
+  # review ls --state all --json：把夹具的 pending 数组包成四态投影。
+  review)
+    if [ "${2:-}" = "ls" ]; then
+      printf '{"states":{"pending":%s,"summary":[],"quarantined":[],"failed":[]},"counts":{"pending":0,"summary":0,"quarantined":0,"failed":0}}\n' "${STUB_CAND_JSON:-[]}"
+    fi
+    ;;
   eval) printf '%s\n' "${STUB_ACTIVITY_JSON:-}" ;;
   # 任何写子命令都会落一个标记文件：⑥ 的「除 watch-state.json 外无写入」才有牙。
   gc|maintain|accept|reject|consolidate|import|ingest)

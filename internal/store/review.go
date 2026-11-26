@@ -62,6 +62,16 @@ type ReviewItem struct {
 	Kind   string `json:"kind"`
 	Scope  string `json:"scope"`
 	Status string `json:"status"`
+	// Project/Content/CreatedAt 仅候选态填充：`mem review ls` 承接原 candidates ls
+	// 的人与巡检视图（R8 按工程积压、R9 载荷残留、R15 TTL），不再有第二个命令面。
+	Project   string `json:"project,omitempty"`
+	Content   string `json:"content,omitempty"`
+	CreatedAt int64  `json:"created_at,omitempty"`
+	// AttributedTo 只参与 Reviewable 计算，不随 JSON 外泄。
+	AttributedTo string `json:"-"`
+	// Reviewable 由 CLI 用 internal/distill 的现行准入判据补算；store 不 import
+	// distill（会形成循环），故不在这里算。
+	Reviewable *bool `json:"reviewable,omitempty"`
 	// StatusReason 是候选最后一次失败/隔离的原因（pending/summary 为空）。
 	StatusReason string `json:"status_reason,omitempty"`
 	Attempt      int    `json:"attempt"`
@@ -340,7 +350,8 @@ func (s *Store) listReviewState(state string, limit int, now int64) ([]ReviewIte
 
 func (s *Store) listReviewCandidates(state string, limit int, now int64) ([]ReviewItem, error) {
 	q := `SELECT c.id, c.kind, c.scope, c.status, c.status_reason, c.attempt, c.created_at,
-			COALESCE(c.memory_id, ''), COALESCE(d.actor, ''), COALESCE(d.action, '')
+			COALESCE(c.memory_id, ''), COALESCE(d.actor, ''), COALESCE(d.action, ''),
+			c.project, c.content, c.attributed_to
 		FROM candidates c
 		LEFT JOIN commit_decisions d ON d.id = (
 			SELECT d2.id FROM commit_decisions d2 WHERE d2.candidate_id = c.id
@@ -364,9 +375,11 @@ func (s *Store) listReviewCandidates(state string, limit int, now int64) ([]Revi
 		var it ReviewItem
 		var createdAt int64
 		if err := rows.Scan(&it.ID, &it.Kind, &it.Scope, &it.Status, &it.StatusReason,
-			&it.Attempt, &createdAt, &it.MemoryID, &it.Actor, &it.Action); err != nil {
+			&it.Attempt, &createdAt, &it.MemoryID, &it.Actor, &it.Action,
+			&it.Project, &it.Content, &it.AttributedTo); err != nil {
 			return nil, err
 		}
+		it.CreatedAt = createdAt
 		it.AgeSeconds = ageSeconds(now, createdAt)
 		out = append(out, it)
 	}

@@ -183,7 +183,7 @@ if [ -f "$AUDIT" ]; then
       "A_SS=\([$e[] | select(.event=="session-start")] | length)",
       "A_OBS=\([$e[] | select(.event=="obs-append")] | length)",
       # A_ADD 数「记忆层真的写进去了几次」：manual-add / write 是手写路径，accept 是
-      # 裁决路径（含 `mem batch --plan` 批量准出，它落的也是 accept 事件）。
+      # 裁决路径（含 `mem maintain --model-auto` 自动裁决，它落的也是 accept 事件）。
       # 只数前两种会让 R4 在「55 条 reject + 6 条 accept 已落 6 条记忆」的窗口里
       # 报「12h 无写入」——决策闭环一旦恢复，这就不再是稀疏写侧，而是判据漏计。
       "A_ADD=\([$e[] | select(.event=="manual-add" or .event=="write" or .event=="accept")] | length)",
@@ -463,7 +463,7 @@ else
   fi
 fi
 
-# R8 候选积压 / R9 载荷残留：统一从 candidates ls --json 采集，避免文本行数口径。
+# R8 候选积压 / R9 载荷残留：统一从 review ls --state all --json 采集，避免文本行数口径。
 # 按 project 分组，窗口值取各工程计数的**最大值**（阈值 5/15 不变）：
 # 跨工程候选不相加——别的项目候选留给它们自己的会话就近裁决，
 # 全局累加会把合法产物误诊成脏数据。见 docs/ops-watch.md §3 R8 / design-write-governance.md §12。
@@ -472,31 +472,21 @@ fi
 # 不是 pending 行数。原因：助手准入判据 2026-11-17 才落到写侧，此前入库的行按定义
 # 都没过这道门，于是 pending 里混着大量过程叙述（一台 cron 的进度汇报就有 17 条）。
 # 把这批算进「待办」，R8 会长期 FAIL 且处置不可执行——它不是没人裁决，是不可裁决。
-# 判据只约束新行、不能追认旧行，所以在读侧重算一遍：--triage 由 internal/distill.Reviewable
-# 统一给每条打 reviewable（与写侧同一套规则，不在脚本里另写正则）。
-# 旧行不删不改，`mem candidates ls --triage` 照常可见，并按 R15 的 TTL 自然过期；
+# 判据只约束新行、不能追认旧行，所以在读侧重算一遍：reviewable 由 internal/distill.Reviewable
+# 统一给每条打标（与写侧同一套规则，不在脚本里另写正则）。
+# 旧行不删不改，`mem review ls --state pending` 照常可见，并按 R15 的 TTL 自然过期；
 # 不可裁决的条数单独在 detail 里报出来，不做静默丢弃。
-CAND_JSON=$( "$MEM_BIN" candidates ls --json --triage --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null )
-# 脚本可能先于二进制更新（钩子跑的是装好的 ~/.local/bin/mem）。老二进制不认 --triage，
-# 此时退回纯 pending 口径并在 detail 说明，而不是把 R8 判成「候选读取失败」——
-# 后者会让人去查库权限，把版本错配误诊成故障。
-CAND_TRIAGE=1
-if ! printf '%s' "$CAND_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
-  if CAND_JSON=$( "$MEM_BIN" candidates ls --json --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null ) \
-     && printf '%s' "$CAND_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
-    CAND_TRIAGE=0
-  fi
-fi
-if printf '%s' "$CAND_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+CAND_JSON=$( "$MEM_BIN" review ls --state all --json --limit 100000 -db "$V2MEM_DIR/mem.db" 2>/dev/null )
+if printf '%s' "$CAND_JSON" | jq -e '.states.pending | type == "array"' >/dev/null 2>&1; then
   CAND_READ_FAIL=0
 else
-  CAND_JSON='[]'
+  CAND_JSON='{"states":{"pending":[]}}'
   CAND_READ_FAIL=1
 fi
-CAND_PENDING=$(printf '%s' "$CAND_JSON" | jq -c '[.[] | select(.status == "pending")]' 2>/dev/null || echo '[]')
+CAND_PENDING=$(printf '%s' "$CAND_JSON" | jq -c '.states.pending' 2>/dev/null || echo '[]')
 CAND=$(printf '%s' "$CAND_PENDING" | jq -r 'length' 2>/dev/null || echo 0)
 CAND=${CAND:-0}
-# 缺 reviewable 键（旧二进制 / 测试夹具）按「可裁决」处理：不可裁决统计以 false 为唯一依据。
+# 缺 reviewable 键（测试夹具）按「可裁决」处理：不可裁决统计以 false 为唯一依据。
 CAND_REVIEWABLE=$(printf '%s' "$CAND_PENDING" | jq -c '[.[] | select(.reviewable != false)]' 2>/dev/null || echo '[]')
 CAND_REV=$(printf '%s' "$CAND_REVIEWABLE" | jq -r 'length' 2>/dev/null || echo 0)
 CAND_REV=${CAND_REV:-0}
@@ -514,10 +504,7 @@ CAND_EXHAUST_TXT=""
 if [ "$CAND_EXHAUST" -gt 0 ]; then
   CAND_EXHAUST_TXT="；另有 ${CAND_EXHAUST} 条按现行准入判据不可裁决（过程叙述/助手偏好，不计入积压，随 R15 TTL 过期）"
 fi
-if [ "${CAND_TRIAGE:-1}" -eq 0 ]; then
-  CAND_EXHAUST_TXT="；二进制不支持 --triage，本窗口按 pending 行数计（重建 mem 后恢复可裁决口径）"
-fi
-# 越线时直接给出「最积压工程的前 3 条」，省掉裁决前的一次 candidates ls。
+# 越线时直接给出「最积压工程的前 3 条」，省掉裁决前的一次 review ls。
 # 只给 id 前半段 + 正文前 40 字：够认出是哪件事，又不把 detail 撑长。
 # 取数集与积压计数同源（CAND_REVIEWABLE）：不可裁决的行列进来只会误导裁决。
 CAND_TODO=$(printf '%s' "$CAND_REVIEWABLE" | jq -r '
@@ -529,11 +516,11 @@ CAND_TODO=$(printf '%s' "$CAND_REVIEWABLE" | jq -r '
 # 只报 CAND_MAX 时，5 条分散在 3 个工程的窗口会显示「候选待处理 2」，
 # 与 detail 里列出的 5 条自相矛盾（2026-11-23 实测：Claw=2, Code=2, buddy=1 → 标题 2）。
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
-  add R8 WARN "候选读取失败" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
+  add R8 WARN "候选读取失败" "review ls --state all --json 不可解析；按 WARN 观察，勿据此判 PASS"
 elif [ "$CAND_MAX" -le 5 ]; then
   add R8 PASS "候选待处理 ${CAND_REV} 条（最大单工程 ${CAND_MAX}）" "隔离区未积压；按工程：${CAND_GROUPS:-无}${CAND_EXHAUST_TXT}"
 elif [ "$CAND_MAX" -le 15 ]; then
-  add R8 WARN "候选积压 ${CAND_REV} 条（最大单工程 ${CAND_MAX}）" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP candidates_ls / accept / reject 就近裁决${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
+  add R8 WARN "候选积压 ${CAND_REV} 条（最大单工程 ${CAND_MAX}）" "按工程：${CAND_GROUPS}；在对应工程会话内用 MCP review_ls / review_withdraw 就近处置（必要时 mem accept / reject）${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
 else
   add R8 FAIL "候选积压 ${CAND_REV} 条（最大单工程 ${CAND_MAX}）" "按工程：${CAND_GROUPS}；某工程长期未裁决，检索质量会受影响${CAND_EXHAUST_TXT}${CAND_TODO:+；可先裁决：$CAND_TODO}"
 fi
@@ -713,7 +700,7 @@ STALE_PENDING=$(printf '%s' "$CAND_PENDING" | jq -r --argjson now "$NOW" --argjs
 case "$STALE_PENDING" in ''|*[!0-9]*) STALE_PENDING=0 ;; esac
 
 if [ "$CAND_READ_FAIL" -eq 1 ]; then
-  add R15 WARN "候选 TTL 未核查" "candidates ls --json 不可解析；按 WARN 观察，勿据此判 PASS"
+  add R15 WARN "候选 TTL 未核查" "review ls --state all --json 不可解析；按 WARN 观察，勿据此判 PASS"
 elif [ "$STALE_PENDING" -eq 0 ]; then
   add R15 PASS "候选 TTL 无超期" "无超过 ${TTL_DAYS} 天的 pending（与 GCCandidates 默认阈值同源）"
 else

@@ -64,6 +64,42 @@ func seedReviewFixture(t *testing.T) (*store.Store, string) {
 	return st, res.ID
 }
 
+// review ls 承接原 candidates ls 的候选投影：pending 段必须带 id/kind/status，
+// 以及巡检 R8/R9/R15 依赖的 project/content/created_at/reviewable。
+func TestReviewLsCoversCandidateProjection(t *testing.T) {
+	st := newJudgeStore(t)
+	cand := seedCandidate(t, st, "fact", "v2mem 的 MCP 通道与 hook 注入相互独立")
+
+	out, err := captureStdout(t, func() error {
+		return cmdReview([]string{"ls", "--state", "all", "--json", "--db", st.Path()})
+	})
+	if err != nil {
+		t.Fatalf("cmdReview ls --state all: %v\n%s", err, out)
+	}
+	var q store.ReviewQueue
+	if err := json.Unmarshal([]byte(out), &q); err != nil {
+		t.Fatalf("解析 review ls JSON: %v\n%s", err, out)
+	}
+	var got *store.ReviewItem
+	for i := range q.States[store.ReviewQueuePending] {
+		if q.States[store.ReviewQueuePending][i].ID == cand.ID {
+			got = &q.States[store.ReviewQueuePending][i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("pending 段应含候选 %s，got %+v", cand.ID, q.States[store.ReviewQueuePending])
+	}
+	if got.Project != cand.Project || got.Content != cand.Content {
+		t.Errorf("候选投影缺 project/content：got %q/%q", got.Project, got.Content)
+	}
+	if got.CreatedAt == 0 {
+		t.Error("候选投影缺 created_at（R15 TTL 依赖）")
+	}
+	if got.Reviewable == nil {
+		t.Error("候选投影缺 reviewable（R8 可裁决口径依赖）")
+	}
+}
+
 func TestReviewLsTextShowsFourStatesAndCounts(t *testing.T) {
 	st, _ := seedReviewFixture(t)
 	db := st.Path()

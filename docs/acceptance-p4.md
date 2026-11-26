@@ -129,7 +129,7 @@ ok  	github.com/v2camp/v2mem/test/e2e	7.348s
 4. 重试轮：换好输出（1 行合法 proposal），等指数退避（attempt=1 → 1 分钟）后重跑
    → sA `ok` attempt=2（G7 的「失败有重试账」样本）、sF `ok` attempt=1、
    sN `noop`（G6 的合法空结果样本）。
-5. 裁决：`mem candidates ls --status pending --json` 取 2 条 → `mem reject <id>` 1 条
+5. 裁决：`mem review ls --state pending --json` 取 2 条 → `mem reject <id>` 1 条
    （actor=human）、`mem accept --all-pending` 1 条 → 记忆 + memory_evidence 绑定。
 6. 收尾：`mem review ls`、`mem maintain --json`（processed=0，队列干净）、
    `mem gc --retention --dry-run`（零写）。
@@ -185,7 +185,8 @@ ok  	github.com/v2camp/v2mem/test/e2e	7.348s
   3. 发起一次会话：UserPromptSubmit + Stop（带 transcript_path）各一条 stdin 给
      `mem hook`；
   4. `mem maintain --json`（SessionStart 在真实链路会自动拉起，此处显式驱动）；
-  5. `mem candidates ls --status accepted`、`mem search <关键词>`、`mem stats`。
+  5. `sqlite3 -readonly ~/.v2mem/mem.db "SELECT id,status FROM candidates WHERE status='accepted';"`
+     （原 `candidates ls --status accepted` 已随命令下线）、`mem search <关键词>`、`mem stats`。
 - **预期**：候选按提交矩阵自动裁决（auto_commit 落库，`--model-auto` 关时人工类型
   留 pending）；`stats` 积压五行归零；检索命中新记忆；全程无手工配置文件编辑。
 - **留痕**：`stats` 的「积压」行与「维护」行；`maintain --json` 的 `ok/noop/inserted`；
@@ -251,7 +252,7 @@ ok  	github.com/v2camp/v2mem/test/e2e	7.348s
   6. `mem eval flow` → G7 必绿。
 - **预期**：failed 有界重试（上限 5 次后隔离）、全程退出码/状态如实；恢复后窗口
   补齐、准出率回到 100%。
-- **留痕**：`maintain --json` 的 `fail/partial/quarantine`；`candidates ls` 的
+- **留痕**：`maintain --json` 的 `fail/partial/quarantine`；`review ls` 的
   `status_reason` 与 `attempt`；`distill_runs` 账；G7 detail。
 - **判定人**：验收人。
 - **自动化**：✅ 坏输出/退避/force 重试由 `make test-faults`（F5、F12）覆盖；

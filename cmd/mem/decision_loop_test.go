@@ -2,7 +2,7 @@ package main
 
 // 候选裁决自动化闭环（docs/design-write-governance.md §12）的四条落点：
 // ① SessionStart 按工程注入待裁决计数 ② MCP 显式裁决三工具
-// ③ candidates ls --project 就近查看 ④ 采纳率判据的采样前提（纯文档，无测试）。
+// ③ review ls --state pending 就近查看 ④ 采纳率判据的采样前提（纯文档，无测试）。
 
 import (
 	"encoding/json"
@@ -179,34 +179,3 @@ func mcpJSON(t *testing.T, result map[string]any, dst any) {
 }
 
 // ---------- ③ CLI 就近查看 ----------
-
-func TestCandidatesLSProjectFlag(t *testing.T) {
-	db := testDB(t)
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	seedVia(t, st, twoProjectSpec("alpha", "beta"))
-	st.Close()
-
-	for _, tc := range []struct {
-		args []string
-		want int
-	}{
-		{[]string{"ls", "--db", db, "--json", "--project", "alpha"}, 2},
-		{[]string{"ls", "--db", db, "--json", "--project", "beta"}, 3},
-		{[]string{"ls", "--db", db, "--json"}, 5},
-	} {
-		out, err := captureStdout(t, func() error { return cmdCandidates(tc.args) })
-		if err != nil {
-			t.Fatalf("cmdCandidates(%v): %v", tc.args, err)
-		}
-		var list []store.Candidate
-		if err := json.Unmarshal([]byte(out), &list); err != nil {
-			t.Fatalf("解析 JSON 失败: %v / %s", err, out)
-		}
-		if len(list) != tc.want {
-			t.Errorf("cmdCandidates(%v) = %d 条, want %d", tc.args, len(list), tc.want)
-		}
-	}
-}
