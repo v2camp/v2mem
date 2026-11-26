@@ -48,6 +48,9 @@
 
 1. **Proposal 独占证据消费进度**。旧规则蒸馏改造成 executor 之一；
    `distill_runs.finished_at` / `window_key` 退出消费游标职责（可留作运行账）。
+   schema v4 起 `distill_runs` 不再有 `UNIQUE(session_id, started_at)`：
+   同 session 同一秒多条运行账是 `maintain` 连续追账的合法形态；窗口幂等由
+   `ux_distill_window` 部分索引守护（见 [design-db-stamp.md](./design-db-stamp.md)）。
 2. **0 条有效提案也必须形成 noop 完成水位**。禁止「过滤后为空就不记进度」的空转。
 3. 发窗水位 = 已发放，Bundle 完成状态 = 已处理，两者语义分离但不再存在第二条旧规则消费链。
 4. 每源有界重试、退避、最大 attempt；超限进入**可回捞隔离区**。

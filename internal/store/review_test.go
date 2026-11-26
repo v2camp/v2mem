@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -150,8 +151,8 @@ func TestReviewSchemaMigratesV2AndBackfillsOnlyDirectWrites(t *testing.T) {
 	if err := st.db.QueryRow(`SELECT v FROM db_meta WHERE k = 'schema_version'`).Scan(&version); err != nil {
 		t.Fatalf("读 schema_version: %v", err)
 	}
-	if version != "3" {
-		t.Fatalf("schema_version = %q, want 3", version)
+	if version != strconv.Itoa(CurrentSchemaVersion) {
+		t.Fatalf("schema_version = %q, want %d", version, CurrentSchemaVersion)
 	}
 	for _, idx := range []string{"ix_mem_review_state", "ix_commit_model"} {
 		if got := migrationIndexSQL(t, st, idx); got == "" {
@@ -204,8 +205,8 @@ func TestReviewSchemaMigratesV2AndBackfillsOnlyDirectWrites(t *testing.T) {
 	if err := st.db.QueryRow(`SELECT v FROM db_meta WHERE k = 'schema_version'`).Scan(&version); err != nil {
 		t.Fatalf("二次读版本: %v", err)
 	}
-	if version != "3" {
-		t.Fatalf("二次 Open 后 schema_version = %q, want 3", version)
+	if version != strconv.Itoa(CurrentSchemaVersion) {
+		t.Fatalf("二次 Open 后 schema_version = %q, want %d", version, CurrentSchemaVersion)
 	}
 	if n := migrationCount(t, st, "memories"); n != 8 {
 		t.Fatalf("二次 Open 改变了行数: %d", n)

@@ -76,6 +76,26 @@ DDL 写在 Go 里（`EnsureWriterStamp`），**不写进 `schema.sql`**：`schem
 全库历史一律标已审核会让复核摘要永远看不到模型写入的行。挂在「刚加上」而不是每次
 `Open`，是为了不让人工撤回过的行在下次打开时被悄悄改回 `confirmed`。
 
+## 版本史：v3 → v4（运行账去旧窗口唯一键）
+
+`CurrentSchemaVersion` 从 3 升到 4。`distill_runs` 去掉表级
+`UNIQUE(session_id, started_at)`：该约束保护的是「按会话窗口推进蒸馏水位」的旧语义，
+已随单轨切换消亡；`maintain --catch-up` 在同一秒连续追多个同源窗口时，第 4 条运行账
+会撞满 `SaveProposalRun` 的 3 次 `started_at` 退避后报错（U5 真实走查在生产库复现）。
+旧二进制读到迁移后的库不会错读行，但会继续按旧假设依赖该约束，故仍 +1。
+
+- **窗口幂等仍受保护**：部分索引 `ux_distill_window(session_id, window_key)
+  WHERE window_key <> ''` 不动，`DistillWindowDone` / `SaveDistillRun` 的
+  「同窗口只能蒸馏一次」语义不变。
+- **为什么不改成 Partial/触发器**：窗口行（`window_key <> ''`）已有部分唯一索引；
+  Proposal 运行账（`bundle_id` 非空、`window_key` 必为空）本来就该允许多条，
+  再给 `(session_id, started_at)` 加任何形式的唯一约束都会把「同秒追账」判成冲突。
+- **迁移形态**：SQLite 不支持 DROP CONSTRAINT，`ensureDistillRunsSchema` 在
+  `ensureEvidenceSchema` 补完列之后重建表（建新表 → INSERT SELECT → DROP → RENAME），
+  迁移前收集的显式索引 DDL 原样重建；二次 `Open` 检测不到旧唯一键即跳过。
+- **写入方不再篡改时间戳**：删除 `SaveProposalRun` 的 `started_at++` 退避，
+  同 session 同秒多条运行账按调用方给的 `started_at` 原样落库。
+
 ## `BinVersion()` 的口径
 
 用 `runtime/debug.ReadBuildInfo()`：`Main.Version` 有值（release tag 或 Go 1.24+ 的

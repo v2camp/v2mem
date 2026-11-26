@@ -149,6 +149,12 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("迁移 Evidence schema 失败: %w", err)
 	}
+	// schema v4：去掉 distill_runs 旧窗口时代的 UNIQUE(session_id, started_at)。
+	// 必须排在 ensureEvidenceSchema 之后：旧库缺 bundle_id 等后加列，先补列再重建。
+	if err := ensureDistillRunsSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 distill_runs schema 失败: %w", err)
+	}
 	// S10a：复核状态列（schema v3）。补列的那一次顺带回填直写来源，见 ensureReviewSchema。
 	if err := ensureReviewSchema(db); err != nil {
 		db.Close()

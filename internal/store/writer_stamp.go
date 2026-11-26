@@ -19,7 +19,10 @@ import (
 //     candidates.status_reason / judge_reason / attempt、commit_decisions.model_tag /
 //     created_memory。新代码依赖这些列（检索可见性看 review_state、复核视图看 attempt），
 //     旧二进制读到迁移后的库会按旧形状解释新数据，故必须 +1。
-const CurrentSchemaVersion = 3
+//   - v4：distill_runs 去掉旧窗口时代的表级 UNIQUE(session_id, started_at)。
+//     同 session 同秒多条运行账是 maintain 连续追账的合法形态；旧唯一键会让第 4 条
+//     起直接报错（U5 真实走查发现）。窗口幂等仍由部分索引 ux_distill_window 保护。
+const CurrentSchemaVersion = 4
 
 // ErrDBSchemaNewer 表示库由更新的二进制写过，当前二进制只理解更旧的 schema。
 // 调用方应直接用 errors.Is 判定并拒绝打开，而不是尝试降级读。

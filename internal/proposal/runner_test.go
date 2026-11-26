@@ -653,6 +653,47 @@ func TestRunnerStepCreatesWindowWhenQueueEmpty(t *testing.T) {
 	}
 }
 
+// U5 真实缺陷回归（runner 面）：同一会话的多个窗口在同一秒完成时，
+// 运行账必须全部落库，且时间戳不被写入方改写。
+func TestRunnerSameSessionSameSecondRuns(t *testing.T) {
+	e := newEnv(t)
+	const n = 5
+	for i := 0; i < n; i++ {
+		e.capture(t, "uid-"+strings.Repeat("x", i+1), "s1", "决定：甲", true)
+		e.bundle(t)
+	}
+	var now int64 = 1000
+	g, _ := gen("fake", func(_ GenerateRequest, call int) (string, error) {
+		return `{"kind":"decision","content":"甲` + strings.Repeat("乙", call) + `","evidence_idx":[1]}`, nil
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, g)}, &now)
+	for i := 0; i < n; i++ {
+		out, err := r.Step(context.Background())
+		if err != nil {
+			t.Fatalf("第 %d 个同秒窗口应成功: %v", i+1, err)
+		}
+		if out.Status != StatusOK {
+			t.Fatalf("第 %d 个同秒窗口应 ok: %+v", i+1, out)
+		}
+	}
+	var count, distinct int
+	if err := e.st.DB().QueryRow(`SELECT COUNT(*), COUNT(DISTINCT started_at)
+		FROM distill_runs WHERE session_id='s1' AND bundle_id <> ''`).Scan(&count, &distinct); err != nil {
+		t.Fatalf("读运行账: %v", err)
+	}
+	if count != n || distinct != 1 {
+		t.Fatalf("同秒运行账应 %d 条且 started_at 唯一值 1 个，got count=%d distinct=%d", n, count, distinct)
+	}
+	var bad int
+	if err := e.st.DB().QueryRow(`SELECT COUNT(*) FROM distill_runs
+		WHERE session_id='s1' AND bundle_id <> '' AND (started_at <> 1000 OR finished_at <> 1000)`).Scan(&bad); err != nil {
+		t.Fatalf("读时间戳: %v", err)
+	}
+	if bad != 0 {
+		t.Fatalf("%d 条运行账的时间戳被篡改", bad)
+	}
+}
+
 // F7：认领竞态——NextRunnable 选中 A 后，A 被别的 worker 抢先租走 → 继续跑 B。
 //
 // 用 BEFORE UPDATE 触发器模拟「另一个 writer 先赢」：内层把 A 写成他人租约，

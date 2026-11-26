@@ -400,12 +400,12 @@ type ProposalRunRecord struct {
 // 与旧 SaveDistillRun 分开：旧函数的 window_key 是「会话窗口」语义，
 // 新 Proposal 用 bundle_id + attempt 表达「哪个连续窗口的第几次尝试」，
 // 两者混用会让「是否已消费」重新退回窗口键，正是 T1.1 明令禁止的。
+//
+// 同 session 同一秒多条运行账是合法形态（maintain 一次追账处理多个窗口），
+// 写入方不得为了避让唯一键而篡改调用方给的时间戳（schema v4 已移除该旧约束）。
 func (s *Store) SaveProposalRun(r ProposalRunRecord) error {
 	if r.ID == "" {
 		r.ID = newID()
-	}
-	if r.SessionID == "" {
-		r.SessionID = ""
 	}
 	now := time.Now().Unix()
 	if r.StartedAt == 0 {
@@ -414,29 +414,19 @@ func (s *Store) SaveProposalRun(r ProposalRunRecord) error {
 	if r.FinishedAt == 0 {
 		r.FinishedAt = now
 	}
-	for i := 0; i < 3; i++ {
-		_, err := s.db.Exec(`INSERT INTO distill_runs(
-			id, session_id, provider, status, error, cand_count, started_at, finished_at,
-			bundle_id, executor, model, model_version, prompt_version, schema_version,
-			generated_count, valid_count, invalid_count, duplicate_count, attempt,
-			source_fingerprint
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			r.ID, r.SessionID, r.Provider, r.Status, r.Error, r.CandCount,
-			r.StartedAt, r.FinishedAt, r.BundleID, r.Executor, r.Model, r.ModelVersion,
-			r.PromptVersion, r.SchemaVersion, r.GeneratedCount, r.ValidCount,
-			r.InvalidCount, r.DuplicateCount, r.Attempt, r.SourceFingerprint)
-		if err == nil {
-			return nil
-		}
-		if strings.Contains(err.Error(), "started_at") {
-			r.StartedAt++
-			r.FinishedAt = r.StartedAt
-			r.ID = newID()
-			continue
-		}
-		return err
-	}
-	return errors.New("写 Proposal 运行账失败：started_at 冲突重试耗尽")
+	_, err := s.db.Exec(`INSERT INTO distill_runs(
+		id, session_id, provider, status, error, cand_count, started_at, finished_at,
+		bundle_id, executor, model, model_version, prompt_version, schema_version,
+		generated_count, valid_count, invalid_count, duplicate_count, attempt,
+		source_fingerprint
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.SessionID, r.Provider, r.Status, r.Error, r.CandCount,
+		r.StartedAt, r.FinishedAt, r.BundleID, r.Executor, r.Model, r.ModelVersion,
+		r.PromptVersion, r.SchemaVersion, r.GeneratedCount, r.ValidCount,
+		r.InvalidCount, r.DuplicateCount, r.Attempt, r.SourceFingerprint)
+	// 主键 newID 的碰撞概率可忽略，直接透传错误即可；不做按时间戳 +1s 的退避，
+	// 那会把「追账发生在同一秒」伪装成数据本身的时间顺序。
+	return err
 }
 
 // ProposalRuns 按 Bundle 读运行账，按开始时间正序。
