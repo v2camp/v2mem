@@ -622,6 +622,23 @@ func (s *Store) replayAccepted(ctx context.Context, q sqlQuerier, cur *CommitCan
 	}, nil
 }
 
+// normalizeMemoryScope 收敛候选域 scope 的写入值。
+//
+// 只允许 global|cross_project|project；大小写/空白归一，未知值（含旧行的
+// conflict 等内部标记）一律置空。写入侧只认这个闭集，避免把内部状态词当作用户语义。
+func normalizeMemoryScope(scope string) string {
+	switch strings.ToLower(strings.TrimSpace(scope)) {
+	case "global":
+		return "global"
+	case "cross_project":
+		return "cross_project"
+	case "project":
+		return "project"
+	default:
+		return ""
+	}
+}
+
 // upsertAcceptedMemory 写记忆并回填 adopted_count。
 //
 // 同 (content_hash, project) 已有记忆时不新建，只把这次采纳计入 adopted_count
@@ -642,6 +659,7 @@ func (s *Store) upsertAcceptedMemory(ctx context.Context, q sqlQuerier, cur *Com
 		salience = 0.5
 	}
 	device, _ := os.Hostname()
+	scope := normalizeMemoryScope(cur.Scope)
 
 	var id string
 	err = q.QueryRowContext(ctx,
@@ -653,9 +671,10 @@ func (s *Store) upsertAcceptedMemory(ctx context.Context, q sqlQuerier, cur *Com
 			SET content = ?, content_idx = ?, updated_at = ?, last_seen_at = ?,
 			    access_count = access_count + 1, salience = MAX(salience, ?),
 			    origin_tool = 'distill', source = 'distill-accept',
-			    adopted_count = adopted_count + 1, last_adopted_at = ?
+			    adopted_count = adopted_count + 1, last_adopted_at = ?,
+			    scope = CASE WHEN scope = '' THEN ? ELSE scope END
 			WHERE id = ?`,
-			cur.Content, idx, now, now, salience, now, id); err != nil {
+			cur.Content, idx, now, now, salience, now, scope, id); err != nil {
 			return "", false, err
 		}
 	case errors.Is(err, sql.ErrNoRows):
@@ -664,11 +683,11 @@ func (s *Store) upsertAcceptedMemory(ctx context.Context, q sqlQuerier, cur *Com
 		if _, err := q.ExecContext(ctx, `INSERT INTO memories
 			(id, content, content_idx, kind, content_hash, project, salience,
 			 created_at, updated_at, last_seen_at, expires_at,
-			 origin_device, origin_tool, source, channel, provenance,
+			 origin_device, origin_tool, source, channel, provenance, scope,
 			 access_count, adopted_count, last_adopted_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,NULL,0,1,?)`,
+			VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,NULL,?,0,1,?)`,
 			id, cur.Content, idx, cur.Kind, hash, cur.Project, salience,
-			now, now, now, device, "distill", "distill-accept", channel, now); err != nil {
+			now, now, now, device, "distill", "distill-accept", channel, scope, now); err != nil {
 			return "", false, err
 		}
 	default:
