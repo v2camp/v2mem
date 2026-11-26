@@ -3,6 +3,7 @@ package flow_test
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -333,5 +334,123 @@ func TestFlowG9G12StayGreenAfterRollback(t *testing.T) {
 			}
 		}
 		t.Fatalf("回滚后应 13/13 全绿，got %d/%d", rep.Passed, rep.Failed)
+	}
+}
+
+// prod 剖面：legacy（bundle_id=”) 候选属于结构性历史数据，被豁免；
+// 但同一 fixture 里带新 bundle_id 的坏候选仍必须红——剖面不得掩盖真实违例。
+func TestFlowProdProfileLegacyExemption(t *testing.T) {
+	e := buildFlow(t)
+	insertCandidate := func(id, bundleID string) {
+		if _, err := e.st.DB().Exec(`INSERT INTO candidates(id, session_id, project, kind, content,
+			content_hash, status, source, created_at, bundle_id, revision)
+			VALUES(?, 's-prod', 'proj', 'fact', 'prod 剖面', ?, 'expired', 'import-proposal', ?, ?, 0)`,
+			id, "ch-"+id, *e.now, bundleID); err != nil {
+			t.Fatalf("注入候选 %s: %v", id, err)
+		}
+	}
+	snapshot := func() eval.FlowSnapshot {
+		snap, err := eval.LoadFlowSnapshot(e.st.DB(), *e.now)
+		if err != nil {
+			t.Fatalf("LoadFlowSnapshot: %v", err)
+		}
+		return snap
+	}
+
+	// 只落 legacy 坏候选：ci 红，prod 豁免后全绿且计数可复算。
+	insertCandidate("prod-legacy", "")
+	ci := eval.CheckFlow(snapshot(), flowWindow)
+	if ci.Failed != 1 {
+		t.Fatalf("ci Failed = %d, want 1（legacy expired 无裁决）", ci.Failed)
+	}
+	prod := eval.CheckFlowWithOptions(snapshot(), flowWindow, eval.FlowOptions{Profile: "prod"})
+	if prod.LegacyExempt != 1 {
+		t.Fatalf("prod LegacyExempt = %d, want 1", prod.LegacyExempt)
+	}
+	if !prod.OK() {
+		for _, c := range prod.Checks {
+			t.Logf("%s pass=%v %s", c.ID, c.Pass, c.Detail)
+		}
+		t.Fatalf("prod 应 13/13 全绿，got %d/%d", prod.Passed, prod.Failed)
+	}
+
+	// 再加一条带真实 bundle_id 的坏候选：prod 仍红，并点名新候选。
+	var bundleID string
+	if err := e.st.DB().QueryRow(`SELECT id FROM evidence_bundles WHERE status='ok' ORDER BY id LIMIT 1`).
+		Scan(&bundleID); err != nil {
+		t.Fatalf("取 Bundle: %v", err)
+	}
+	insertCandidate("prod-new-bad", bundleID)
+	prod = eval.CheckFlowWithOptions(snapshot(), flowWindow, eval.FlowOptions{Profile: "prod"})
+	if prod.Failed != 1 {
+		for _, c := range prod.Checks {
+			t.Logf("%s pass=%v %s", c.ID, c.Pass, c.Detail)
+		}
+		t.Fatalf("prod Failed = %d, want 1（新 bundle 的 expired 无裁决）", prod.Failed)
+	}
+	for _, c := range prod.Checks {
+		if c.ID != "G9" && !c.Pass {
+			t.Fatalf("%s 不应受新坏候选影响: %s", c.ID, c.Detail)
+		}
+		if c.ID == "G9" {
+			if c.Pass {
+				t.Fatal("新 bundle_id 的坏候选必须让 G9 红")
+			}
+			if !strings.Contains(c.Detail, "prod-new-bad") || strings.Contains(c.Detail, "prod-legacy") {
+				t.Fatalf("G9 应点名新候选且不提 legacy，got %q", c.Detail)
+			}
+		}
+	}
+}
+
+// E3 的注入在 prod 下同样只红对应项（非 legacy 数据不受剖面影响）。
+func TestFlowProdSinglePointBreakage(t *testing.T) {
+	cases := []struct {
+		name   string
+		inject func(t *testing.T, e *flowEnv)
+		want   string
+	}{
+		{"observation_without_archive", func(t *testing.T, e *flowEnv) {
+			if _, err := e.st.DB().Exec(`INSERT INTO observations(id, session_id, event, content_hash, created_at,
+				source_id, source_generation, source_seq, event_uid, archive_hash)
+				VALUES('inj-o','sA','stop','inj-h',?,'srcA',1,4,'inj-u','')`, *e.now); err != nil {
+				t.Fatalf("注入观测: %v", err)
+			}
+		}, "G2"},
+		{"fail_bundle_without_retry", func(t *testing.T, e *flowEnv) {
+			if _, err := e.st.DB().Exec(`INSERT INTO evidence_bundles(id, source_id, generation,
+				from_seq_exclusive, to_seq_inclusive, evidence_hash, status, attempt, last_run_id, created_at, updated_at)
+				VALUES('inj-b','srcN',1,1,1,'inj-eh','fail',0,'',?,?)`, *e.now, *e.now); err != nil {
+				t.Fatalf("注入 Bundle: %v", err)
+			}
+		}, "G7"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := buildFlow(t)
+			tc.inject(t, e)
+			snap, err := eval.LoadFlowSnapshot(e.st.DB(), *e.now)
+			if err != nil {
+				t.Fatalf("LoadFlowSnapshot: %v", err)
+			}
+			rep := eval.CheckFlowWithOptions(snap, flowWindow, eval.FlowOptions{Profile: "prod"})
+			if rep.Failed != 1 {
+				for _, c := range rep.Checks {
+					t.Logf("%s pass=%v %s", c.ID, c.Pass, c.Detail)
+				}
+				t.Fatalf("prod Failed = %d, want 1", rep.Failed)
+			}
+			for _, c := range rep.Checks {
+				if c.ID == tc.want {
+					if c.Pass {
+						t.Fatalf("%s 应为唯一失败项: %s", tc.want, c.Detail)
+					}
+					continue
+				}
+				if !c.Pass {
+					t.Fatalf("%s 不应受 %s 影响: %s", c.ID, tc.want, c.Detail)
+				}
+			}
+		})
 	}
 }

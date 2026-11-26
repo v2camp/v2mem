@@ -40,37 +40,85 @@ type FlowCheckReport struct {
 	Failed        int         `json:"failed"`
 	ManualRate    float64     `json:"manual_rate"`
 	WindowSeconds int64       `json:"window_seconds,omitempty"`
+	Profile       string      `json:"profile"`
+	LegacyExempt  int         `json:"legacy_exempt"`
+}
+
+// FlowOptions 是 eval flow 的剖面选项。
+type FlowOptions struct {
+	Profile    string // "ci"（默认，严格）| "prod"（legacy 豁免 + 无样本降级）
+	AllowEmpty bool   // 仅 prod：把「无样本」降级为 PASS-with-note
 }
 
 // OK 表示全部 G 检查通过（cmd 据此决定退出码）。
 func (r FlowCheckReport) OK() bool { return r.Failed == 0 }
 
-// CheckFlow 对快照跑全部 13 条 G 检查。window<=0 取 15 天 SLA。
+// CheckFlow 对快照跑全部 13 条 G 检查（严格 ci 剖面）。window<=0 取 15 天 SLA。
 func CheckFlow(s FlowSnapshot, window time.Duration) FlowCheckReport {
+	return CheckFlowWithOptions(s, window, FlowOptions{})
+}
+
+// CheckFlowWithOptions 是带剖面的 CheckFlow；默认行为与 CheckFlow 完全一致。
+//
+// prod 剖面只做两件事：
+//   - 把 legacy 候选（bundle_id 为空）从 G8/G9/G11/G12/G13 的输入中剔除，
+//     把 legacy 运行账从 G7 的输入中剔除；
+//   - AllowEmpty 时把「无样本」分支降级为 PASS-with-note。
+//
+// 当前行的真实违例仍照常判红：豁免只认结构性的 bundle_id 空值。
+func CheckFlowWithOptions(s FlowSnapshot, window time.Duration, opts FlowOptions) FlowCheckReport {
 	if window <= 0 {
 		window = flowDefaultWindow
+	}
+	profile := "ci"
+	if opts.Profile == "prod" {
+		profile = "prod"
 	}
 	now := s.Now
 	if now <= 0 {
 		now = time.Now().Unix()
 	}
-	idx := newFlowIndex(s)
-	checks := []FlowCheck{
-		flowG1(s.Observations),
-		flowG2(s.Observations, idx),
-		flowG3(s.Archives, idx),
-		flowG4(s.Archives, idx),
-		flowG5(s.Bundles, idx),
-		flowG6(s.Bundles, idx),
-		flowG7(s.Runs, s.Bundles, idx),
-		flowG8(s.Candidates, now, window),
-		flowG9(s.Candidates, idx),
-		flowG10(s.Candidates, s.Decisions, idx),
-		flowG11(s.Candidates, idx),
-		flowG12(s.Candidates),
-		flowG13(s.Candidates, idx),
+	allowEmpty := profile == "prod" && opts.AllowEmpty
+
+	filtered := s
+	exemptCandidates, exemptRuns := 0, 0
+	if profile == "prod" {
+		filtered.Candidates = make([]FlowCandidate, 0, len(s.Candidates))
+		for _, c := range s.Candidates {
+			if IsLegacyCandidate(c) {
+				exemptCandidates++
+				continue
+			}
+			filtered.Candidates = append(filtered.Candidates, c)
+		}
+		filtered.Runs = make([]FlowRun, 0, len(s.Runs))
+		for _, r := range s.Runs {
+			if IsLegacyRun(r) {
+				exemptRuns++
+				continue
+			}
+			filtered.Runs = append(filtered.Runs, r)
+		}
 	}
-	rep := FlowCheckReport{Checks: checks, WindowSeconds: int64(window / time.Second)}
+	idx := newFlowIndex(filtered)
+	checks := []FlowCheck{
+		flowG1(filtered.Observations),
+		flowG2(filtered.Observations, idx),
+		flowG3(filtered.Archives, idx),
+		flowG4(filtered.Archives, idx),
+		flowG5(filtered.Bundles, idx),
+		flowG6(filtered.Bundles, idx),
+		flowG7(filtered.Runs, filtered.Bundles, idx, allowEmpty),
+		flowG8(filtered.Candidates, now, window, allowEmpty),
+		flowG9(filtered.Candidates, idx, allowEmpty),
+		flowG10(filtered.Candidates, filtered.Decisions, idx),
+		flowG11(filtered.Candidates, idx, allowEmpty),
+		flowG12(filtered.Candidates, allowEmpty),
+		flowG13(filtered.Candidates, idx, allowEmpty),
+	}
+	markLegacyExempt(checks, exemptCandidates, exemptRuns)
+	rep := FlowCheckReport{Checks: checks, WindowSeconds: int64(window / time.Second),
+		Profile: profile, LegacyExempt: exemptCandidates + exemptRuns}
 	for _, c := range checks {
 		if c.Pass {
 			rep.Passed++
@@ -175,6 +223,23 @@ func flowPass(id, name, detail string) FlowCheck {
 
 func flowFail(id, name, detail string) FlowCheck {
 	return FlowCheck{ID: id, Name: name, Pass: false, Detail: detail}
+}
+
+// markLegacyExempt 在受影响检查的 detail 末尾注明豁免数量，便于复算
+// legacy_exempt（docs/design-eval-flows.md §3.1 的 prod 剖面）。
+func markLegacyExempt(checks []FlowCheck, candidates, runs int) {
+	for i := range checks {
+		switch checks[i].ID {
+		case "G7":
+			if runs > 0 {
+				checks[i].Detail += fmt.Sprintf("（legacy 豁免 %d）", runs)
+			}
+		case "G8", "G9", "G11", "G12", "G13":
+			if candidates > 0 {
+				checks[i].Detail += fmt.Sprintf("（legacy 豁免 %d）", candidates)
+			}
+		}
+	}
 }
 
 // flowIDs 排序并截断点名，保证输出稳定、不刷屏。
@@ -365,7 +430,7 @@ func flowG6(bundles []FlowBundle, idx *flowIndex) FlowCheck {
 }
 
 // G7 失败不冒充 noop：失败运行必须被重试（attempt 递增）或按上限隔离。
-func flowG7(runs []FlowRun, bundles []FlowBundle, idx *flowIndex) FlowCheck {
+func flowG7(runs []FlowRun, bundles []FlowBundle, idx *flowIndex, allowEmpty bool) FlowCheck {
 	const id, name = "G7", "失败有重试账"
 	var failedRuns []FlowRun
 	for _, r := range runs {
@@ -384,6 +449,9 @@ func flowG7(runs []FlowRun, bundles []FlowBundle, idx *flowIndex) FlowCheck {
 		}
 	}
 	if len(failedRuns) == 0 && len(openBad) == 0 && len(quarantined) == 0 {
+		if allowEmpty {
+			return flowPass(id, name, "无失败窗口样本：prod 剖面按无样本降级")
+		}
 		return flowFail(id, name, "无失败窗口样本：失败不算 noop 未被验证")
 	}
 	var bad []string
@@ -417,9 +485,12 @@ func flowG7(runs []FlowRun, bundles []FlowBundle, idx *flowIndex) FlowCheck {
 }
 
 // G8 候选无悬空：超过处理 SLA 仍 pending 即为悬空。
-func flowG8(cands []FlowCandidate, now int64, window time.Duration) FlowCheck {
+func flowG8(cands []FlowCandidate, now int64, window time.Duration, allowEmpty bool) FlowCheck {
 	const id, name = "G8", "无悬空候选"
 	if len(cands) == 0 {
+		if allowEmpty {
+			return flowPass(id, name, "无候选：prod 剖面按无样本降级")
+		}
 		return flowFail(id, name, "无候选：候选→裁决 未被验证")
 	}
 	threshold := now - int64(window/time.Second)
@@ -444,9 +515,12 @@ func flowG8(cands []FlowCandidate, now int64, window time.Duration) FlowCheck {
 //     为了过闸去伪造一条裁决。
 //   - pending 的「已有终态裁决」只看**最近一次 reopen 之后**：`mem batch --rollback`
 //     把候选退回 pending 时历史裁决合法地留在账上，旧口径会把每个回滚过的候选判红。
-func flowG9(cands []FlowCandidate, idx *flowIndex) FlowCheck {
+func flowG9(cands []FlowCandidate, idx *flowIndex, allowEmpty bool) FlowCheck {
 	const id, name = "G9", "候选裁决闭环"
 	if len(cands) == 0 {
+		if allowEmpty {
+			return flowPass(id, name, "无候选：prod 剖面按无样本降级")
+		}
 		return flowFail(id, name, "无候选：裁决矩阵未被验证")
 	}
 	var bad []string
@@ -548,7 +622,7 @@ func flowG10(cands []FlowCandidate, decisions []FlowDecision, idx *flowIndex) Fl
 }
 
 // G11 记忆绑定：采纳必须有记忆、裁决 memory_id 一致、证据链覆盖完整。
-func flowG11(cands []FlowCandidate, idx *flowIndex) FlowCheck {
+func flowG11(cands []FlowCandidate, idx *flowIndex, allowEmpty bool) FlowCheck {
 	const id, name = "G11", "记忆证据绑定"
 	var accepted int
 	var bad []string
@@ -578,9 +652,15 @@ func flowG11(cands []FlowCandidate, idx *flowIndex) FlowCheck {
 		}
 	}
 	if accepted == 0 {
+		if allowEmpty {
+			return flowPass(id, name, "无已采纳候选：prod 剖面按无样本降级")
+		}
 		return flowFail(id, name, "无已采纳候选：裁决→记忆 未被验证")
 	}
 	if withEvidence == 0 {
+		if allowEmpty {
+			return flowPass(id, name, "已采纳候选均无证据绑定样本：prod 剖面按无样本降级")
+		}
 		return flowFail(id, name, "已采纳候选均无证据绑定样本")
 	}
 	if len(bad) > 0 {
@@ -595,9 +675,12 @@ func flowG11(cands []FlowCandidate, idx *flowIndex) FlowCheck {
 // expired 计终态（它确实到了显式状态）；合法性由 G9 守，不在这里重复判。
 // failed **不**计终态：它还在重试队列里，算成终态会让准出率虚高——这正是「失败不算 noop」
 // 在准出率上的同一句话。
-func flowG12(cands []FlowCandidate) FlowCheck {
+func flowG12(cands []FlowCandidate, allowEmpty bool) FlowCheck {
 	const id, name = "G12", "准出率对账"
 	if len(cands) == 0 {
+		if allowEmpty {
+			return flowPass(id, name, "无候选：prod 剖面按无样本降级")
+		}
 		return flowFail(id, name, "无候选：准出率未被验证")
 	}
 	window := make(map[string]*FlowLedger)
@@ -635,9 +718,12 @@ func flowG12(cands []FlowCandidate) FlowCheck {
 }
 
 // G13 重复提交与严密度：同一会话同一内容不得重复落库；采纳不得无证据强写。
-func flowG13(cands []FlowCandidate, idx *flowIndex) FlowCheck {
+func flowG13(cands []FlowCandidate, idx *flowIndex, allowEmpty bool) FlowCheck {
 	const id, name = "G13", "重复与严密度"
 	if len(cands) == 0 {
+		if allowEmpty {
+			return flowPass(id, name, "无候选：prod 剖面按无样本降级")
+		}
 		return flowFail(id, name, "无候选：重复率未被验证")
 	}
 	dup := make(map[string]int)

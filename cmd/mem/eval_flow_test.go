@@ -115,3 +115,67 @@ func tableCounts(t *testing.T, st *store.Store) map[string]int {
 	}
 	return out
 }
+
+// --profile=prod：JSON 带 profile 与 legacy_exempt；空库只剩真实缺口（G1–G6、G10）
+// 失败，其余「无样本」按 prod 降级。
+func TestEvalFlowProfileProdJSON(t *testing.T) {
+	db := testDB(t)
+	out, err := captureStdout(t, func() error {
+		return cmdEvalFlow([]string{"--db", db, "--json", "--profile=prod"})
+	})
+	if err == nil {
+		t.Fatal("空库仍有真实缺口，prod 也必须返回非 nil 错误")
+	}
+	var rep eval.FlowCheckReport
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatalf("JSON 解析失败: %v\n%s", err, out)
+	}
+	if rep.Profile != "prod" {
+		t.Fatalf("profile = %q, want prod\n%s", rep.Profile, out)
+	}
+	if rep.LegacyExempt != 0 {
+		t.Fatalf("legacy_exempt = %d, want 0", rep.LegacyExempt)
+	}
+	if len(rep.Checks) != 13 || rep.Passed+rep.Failed != 13 {
+		t.Fatalf("checks/passed/failed = %d/%d/%d", len(rep.Checks), rep.Passed, rep.Failed)
+	}
+	// G1–G6 是真实缺口，G10 无裁决账也仍是缺口；G7/G8/G9/G11/G12/G13 无样本已降级。
+	if rep.Failed != 7 {
+		for _, c := range rep.Checks {
+			t.Logf("%s pass=%v %s", c.ID, c.Pass, c.Detail)
+		}
+		t.Fatalf("Failed = %d, want 7（G1–G6 + G10）", rep.Failed)
+	}
+	if !strings.Contains(out, `"profile":"prod"`) || !strings.Contains(out, `"legacy_exempt":0`) {
+		t.Fatalf("JSON 应含 profile/legacy_exempt 字段:\n%s", out)
+	}
+}
+
+// --allow-empty=false 关闭 prod 的无样本降级：空库回到 13 项全红。
+func TestEvalFlowProdAllowEmptyOff(t *testing.T) {
+	db := testDB(t)
+	out, err := captureStdout(t, func() error {
+		return cmdEvalFlow([]string{"--db", db, "--json", "--profile=prod", "--allow-empty=false"})
+	})
+	if err == nil {
+		t.Fatal("关闭降级后空库应返回非 nil 错误")
+	}
+	var rep eval.FlowCheckReport
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatalf("JSON 解析失败: %v\n%s", err, out)
+	}
+	if rep.Failed != 13 || rep.Passed != 0 {
+		t.Fatalf("passed/failed = %d/%d, want 0/13", rep.Passed, rep.Failed)
+	}
+}
+
+// 未知剖面直接报用法错误，不落库、不跑判定。
+func TestEvalFlowProfileInvalid(t *testing.T) {
+	db := testDB(t)
+	_, err := captureStdout(t, func() error {
+		return cmdEvalFlow([]string{"--db", db, "--profile=bogus"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "profile") {
+		t.Fatalf("未知 profile 应报错并点名 profile，got %v", err)
+	}
+}

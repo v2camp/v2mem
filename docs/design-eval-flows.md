@@ -56,7 +56,7 @@
 下表由 §3 的逐跳断言拆成**可执行**检查：每条只从库表/审计账判定，
 空库或该跳无样本一律显式 FAIL（「没验证」不等于「没问题」）。
 ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval/flow_check.go`
-与 `test/flow`。运行：`mem eval flow [--db] [--json] [--window 360h]`，
+与 `test/flow`。运行：`mem eval flow [--db] [--json] [--window 360h] [--profile ci|prod]`，
 `make test` 已包含该套件（`test-flow`）。
 
 | ID | 跳 | 检查（口径） | 数据来源 | 自动检查 |
@@ -74,6 +74,12 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 | G11 | 裁决 → 记忆 | 采纳必须落到 memories；裁决 memory_id 一致；候选证据在 memory_evidence 全绑定 | candidates、commit_decisions、candidate_evidence、memory_evidence、memories | `eval flow` 的 G11 |
 | G12 | 候选 → 裁决 | 逐 Bundle 窗口「终态数 = 准入数」，准出率 100%（终态 = accepted/rejected/expired/quarantined/withdrawn；failed 非终态，复用账本对账） | candidates | `eval flow` 的 G12 |
 | G13 | 候选 → 裁决 | 同一会话同一内容不重复落库；采纳不得无证据强写 | candidates、candidate_evidence | `eval flow` 的 G13 |
+
+> **prod 剖面（legacy 豁免）**：`--profile=ci`（默认）保持上表严格口径。`--profile=prod` 先按
+> `bundle_id` 为空剔除 legacy 候选（G8/G9/G11/G12/G13 输入）与 legacy 运行账（G7 输入），
+> 报告以 `legacy_exempt` 给出豁免总数；`--allow-empty`（prod 下默认开）只把过滤后的
+> 「无样本」分支降级为 PASS-with-note。带 bundle_id 的当前行真实违例仍 FAIL。
+> 实现见 `internal/eval/legacy.go` 与 `CheckFlowWithOptions`。
 
 > **S10a 口径变更（G9 / G12）**：
 > - **G9**：`failed` / `quarantined` / `withdrawn` 不是裁决驱动的状态（`failed` 在重试队列、

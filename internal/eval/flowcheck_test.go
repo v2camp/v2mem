@@ -488,6 +488,165 @@ func TestCheckFlowG9PendingIgnoresDecisionsBeforeReopen(t *testing.T) {
 	}
 }
 
+// ---------- prod 剖面：legacy 分桶 ----------
+
+func legacyFlowCandidate(id string, now int64) FlowCandidate {
+	return FlowCandidate{ID: id, SessionID: "s-" + id, ContentHash: "h-" + id,
+		Status: "expired", BundleID: "", CreatedAt: now}
+}
+
+// legacy 判定只认 bundle_id 空：生产历史候选全部如此，单轨后的新候选必有 bundle_id。
+func TestIsLegacyCandidateAndRun(t *testing.T) {
+	if !IsLegacyCandidate(FlowCandidate{BundleID: ""}) || !IsLegacyCandidate(FlowCandidate{BundleID: "  "}) {
+		t.Fatal("bundle_id 为空/空白应判 legacy")
+	}
+	if IsLegacyCandidate(FlowCandidate{BundleID: "bA"}) {
+		t.Fatal("有 bundle_id 不应判 legacy")
+	}
+	if !IsLegacyRun(FlowRun{BundleID: ""}) || IsLegacyRun(FlowRun{BundleID: "bA"}) {
+		t.Fatal("IsLegacyRun 判定错误")
+	}
+}
+
+// prod 剖面豁免 legacy 候选：ci 下 G9 红，prod 下 G9 绿且 legacy_exempt 可复算。
+func TestCheckFlowProdExemptsLegacyCandidate(t *testing.T) {
+	now := int64(1_700_000_000)
+	s := cleanSnapshot(now)
+	s.Candidates = append(s.Candidates, legacyFlowCandidate("cLegacy", now))
+
+	ci := CheckFlow(s, testFlowWindow)
+	if ci.Profile != "ci" {
+		t.Fatalf("严格剖面 Profile = %q, want ci", ci.Profile)
+	}
+	if ci.Failed != 1 {
+		t.Fatalf("ci Failed = %d, want 1（legacy expired 无裁决）", ci.Failed)
+	}
+	if c, _ := checkByID(ci, "G9"); c.Pass {
+		t.Fatal("ci 下 legacy expired 候选必须让 G9 红")
+	}
+
+	prod := CheckFlowWithOptions(s, testFlowWindow, FlowOptions{Profile: "prod"})
+	if !prod.OK() || prod.Failed != 0 {
+		for _, c := range prod.Checks {
+			t.Logf("%s pass=%v %s", c.ID, c.Pass, c.Detail)
+		}
+		t.Fatalf("prod 应 13/13 全绿，got %d/%d", prod.Passed, prod.Failed)
+	}
+	if prod.Profile != "prod" || prod.LegacyExempt != 1 {
+		t.Fatalf("prod Profile/LegacyExempt = %q/%d, want prod/1", prod.Profile, prod.LegacyExempt)
+	}
+	if c, _ := checkByID(prod, "G9"); !strings.Contains(c.Detail, "legacy 豁免 1") {
+		t.Fatalf("G9 detail 应带 legacy 豁免 1，got %q", c.Detail)
+	}
+}
+
+// prod 只豁免 legacy：同一 fixture 中带新 bundle_id 的坏候选仍必须红，且点名新候选而非 legacy。
+func TestCheckFlowProdStillCatchesNewBundleViolation(t *testing.T) {
+	now := int64(1_700_000_000)
+	s := cleanSnapshot(now)
+	s.Candidates = append(s.Candidates,
+		legacyFlowCandidate("cLegacy", now),
+		FlowCandidate{ID: "cNewBad", SessionID: "s-new", ContentHash: "h-new",
+			Status: "expired", BundleID: "bA", CreatedAt: now})
+
+	rep := CheckFlowWithOptions(s, testFlowWindow, FlowOptions{Profile: "prod", AllowEmpty: true})
+	if rep.LegacyExempt != 1 {
+		t.Fatalf("LegacyExempt = %d, want 1", rep.LegacyExempt)
+	}
+	if rep.Failed != 1 {
+		for _, c := range rep.Checks {
+			t.Logf("%s pass=%v %s", c.ID, c.Pass, c.Detail)
+		}
+		t.Fatalf("Failed = %d, want 1（新 bundle 的 expired 无裁决）", rep.Failed)
+	}
+	c, _ := checkByID(rep, "G9")
+	if c.Pass {
+		t.Fatal("新 bundle_id 的坏候选必须让 G9 红，prod 不得掩盖真实违例")
+	}
+	if !strings.Contains(c.Detail, "cNewBad") || strings.Contains(c.Detail, "cLegacy") {
+		t.Fatalf("G9 应点名新候选且不提 legacy，got %q", c.Detail)
+	}
+}
+
+// AllowEmpty 只降级「无样本」分支，且仅 prod 生效；真实违例仍 FAIL。
+func TestCheckFlowAllowEmptyOnlyForNoSample(t *testing.T) {
+	now := int64(1_700_000_000)
+	s := cleanSnapshot(now)
+	// 非 legacy 的真实违例：归档计数与观测数不符。
+	s.Archives[0].RawCount = 2
+
+	ciLoose := CheckFlowWithOptions(s, testFlowWindow, FlowOptions{Profile: "ci", AllowEmpty: true})
+	if ciLoose.Failed != 1 {
+		t.Fatalf("AllowEmpty 在 ci 下不得生效，Failed = %d", ciLoose.Failed)
+	}
+
+	prodLoose := CheckFlowWithOptions(s, testFlowWindow, FlowOptions{Profile: "prod", AllowEmpty: true})
+	if prodLoose.Failed != 1 {
+		t.Fatalf("AllowEmpty 不得掩盖真实违例，Failed = %d", prodLoose.Failed)
+	}
+	if c, _ := checkByID(prodLoose, "G3"); c.Pass {
+		t.Fatal("G3 真实违例必须仍红")
+	}
+
+	// 全部候选都是 legacy：过滤后无样本，prod+AllowEmpty 降级为 PASS 并注明剖面。
+	s = cleanSnapshot(now)
+	for i := range s.Candidates {
+		s.Candidates[i].BundleID = ""
+	}
+	strict := CheckFlowWithOptions(s, testFlowWindow, FlowOptions{Profile: "prod"})
+	for _, id := range []string{"G8", "G9", "G11", "G12", "G13"} {
+		if c, _ := checkByID(strict, id); c.Pass {
+			t.Fatalf("%s 在 prod 未开 AllowEmpty 时无样本必须红", id)
+		}
+	}
+	loose := CheckFlowWithOptions(s, testFlowWindow, FlowOptions{Profile: "prod", AllowEmpty: true})
+	if !loose.OK() {
+		for _, c := range loose.Checks {
+			t.Logf("%s pass=%v %s", c.ID, c.Pass, c.Detail)
+		}
+		t.Fatalf("prod+AllowEmpty 无样本应降级为全绿，got %d/%d", loose.Passed, loose.Failed)
+	}
+	if c, _ := checkByID(loose, "G8"); !strings.Contains(c.Detail, "prod") {
+		t.Fatalf("降级 detail 应注明 prod 剖面，got %q", c.Detail)
+	}
+}
+
+// legacy run 从 G7 输入中过滤：ci 下失联 run 红，prod 下变无样本（AllowEmpty 时降级）。
+func TestCheckFlowProdFiltersLegacyRuns(t *testing.T) {
+	now := int64(1_700_000_000)
+	s := cleanSnapshot(now)
+	s.Runs = append(s.Runs, FlowRun{ID: "runLegacy", BundleID: " ", Status: "fail", Attempt: 1})
+
+	if c, _ := checkByID(CheckFlow(s, testFlowWindow), "G7"); c.Pass {
+		t.Fatal("ci 下 legacy 失联失败运行必须让 G7 红")
+	}
+	rep := CheckFlowWithOptions(s, testFlowWindow, FlowOptions{Profile: "prod", AllowEmpty: true})
+	c, _ := checkByID(rep, "G7")
+	if !c.Pass || !strings.Contains(c.Detail, "legacy 豁免 1") {
+		t.Fatalf("prod 应过滤 legacy run 并注明豁免，got pass=%v %q", c.Pass, c.Detail)
+	}
+	if rep.LegacyExempt != 1 {
+		t.Fatalf("LegacyExempt = %d, want 1", rep.LegacyExempt)
+	}
+}
+
+// 默认 options 与 CheckFlow 字节级同结果（ci 严格）。
+func TestCheckFlowWithOptionsDefaultsToStrictCI(t *testing.T) {
+	s := cleanSnapshot(1_700_000_000)
+	s.Candidates = append(s.Candidates, legacyFlowCandidate("cLegacy", s.Now))
+	strict := CheckFlow(s, testFlowWindow)
+	def := CheckFlowWithOptions(s, testFlowWindow, FlowOptions{})
+	if def.Profile != "ci" || def.Passed != strict.Passed || def.Failed != strict.Failed {
+		t.Fatalf("默认 options 应与 CheckFlow 一致: %+v vs %+v", def, strict)
+	}
+	for i := range strict.Checks {
+		if def.Checks[i].ID != strict.Checks[i].ID || def.Checks[i].Pass != strict.Checks[i].Pass ||
+			def.Checks[i].Detail != strict.Checks[i].Detail {
+			t.Fatalf("%s 结果漂移: %+v vs %+v", strict.Checks[i].ID, def.Checks[i], strict.Checks[i])
+		}
+	}
+}
+
 // S10a：G12 终态集合 = accepted/rejected/expired/quarantined/withdrawn。
 // failed 不是终态：它还在重试队列里，算成终态会让准出率虚高。
 func TestCheckFlowG12TerminalSet(t *testing.T) {
