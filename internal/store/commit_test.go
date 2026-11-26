@@ -613,6 +613,126 @@ func TestSyncMergeEvidenceKeepsLocalID(t *testing.T) {
 	}
 }
 
+func memoryScope(t *testing.T, s *Store, memoryID string) string {
+	t.Helper()
+	var scope string
+	if err := s.db.QueryRow(`SELECT scope FROM memories WHERE id = ?`, memoryID).Scan(&scope); err != nil {
+		t.Fatalf("read memories.scope: %v", err)
+	}
+	return scope
+}
+
+func adoptCandidate(t *testing.T, s *Store, candidateID string) *CommitResult {
+	t.Helper()
+	view, err := s.CommitCandidate(candidateID)
+	if err != nil {
+		t.Fatalf("CommitCandidate: %v", err)
+	}
+	out, err := s.CommitAccept(candidateID, view.Revision, commit.ActorHuman)
+	if err != nil {
+		t.Fatalf("CommitAccept: %v", err)
+	}
+	return out
+}
+
+// 候选的 scope 是唯一有意义的输入；落库时必须归一后写进 memories.scope。
+// task B 的红 case：旧代码 INSERT 没有 scope 列，采纳后仍为空。
+func TestCommitAcceptWritesNormalizedCandidateScope(t *testing.T) {
+	s := newTestStore(t)
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"global", "global"},
+		{" Global ", "global"},
+		{"CROSS_PROJECT", "cross_project"},
+		{"project", "project"},
+		{"team", ""},
+		{"", ""},
+	}
+	for i, tc := range cases {
+		res := newCandidate(t, s, "fact", "p", "scope 写入用例 "+string(rune('A'+i)))
+		if _, err := s.db.Exec(`UPDATE candidates SET scope = ? WHERE id = ?`, tc.in, res.Candidate.ID); err != nil {
+			t.Fatalf("set scope: %v", err)
+		}
+		out := adoptCandidate(t, s, res.Candidate.ID)
+		if got := memoryScope(t, s, out.MemoryID); got != tc.want {
+			t.Errorf("候选 scope=%q 应落库为 %q，got %q", tc.in, tc.want, got)
+		}
+	}
+}
+
+func TestNormalizeMemoryScope(t *testing.T) {
+	cases := map[string]string{
+		"":              "",
+		"global":        "global",
+		" Global ":      "global",
+		"\tPROJECT\n":   "project",
+		"cross_project": "cross_project",
+		"Cross_Project": "cross_project",
+		"team":          "",
+		"conflict":      "",
+	}
+	for in, want := range cases {
+		if got := normalizeMemoryScope(in); got != want {
+			t.Errorf("normalizeMemoryScope(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// 重复采纳时 scope 只补空：已有非空值不被空/旧候选覆盖；历史空值可被首次补上。
+func TestCommitAcceptScopeOnlyFillsEmpty(t *testing.T) {
+	s := newTestStore(t)
+	const content = "同一事实被采纳两次"
+	first := newCandidate(t, s, "fact", "p", content)
+	if _, err := s.db.Exec(`UPDATE candidates SET scope = 'global' WHERE id = ?`, first.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	out := adoptCandidate(t, s, first.Candidate.ID)
+	if got := memoryScope(t, s, out.MemoryID); got != "global" {
+		t.Fatalf("首次采纳应写入 global，got %q", got)
+	}
+
+	// 另一会话、同内容同工程：命中同一条记忆；空 scope 不得把 global 抹掉。
+	second, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s2", Project: "p", Kind: "fact", Content: content, Source: "distill",
+	})
+	if err != nil {
+		t.Fatalf("InsertCandidate: %v", err)
+	}
+	again := adoptCandidate(t, s, second.Candidate.ID)
+	if again.MemoryID != out.MemoryID {
+		t.Fatalf("应链接同一条记忆，got %s want %s", again.MemoryID, out.MemoryID)
+	}
+	if got := memoryScope(t, s, out.MemoryID); got != "global" {
+		t.Fatalf("空 scope 不得覆盖已有 global，got %q", got)
+	}
+
+	// 历史空 scope（Add 直写）遇到非空候选：应被补上。
+	mem, err := s.Add(AddInput{Content: "历史空 scope 的记忆", Project: "p", Kind: "fact"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := memoryScope(t, s, mem.ID); got != "" {
+		t.Fatalf("Add 不应伪造 scope，got %q", got)
+	}
+	third, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s3", Project: "p", Kind: "fact", Content: "历史空 scope 的记忆", Source: "distill",
+	})
+	if err != nil {
+		t.Fatalf("InsertCandidate: %v", err)
+	}
+	if _, err := s.db.Exec(`UPDATE candidates SET scope = 'cross_project' WHERE id = ?`, third.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	if out := adoptCandidate(t, s, third.Candidate.ID); out.MemoryID != mem.ID {
+		t.Fatalf("应链接已有记忆，got %s want %s", out.MemoryID, mem.ID)
+	}
+	if got := memoryScope(t, s, mem.ID); got != "cross_project" {
+		t.Fatalf("空 scope 记忆应被候选补上，got %q", got)
+	}
+}
+
 func TestCommitDecisionIdempotencyKeyUnique(t *testing.T) {
 	s := newTestStore(t)
 	res := newCandidate(t, s, "task", "p", "同一 revision 同一动作只落一条裁决")

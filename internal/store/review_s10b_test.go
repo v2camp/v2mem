@@ -463,3 +463,58 @@ func TestReviewSummaryEligiblePureFunction(t *testing.T) {
 		t.Fatalf("短正文原样保留，got %q", got)
 	}
 }
+
+// 采纳写入的 scope 必须真的影响摘要：global 记忆按 sha256(id)[0]%10==0 抽样，
+// 命中的进 summary，未命中的不进。这条把「写 scope」与「复核摘要」两端钉在一起。
+func TestReviewSummaryIncludesSampledGlobalMemory(t *testing.T) {
+	s := newTestStore(t)
+	var hitID, missID string
+	for i := 0; i < 200 && (hitID == "" || missID == ""); i++ {
+		res, err := s.Add(AddInput{
+			Content: fmt.Sprintf("scope 抽样记忆 %d", i), Project: "p", Kind: "fact",
+			Source: "distill-accept",
+		})
+		if err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		switch {
+		case sampleHighImpact(res.ID) && hitID == "":
+			hitID = res.ID
+		case !sampleHighImpact(res.ID) && missID == "":
+			missID = res.ID
+		}
+	}
+	if hitID == "" || missID == "" {
+		t.Fatalf("未能造出命中/未命中两条记忆: hit=%q miss=%q", hitID, missID)
+	}
+	for _, id := range []string{hitID, missID} {
+		if _, err := s.db.Exec(`UPDATE memories SET scope = 'global' WHERE id = ?`, id); err != nil {
+			t.Fatalf("set scope: %v", err)
+		}
+		if _, err := s.db.Exec(`INSERT INTO commit_decisions
+			(id, candidate_id, revision, evidence_hash, action, actor, reason_codes_json,
+			 memory_id, model_tag, created_memory, idempotency_key, created_at)
+			VALUES (?,?,0,'','auto_commit','model-auto','[]',?,'m@v1',1,?,1700000000)`,
+			"dec-"+id, "cand-"+id, id, "key-"+id); err != nil {
+			t.Fatalf("insert decision: %v", err)
+		}
+	}
+
+	q, err := s.ListReviewQueue(ReviewQueueSummary, 50)
+	if err != nil {
+		t.Fatalf("ListReviewQueue: %v", err)
+	}
+	got := map[string]bool{}
+	for _, it := range q.States[ReviewQueueSummary] {
+		got[it.ID] = true
+	}
+	if !got[hitID] {
+		t.Fatal("hash(id)%10==0 的 global 记忆必须进 summary")
+	}
+	if got[missID] {
+		t.Fatal("未命中抽样的 global 记忆不应进 summary")
+	}
+	if q.Counts[ReviewQueueSummary] != 1 {
+		t.Fatalf("summary 计数应与列表同源，got %d", q.Counts[ReviewQueueSummary])
+	}
+}
