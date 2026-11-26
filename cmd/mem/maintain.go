@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/v2camp/v2mem/internal/commit"
 	"github.com/v2camp/v2mem/internal/distill"
 	"github.com/v2camp/v2mem/internal/evidence"
 	"github.com/v2camp/v2mem/internal/proposal"
@@ -35,6 +36,18 @@ import (
 // maintainDefaultMaxBundles 是一次唤醒的默认预算：Hook 唤醒应该短命，
 // 剩下的留给下一轮；显式 `--max-bundles 0` 也落回默认，而不是变成「不处理」。
 const maintainDefaultMaxBundles = 20
+
+// maintainDefaultMaxAdjudications 是单次自动裁决的默认上限：
+// 与 accept --all-pending 的 1000 不同，maintain 是常驻小步，200 条足够一轮灰度，
+// 剩下的下一轮继续，避免一次唤醒写库过久。
+const maintainDefaultMaxAdjudications = 200
+
+// 裁决范围：this-run 只覆盖本轮产出的 Bundle（默认，最小爆炸半径）；
+// all 覆盖当前全部 pending（供灰度/排障显式 opt-in）。
+const (
+	maintainAdjudicateThisRun = "this-run"
+	maintainAdjudicateAll     = "all"
+)
 
 // maintainLocalGenerator 是「本地模型来源」的构造点。
 //
@@ -52,25 +65,31 @@ var maintainLocalGenerator = func(cfg distill.ModelConfig, model string, timeout
 
 // maintainReport 是文本与 `--json` 的共同账目。
 //
-// Committed/Rejected 本期恒 0（S10 接入自动提交），保留字段是为了让巡检与自动化
-// 现在就能按稳定键解析，而不是等接入时再改契约。
+// Committed 在未开 --model-auto 时恒 0（S10 之前的口径保留）；开启后是自动裁决
+// 真正落库的条数。AdjudicateScope 为空即「本轮没跑裁决」，与「跑了但为 0」可区分。
 type maintainReport struct {
-	DryRun        bool           `json:"dry_run"`
-	CatchUp       bool           `json:"catch_up"`
-	Forced        int            `json:"forced_retry"`
-	Processed     int            `json:"processed"`
-	OK            int            `json:"ok"`
-	Noop          int            `json:"noop"`
-	Fail          int            `json:"fail"`
-	Partial       int            `json:"partial"`
-	Quarantine    int            `json:"quarantine"`
-	Backlog       int            `json:"backlog"`
-	WouldGenerate int            `json:"would_generate"`
-	Committed     int            `json:"committed"`
-	Rejected      int            `json:"rejected"`
-	Remaining     int            `json:"remaining"`
-	Blocked       string         `json:"blocked,omitempty"`
-	Results       []maintainStep `json:"results,omitempty"`
+	DryRun             bool           `json:"dry_run"`
+	CatchUp            bool           `json:"catch_up"`
+	Forced             int            `json:"forced_retry"`
+	Processed          int            `json:"processed"`
+	OK                 int            `json:"ok"`
+	Noop               int            `json:"noop"`
+	Fail               int            `json:"fail"`
+	Partial            int            `json:"partial"`
+	Quarantine         int            `json:"quarantine"`
+	Backlog            int            `json:"backlog"`
+	WouldGenerate      int            `json:"would_generate"`
+	Committed          int            `json:"committed"`
+	Rejected           int            `json:"rejected"`
+	AdjudicateScope    string         `json:"adjudicate_scope"`
+	WouldAdjudicate    int            `json:"would_adjudicate"`
+	Adjudicated        int            `json:"adjudicated"`
+	Deferred           int            `json:"deferred"`
+	Conflict           int            `json:"conflict"`
+	AdjudicationErrors int            `json:"adjudication_errors"`
+	Remaining          int            `json:"remaining"`
+	Blocked            string         `json:"blocked,omitempty"`
+	Results            []maintainStep `json:"results,omitempty"`
 }
 
 // maintainStep 是单个 Bundle 的处理账目。error 必须逐窗保留：
@@ -96,15 +115,28 @@ func cmdMaintain(args []string) (retErr error) {
 	dry := fs.Bool("dry-run", false, "只读预演：不认领、不落候选、不写库")
 	force := fs.Bool("force", false, "把退避中的 fail/partial/backlog 清零 not_before，本轮立即重试（不改 attempt）")
 	maxBundles := fs.Int("max-bundles", maintainDefaultMaxBundles, "本次最多处理几个 Bundle")
+	// S10：proposal 之后的自动裁决。默认关——灰度通过前保持 proposal-only。
+	modelAuto := fs.Bool("model-auto", false, "proposal 之后按提交矩阵自动裁决候选（默认关；Conflict/Defer 保留）")
+	modelTag := fs.String("model-tag", "", "裁决归因 model@promptver（默认取 model.json 的 model_tag）")
+	adjudicateScope := fs.String("adjudicate-scope", maintainAdjudicateThisRun, "裁决范围：this-run（只本轮 Bundle）| all（全部 pending）")
+	maxAdjudications := fs.Int("max-adjudications", maintainDefaultMaxAdjudications, "单次最多裁决多少条候选")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *dry && *force {
 		return errors.New("--dry-run 与 --force 不能同用：前者只读，后者会写 not_before")
 	}
+	if *adjudicateScope != maintainAdjudicateThisRun && *adjudicateScope != maintainAdjudicateAll {
+		return fmt.Errorf("--adjudicate-scope 只支持 %s|%s，got %q",
+			maintainAdjudicateThisRun, maintainAdjudicateAll, *adjudicateScope)
+	}
 	limit := *maxBundles
 	if limit <= 0 {
 		limit = maintainDefaultMaxBundles
+	}
+	adjLimit := *maxAdjudications
+	if adjLimit <= 0 {
+		adjLimit = maintainDefaultMaxAdjudications
 	}
 
 	st, err := store.Open(c.db)
@@ -126,6 +158,15 @@ func cmdMaintain(args []string) (retErr error) {
 	if err != nil {
 		// 与 distill 同一条 fail-closed：非法 model.json 当「没配」会静默外发。
 		return fmt.Errorf("读取模型配置失败（%s）: %w", distill.DefaultModelConfigPath(), err)
+	}
+	// 归因优先级：显式 --model-tag > model.json.model_tag。开启自动裁决却没有可
+	// 归因的 tag 时必须报错——写空 tag 等于放弃「按版本回滚」的唯一凭据。
+	tag := strings.TrimSpace(*modelTag)
+	if tag == "" && *modelAuto {
+		tag = strings.TrimSpace(cfg.ModelTag)
+	}
+	if *modelAuto && tag == "" {
+		return errors.New("--model-auto 需要可归因的 model tag：请传 --model-tag 或在 model.json 配置 model_tag")
 	}
 	ev := evidence.New(st)
 	// auto（本地模型）+ 规则兜底：模型不可用时仍能把决策/踩坑类证据落成候选，
@@ -167,11 +208,115 @@ func cmdMaintain(args []string) (retErr error) {
 	}
 	rep.Remaining = bl.OpenBundles
 
-	if !*dry {
-		// 只有命令成功返回才打点；任何分支已提前 return，不会写水位。
+	// 自动裁决放在 proposal 之后：只有本轮真的产出过候选，this-run 才有东西可裁。
+	// 单条失败聚合返回、不阻断其余；已成功的裁决留在库里（与 accept 逐条语义一致）。
+	var adjudicateErr error
+	if *modelAuto {
+		adjudicateErr = adjudicateRun(st, rep, adjudicateOptions{
+			Scope: *adjudicateScope, Tag: tag, Limit: adjLimit, DryRun: *dry,
+			Bundles: maintainProcessedBundles(rep),
+		})
+	}
+
+	if !*dry && adjudicateErr == nil {
+		// 只有命令成功返回才打点；裁决有错时留给 markMaintainFail，不写成功水位。
 		markMaintainOK(st)
 	}
-	return printMaintainReport(rep, c.json)
+	if err := printMaintainReport(rep, c.json); err != nil {
+		return err
+	}
+	return adjudicateErr
+}
+
+// adjudicateOptions 是一次自动裁决的输入。
+type adjudicateOptions struct {
+	Scope   string
+	Tag     string
+	Limit   int
+	DryRun  bool
+	Bundles []string
+}
+
+// adjudicateRun 逐条调用 ModelAutoCommit 并汇总账目。
+//
+// dry-run 只数 would_adjudicate：不调用 ModelAutoCommit、不写 commit_decisions、
+// 不改候选（统计口径与真跑完全相同，避免「预演说 0、真跑写 20」）。
+func adjudicateRun(st *store.Store, rep *maintainReport, opts adjudicateOptions) error {
+	rep.AdjudicateScope = opts.Scope
+	refs, err := pendingRefsForAdjudication(st, opts)
+	if err != nil {
+		return err
+	}
+	rep.WouldAdjudicate = len(refs)
+	if opts.DryRun {
+		return nil
+	}
+	var errs []error
+	for _, ref := range refs {
+		rev := ref.Revision
+		if rev < 0 {
+			// all 走 ListCandidates：它不返回 revision，这里按当前值再读一次，
+			// 与 accept 单条路径一致（CAS 仍由事务内的 revision 判定）。
+			view, verr := st.CommitCandidate(ref.ID)
+			if verr != nil {
+				rep.AdjudicationErrors++
+				errs = append(errs, fmt.Errorf("%s: %w", shortID(ref.ID), verr))
+				fmt.Fprintf(os.Stderr, "v2mem maintain: 裁决 %s 失败: %v\n", shortID(ref.ID), verr)
+				continue
+			}
+			rev = view.Revision
+		}
+		res, cerr := st.ModelAutoCommit(ref.ID, rev, opts.Tag)
+		if cerr != nil {
+			rep.AdjudicationErrors++
+			errs = append(errs, fmt.Errorf("%s: %w", shortID(ref.ID), cerr))
+			fmt.Fprintf(os.Stderr, "v2mem maintain: 裁决 %s 失败: %v\n", shortID(ref.ID), cerr)
+			continue
+		}
+		rep.Adjudicated++
+		switch {
+		case res.Committed:
+			rep.Committed++
+		case res.Action == commit.ActionConflict:
+			rep.Conflict++
+		default:
+			// Defer（以及任何非提交动作）原样保留，等价于「需人工」。
+			rep.Deferred++
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// pendingRefsForAdjudication 按 scope 取候选：this-run 只认本轮 Bundle；
+// all 复用 ListCandidates("pending")，revision 用 -1 表示「执行时读当前值」。
+func pendingRefsForAdjudication(st *store.Store, opts adjudicateOptions) ([]store.PendingCandidateRef, error) {
+	if opts.Scope == maintainAdjudicateAll {
+		list, err := st.ListCandidates("pending", "", opts.Limit)
+		if err != nil {
+			return nil, err
+		}
+		refs := make([]store.PendingCandidateRef, 0, len(list))
+		for _, c := range list {
+			refs = append(refs, store.PendingCandidateRef{ID: c.ID, Revision: -1})
+		}
+		return refs, nil
+	}
+	return st.ListPendingCandidatesByBundles(opts.Bundles, opts.Limit)
+}
+
+// maintainProcessedBundles 去重收集本轮 rep.Results 的 BundleID。
+// 只取本轮真正处理过的窗口（含 noop/fail/quarantined），不读历史。
+func maintainProcessedBundles(rep *maintainReport) []string {
+	seen := make(map[string]bool, len(rep.Results))
+	out := make([]string, 0, len(rep.Results))
+	for _, r := range rep.Results {
+		if r.Bundle == "" || seen[r.Bundle] {
+			continue
+		}
+		seen[r.Bundle] = true
+		out = append(out, r.Bundle)
+	}
+	return out
 }
 
 // maintainRun 连续 Step 到预算耗尽 / 队列清空（skipped）/ 全源让位（backlog）/
@@ -291,10 +436,19 @@ func printMaintainReport(rep *maintainReport, asJSON bool) error {
 	if rep.DryRun {
 		fmt.Printf("已维护（dry-run，未认领） 预演 %d（would_generate %d noop %d fail %d backlog %d）｜剩余 %d\n",
 			rep.Processed, rep.WouldGenerate, rep.Noop, rep.Fail, rep.Backlog, rep.Remaining)
-	} else {
+	} else if rep.AdjudicateScope == "" {
 		fmt.Printf("已维护 处理 %d（ok %d noop %d fail %d partial %d quarantine %d）｜提交 %d 拒绝 %d（自动提交待 S10 接入）｜剩余 %d\n",
 			rep.Processed, rep.OK, rep.Noop, rep.Fail, rep.Partial, rep.Quarantine,
 			rep.Committed, rep.Rejected, rep.Remaining)
+	} else {
+		fmt.Printf("已维护 处理 %d（ok %d noop %d fail %d partial %d quarantine %d）｜提交 %d 拒绝 %d（model-auto）｜剩余 %d\n",
+			rep.Processed, rep.OK, rep.Noop, rep.Fail, rep.Partial, rep.Quarantine,
+			rep.Committed, rep.Rejected, rep.Remaining)
+	}
+	if rep.AdjudicateScope != "" {
+		fmt.Printf("自动裁决（%s）检查 %d 裁决 %d（committed %d deferred %d conflict %d）错误 %d\n",
+			rep.AdjudicateScope, rep.WouldAdjudicate, rep.Adjudicated,
+			rep.Committed, rep.Deferred, rep.Conflict, rep.AdjudicationErrors)
 	}
 	if rep.Forced > 0 {
 		fmt.Printf("已清除 %d 个退避窗口的 not_before（attempt 不变），本轮立即重试\n", rep.Forced)

@@ -56,6 +56,70 @@ func TestCountPendingByProject(t *testing.T) {
 	}
 }
 
+// ListPendingCandidatesByBundles 供 maintain 只裁决「本轮处理过的窗口」：
+// 空列表必须返回空集（不是全表），否则没处理任何窗口的一轮会误裁决历史积压。
+func TestListPendingCandidatesByBundles(t *testing.T) {
+	s := newTestStore(t)
+	insert := func(session, content string) string {
+		t.Helper()
+		res, err := s.InsertCandidate(CandidateInput{
+			SessionID: session, Project: "p", Kind: "decision",
+			Content: content, Source: "distill",
+		})
+		if err != nil {
+			t.Fatalf("InsertCandidate(%s): %v", session, err)
+		}
+		return res.Candidate.ID
+	}
+	a1 := insert("s1", "b1 候选一")
+	a2 := insert("s2", "b1 候选二")
+	b1 := insert("s3", "b2 候选一")
+	c1 := insert("s4", "b3 候选一")
+	insert("s5", "unbundled 候选")
+	for id, bundle := range map[string]string{a1: "bnd-1", a2: "bnd-1", b1: "bnd-2", c1: "bnd-3"} {
+		if _, err := s.DB().Exec(
+			`UPDATE candidates SET bundle_id = ?, revision = 2 WHERE id = ?`, bundle, id); err != nil {
+			t.Fatalf("设置 bundle %s: %v", id, err)
+		}
+	}
+
+	got, err := s.ListPendingCandidatesByBundles([]string{"bnd-1", "bnd-2"}, 10)
+	if err != nil {
+		t.Fatalf("ListPendingCandidatesByBundles: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("应取 bnd-1/bnd-2 的 3 条 pending，got %d: %+v", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, ref := range got {
+		seen[ref.ID] = true
+		if ref.Revision != 2 {
+			t.Errorf("%s revision 应为 2，got %d", ref.ID, ref.Revision)
+		}
+	}
+	if seen[c1] {
+		t.Error("不得混入未请求的 bnd-3 候选")
+	}
+
+	limited, err := s.ListPendingCandidatesByBundles([]string{"bnd-1", "bnd-2"}, 2)
+	if err != nil || len(limited) != 2 {
+		t.Fatalf("limit 应生效：got %d err=%v", len(limited), err)
+	}
+
+	empty, err := s.ListPendingCandidatesByBundles(nil, 10)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("空列表应立即返回空集，got %d err=%v", len(empty), err)
+	}
+
+	if _, err := s.DB().Exec(`UPDATE candidates SET status = 'rejected' WHERE id = ?`, a1); err != nil {
+		t.Fatalf("标记 rejected: %v", err)
+	}
+	left, err := s.ListPendingCandidatesByBundles([]string{"bnd-1", "bnd-2"}, 10)
+	if err != nil || len(left) != 2 {
+		t.Fatalf("rejected 不应出现在 pending 结果里：got %d err=%v", len(left), err)
+	}
+}
+
 // ListCandidatesByProject 的空 project 表示不过滤；旧签名必须保持等价。
 func TestListCandidatesByProject(t *testing.T) {
 	s := projectFixture(t)

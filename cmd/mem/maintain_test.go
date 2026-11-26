@@ -9,7 +9,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -40,16 +44,23 @@ func stubRulesFallback(t *testing.T) {
 // 逐条切窗是为了得到多个可独立调度的 Bundle（一次 NextBundle 会把能装的全装走）。
 func seedMaintainBundle(t *testing.T, db, uid string) string {
 	t.Helper()
+	return seedMaintainEvidence(t, db, "src-mnt", uid, "sess-mnt", "决策：维护窗口 "+uid, true)
+}
+
+// seedMaintainEvidence 是 maintain 夹具的统一入口：hook 侧落一条证据后立刻切窗。
+// source/session/summary/eligible 可调，用于端到端夹具构造多源、noop 与失败重试场景。
+func seedMaintainEvidence(t *testing.T, db, source, uid, session, summary string, eligible bool) string {
+	t.Helper()
 	st, err := store.Open(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 	if _, _, err := st.CaptureEvidence(store.EvidenceCaptureInput{
-		EventUID: uid, SourceID: "src-mnt", SourceKind: "hook", Generation: 1,
-		OccurredAtNS: 1700000000000000000, SessionID: "sess-mnt", Project: "demo",
+		EventUID: uid, SourceID: source, SourceKind: "hook", Generation: 1,
+		OccurredAtNS: 1700000000000000000, SessionID: session, Project: "demo",
 		Harness: "workbuddy", EventType: "user-prompt", ParserVersion: "evidence/v1",
-		ProposalEligible: true, Summary: "决策：维护窗口 " + uid,
+		ProposalEligible: eligible, Summary: summary,
 		ArchiveHash: "ah-" + uid, ArchivePath: "/tmp/" + uid + ".gz",
 		RawRecordHash: "rh-" + uid, ByteSize: 16, RawCount: 1,
 	}); err != nil {
@@ -387,5 +398,363 @@ func TestMaintainReportAndLastOK(t *testing.T) {
 func TestMaintainDryRunRejectsForce(t *testing.T) {
 	if err := cmdMaintain([]string{"--db", testDB(t), "--dry-run", "--force"}); err == nil {
 		t.Fatal("--dry-run 与 --force 互斥：前者只读，后者写 not_before")
+	}
+}
+
+// ---------- S10 接入：maintain 自动裁决（--model-auto，默认关） ----------
+
+func pendingCandidates(t *testing.T, db, bundleID string) int {
+	t.Helper()
+	q := `SELECT COUNT(*) FROM candidates WHERE status = 'pending'`
+	var args []any
+	if bundleID != "" {
+		q += ` AND bundle_id = ?`
+		args = append(args, bundleID)
+	}
+	var n int
+	if err := rawDB(t, db).QueryRow(q, args...).Scan(&n); err != nil {
+		t.Fatalf("统计 pending 候选: %v", err)
+	}
+	return n
+}
+
+func decisionCount(t *testing.T, db, actor, modelTag string) int {
+	t.Helper()
+	q := `SELECT COUNT(*) FROM commit_decisions WHERE 1=1`
+	var args []any
+	if actor != "" {
+		q += ` AND actor = ?`
+		args = append(args, actor)
+	}
+	if modelTag != "" {
+		q += ` AND model_tag = ?`
+		args = append(args, modelTag)
+	}
+	var n int
+	if err := rawDB(t, db).QueryRow(q, args...).Scan(&n); err != nil {
+		t.Fatalf("统计裁决: %v", err)
+	}
+	return n
+}
+
+func metaValue(t *testing.T, db, key string) (string, bool) {
+	t.Helper()
+	var v string
+	err := rawDB(t, db).QueryRow(`SELECT v FROM db_meta WHERE k = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false
+	}
+	if err != nil {
+		t.Fatalf("读取 meta %s: %v", key, err)
+	}
+	return v, true
+}
+
+// 默认路径：不带 --model-auto 时只产候选，不写记忆、不写裁决、报告字段为零值。
+func TestMaintainDefaultDoesNotAdjudicate(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	seedMaintainBundle(t, db, "mnt-noauto")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--json"})
+	})
+	if err != nil {
+		t.Fatalf("cmdMaintain: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if got["adjudicate_scope"] != "" {
+		t.Fatalf("默认不应声明裁决范围，got %v", got["adjudicate_scope"])
+	}
+	for _, key := range []string{"would_adjudicate", "adjudicated", "committed", "deferred", "conflict", "adjudication_errors"} {
+		if num(got, key) != 0 {
+			t.Fatalf("默认 %s 应为 0，got %v（%v）", key, num(got, key), got)
+		}
+	}
+	if n := pendingCandidates(t, db, ""); n == 0 {
+		t.Fatal("默认应只产候选、保持 pending")
+	}
+	if n := decisionCount(t, db, "", ""); n != 0 {
+		t.Fatalf("默认不得写 commit_decisions，got %d", n)
+	}
+	if n := countAllMemories(t, db); n != 0 {
+		t.Fatalf("默认不得落记忆，got %d", n)
+	}
+}
+
+// 开启后：本轮候选被自动裁决，actor=model-auto、tag 落裁决账，pending 清零。
+func TestMaintainModelAutoCommitsThisRun(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	bundle := seedMaintainBundle(t, db, "mnt-auto")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--model-auto", "--model-tag", "test@v1", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("cmdMaintain --model-auto: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if got["adjudicate_scope"] != "this-run" {
+		t.Fatalf("默认裁决范围应为 this-run，got %v", got["adjudicate_scope"])
+	}
+	would, adjudicated, committed := num(got, "would_adjudicate"), num(got, "adjudicated"), num(got, "committed")
+	if would < 1 || adjudicated != would || committed < 1 || num(got, "adjudication_errors") != 0 {
+		t.Fatalf("应裁决本轮候选且无错误：%v\n%s", got, out)
+	}
+	if n := pendingCandidates(t, db, bundle); n != 0 {
+		t.Fatalf("本轮候选应全部离开 pending，剩 %d", n)
+	}
+	if n := countAllMemories(t, db); n < 1 {
+		t.Fatal("自动裁决应落记忆")
+	}
+	if n := decisionCount(t, db, "model-auto", "test@v1"); n != int(committed) {
+		t.Fatalf("裁决账 actor/tag 不符：decisions=%d committed=%v", n, committed)
+	}
+}
+
+// --model-tag 缺省取 model.json 的 model_tag（不写空 tag）。
+func TestMaintainModelAutoUsesConfigTag(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	seedMaintainBundle(t, db, "mnt-cfgtag")
+
+	cfg := filepath.Join(os.Getenv("HOME"), ".v2mem", "model.json")
+	if err := os.MkdirAll(filepath.Dir(cfg), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg, []byte(`{"mode":"cli","cli":"claude","model_tag":"cfg@v2"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(cfg) })
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--model-auto", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("cmdMaintain --model-auto: %v\n%s", err, out)
+	}
+	if n := decisionCount(t, db, "model-auto", "cfg@v2"); n < 1 {
+		t.Fatalf("应使用 model.json 的 model_tag，got decisions=%d (%s)", n, out)
+	}
+}
+
+// 缺 tag：--model-auto 必须报错退出，不写空 tag。
+func TestMaintainModelAutoRequiresTag(t *testing.T) {
+	db := testDB(t)
+	_, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--model-auto", "--json"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "model tag") {
+		t.Fatalf("缺 model tag 必须报错，got %v", err)
+	}
+}
+
+// this-run：只裁决本轮 Bundle，历史 pending 原样保留。
+func TestMaintainAdjudicateScopeThisRunKeepsHistory(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	oldBundle := seedMaintainBundle(t, db, "mnt-old")
+	if _, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--json"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n := pendingCandidates(t, db, oldBundle); n == 0 {
+		t.Fatal("第一轮应留下历史 pending")
+	}
+	newBundle := seedMaintainBundle(t, db, "mnt-new")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--model-auto", "--model-tag", "test@v1", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("cmdMaintain: %v\n%s", err, out)
+	}
+	if n := pendingCandidates(t, db, oldBundle); n == 0 {
+		t.Fatal("this-run 不得裁决历史 pending")
+	}
+	if n := pendingCandidates(t, db, newBundle); n != 0 {
+		t.Fatalf("本轮候选应被裁决，剩 %d", n)
+	}
+}
+
+// all：裁决当前全部 pending（灰度/排障用）。
+func TestMaintainAdjudicateScopeAllCoversHistory(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	oldBundle := seedMaintainBundle(t, db, "mnt-old-all")
+	if _, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--json"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newBundle := seedMaintainBundle(t, db, "mnt-new-all")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--model-auto", "--model-tag", "test@v1",
+			"--adjudicate-scope", "all", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("cmdMaintain: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if got["adjudicate_scope"] != "all" {
+		t.Fatalf("scope 应如实报告 all，got %v", got["adjudicate_scope"])
+	}
+	if n := pendingCandidates(t, db, oldBundle); n != 0 {
+		t.Fatalf("all 应覆盖历史 pending，剩 %d", n)
+	}
+	if n := pendingCandidates(t, db, newBundle); n != 0 {
+		t.Fatalf("all 应覆盖本轮 pending，剩 %d", n)
+	}
+}
+
+// dry-run：只统计 would_adjudicate，零 decision、零记忆、候选不动、不打成功水位。
+func TestMaintainModelAutoDryRunCountsOnly(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	seedMaintainBundle(t, db, "mnt-adj-dry")
+	if _, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--json"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, hadOK := readLastOK(t, db)
+	pendingBefore := pendingCandidates(t, db, "")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--dry-run", "--model-auto", "--model-tag", "test@v1",
+			"--adjudicate-scope", "all", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if got["dry_run"] != true || num(got, "would_adjudicate") < 1 {
+		t.Fatalf("dry-run 应报告 would_adjudicate>0：%v\n%s", got, out)
+	}
+	for _, key := range []string{"adjudicated", "committed", "deferred", "conflict", "adjudication_errors"} {
+		if num(got, key) != 0 {
+			t.Fatalf("dry-run %s 应为 0，got %v", key, num(got, key))
+		}
+	}
+	if n := decisionCount(t, db, "", ""); n != 0 {
+		t.Fatalf("dry-run 不得写裁决，got %d", n)
+	}
+	if n := countAllMemories(t, db); n != 0 {
+		t.Fatalf("dry-run 不得落记忆，got %d", n)
+	}
+	if n := pendingCandidates(t, db, ""); n != pendingBefore {
+		t.Fatalf("dry-run 不得改候选：前 %d 后 %d", pendingBefore, n)
+	}
+	if at, ok := readLastOK(t, db); ok != hadOK || at != before {
+		t.Fatalf("dry-run 不得打 maintain:last_ok：前 %d/%v 后 %d/%v", before, hadOK, at, ok)
+	}
+}
+
+// 单条裁决失败不阻断其余：成功的保留，错误聚合后非零退出并点亮维护失败。
+func TestMaintainAdjudicationErrorDoesNotBlockOthers(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	bad := seedMaintainBundle(t, db, "mnt-adj-bad")
+	good := seedMaintainBundle(t, db, "mnt-adj-good")
+	if _, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--json"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 非法 channel 会让 upsertAcceptedMemory 在落库阶段失败（矩阵仍判 auto_commit）。
+	if _, err := rawDB(t, db).Exec(`UPDATE candidates SET channel = 'bogus' WHERE bundle_id = ?`, bad); err != nil {
+		t.Fatalf("制造失败候选: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--model-auto", "--model-tag", "test@v1",
+			"--adjudicate-scope", "all", "--json"})
+	})
+	if err == nil {
+		t.Fatalf("裁决错误必须非零退出\n%s", out)
+	}
+	got := decodeJSONOut(t, out)
+	if num(got, "adjudication_errors") != 1 || num(got, "committed") != 1 {
+		t.Fatalf("应 1 错 1 成：%v\n%s", got, out)
+	}
+	if n := pendingCandidates(t, db, bad); n != 1 {
+		t.Fatalf("失败候选应保持 pending，剩 %d", n)
+	}
+	if n := pendingCandidates(t, db, good); n != 0 {
+		t.Fatalf("成功候选不得被失败阻断，pending=%d", n)
+	}
+	if _, ok := metaValue(t, db, store.MetaMaintainLastFailAt); !ok {
+		t.Fatal("裁决失败应点亮 maintain:last_fail_at")
+	}
+}
+
+// 端到端：hook 造证据 → maintain --model-auto → 记忆 → eval flow 13/13。
+func TestMaintainModelAutoEndToEndFlow(t *testing.T) {
+	db := testDB(t)
+	seedMaintainEvidence(t, db, "src-ok", "ok-1", "sess-ok", "决策：用 SQLite 存记忆", true)
+	seedMaintainEvidence(t, db, "src-ok", "ok-2", "sess-ok", "偏好：中文注释优先", true)
+	seedMaintainEvidence(t, db, "src-ok", "ok-3", "sess-ok", "踩坑：WAL 必须开启", true)
+	seedMaintainEvidence(t, db, "src-noop", "noop-1", "sess-noop", "子会话事件", false)
+	failBundle := seedMaintainEvidence(t, db, "src-fail", "fail-1", "sess-fail", "决策：失败必须重试", true)
+
+	failing := true
+	stubMaintainLocal(t, proposal.FuncGenerator{
+		Label: "e2e",
+		Fn: func(_ context.Context, req proposal.GenerateRequest) (string, error) {
+			if req.BundleID == failBundle && failing {
+				return "不是 JSON", nil
+			}
+			return fmt.Sprintf(`{"kind":"decision","content":"E2E 事实 %s","evidence_idx":[1]}`, req.BundleID), nil
+		},
+	})
+
+	// 第一轮：正常窗 ok、0 提案窗 noop、失败窗 fail（不落记忆）。
+	if _, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--json"})
+	}); err != nil {
+		t.Fatalf("第一轮 maintain: %v", err)
+	}
+	if n := countAllMemories(t, db); n != 0 {
+		t.Fatalf("未开 model-auto 不得落记忆，got %d", n)
+	}
+
+	// 第二轮：清退避后重试失败窗，并只裁决本轮（失败窗）候选。
+	updateBundle(t, db, failBundle, "not_before = 0")
+	failing = false
+	if _, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--model-auto", "--model-tag", "e2e@v1", "--json"})
+	}); err != nil {
+		t.Fatalf("第二轮 maintain: %v", err)
+	}
+
+	// 第三轮：all 兜底，把历史 pending 全部裁决完。
+	if _, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--model-auto", "--model-tag", "e2e@v1",
+			"--adjudicate-scope", "all", "--json"})
+	}); err != nil {
+		t.Fatalf("第三轮 maintain: %v", err)
+	}
+	if n := pendingCandidates(t, db, ""); n != 0 {
+		t.Fatalf("全部候选应离场，剩 %d 条 pending", n)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdEvalFlow([]string{"--db", db, "--json"})
+	})
+	if err != nil {
+		t.Fatalf("eval flow 应全绿: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if num(got, "passed") != 13 || num(got, "failed") != 0 {
+		for _, c := range got["checks"].([]any) {
+			t.Logf("%v", c)
+		}
+		t.Fatalf("eval flow 应 13/13，got %v/%v\n%s", num(got, "passed"), num(got, "failed"), out)
+	}
+	if num(got, "manual_rate") != 0 {
+		t.Fatalf("全自动裁决下人工介入率应为 0，got %v", num(got, "manual_rate"))
 	}
 }
