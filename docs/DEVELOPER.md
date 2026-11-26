@@ -19,6 +19,9 @@ make cover-update # 用当前实测值刷新下限（棘轮：只允许上调；
 
 提交前必跑 `make cover-gate`。阈值单一真理源是 `coverage-policy.txt`，不在 README 重复。
 
+维护入口示例：`mem maintain --stage=proposal,adjudicate --model-auto --model-tag dev@v1`
+（阶段顺序固定 proposal→adjudicate→consolidate→gc；`--dry-run` 全阶段零写）。
+
 ## 安装 / 更新 / 部署
 
 ### 本地调试部署（开发时推荐）

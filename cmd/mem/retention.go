@@ -252,14 +252,23 @@ type dbRetentionReport struct {
 	Decisions  *store.DecisionGCResult `json:"decisions"`
 }
 
-// cmdGCRetention 是 mem gc --retention 的执行体。
+// retentionResult 是一次终态保留回收的汇总：文件侧 + 库侧。
+type retentionResult struct {
+	DryRun     bool
+	BackupRoot string
+	Files      *fileSweepReport
+	DB         *dbRetentionReport
+}
+
+// runRetention 是 cmdGCRetention 的执行核心（供 mem gc --retention 与
+// maintain --stage=gc 复用）。
 //
-// dry-run：只做文件侧预览，库侧三个方法没有预览模式，一律跳过（零写）。
-// 实删：cmdGC 只在备份前置通过（或 --no-backup 显式豁免，既有逃生口）后才派发
-// 到这里，故非 dry-run 视为 §8.1 已满足；backupRoot 非空只是「真做过备份」的凭证。
-func cmdGCRetention(c common, dryRun bool, backupRoot string) error {
+// dry-run：只做文件侧预览，库侧三个方法没有预览模式，一律跳过（零写）；
+// 此时 st 允许为 nil，调用方无需为了预览去 Open（Open 会跑迁移）。
+// 实删：沿用 §8.1 顺序——文件侧 → 完成 Bundle → 候选 → 决策账；st 必须已打开，
+// backupRoot 非空只是「真做过备份」的凭证（备份前置仍在调用方）。
+func runRetention(st *store.Store, dbPath string, dryRun bool, backupRoot string) (*retentionResult, error) {
 	cfg := defaultFileRetentionConfig()
-	dbPath := c.db
 	if dbPath == "" {
 		dbPath = store.DefaultPath()
 	}
@@ -268,16 +277,54 @@ func cmdGCRetention(c common, dryRun bool, backupRoot string) error {
 	if dryRun {
 		rep, err := sweepRetentionFiles(root, time.Now(), cfg, true, false)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return printRetentionReport(c, rep, nil, true, backupRoot)
+		return &retentionResult{DryRun: true, BackupRoot: backupRoot, Files: rep}, nil
+	}
+	if st == nil {
+		return nil, errors.New("runRetention: 非 dry-run 需要已打开的库")
 	}
 
-	// 顺序按 §8.1「全量引用保护」：先跑文件侧/库侧里引用判断最全的 Bundle，
-	// 再 GC 候选，最后 GC 决策账（它要求「候选已不存在」，必须排在候选之后）。
 	rep, err := sweepRetentionFiles(root, time.Now(), cfg, false, true)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	bundles, err := st.GCTerminalBundles(0)
+	if err != nil {
+		return nil, err
+	}
+	cand, err := st.GCCandidates(14*24*time.Hour, 90*24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	decisions, err := st.GCCommitDecisions(0)
+	if err != nil {
+		return nil, err
+	}
+	return &retentionResult{
+		BackupRoot: backupRoot,
+		Files:      rep,
+		DB: &dbRetentionReport{
+			Candidates: cand, Bundles: bundles, Decisions: decisions,
+		},
+	}, nil
+}
+
+// cmdGCRetention 是 mem gc --retention 的 CLI 包装：只负责打开库与打印。
+//
+// 实删：cmdGC 只在备份前置通过（或 --no-backup 显式豁免，既有逃生口）后才派发
+// 到这里，故非 dry-run 视为 §8.1 已满足。
+func cmdGCRetention(c common, dryRun bool, backupRoot string) error {
+	dbPath := c.db
+	if dbPath == "" {
+		dbPath = store.DefaultPath()
+	}
+	if dryRun {
+		res, err := runRetention(nil, dbPath, true, backupRoot)
+		if err != nil {
+			return err
+		}
+		return printRetentionReport(c, res)
 	}
 
 	st, err := store.Open(dbPath)
@@ -285,37 +332,28 @@ func cmdGCRetention(c common, dryRun bool, backupRoot string) error {
 		return err
 	}
 	defer st.Close()
-	bundles, err := st.GCTerminalBundles(0)
+	res, err := runRetention(st, dbPath, false, backupRoot)
 	if err != nil {
 		return err
 	}
-	cand, err := st.GCCandidates(14*24*time.Hour, 90*24*time.Hour)
-	if err != nil {
-		return err
-	}
-	decisions, err := st.GCCommitDecisions(0)
-	if err != nil {
-		return err
-	}
-	return printRetentionReport(c, rep, &dbRetentionReport{
-		Candidates: cand, Bundles: bundles, Decisions: decisions,
-	}, false, backupRoot)
+	return printRetentionReport(c, res)
 }
 
 // printRetentionReport 输出文件侧 + 库侧的预览/结果计数。
-func printRetentionReport(c common, rep *fileSweepReport, db *dbRetentionReport, dryRun bool, backupRoot string) error {
+func printRetentionReport(c common, r *retentionResult) error {
 	if c.json {
 		return printJSON(struct {
 			DryRun     bool               `json:"dry_run"`
 			BackupRoot string             `json:"backup_root,omitempty"`
 			Files      *fileSweepReport   `json:"files"`
 			DB         *dbRetentionReport `json:"db,omitempty"`
-		}{dryRun, backupRoot, rep, db})
+		}{r.DryRun, r.BackupRoot, r.Files, r.DB})
 	}
-	if dryRun {
+	rep, db := r.Files, r.DB
+	if r.DryRun {
 		fmt.Println("dry-run 预览（零写：不删文件、不写库、不生成备份快照）")
 	} else {
-		shown := backupRoot
+		shown := r.BackupRoot
 		if shown == "" {
 			shown = "（--no-backup 逃生口）"
 		}

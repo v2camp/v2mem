@@ -758,3 +758,348 @@ func TestMaintainModelAutoEndToEndFlow(t *testing.T) {
 		t.Fatalf("全自动裁决下人工介入率应为 0，got %v", num(got, "manual_rate"))
 	}
 }
+
+// ---------- S15：maintain --stage 全阶段（proposal/adjudicate/consolidate/gc） ----------
+
+// stageNames 按报告顺序取出 stages[].name。
+func stageNames(got map[string]any) []string {
+	raw, _ := got["stages"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		m, _ := v.(map[string]any)
+		name, _ := m["name"].(string)
+		out = append(out, name)
+	}
+	return out
+}
+
+// stageEntry 取单个阶段账目；不存在返回 nil。
+func stageEntry(got map[string]any, name string) map[string]any {
+	raw, _ := got["stages"].([]any)
+	for _, v := range raw {
+		if m, ok := v.(map[string]any); ok && m["name"] == name {
+			return m
+		}
+	}
+	return nil
+}
+
+func stageCounts(t *testing.T, got map[string]any, name string) map[string]any {
+	t.Helper()
+	entry := stageEntry(got, name)
+	if entry == nil {
+		t.Fatalf("报告缺少阶段 %q：%v", name, got["stages"])
+	}
+	counts, _ := entry["counts"].(map[string]any)
+	if counts == nil {
+		t.Fatalf("阶段 %q 缺少 counts：%v", name, entry)
+	}
+	return counts
+}
+
+func TestMaintainStageRejectsUnknownValue(t *testing.T) {
+	db := testDB(t)
+	_, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "bogus"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "--stage") {
+		t.Fatalf("未知 --stage 应报用法错误，got %v", err)
+	}
+}
+
+func TestMaintainStageAdjudicateRequiresModelAuto(t *testing.T) {
+	db := testDB(t)
+	_, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "adjudicate"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "--model-auto") {
+		t.Fatalf("--stage=adjudicate 必须要求 --model-auto，got %v", err)
+	}
+}
+
+func TestMaintainStageAdjudicateRequiresTag(t *testing.T) {
+	db := testDB(t)
+	_, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "adjudicate", "--model-auto"})
+	})
+	if err == nil || !strings.Contains(err.Error(), "model tag") {
+		t.Fatalf("--stage=adjudicate 必须要求可归因 tag，got %v", err)
+	}
+}
+
+// 单 stage consolidate：只做归并，不跑 proposal。
+func TestMaintainStageConsolidateOnly(t *testing.T) {
+	db := testDB(t)
+	bundle := seedMaintainBundle(t, db, "mnt-stage-cons")
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "--salience", "0.9", cliSimBase}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "--salience", "0.3", cliSimVariant}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "consolidate", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("maintain --stage=consolidate: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if names := stageNames(got); len(names) != 1 || names[0] != "consolidate" {
+		t.Fatalf("只应跑 consolidate，got %v\n%s", names, out)
+	}
+	if n := num(stageCounts(t, got, "consolidate"), "superseded"); n != 1 {
+		t.Fatalf("应取代 1 条近重复，got %v\n%s", n, out)
+	}
+	if num(got, "processed") != 0 {
+		t.Fatalf("不含 proposal 时不得处理 Bundle：%v", got)
+	}
+	if b := loadBundle(t, db, bundle); b.Status != "pending" || b.Attempt != 0 {
+		t.Fatalf("consolidate 不得跑 proposal：%+v", b)
+	}
+}
+
+// 单 stage gc：dry-run 零写（不建备份、不删）。
+func TestMaintainStageGCDryRunWritesNothing(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "待保留的记忆"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	backupDir := filepath.Join(filepath.Dir(db), "backup")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "gc", "--dry-run", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("maintain --stage=gc --dry-run: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if names := stageNames(got); len(names) != 1 || names[0] != "gc" {
+		t.Fatalf("只应跑 gc，got %v\n%s", names, out)
+	}
+	if entry := stageEntry(got, "gc"); entry["status"] != "ok" {
+		t.Fatalf("gc 阶段状态应为 ok：%v", entry)
+	}
+	if _, err := os.Stat(backupDir); !os.IsNotExist(err) {
+		t.Fatalf("dry-run 不得创建备份目录（%v）", err)
+	}
+	if n := countAllMemories(t, db); n != 1 {
+		t.Fatalf("dry-run 不得删记忆，got %d", n)
+	}
+}
+
+// 单 stage gc：非 dry-run 仍先备份再回收（保留 §8.1 顺序）。
+func TestMaintainStageGCBacksUpBeforeMutating(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "待保留的记忆"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "gc", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("maintain --stage=gc: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if entry := stageEntry(got, "gc"); entry == nil || entry["status"] != "ok" {
+		t.Fatalf("gc 阶段应成功：%v", got["stages"])
+	}
+	entries, err := os.ReadDir(filepath.Join(filepath.Dir(db), "backup"))
+	if err != nil {
+		t.Fatalf("读备份目录: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("非 dry-run 的 gc 阶段必须先做库备份")
+	}
+}
+
+// --stage=all + --model-auto：固定顺序 proposal→adjudicate→consolidate→gc。
+func TestMaintainStageAllOrderWithModelAuto(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	seedMaintainBundle(t, db, "mnt-stage-all")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "all", "--model-auto",
+			"--model-tag", "test@v1", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("maintain --stage=all: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	want := []string{"proposal", "adjudicate", "consolidate", "gc"}
+	if names := stageNames(got); strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("阶段顺序应为 %v，got %v\n%s", want, names, out)
+	}
+	if n := num(stageCounts(t, got, "adjudicate"), "committed"); n < 1 {
+		t.Fatalf("all + model-auto 应自动裁决：%v\n%s", n, out)
+	}
+	if got["adjudicate_scope"] != "this-run" {
+		t.Fatalf("默认裁决范围应保持 this-run，got %v", got["adjudicate_scope"])
+	}
+}
+
+// --stage=all 不给 --model-auto：跳过 adjudicate，其余三阶段照跑。
+func TestMaintainStageAllWithoutModelAutoSkipsAdjudicate(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	seedMaintainBundle(t, db, "mnt-stage-all-noauto")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "all", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("maintain --stage=all: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	want := []string{"proposal", "consolidate", "gc"}
+	if names := stageNames(got); strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("阶段顺序应为 %v，got %v\n%s", want, names, out)
+	}
+	if got["adjudicate_scope"] != "" {
+		t.Fatalf("未开 model-auto 不得声明裁决范围，got %v", got["adjudicate_scope"])
+	}
+	if n := decisionCount(t, db, "", ""); n != 0 {
+		t.Fatalf("未开 model-auto 不得写裁决，got %d", n)
+	}
+}
+
+// 逗号多阶段按固定顺序执行，与书写顺序无关。
+func TestMaintainStageCommaUsesFixedOrder(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "固定顺序的记忆"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "gc,proposal", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("maintain --stage=gc,proposal: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	want := []string{"proposal", "gc"}
+	if names := stageNames(got); strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("阶段顺序应为 %v，got %v\n%s", want, names, out)
+	}
+}
+
+// 某 stage 出错即停止：consolidate 备份失败后不得继续跑 gc。
+func TestMaintainStageErrorStopsLaterStages(t *testing.T) {
+	db := testDB(t)
+	if err := cmdAdd([]string{"--db", db, "--project", "p1", "触发备份失败的记忆"}); err != nil {
+		t.Fatalf("cmdAdd: %v", err)
+	}
+	// 用普通文件占住 backup 路径：MkdirAll 必然失败，且不依赖权限位（root 也可复现）。
+	if err := os.WriteFile(filepath.Join(filepath.Dir(db), "backup"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("占位 backup: %v", err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "consolidate,gc", "--json"})
+	})
+	if err == nil {
+		t.Fatalf("备份失败应非零退出\n%s", out)
+	}
+	got := decodeJSONOut(t, out)
+	names := stageNames(got)
+	if len(names) != 1 || names[0] != "consolidate" {
+		t.Fatalf("consolidate 失败后不得执行 gc，got %v\n%s", names, out)
+	}
+	if entry := stageEntry(got, "consolidate"); entry["status"] != "error" || entry["error"] == "" {
+		t.Fatalf("失败阶段应带 status=error 与原因：%v", entry)
+	}
+}
+
+// --stage=all --dry-run：全阶段零写（无候选/记忆/裁决/备份，Bundle 不动）。
+func TestMaintainStageAllDryRunWritesNothing(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	bundle := seedMaintainBundle(t, db, "mnt-stage-dry")
+	beforePending := pendingCandidates(t, db, "")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "all", "--dry-run",
+			"--model-auto", "--model-tag", "test@v1", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("maintain --stage=all --dry-run: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	want := []string{"proposal", "adjudicate", "consolidate", "gc"}
+	if names := stageNames(got); strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("阶段顺序应为 %v，got %v\n%s", want, names, out)
+	}
+	if entry := stageEntry(got, "consolidate"); entry["status"] != "skipped" {
+		t.Fatalf("consolidate 无预览模式，dry-run 应标 skipped：%v", entry)
+	}
+	if n := pendingCandidates(t, db, ""); n != beforePending {
+		t.Fatalf("dry-run 不得产生候选：前 %d 后 %d", beforePending, n)
+	}
+	if n := countAllMemories(t, db); n != 0 {
+		t.Fatalf("dry-run 不得落记忆，got %d", n)
+	}
+	if n := decisionCount(t, db, "", ""); n != 0 {
+		t.Fatalf("dry-run 不得写裁决，got %d", n)
+	}
+	if b := loadBundle(t, db, bundle); b.Status != "pending" || b.Attempt != 0 {
+		t.Fatalf("dry-run 不得认领/推进 Bundle：%+v", b)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(db), "backup")); !os.IsNotExist(err) {
+		t.Fatalf("dry-run 不得创建备份目录（%v）", err)
+	}
+	if _, ok := readLastOK(t, db); ok {
+		t.Fatal("dry-run 不得写 maintain:last_ok")
+	}
+}
+
+// 单独 adjudicate：不跑 proposal，按 --adjudicate-scope=all 裁决历史 pending。
+func TestMaintainStageAdjudicateOnly(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	seedMaintainBundle(t, db, "mnt-stage-adj")
+	if _, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--json"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--stage", "adjudicate", "--model-auto",
+			"--model-tag", "test@v1", "--adjudicate-scope", "all", "--json"})
+	})
+	if err != nil {
+		t.Fatalf("maintain --stage=adjudicate: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if names := stageNames(got); len(names) != 1 || names[0] != "adjudicate" {
+		t.Fatalf("只应跑 adjudicate，got %v\n%s", names, out)
+	}
+	if n := num(stageCounts(t, got, "adjudicate"), "committed"); n < 1 {
+		t.Fatalf("应裁决历史 pending：%v\n%s", n, out)
+	}
+	if num(got, "processed") != 0 {
+		t.Fatalf("adjudicate 单跑不得处理 Bundle：%v", got)
+	}
+}
+
+// 默认（无 --stage）行为不变：只跑 proposal，报告 stages 也只有它。
+func TestMaintainDefaultStageIsProposalOnly(t *testing.T) {
+	db := testDB(t)
+	stubRulesFallback(t)
+	seedMaintainBundle(t, db, "mnt-stage-default")
+
+	out, err := captureStdout(t, func() error {
+		return cmdMaintain([]string{"--db", db, "--json"})
+	})
+	if err != nil {
+		t.Fatalf("cmdMaintain: %v\n%s", err, out)
+	}
+	got := decodeJSONOut(t, out)
+	if names := stageNames(got); len(names) != 1 || names[0] != "proposal" {
+		t.Fatalf("默认只应跑 proposal，got %v\n%s", names, out)
+	}
+	if num(got, "ok") != 1 {
+		t.Fatalf("默认行为应保持不变：%v", got)
+	}
+}
