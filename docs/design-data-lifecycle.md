@@ -486,7 +486,7 @@ design-admission.md 取代声明、design-write-governance.md 再修订），代
 ### 12.2 收编进 `mem maintain`
 
 `distill` / `gc`（含 R15 的 `gc --candidates` 手动路径）/ `consolidate` / 判跑——
-都是维护阶段，降为内部步骤；保留 `maintain --stage=…`、`--no-gc` 调试口。
+都是维护阶段，降为内部步骤；`maintain --stage=…` 按固定顺序执行——S15 已落地（opt-in）——保留 `--no-gc` 调试口。
 
 ### 12.3 合并成一个待处置视图
 

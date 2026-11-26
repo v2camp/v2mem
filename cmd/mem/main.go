@@ -111,6 +111,9 @@ gc 选项:
 
 maintain 选项:
   --catch-up            故障恢复模式：与默认行为等价（保留给 Harness / SOP 明示）
+  --stage <s>           阶段：proposal|adjudicate|consolidate|gc|all（默认 proposal；逗号可多选，顺序固定）
+  --model-auto          阶段含 proposal 时在之后追加自动裁决（默认关；adjudicate 需同时给）
+  --adjudicate-scope <s> 裁决范围：this-run（只本轮 Bundle，默认）| all（全部 pending）
   --max-bundles <n>     本次最多处理几个 Bundle（默认 20）
   --force               清零退避中 fail/partial/backlog 的 not_before，本轮立即重试（不改 attempt）
   --dry-run             只读预演：不认领、不落候选、不写库（与 --force 互斥）
@@ -1157,6 +1160,51 @@ func cmdImport(args []string) error {
 	return nil
 }
 
+// consolidateOptions 是归并核心的输入：CLI 与 maintain 共用。
+type consolidateOptions struct {
+	Threshold float64
+	NoBackup  bool
+	BackupDir string
+	DryRun    bool
+}
+
+// consolidateReport 是一次归并的备份凭证与结果。
+//
+// Skipped 只出现在 dry-run：store.Consolidate 没有预览模式，全阶段零写时
+// 宁可不跑，也不为了「报个数」写库。
+type consolidateReport struct {
+	Backup  string
+	DryRun  bool
+	Skipped bool
+	Result  *store.ConsolidateResult
+}
+
+// runConsolidate 是归并的执行核心（供 cmdConsolidate 与 maintain --stage=consolidate 复用）。
+//
+// 备份前置与 CLI 原行为一致：先 backupBeforeMutating（备份校验失败直接拒绝执行），
+// 再调 store.Consolidate。dry-run 全阶段零写，不做备份、不调归并。
+func runConsolidate(st *store.Store, opts consolidateOptions) (*consolidateReport, error) {
+	rep := &consolidateReport{
+		DryRun: opts.DryRun,
+		Result: &store.ConsolidateResult{Pairs: []store.ConsolidatePair{}},
+	}
+	if opts.DryRun {
+		rep.Skipped = true
+		return rep, nil
+	}
+	bak, err := backupBeforeMutating(st.Path(), opts.NoBackup, opts.BackupDir)
+	if err != nil {
+		return nil, err
+	}
+	rep.Backup = bak
+	res, err := st.Consolidate(opts.Threshold)
+	if err != nil {
+		return nil, err
+	}
+	rep.Result = res
+	return rep, nil
+}
+
 // cmdConsolidate 做相似知识归并：把措辞略有差异的近重复聚成簇，
 // 留 1 条（salience / 命中次数 / 更早创建 依次优先），其余置 superseded_by。
 //
@@ -1175,24 +1223,22 @@ func cmdConsolidate(args []string) error {
 		return fmt.Errorf("--threshold 应落在 [0,1]，got %v", *threshold)
 	}
 
-	bak, err := backupBeforeMutating(c.db, *noBackup, *backupDir)
-	if err != nil {
-		return err
-	}
-	if bak != "" && !c.json {
-		fmt.Printf("已备份 → %s\n", bak)
-	}
-
 	st, err := store.Open(c.db)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	res, err := st.Consolidate(*threshold)
+	rep, err := runConsolidate(st, consolidateOptions{
+		Threshold: *threshold, NoBackup: *noBackup, BackupDir: *backupDir,
+	})
 	if err != nil {
 		return err
 	}
+	if rep.Backup != "" && !c.json {
+		fmt.Printf("已备份 → %s\n", rep.Backup)
+	}
+	res := rep.Result
 	if c.json {
 		if err := printJSON(res); err != nil {
 			return err
