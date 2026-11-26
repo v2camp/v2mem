@@ -253,6 +253,51 @@ func (s *Store) ListCandidates(status, session string, limit int) ([]Candidate, 
 	return s.ListCandidatesByProject(status, session, "", limit)
 }
 
+// PendingCandidateRef 是「只够裁决用」的最小投影：ID + revision。
+//
+// maintain 自动裁决只需要 CAS 前提，正文与证据由 Commit 路径自己读；
+// 返回整行 Candidate 会把不需要的列也扫一遍，且 revision 不在 Candidate 里。
+type PendingCandidateRef struct {
+	ID       string `json:"id"`
+	Revision int    `json:"revision"`
+}
+
+// ListPendingCandidatesByBundles 取指定 Bundle 下仍在 pending 的候选，供 maintain
+// 只裁决「本轮处理过的窗口」。
+//
+// 空列表返回空集而不是全表：一轮没处理任何窗口时，语义是「无候选可裁」，
+// 误退化成全表会让一次空跑把历史积压全部裁决掉。
+func (s *Store) ListPendingCandidatesByBundles(bundleIDs []string, limit int) ([]PendingCandidateRef, error) {
+	if len(bundleIDs) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(bundleIDs)), ",")
+	args := make([]any, 0, len(bundleIDs)+1)
+	for _, id := range bundleIDs {
+		args = append(args, id)
+	}
+	args = append(args, limit)
+	rows, err := s.db.Query(`SELECT id, revision FROM candidates
+		  WHERE status = 'pending' AND bundle_id IN (`+placeholders+`)
+		  ORDER BY created_at ASC, id ASC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingCandidateRef
+	for rows.Next() {
+		var ref PendingCandidateRef
+		if err := rows.Scan(&ref.ID, &ref.Revision); err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
 // candidateSelect 是候选行列表的统一读法，避免两处查询的列顺序漂移。
 const candidateSelect = `SELECT id, session_id, project, kind, content, content_hash,
 	status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id,
