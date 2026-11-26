@@ -19,8 +19,14 @@ func cmdEvalFlow(args []string) error {
 	c.register(fs)
 	window := fs.Duration("window", 15*24*time.Hour,
 		"悬空候选的处理 SLA（design-data-lifecycle §5，默认 15 天）")
+	profile := fs.String("profile", "ci", "剖面：ci（严格，默认）| prod（legacy 豁免）")
+	allowEmpty := fs.Bool("allow-empty", true,
+		"仅 --profile=prod 生效：无样本分支降级为 PASS-with-note")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *profile != "ci" && *profile != "prod" {
+		return fmt.Errorf("eval flow: 未知 --profile=%q（可选 ci|prod）", *profile)
 	}
 	st, err := store.Open(c.db)
 	if err != nil {
@@ -31,7 +37,10 @@ func cmdEvalFlow(args []string) error {
 	if err != nil {
 		return fmt.Errorf("读取动线快照失败: %w", err)
 	}
-	rep := eval.CheckFlow(snap, *window)
+	rep := eval.CheckFlowWithOptions(snap, *window, eval.FlowOptions{
+		Profile:    *profile,
+		AllowEmpty: *allowEmpty,
+	})
 	if c.json {
 		if err := printJSON(rep); err != nil {
 			return err
@@ -44,8 +53,8 @@ func cmdEvalFlow(args []string) error {
 			}
 			fmt.Printf("%s  %s  %s：%s\n", chk.ID, status, chk.Name, chk.Detail)
 		}
-		fmt.Printf("\n通过 %d/%d，人工介入率 %.1f%%\n",
-			rep.Passed, len(rep.Checks), rep.ManualRate*100)
+		fmt.Printf("\n通过 %d/%d，人工介入率 %.1f%%（profile=%s，legacy 豁免 %d）\n",
+			rep.Passed, len(rep.Checks), rep.ManualRate*100, rep.Profile, rep.LegacyExempt)
 	}
 	if !rep.OK() {
 		return fmt.Errorf("eval flow: %d 项未通过", rep.Failed)
