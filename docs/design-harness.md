@@ -326,3 +326,58 @@ INSERT INTO hook_dedup(key, ts) VALUES(?, ?)
 
 Claude 等的 PostToolUse 字段本波未逐家核销 stdin，所以不给它们加 `ExtraEvents`。不启动常驻进程。
 
+### 12.15 detach 存活验证（2026-11-26）
+
+**问题**：`startMemProc` 拉起的是不等待的子进程（`cmd/mem/distill_hook.go:33-50`），
+SessionStart 的 `distillPendingFailOpen`（`cmd/mem/hook.go:170-175`）与 SessionEnd 冷启动
+都靠它。宿主会话退出、父进程被强制结束或整机休眠时，子进程是否还在跑、租约会不会卡死，
+此前只有代码推断，没有实测。
+
+**方法**（临时 HOME + 临时库 + 假 CLI，不触碰 `~/.v2mem`）：
+
+1. 先用真实 `mem hook` 的 UserPromptSubmit 写满 fidelity=full 的证据，再由 SessionStart
+   拉起 `distill --proposal --executor auto --max-bundles 1 --db <tmp>`；`model.json`
+   指向 PATH 里的假 `codebuddy`（`sleep 6` 后吐一行合法 JSONL）。
+2. 观测点：`ps` 的 PPID/PGID、`evidence_bundles`、`distill_runs`、`candidates`、
+   `~/.v2mem/spawn.log`。
+3. 父进程 SIGKILL 用「无读端 FIFO 作 `--audit`」把 hook 稳定卡在 spawn 之后再杀，
+   避开毫秒级竞态；租约到期用 `update evidence_bundles set lease_until=now-1` 等价模拟，
+   不真等 2 分钟 LeaseTTL。
+
+**结果**：
+
+| # | 场景 | 结果 | 关键证据 |
+|:--|:---|:---|:---|
+| 1 | 宿主正常退出 | hook 0.03s 返回，子进程继续并完成 | `hook_seconds=0.029`；子进程 `PPID=1`；bundle `ok` attempt=1；1 候选 / 1 运行账 |
+| 2 | 父进程被 SIGKILL（spawn 后） | 父死、子存活并完成 | `hook_alive_after_kill=no`；子进程 `PPID=1`；bundle `ok`；1 候选 / 1 运行账 |
+| 3 | 子进程 `-STOP` → 租约到期 → maintain catch-up → `-CONT` | catch-up 成功；旧进程恢复后以租约丢失退出 | 停时 `lease_ttl=120s`；maintain 后 attempt=2/`ok`；CONT 后 spawn.log 记 `证据 Bundle 租约已丢失: status=ok owner=`；候选仍 1，运行账 2 条（attempt 1/2 各一条 `ok`） |
+| 4 | 两会话并行重复触发同一窗口 | 只消费一次 | 2 个子进程 → `distill_runs=1`、`candidates=1`、attempt=1；窗口消费后再触发零新增 |
+| 5 | 子进程持租约时 SIGKILL（模拟崩溃） | 到期前让位，到期后自动 catch-up | 崩溃后 `leased/attempt=1/ttl=120s`；未到期重触发 `runs=0`；到期后 `ok/attempt=2`、1 候选 |
+| 6 | 对进程组发信号（附加） | ⚠️ 子进程被一起带走 | `child_pgid == hook_pgid`；`killpg` 后子进程消失、`runs=0` |
+
+**机制**：`exec.Command` + `cmd.Start()` 不 `Wait`，stdin/stdout 置 nil（/dev/null），
+stderr 落 `spawn.log`；父进程退出后子进程被 reparent 到 launchd/init。所以「父进程自己退出」
+与「只杀父 PID」都不影响子进程。租约（2 分钟）写在 `evidence_bundles.lease_until`，
+`NextRunnableProposalBundle` 只在 `lease_until <= now` 时把窗口视为可认领：崩溃后
+2 分钟内无人越过头重跑，到期后下一次 SessionStart 自动恢复。候选由
+`ux_cand_hash(session_id, content_hash)` 去重，重复执行只合并证据，不新增候选行。
+
+**未验证 / 已知限制**：
+
+1. **真实整机睡眠未测。** `kill -STOP` 只冻结进程，不模拟合盖休眠后的时钟跳变、网络中断
+   与宿主被杀；睡眠期间的租约到期与恢复只能按同一套 claim/SQL 推演。这是本验证最大的空白。
+2. **进程组信号会带走子进程。** `startMemProc` 未设置 `SysProcAttr{Setpgid/Setsid}`，
+   实测子进程与 hook 同 PGID：终端 Ctrl-C、`kill -- -<pgid>` 或宿主按组回收时子进程同死；
+   单 PID SIGKILL / 正常退出不受影响。是否隔离进程组交主控决定，本任务不改产品代码。
+3. **子进程 stdout 被丢弃。** `backlog` / `skipped` 这类正常结束在 `spawn.log` 里没有痕迹
+   （只有 stderr 落盘），排障时只能查库。
+4. 大 Bundle、长事务与睡眠、GC、`--retention` 的交互未覆盖。
+
+**附带发现（非 detach 语义，未改代码）**：实验里所有 `candidates.run_id` 与
+`evidence_bundles.last_run_id` 恒为空。原因：`internal/proposal/runner.go:226` 先给
+`out.RunID` 赋值，`:239` 的 `out.Result = res` 又把嵌入的 `Result.RunID` 覆盖成空串，
+`:257` / `:405` 随后按空值落库。后果是运行账与候选无法按 run_id 关联，
+`FinishProposalBundle` 的重复完成幂等分支（`internal/store/proposal_store.go:225`）也
+永不命中。复现：任意 `mem distill --proposal --bundle <id> --db <tmp>` 后
+`select run_id from candidates`。
+
