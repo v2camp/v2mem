@@ -48,10 +48,6 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem judge [选项]                  准入判定：只记 verdict，不改状态（影子期）
   mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
   mem reject <id|前缀>             拒绝候选
-  mem batch  [选项]                批量裁决：按方案文件一次 accept/reject（--dry-run 只校验，--rollback 撤销）
-  mem migrate --summary-external   把 observations.summary / summary_idx 迁移到 content/（--dry-run 只估算）
-                                    --reject-judged 批量否决影子判定为 reject 的候选（只否决、不采纳）
-  mem candidates ls [选项]         列出隔离区候选
   mem review ls [选项]             复核队列（只读四态）：pending 待判定 / summary 未审核摘要 / quarantined 隔离 / failed 失败
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
@@ -142,6 +138,10 @@ hook 选项:
   mem add --kind decision "记忆库数据必须放在 ~/.v2mem，不放代码目录"
   mem search "记忆库 数据 路径"
   mem stats --json
+
+兼容保留（下一轮随 P4/灰度删除）:
+  accept / reject / judge / distill / gc / consolidate 仍可用，但只作人工运维与灾备兜底；
+  常规维护主入口是 mem maintain --stage=proposal|adjudicate|consolidate|gc|all。
 `
 
 // knownSubcommands 是子命令的**唯一清单**。
@@ -153,7 +153,7 @@ var knownSubcommands = []string{
 	"add", "search", "asset", "ls", "stats", "touch", "show", "feedback", "forget", "notes", "lexicon",
 	"gc", "consolidate", "maintain", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
-	"distill", "accept", "reject", "batch", "candidates", "judge", "setup", "migrate",
+	"distill", "accept", "reject", "judge", "setup",
 	"review",
 }
 
@@ -258,11 +258,14 @@ func dispatch(args []string) error {
 	case "reject":
 		err = cmdReject(args[1:])
 	case "batch":
-		err = cmdBatch(args[1:])
+		// 已下线：批量准出的归档与回滚由 review rollback 承接。
+		return usageError{msg: "命令 batch 已下线：回滚用 mem review rollback；复核入口见 mem review ls --state all"}
 	case "migrate":
-		err = cmdMigrate(args[1:])
+		// 已下线：summary / summary_idx 外置迁移已随旧库迁移完成。
+		return usageError{msg: "命令 migrate 已下线：summary/summary_idx 外置迁移已完成，无需再执行"}
 	case "candidates":
-		err = cmdCandidates(args[1:])
+		// 已下线：候选查看并入 review 四态视图。
+		return usageError{msg: "命令 candidates 已下线：用 mem review ls --state pending|all"}
 	case "review":
 		err = cmdReview(args[1:])
 	case "sync":

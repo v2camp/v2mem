@@ -33,6 +33,45 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	return buf.String(), runErr
 }
 
+// 命令面收编：migrate / batch / candidates 已下线，调用必须是用法错误（退出码 2）
+// 且提示承接入口，而不是落到业务错误或静默成功。
+func TestRemovedSubcommandsExitTwoWithReplacement(t *testing.T) {
+	cases := map[string]string{
+		"migrate":    "已下线",
+		"batch":      "mem review rollback",
+		"candidates": "mem review ls",
+	}
+	for name, want := range cases {
+		t.Run(name, func(t *testing.T) {
+			var code int
+			out := captureStderr(t, func() { code = run([]string{name}) })
+			if code != 2 {
+				t.Fatalf("%s 应退出码 2，got %d\n%s", name, code, out)
+			}
+			if !strings.Contains(out, want) {
+				t.Errorf("%s 的提示应包含替代入口 %q，got:\n%s", name, want, out)
+			}
+		})
+	}
+}
+
+// knownSubcommands 是命令面的唯一清单：被删的三条不得再出现。
+func TestKnownSubcommandsExcludesRemovedCommands(t *testing.T) {
+	known := map[string]bool{}
+	for _, s := range knownSubcommands {
+		known[s] = true
+	}
+	for _, removed := range []string{"migrate", "batch", "candidates"} {
+		if known[removed] {
+			t.Errorf("knownSubcommands 仍包含已下线命令 %q", removed)
+		}
+	}
+	// 37 → 34：基线 b2cc2b9 的清单是 37 条（设计文档里的「33」早于 setup/review 等新增）。
+	if len(knownSubcommands) != 34 {
+		t.Fatalf("命令面应为 34 条，got %d", len(knownSubcommands))
+	}
+}
+
 // ---------- M3: 标记过滤 ----------
 
 func TestCmdSearchHonoursTagFlag(t *testing.T) {

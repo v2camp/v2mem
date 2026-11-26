@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/v2camp/v2mem/internal/store"
@@ -119,73 +118,6 @@ func TestRejectRevisionConflict(t *testing.T) {
 	}
 	if err := cmdReject([]string{"--db", db, "--audit-file", "-", "nope"}); err == nil {
 		t.Fatal("不存在的 id 应报错")
-	}
-}
-
-func TestCandidatesPolicyViewIsReadOnly(t *testing.T) {
-	db := testDB(t)
-	st, err := store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dec, err := st.InsertCandidate(store.CandidateInput{
-		SessionID: "s", Project: "p", Kind: "decision", Content: "决定：需要人看", Source: "distill",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	task, err := st.InsertCandidate(store.CandidateInput{
-		SessionID: "s", Project: "p", Kind: "task", Content: "待办：完成的自动", Source: "distill",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
-	execSQL(t, db, `UPDATE candidates SET task_state='done' WHERE id='`+task.Candidate.ID+`'`)
-
-	out, err := captureStdout(t, func() error {
-		return cmdCandidates([]string{"ls", "--db", db, "--policy"})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, "action=human_accept") || !strings.Contains(out, "action=auto_commit") {
-		t.Fatalf("策略视图应区分人工/自动，got:\n%s", out)
-	}
-	if !strings.Contains(out, "rev=0") {
-		t.Fatalf("策略视图应展示 revision，got:\n%s", out)
-	}
-	if !strings.Contains(out, "理由:") {
-		t.Fatalf("策略视图应展示原因码，got:\n%s", out)
-	}
-
-	out, err = captureStdout(t, func() error {
-		return cmdCandidates([]string{"ls", "--db", db, "--policy", "--json"})
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, `"action":"auto_commit"`) || !strings.Contains(out, `"revision":0`) {
-		t.Fatalf("JSON 策略视图字段不全，got:\n%s", out)
-	}
-
-	// 只读：不得产生裁决记录或记忆。
-	st, err = store.Open(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	for _, id := range []string{dec.Candidate.ID, task.Candidate.ID} {
-		decisions, derr := st.CommitDecisions(id)
-		if derr != nil {
-			t.Fatal(derr)
-		}
-		if len(decisions) != 0 {
-			t.Fatalf("--policy 不得写裁决，got %+v", decisions)
-		}
-	}
-	if countAllMemories(t, db) != 0 {
-		t.Fatal("--policy 不得写记忆")
 	}
 }
 

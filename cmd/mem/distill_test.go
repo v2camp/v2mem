@@ -59,7 +59,7 @@ func TestDistillNoneThenAcceptAndReject(t *testing.T) {
 		t.Fatalf("候选不得被 search 命中，got %s", out)
 	}
 	listed, err := captureStdout(t, func() error {
-		return cmdCandidates([]string{"ls", "--db", db, "--json"})
+		return cmdReview([]string{"ls", "--state", "pending", "--db", db, "--json"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -274,10 +274,10 @@ func TestCmdGCCandidatesAndTextList(t *testing.T) {
 	}
 	st.Close()
 	out, err := captureStdout(t, func() error {
-		return cmdCandidates([]string{"ls", "--db", db})
+		return cmdReview([]string{"ls", "--state", "pending", "--db", db})
 	})
-	if err != nil || !strings.Contains(out, "待办") {
-		t.Fatalf("文本列表应打出候选，got %q %v", out, err)
+	if err != nil || !strings.Contains(out, "待判定：1") {
+		t.Fatalf("四态视图应打出 pending 计数，got %q %v", out, err)
 	}
 	if err := cmdGC([]string{"--db", db, "--candidates"}); err != nil {
 		t.Fatal(err)
@@ -298,10 +298,10 @@ func TestDistillSkippedOnEmptyQueue(t *testing.T) {
 		t.Fatalf("空队列应说明，got %q %v", out, err)
 	}
 	none, err := captureStdout(t, func() error {
-		return cmdCandidates([]string{"ls", "--db", db})
+		return cmdReview([]string{"ls", "--state", "pending", "--db", db})
 	})
-	if err != nil || !strings.Contains(none, "没有候选") {
-		t.Fatalf("空候选列表，got %q %v", none, err)
+	if err != nil || !strings.Contains(none, "待判定：0") {
+		t.Fatalf("空候选视图，got %q %v", none, err)
 	}
 }
 

@@ -433,7 +433,7 @@ design-admission.md 取代声明、design-write-governance.md 再修订），代
 | `docs/design-admission.md` 头部 | 取代声明；§2/§3 降级为标定工具 | ✅ 本提交 |
 | `docs/design-write-governance.md` §12.2 修订注 | 「不自动授予」→「自动授予 + 后审核」 | ✅ 本提交 |
 | `internal/commit/policy.go` | §6.3 矩阵改造（含 actor 与幂等键） | 开发时 |
-| `cmd/mem` / MCP 工具面 | §12 命令面收编（随 P2）；`review` 系列替换 accept/reject/batch/candidates | 开发时 |
+| `cmd/mem` / MCP 工具面 | §12 命令面收编（随 P2）；`batch`/`candidates`/`migrate` 已下线，`accept`/`reject` 等兼容保留待灰度后删除 | ✅ 本提交 |
 | 评测门禁 | §13 动线级 e2e（`eval flow` + U1–U8 + 逐跳 case，随各 P 阶段交付） | 开发时 |
 | `docs/ops-watch.md` + `scripts/watch-v2mem.sh` | 两处同改：R15 拆分只读化；R8 增未审核/最老年龄口径 | 开发时 |
 | `docs/design-harness.md` | detach 验证结论、无 SessionEnd 降级矩阵 | 开发时 |
@@ -463,7 +463,7 @@ design-admission.md 取代声明、design-write-governance.md 再修订），代
 ## 12. 命令面简化（随 P2 收编）
 
 > 判据：**每个命令都要答「自动化环里谁调它」**——答案是「用户例行去调」的即设计味，
-> 收编或退役。现状 33 个 CLI 子命令 + 8 个 MCP 工具 → 目标约 20 + 7。
+> 收编或退役。现状 34 个 CLI 子命令（2026-11-26 由 37 收编而来）+ 8 个 MCP 工具 → 目标约 20 + 7。
 > 用户与 agent 的常规操作只剩「读写 + 出错撤回」，其余要么自动、要么一次性、
 > 要么在 §3.1 触达面里找你。
 
@@ -481,7 +481,9 @@ design-admission.md 取代声明、design-write-governance.md 再修订），代
 > 一并退役——自动写侧只剩 proposal 单轨（SessionStart spawn + 一次性冷启动），手动入口
 > 只剩 `distill --proposal/--bundle` 与三个运维出口。`judge --stats` 退役，标定统计由
 > `mem review stats` 承接（judge 命令本体保留，判跑内联 maintain 属 §12.2 随 P2）。
-> CLI `batch` / `accept` / `reject` / `migrate` 的下线随后续切片执行（MCP 面已先行收编，见 §12.3）。
+> CLI `batch` / `migrate` / `candidates` 已下线（`batch --rollback` 由 `review rollback`
+> 承接，候选查看并入 `review ls --state pending|all`）；`accept` / `reject` / `judge` /
+> `distill` / `gc` / `consolidate` 兼容保留，下一轮随 P4/灰度删除。
 
 ### 12.2 收编进 `mem maintain`
 

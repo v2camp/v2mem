@@ -163,8 +163,8 @@ scripts/
   `tools/list` / `tools/call` / `ping`），自实现约 250 行且可纯函数单测；
   引 mcp-go 会破坏单文件轻量卖点，换来的流式/采样能力当前用不上
 - **工具面刻意最小**：`search` / `add` / `ls` / `touch` + 只读 `recall_context`，
-  再加隔离区裁决 `candidates_ls` / `accept` / `reject`（显式调用，见 design-write-governance.md §12）。
-  `distill` 与评测/运维（audit、eval、gc、consolidate）仍不进工具面
+  再加复核面 `review_ls` / `review_withdraw` 与无钩子兜底 `maintain_wake`
+  （见 design-write-governance.md §12）。`distill` 与评测/运维（audit、eval、gc、consolidate）仍不进工具面
 - **审计复用**：MCP 的检索/写入与 CLI 共享 `manual-search`/`manual-add` 埋点，
   MCP 通道的使用也会进入 `mem eval activity` 的评测样本，不会被悄悄漏掉
 - **测试分层**：协议纯函数（`dispatch`）直接喂 map 断言响应；传输层（`serve`）
