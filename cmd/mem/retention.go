@@ -7,6 +7,7 @@ package main
 // 必须确认备份有效（cmdGC 的备份前置 + 本文件 sweepRetentionFiles 的函数级守卫）。
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -25,7 +26,8 @@ import (
 //   - BackupsKeep / BackupsAge：库快照按代数 + 年龄双条件轮转；归档备份目录按年龄。
 //   - SpawnMaxBytes 与 audit.MaxArchiveBytes 同一量级（5MiB），避免一处 5MiB、一处无限。
 //   - SpoolTmpAge 24h：seg-*.tmp 是「写了一半」的临时段，24h 未转成 .jsonl 即视为死段。
-//   - CursorAge 30 天：只作「该关注了」的报数线，不触发删除（见下）。
+//   - CursorAge 30 天：cursor 年龄线；再叠加「transcript 已不存在 / 已完全消费」
+//     才删除（见 sweepRetentionFiles 第 (5) 步）。
 const (
 	plansRetention    = 90 * 24 * time.Hour
 	backupsKeep       = 3
@@ -42,7 +44,7 @@ type fileRetentionConfig struct {
 	BackupsAge    time.Duration // backup/ 超过年龄也回收
 	SpawnMaxBytes int64         // spawn.log 轮转阈值
 	SpoolTmpAge   time.Duration // spool seg-*.tmp 安全回收年龄
-	CursorAge     time.Duration // transcript cursor 只报不删的年龄线
+	CursorAge     time.Duration // transcript cursor 终态回收年龄线（30 天 + 完全消费）
 }
 
 func defaultFileRetentionConfig() fileRetentionConfig {
@@ -58,12 +60,12 @@ func defaultFileRetentionConfig() fileRetentionConfig {
 
 // fileSweepReport 是一次文件侧回收的预览/结果计数。
 type fileSweepReport struct {
-	Plans         int `json:"plans"`
-	Backups       int `json:"backups"`
-	SpawnRotated  int `json:"spawn_rotated"`
-	SpoolTmp      int `json:"spool_tmp"`
-	Cursors       int `json:"cursors"`
-	CursorsListed int `json:"cursors_listed"`
+	Plans          int `json:"plans"`
+	Backups        int `json:"backups"`
+	SpawnRotated   int `json:"spawn_rotated"`
+	SpoolTmp       int `json:"spool_tmp"`
+	CursorsDeleted int `json:"cursors_deleted"`
+	CursorsListed  int `json:"cursors_listed"`
 }
 
 // olderThan 判断文件 mtime 是否早于 now-age。保留期未配置（<=0）时一律不删，
@@ -180,17 +182,23 @@ func sweepRetentionFiles(root string, now time.Time, cfg fileRetentionConfig, dr
 		return nil
 	})
 
-	// (5) evidence/transcripts/*.cursor：transcriptCursor 只有 Path/Offset/Tools，
-	//     没有「会话终态」字段，现状无从判定会话是否已结束（§8.2「保守：只删明确
-	//     终态且超龄的」）。宁可不删：只报超龄数量，列为波 5 遗留，绝不猜着删。
-	rep.Cursors = 0
+	// (5) evidence/transcripts/*.cursor：游标只有 Path/Offset/Tools，没有显式「会话
+	//     终态」字段。用「文件年龄 + transcript 消费状态」判定终态：超过 CursorAge
+	//     且（transcript 已不存在，或 stat.Size() <= Offset 即完全消费）才回收。
+	//     30 天远大于任何活动会话；Size > Offset（有未读余量）或文件不可读时保留，
+	//     只删明确终态，绝不猜着删。dry-run 下同样只计数（下面统一跳过物理删）。
 	cursorRoot := filepath.Join(root, "evidence", "transcripts")
 	_ = filepath.WalkDir(cursorRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		if strings.HasSuffix(d.Name(), ".cursor") && olderThan(path, now, cfg.CursorAge) {
-			rep.CursorsListed++
+		if !strings.HasSuffix(d.Name(), ".cursor") || !olderThan(path, now, cfg.CursorAge) {
+			return nil
+		}
+		rep.CursorsListed++
+		if cursorReclaimable(path) {
+			rep.CursorsDeleted++
+			toDelete = append(toDelete, path)
 		}
 		return nil
 	})
@@ -216,6 +224,25 @@ func sweepRetentionFiles(root string, now time.Time, cfg fileRetentionConfig, dr
 		}
 	}
 	return rep, nil
+}
+
+// cursorReclaimable 判断超龄 cursor 是否已到终态：transcript 不存在，或已被
+// 完全消费（Size <= Offset）。坏 JSON、读不到 cursor、transcript 不可读时一律
+// 返回 false（保留）——判不准就不删。
+func cursorReclaimable(path string) bool {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var cur transcriptCursor
+	if err := json.Unmarshal(b, &cur); err != nil {
+		return false
+	}
+	fi, err := os.Stat(cur.Path)
+	if err != nil {
+		return os.IsNotExist(err) // 只有「确实不存在」算终态；权限等不可读保留
+	}
+	return fi.Size() <= cur.Offset
 }
 
 // readDirIfExists 读目录；目录不存在视为空，不报错（新库还没建 plans/backup 是常态）。
@@ -359,8 +386,8 @@ func printRetentionReport(c common, r *retentionResult) error {
 		}
 		fmt.Printf("备份根：%s\n", shown)
 	}
-	fmt.Printf("文件侧：plans %d，backup %d，spawn.log 轮转 %d，spool .tmp %d，cursor 报数 %d（删除 %d，终态不可判定，波 5 遗留）\n",
-		rep.Plans, rep.Backups, rep.SpawnRotated, rep.SpoolTmp, rep.CursorsListed, rep.Cursors)
+	fmt.Printf("文件侧：plans %d，backup %d，spawn.log 轮转 %d，spool .tmp %d，cursor 报数 %d（删除 %d）\n",
+		rep.Plans, rep.Backups, rep.SpawnRotated, rep.SpoolTmp, rep.CursorsListed, rep.CursorsDeleted)
 	if db == nil {
 		fmt.Println("库侧：dry-run 跳过（GCCandidates / GCTerminalBundles / GCCommitDecisions 无预览模式）")
 		return nil

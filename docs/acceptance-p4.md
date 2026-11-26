@@ -353,9 +353,9 @@ ok  	github.com/v2camp/v2mem/test/e2e	7.348s
    `store.go`、`coverage-policy.txt`、`Makefile` 被两者触碰，基线数字（覆盖率、
    耗时）允许变化，判据不变。
 2. **transcript cursor 终态回收**：`mem gc --retention --dry-run` 输出
-   「cursor 报数 0（删除 0，终态不可判定，波 5 遗留）」——cursor 只报数不处置的
-   只读边界是本波刻意口径，终态回收留待后续波次（见 `cmd/mem/retention.go`
-   CursorAge 注释）。
+   「cursor 报数 N（删除 M）」。只删超过 30 天且 transcript 已不存在或已完全消费
+   （`Size <= Offset`）的游标；仍有未读余量或不可读时只报不删
+   （见 `cmd/mem/retention.go` 第 (5) 步注释）。
 3. **U 类演练偏离**（2026-11-26 续跑已补做 U6/U8，详见 §7）：
    - U1/U4 的真实 key 失效→换 key 仍未演练（codebuddy CLI 实测可用，无法制造真实
      失效；以坏输出假 CLI 等价验证 invalid→fail→重试→ok）。
