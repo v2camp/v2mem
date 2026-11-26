@@ -443,3 +443,6 @@ G1–G6、G8、G10 绿；G7/G9/G11/G12/G13 红，逐条归因：
 4. 只拷 `mem.db` 不足以复现证据链：`content/` 必须一起搬，否则 maintain 会报
    「打开外置内容失败」（本轮 U2 副本已复现）；建议写进验收操作手册。
 
+> 建议 1–5 的多波落地证据（自动裁决、scope、eval prod、`--stage`、cursor 回收、
+> 命令面收编）见 [`acceptance-automation.md`](./acceptance-automation.md)。
+
