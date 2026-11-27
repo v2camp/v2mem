@@ -17,7 +17,7 @@ import (
 	"github.com/v2camp/v2mem/internal/store"
 )
 
-const testEnhanceTag = "local:fake@enhance-v1"
+const testEnhanceTag = "local:fake@" + enhancePromptVersion
 
 func newEnhanceDB(t *testing.T) (string, *store.Store) {
 	t.Helper()
@@ -442,6 +442,83 @@ func TestRepairContentSkipsChangedSinceSelection(t *testing.T) {
 	}
 }
 
+// TestRepairContentSuggestsWithdraw 验证空正文表示「建议撤回」：不写库、不归档、
+// 不计 failed，只计入 suggested_withdraw。
+func TestRepairContentSuggestsWithdraw(t *testing.T) {
+	db, st := newEnhanceDB(t)
+	keep := addEnhanceMemory(t, st, "我刚才尝试了命令 A，报错了", "p", "fact")
+	drop := addEnhanceMemory(t, st, "调研已完成，报告已生成：/tmp/report.md", "p", "fact")
+	installFakeEnhance(t, func(prompt string) (string, error) {
+		return enhanceOutputFor(enhanceInputIDs(t, prompt), func(id string) string {
+			if id == drop {
+				return ""
+			}
+			return "遇到命令报错时，先确认环境变量是否缺失"
+		}), nil
+	})
+
+	rep, _, err := runRepairContentJSON(t, "--db", db, "--json", "--model-tag", testEnhanceTag)
+	if err != nil {
+		t.Fatalf("建议撤回不应让命令失败: %v", err)
+	}
+	if rep.Rewritten != 1 || rep.SuggestedWithdraw != 1 || rep.Failed != 0 || rep.Conflict != 0 {
+		t.Fatalf("应 1 改写 + 1 建议撤回，got %+v", rep)
+	}
+	if got, _, _, _ := enhanceMemoryRow(t, st, keep); got != "遇到命令报错时，先确认环境变量是否缺失" {
+		t.Errorf("可复用条目应被改写，got %q", got)
+	}
+	if got, _, _, _ := enhanceMemoryRow(t, st, drop); got != "调研已完成，报告已生成：/tmp/report.md" {
+		t.Errorf("建议撤回的条目不得写库，got %q", got)
+	}
+	if rep.Archive == "" {
+		t.Fatal("唯一成功改写应产生归档")
+	}
+	data, err := os.ReadFile(rep.Archive)
+	if err != nil {
+		t.Fatalf("读归档: %v", err)
+	}
+	if lines := strings.Split(strings.TrimSpace(string(data)), "\n"); len(lines) != 1 {
+		t.Fatalf("归档只应有 1 行（空正文不归档），got %d:\n%s", len(lines), data)
+	}
+}
+
+// TestRepairContentPreviewSuggestsWithdraw 验证 preview 打印「建议撤回」且零写。
+func TestRepairContentPreviewSuggestsWithdraw(t *testing.T) {
+	db, st := newEnhanceDB(t)
+	id := addEnhanceMemory(t, st, "本次报告已完成，路径 /tmp/r.md", "p", "fact")
+	installFakeEnhance(t, func(prompt string) (string, error) {
+		return enhanceOutputFor(enhanceInputIDs(t, prompt), func(string) string { return "" }), nil
+	})
+
+	out, err := captureStdout(t, func() error {
+		return cmdRepairContent([]string{"--db", db, "--preview", "--model-tag", testEnhanceTag})
+	})
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if !strings.Contains(out, "建议撤回") || !strings.Contains(out, "建议撤回 1 条") {
+		t.Fatalf("preview 应打印建议撤回:\n%s", out)
+	}
+	if got, _, _, _ := enhanceMemoryRow(t, st, id); got != "本次报告已完成，路径 /tmp/r.md" {
+		t.Errorf("preview 不得写库，got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(db), "enhance")); !os.IsNotExist(err) {
+		t.Errorf("preview 不得产生归档目录，got err=%v", err)
+	}
+}
+
+// TestEnhancePromptVersionIsV2 固定提示词版本与关键语义，防止悄悄回退到 v1。
+func TestEnhancePromptVersionIsV2(t *testing.T) {
+	if enhancePromptVersion != "enhance-v2" {
+		t.Fatalf("提示词版本应为 enhance-v2，got %q", enhancePromptVersion)
+	}
+	for _, want := range []string{"一次性元数据必须删除", "建议撤回", "更短或持平"} {
+		if !strings.Contains(enhancePrompt, want) {
+			t.Errorf("enhance-v2 提示词缺少 %q", want)
+		}
+	}
+}
+
 // TestRepairContentBatchCallCount 验证 12 条 candidate、batch=10 恰好 2 次模型调用。
 func TestRepairContentBatchCallCount(t *testing.T) {
 	db, st := newEnhanceDB(t)
@@ -570,8 +647,8 @@ func TestRepairContentJSONFields(t *testing.T) {
 		t.Fatalf("JSON: %v\n%s", err, out)
 	}
 	for _, k := range []string{"mode", "filter", "model_tag", "scanned", "eligible",
-		"processed", "rewritten", "unchanged", "skipped_confirmed", "skipped_other",
-		"conflict", "failed", "archive"} {
+		"processed", "rewritten", "unchanged", "suggested_withdraw", "skipped_confirmed",
+		"skipped_other", "conflict", "failed", "archive"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("报告缺少字段 %q: %s", k, out)
 		}

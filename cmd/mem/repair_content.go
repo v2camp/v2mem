@@ -29,7 +29,7 @@ import (
 
 const (
 	// enhancePromptVersion 是归因的一部分：同 tag 的归档能回答「哪版提示词」。
-	enhancePromptVersion = "enhance-v1"
+	enhancePromptVersion = "enhance-v2"
 	enhanceDefaultLimit  = 20
 	enhanceDefaultBatch  = 10
 	// overlong 阈值：与候选正文的 240 rune 预算同口径，超过即视为需要压缩。
@@ -51,12 +51,14 @@ const enhancePrompt = `你是记忆正文提炼器。把已入库的过程叙述
 硬约束：
 1. 不新增事实：只能压缩、重排、去指代化；库外知识与推测一律不得引入。
 2. 禁止第一人称（我 / 我们）、会话指代（这个链接 / 那个报错）、时点词（刚才 / 本次 / 目前）。
-3. 专名原样保留：命令、路径、函数名、错误码、数字、机器名不改写、不翻译。
+3. 稳定的专名原样保留：命令、函数名、错误码、机器名、数字，以及作为接口标识的路径不改写、不翻译；一次性报告或临时文件路径按第 6 条删除。
 4. 不改变语义类别：kind 由代码保留，不要改写。
-5. 长度尽量不超过原正文的 1.2 倍。
+5. 一次性元数据必须删除：日期（20xx-xx-xx）、提交/回填 SHA、临时或报告文件路径（/tmp/...、.../temp_*、*.md 报告路径）、任务编号、版本号——除非它是稳定的接口标识（错误码、配置键、函数名）。
+6. 一次性回执不是知识：完成/已修复/已合入/调研完成/任务完成这类正文，先问「去掉时间和动作后还剩什么可复用判断」；有就只留判断与做法，没有就把 content 输出为空字符串 ""（表示建议撤回，不是失败）。
+7. 改写后正文必须比原文更短或持平；禁止用「可参考既有结论 / 既有落点方式」这类空话开头。
 
 只输出 JSON，不要解释，不要代码块，输出格式：
-{"items":[{"id":"输入里的 id","content":"改写后的正文"}]}
+{"items":[{"id":"输入里的 id","content":"改写后的正文；无复用价值时为空字符串"}]}
 
 ` + enhancePromptMarker
 
@@ -89,24 +91,25 @@ type enhanceItem struct {
 // enhanceReport 是文本与 --json 共用的报告。回滚字段始终输出 0，
 // 让脚本可以只认一套键而不必区分模式。
 type enhanceReport struct {
-	Mode             string        `json:"mode"`
-	Filter           string        `json:"filter"`
-	ModelTag         string        `json:"model_tag"`
-	DryRun           bool          `json:"dry_run"`
-	Scanned          int           `json:"scanned"`
-	Eligible         int           `json:"eligible"`
-	Processed        int           `json:"processed"`
-	Rewritten        int           `json:"rewritten"`
-	Unchanged        int           `json:"unchanged"`
-	SkippedConfirmed int           `json:"skipped_confirmed"`
-	SkippedOther     int           `json:"skipped_other"`
-	Conflict         int           `json:"conflict"`
-	Failed           int           `json:"failed"`
-	Archive          string        `json:"archive"`
-	Restored         int           `json:"restored"`
-	Skipped          int           `json:"skipped"`
-	SkippedConflict  int           `json:"skipped_conflict"`
-	Items            []enhanceItem `json:"items"`
+	Mode              string        `json:"mode"`
+	Filter            string        `json:"filter"`
+	ModelTag          string        `json:"model_tag"`
+	DryRun            bool          `json:"dry_run"`
+	Scanned           int           `json:"scanned"`
+	Eligible          int           `json:"eligible"`
+	Processed         int           `json:"processed"`
+	Rewritten         int           `json:"rewritten"`
+	Unchanged         int           `json:"unchanged"`
+	SuggestedWithdraw int           `json:"suggested_withdraw"`
+	SkippedConfirmed  int           `json:"skipped_confirmed"`
+	SkippedOther      int           `json:"skipped_other"`
+	Conflict          int           `json:"conflict"`
+	Failed            int           `json:"failed"`
+	Archive           string        `json:"archive"`
+	Restored          int           `json:"restored"`
+	Skipped           int           `json:"skipped"`
+	SkippedConflict   int           `json:"skipped_conflict"`
+	Items             []enhanceItem `json:"items"`
 }
 
 // enhanceArchiveRecord 是回滚凭证的冻结字段，不允许增删改名。
@@ -132,7 +135,7 @@ func cmdRepairContent(args []string) error {
 	preview := fs.Bool("preview", false, "调模型出 before/after，不写库")
 	limit := fs.Int("limit", enhanceDefaultLimit, "本次最多处理条数")
 	batch := fs.Int("batch", enhanceDefaultBatch, "单次模型调用条数")
-	modelTag := fs.String("model-tag", "", "归因标签（默认取模型配置拼出的 <provider>:<model>@enhance-v1）")
+	modelTag := fs.String("model-tag", "", "归因标签（默认取模型配置拼出的 <provider>:<model>@enhance-v2）")
 	includeConfirmed := fs.Bool("include-confirmed", false, "连人工已确认/修正的条目一起处理")
 	rollback := fs.String("rollback", "", "按归档回滚：<tag|file>")
 	positional, flagArgs := splitLeadingArgs(args)
@@ -513,7 +516,7 @@ func buildEnhancePrompt(candidates []enhanceCandidate) string {
 }
 
 // parseEnhanceRewrites 强制一输入一输出：输出 id 集合必须与输入完全一致，
-// 不允许未知 id、重复、缺失或空正文。坏输出让整批失败，不做部分写入。
+// 不允许未知 id、重复或缺失。空正文是合法输出（表示建议撤回），不算违例。
 func parseEnhanceRewrites(raw string, chunk []enhanceCandidate) (map[string]string, error) {
 	i, j := strings.Index(raw, "{"), strings.LastIndex(raw, "}")
 	if i < 0 || j <= i {
@@ -546,7 +549,9 @@ func parseEnhanceRewrites(raw string, chunk []enhanceCandidate) (map[string]stri
 			return nil, fmt.Errorf("输出重复 id %q", id)
 		}
 		if content == "" {
-			return nil, fmt.Errorf("输出 id %q 正文为空", id)
+			// 空正文合法：表示「没有可复用判断，建议撤回」，不是坏输出。
+			out[id] = ""
+			continue
 		}
 		out[id] = content
 	}
@@ -572,10 +577,18 @@ func applyEnhancePreview(rep *enhanceReport, batches []enhanceBatchOutcome) {
 			continue
 		}
 		for _, c := range b.Candidates {
-			rep.Items = append(rep.Items, enhanceItem{
+			newContent := b.Rewrites[c.ID]
+			item := enhanceItem{
 				ID: c.ID, Kind: c.Kind, Project: c.Project, ReviewState: c.ReviewState,
-				Status: "preview", OldContent: c.Content, NewContent: b.Rewrites[c.ID],
-			})
+				OldContent: c.Content,
+			}
+			if strings.TrimSpace(newContent) == "" {
+				item.Status = "withdraw_suggested"
+				rep.SuggestedWithdraw++
+			} else {
+				item.Status, item.NewContent = "preview", newContent
+			}
+			rep.Items = append(rep.Items, item)
 		}
 	}
 }
@@ -601,6 +614,13 @@ func applyEnhanceRewrites(st *store.Store, rep *enhanceReport, batches []enhance
 		for _, c := range b.Candidates {
 			newContent := b.Rewrites[c.ID]
 			item := enhanceItem{ID: c.ID, Kind: c.Kind, Project: c.Project, ReviewState: c.ReviewState}
+			if strings.TrimSpace(newContent) == "" {
+				// 空正文是合法输出：该条没有可复用判断，建议撤回，不写库也不归档。
+				item.Status = "withdraw_suggested"
+				rep.SuggestedWithdraw++
+				rep.Items = append(rep.Items, item)
+				continue
+			}
 			res, err := st.RewriteMemoryContent(c.ID, newContent, tag, c.ContentHash, time.Now().Unix())
 			switch {
 			case errors.Is(err, store.ErrMemoryContentChanged):
@@ -872,13 +892,15 @@ func renderEnhanceReport(rep *enhanceReport) {
 				reviewStateText(it.ReviewState), it.Reason)
 		}
 	case "preview":
-		fmt.Printf("预览（不写库）：扫描 %d 条，符合 %d 条，处理 %d 条\n",
-			rep.Scanned, rep.Eligible, rep.Processed)
+		fmt.Printf("预览（不写库）：扫描 %d 条，符合 %d 条，处理 %d 条，建议撤回 %d 条\n",
+			rep.Scanned, rep.Eligible, rep.Processed, rep.SuggestedWithdraw)
 		for _, it := range rep.Items {
 			switch it.Status {
 			case "preview":
 				fmt.Printf("  %s\n    改写前: %s\n    改写后: %s\n",
 					shortID(it.ID), oneLine(it.OldContent), oneLine(it.NewContent))
+			case "withdraw_suggested":
+				fmt.Printf("  %s  建议撤回（去掉时间和动作后无可复用判断）\n", shortID(it.ID))
 			case "failed":
 				fmt.Printf("  %s  失败: %s\n", shortID(it.ID), it.Error)
 			}
@@ -886,13 +908,16 @@ func renderEnhanceReport(rep *enhanceReport) {
 	default:
 		fmt.Printf("正文提炼：扫描 %d 条，符合 %d 条，处理 %d 条\n",
 			rep.Scanned, rep.Eligible, rep.Processed)
-		fmt.Printf("  改写 %d / 未变 %d / 冲突 %d / 失败 %d；跳过（已确认 %d，其它 %d）\n",
-			rep.Rewritten, rep.Unchanged, rep.Conflict, rep.Failed, rep.SkippedConfirmed, rep.SkippedOther)
+		fmt.Printf("  改写 %d / 未变 %d / 建议撤回 %d / 冲突 %d / 失败 %d；跳过（已确认 %d，其它 %d）\n",
+			rep.Rewritten, rep.Unchanged, rep.SuggestedWithdraw, rep.Conflict, rep.Failed,
+			rep.SkippedConfirmed, rep.SkippedOther)
 		if rep.Archive != "" {
 			fmt.Printf("  归档 → %s\n", rep.Archive)
 		}
 		for _, it := range rep.Items {
 			switch it.Status {
+			case "withdraw_suggested":
+				fmt.Printf("  %s  建议撤回（未写库）\n", shortID(it.ID))
 			case "conflict", "failed":
 				fmt.Printf("  %s  %s: %s\n", shortID(it.ID), it.Status, it.Error)
 			}
