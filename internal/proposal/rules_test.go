@@ -101,6 +101,38 @@ func TestRulesGeneratorExtractsDurableFacts(t *testing.T) {
 	}
 }
 
+// 规则兜底与解析层的口径必须一致：ExtractRules 会把整段助手结论摘成 fact/pitfall，
+// 里面常带「本次/刚才」这类时点词，validateDraft 按过程叙述整条拒收。
+//
+// 不一致的代价不是「少一条候选」而是窗口反复 invalid：实测 bnd_f27e2 与 bnd_a7a3
+// 都是这一条路径，重试 5 次后进隔离，而按设计它该落 noop 并消费窗口。
+func TestRulesGeneratorDropsDraftsThatValidationWouldReject(t *testing.T) {
+	refs := []evidence.Ref{
+		{EventUID: "e1", SessionID: "s1", Project: "p", EventType: "stop",
+			// 实测正文（bnd_f27e2 第 4 条证据）：助手把整段排查结论当事实交给规则，
+			// 其中「本次未生成结果」正好命中 narrativeTemporal。
+			Summary: "## 结论 截图中连续 5 次「任务执行中断，本次未生成结果」的根因是 **WorkBuddy 定时任务调度器的执行层超时**，" +
+				"与 v2mem 项目、巡检脚本、记忆钩子均无关。三个不同任务、不同工作目录、不同 prompt 全部以**完全相同的 90 分钟**被取消，" +
+				"这是平台级硬超时最直接的证据。 ## 证据链 平台日志 `~/.workbuddy/logs/automation.log` 记录了三次同类失败，时间精确到秒： | 任务 | 开始（UTC） | 结束（UTC",
+			ProposalEligible: true, Fidelity: evidence.FidelityFull},
+	}
+	raw, err := NewRulesGenerator().Generate(context.Background(), GenerateRequest{Evidence: refs})
+	if err != nil {
+		t.Fatalf("规则生成不应报错: %v", err)
+	}
+	if strings.TrimSpace(raw) != "" {
+		t.Fatalf("过不了解析层校验的草案不该输出（会让窗口变 invalid），got %q", raw)
+	}
+	parsed, err := ParseDrafts(raw, len(refs))
+	if err != nil {
+		t.Fatalf("空输出应是合法的 0 条: %v", err)
+	}
+	if len(parsed.Drafts) != 0 || parsed.Invalid != 0 {
+		t.Fatalf("应为 0 草案 0 非法（窗口落 noop），got drafts=%d invalid=%d",
+			len(parsed.Drafts), parsed.Invalid)
+	}
+}
+
 // R2：不可提案的 pointer 证据既不进 Observation，也不被草案引用。
 func TestRulesGeneratorSkipsIneligibleRefs(t *testing.T) {
 	mixed := []evidence.Ref{

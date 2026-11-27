@@ -67,12 +67,21 @@ func (rulesGenerator) Generate(_ context.Context, req GenerateRequest) (string, 
 		}
 		// scope 固定 project：规则从单会话摘要抽出的是可复用结论，不是会话内
 		// 临时态；与 validateDraft 的默认 scope 同值，落库层不必再猜。
-		// wireDraft 只有 string/[]int，Marshal 不会失败，故不分支。
-		line, _ := json.Marshal(wireDraft{
+		w := wireDraft{
 			Kind: f.Kind, Scope: "project", Content: f.Content,
 			Rationale: f.Rationale, AttributedTo: f.AttributedTo,
 			EvidenceIdx: idx,
-		})
+		}
+		// 出栈前先过一遍解析层的校验：规则侧与 validateDraft 的口径必须一致。
+		// ExtractRules 会把整段助手结论当事实摘出（实测含「本次未生成结果」这类
+		// 时点词），解析层按过程叙述整条拒收——两条路径各判一次的结果是窗口
+		// 反复 invalid、5 次后进隔离；按设计它该落 noop 并消费窗口。
+		// 直接复用 validateDraft 而不是再写一套判据：口径只有一处，才不会漂。
+		if _, ok := validateDraft(w, len(req.Evidence)); !ok {
+			continue
+		}
+		// wireDraft 只有 string/[]int，Marshal 不会失败，故不分支。
+		line, _ := json.Marshal(w)
 		b.Write(line)
 		b.WriteByte('\n')
 	}
