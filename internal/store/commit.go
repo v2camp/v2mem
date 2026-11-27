@@ -548,7 +548,7 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 			WHERE id = ?`, prov, memoryID); err != nil {
 			return err
 		}
-		if err := writeMemoryEvidence(ctx, q, memoryID, rows, now); err != nil {
+		if _, err := writeMemoryEvidence(ctx, q, memoryID, rows, now); err != nil {
 			return err
 		}
 		// 记忆沿用候选 id 后 src 与 dst 同值，自环不表达任何派生关系，跳过；
@@ -618,7 +618,7 @@ func (s *Store) replayAccepted(ctx context.Context, q sqlQuerier, cur *CommitCan
 		return nil, fmt.Errorf("候选 %s 的 memory_id %s 已不存在，不能重放", cur.ID, cur.MemoryID)
 	}
 	now := time.Now().Unix()
-	if err := writeMemoryEvidence(ctx, q, cur.MemoryID, rows, now); err != nil {
+	if _, err := writeMemoryEvidence(ctx, q, cur.MemoryID, rows, now); err != nil {
 		return nil, err
 	}
 	prov := commitProvenance(rows, cur.ID)
@@ -730,6 +730,107 @@ func (s *Store) upsertAcceptedMemory(ctx context.Context, q sqlQuerier, cur *Com
 	return id, created, nil
 }
 
+// MemoryRepairReport 是一次证据链修复的汇总（CLI --json 直接输出）。
+type MemoryRepairReport struct {
+	Scanned       int                `json:"scanned"`
+	Repaired      int                `json:"repaired"`
+	Skipped       int                `json:"skipped"`
+	Failed        int                `json:"failed"`
+	AddedEvidence int                `json:"added_evidence"`
+	DryRun        bool               `json:"dry_run"`
+	Items         []MemoryRepairItem `json:"items,omitempty"`
+}
+
+// MemoryRepairItem 是单条记忆的修复结果。
+type MemoryRepairItem struct {
+	MemoryID      string `json:"memory_id"`
+	Status        string `json:"status"` // repaired | skipped | failed | pending
+	AddedEvidence int    `json:"added_evidence,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+// RepairAllMemoryEvidence 遍历库内全部记忆补证据链。
+//
+// dryRun 只报告「哪些记忆缺证据且能从候选的 obs_ids 补」，不写库；执行态逐条
+// 调 RepairMemoryEvidence（每条一个事务，失败不阻断其余条目）。
+// 规模阈值不在这里卡：调用方决定是否该走全量（CLI 的 100 条约定）。
+func (s *Store) RepairAllMemoryEvidence(dryRun bool) (*MemoryRepairReport, error) {
+	rows, err := s.db.Query(`SELECT id FROM memories ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	rep := &MemoryRepairReport{Scanned: len(ids), DryRun: dryRun}
+	for _, id := range ids {
+		if dryRun {
+			needs, err := s.memoryNeedsEvidenceRepair(id)
+			if err != nil {
+				rep.Failed++
+				rep.Items = append(rep.Items, MemoryRepairItem{MemoryID: id, Status: "failed", Error: err.Error()})
+				continue
+			}
+			if needs {
+				rep.Items = append(rep.Items, MemoryRepairItem{MemoryID: id, Status: "pending"})
+			} else {
+				rep.Skipped++
+			}
+			continue
+		}
+		n, err := s.RepairMemoryEvidence(id)
+		switch {
+		case err != nil:
+			rep.Failed++
+			rep.Items = append(rep.Items, MemoryRepairItem{MemoryID: id, Status: "failed", Error: err.Error()})
+		case n > 0:
+			rep.Repaired++
+			rep.AddedEvidence += n
+			rep.Items = append(rep.Items, MemoryRepairItem{MemoryID: id, Status: "repaired", AddedEvidence: n})
+		default:
+			rep.Skipped++
+		}
+	}
+	return rep, nil
+}
+
+// MemoryNeedsEvidenceRepair 报告一条记忆是否「缺证据且补得回来」，供 --dry-run。
+func (s *Store) MemoryNeedsEvidenceRepair(idOrPrefix string) (bool, error) {
+	id, err := s.resolveID(idOrPrefix)
+	if err != nil {
+		return false, err
+	}
+	return s.memoryNeedsEvidenceRepair(id)
+}
+
+// memoryNeedsEvidenceRepair 判断一条记忆是否「缺证据但补得回来」：
+// memory_evidence 为空，且它的候选还留着 obs_ids_json。两者都成立才算待修，
+// 否则是无来源的直写记忆，补不了也不该报成失败。
+func (s *Store) memoryNeedsEvidenceRepair(memoryID string) (bool, error) {
+	var haveEvidence, haveObs int
+	err := s.db.QueryRow(`SELECT
+		  (SELECT COUNT(*) FROM memory_evidence e WHERE e.memory_id = ?),
+		  (SELECT COUNT(*) FROM candidates c
+		     WHERE c.memory_id = ? AND c.obs_ids_json NOT IN ('', '[]'))`,
+		memoryID, memoryID).Scan(&haveEvidence, &haveObs)
+	if err != nil {
+		return false, err
+	}
+	return haveEvidence == 0 && haveObs > 0, nil
+}
+
 // RepairMemoryEvidence 为已落库的记忆补齐证据链（幂等）。
 //
 // 历史缺口：规则蒸馏路径的候选只写 obs_ids_json，candidate_evidence 为空，
@@ -764,15 +865,17 @@ func (s *Store) RepairMemoryEvidence(memoryID string) (int, error) {
 			return nil
 		}
 		now := time.Now().Unix()
-		n, err := s.candidateEvidenceFromObs(ctx, q, candID, obsIDs, now)
-		if err != nil {
+		if _, err := s.candidateEvidenceFromObs(ctx, q, candID, obsIDs, now); err != nil {
 			return err
 		}
 		rows, err := s.loadCandidateEvidence(ctx, q, candID)
 		if err != nil {
 			return err
 		}
-		if err := writeMemoryEvidence(ctx, q, id, rows, now); err != nil {
+		// 计数以「记忆侧实际新增的证据行」为准：候选证据可能早已存在，
+		// 只有 memory_evidence 缺失，这种修复同样应算修好了一条。
+		n, err := writeMemoryEvidence(ctx, q, id, rows, now)
+		if err != nil {
 			return err
 		}
 		if _, err := q.ExecContext(ctx, `UPDATE memories SET provenance = ? WHERE id = ?`,
@@ -799,21 +902,29 @@ func keepOriginalHash(old, next string) string {
 	return provenanceWithOriginalHash(next, h)
 }
 
-func writeMemoryEvidence(ctx context.Context, q sqlQuerier, memoryID string, rows []candidateEvidenceRow, now int64) error {
+// writeMemoryEvidence 把候选证据绑定到记忆上，返回本次新增的行数。
+// 用 RowsAffected 而不是 len(rows)：重复绑定是幂等的，计入条数会让
+// RepairMemoryEvidence 把「已修过」误报成「又修了一次」。
+func writeMemoryEvidence(ctx context.Context, q sqlQuerier, memoryID string, rows []candidateEvidenceRow, now int64) (int, error) {
+	added := 0
 	for _, e := range rows {
 		if strings.TrimSpace(e.EvidenceID) == "" && strings.TrimSpace(e.EventUID) == "" {
 			continue
 		}
-		if _, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO memory_evidence(
+		res, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO memory_evidence(
 			memory_id, evidence_id, event_uid, archive_hash, raw_locator, grade,
 			seq, occurred_at_ns, created_at
 		) VALUES (?,?,?,?,?,?,?,?,?)`,
 			memoryID, e.EvidenceID, e.EventUID, e.ArchiveHash, e.RawLocator,
-			string(e.Grade), e.Seq, e.OccurredAtNS, now); err != nil {
-			return err
+			string(e.Grade), e.Seq, e.OccurredAtNS, now)
+		if err != nil {
+			return added, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			added += int(n)
 		}
 	}
-	return nil
+	return added, nil
 }
 
 // recordDecision 写一条裁决账。

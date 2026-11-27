@@ -76,6 +76,56 @@ func TestCommitAcceptBackfillsLegacyCandidateEvidence(t *testing.T) {
 	}
 }
 
+func TestRepairAllMemoryEvidenceScansAndReports(t *testing.T) {
+	s := newTestStore(t)
+	ev := captureEvidence(t, s, "uid-all", "s", "p", "全量扫描的证据")
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Project: "p", Kind: "fact", Content: "缺证据的记忆", Source: "distill",
+		ObsIDs: []string{ev.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := s.CommitCandidate(res.Candidate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := s.CommitAccept(res.Candidate.ID, view.Revision, commit.ActorHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟历史缺口：只删记忆侧证据，候选侧仍在（补得回来）。
+	if _, err := s.db.Exec(`DELETE FROM memory_evidence WHERE memory_id = ?`, out.MemoryID); err != nil {
+		t.Fatal(err)
+	}
+	// 直写记忆没有候选背书，属于「补不了也不该报失败」。
+	if _, err := s.Add(AddInput{Content: "没有候选的直写记忆", Project: "p", Kind: "fact"}); err != nil {
+		t.Fatal(err)
+	}
+
+	probe, err := s.RepairAllMemoryEvidence(true)
+	if err != nil {
+		t.Fatalf("预演: %v", err)
+	}
+	if probe.Scanned != 2 || probe.Skipped != 1 || len(probe.Items) != 1 || probe.Items[0].Status != "pending" {
+		t.Fatalf("预演应报 1 条待修、1 条跳过，got %+v", probe)
+	}
+	if n := countMemoryEvidence(t, s, out.MemoryID); n != 0 {
+		t.Fatalf("预演不得写库，got %d", n)
+	}
+
+	rep, err := s.RepairAllMemoryEvidence(false)
+	if err != nil {
+		t.Fatalf("执行: %v", err)
+	}
+	if rep.Repaired != 1 || rep.Skipped != 1 || rep.AddedEvidence != 1 || rep.Failed != 0 {
+		t.Fatalf("全量修复结果不对: %+v", rep)
+	}
+	if n := countMemoryEvidence(t, s, out.MemoryID); n != 1 {
+		t.Fatalf("修复后应有 1 条证据，got %d", n)
+	}
+}
+
 func TestRepairMemoryEvidenceIsIdempotent(t *testing.T) {
 	s := newTestStore(t)
 	ev := captureEvidence(t, s, "uid-repair", "s", "p", "待修复的证据")

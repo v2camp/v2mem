@@ -67,8 +67,9 @@ func TestKnownSubcommandsExcludesRemovedCommands(t *testing.T) {
 		}
 	}
 	// 37 → 34：基线 b2cc2b9 的清单是 37 条（设计文档里的「33」早于 setup/review 等新增）。
-	if len(knownSubcommands) != 34 {
-		t.Fatalf("命令面应为 34 条，got %d", len(knownSubcommands))
+	// 34 → 35：新增 repair（证据链修复入口）。
+	if len(knownSubcommands) != 35 {
+		t.Fatalf("命令面应为 35 条，got %d", len(knownSubcommands))
 	}
 }
 
