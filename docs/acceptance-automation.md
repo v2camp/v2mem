@@ -155,6 +155,9 @@ proposal ok(processed=1) → adjudicate ok(committed=1) → consolidate ok(0) �
 | memories | reviewed 11 + 未审核 7 |
 | eval flow（库副本） | ci 8/13；prod 13/13（legacy_exempt 343） |
 
+口径：`ci` 只用于干净夹具/tag 判据；生产健康检查用 `prod`，不得用生产库的
+ci 红项判 tag，也不得用 prod 绿灯掩盖当前行违例。
+
 解释：机制侧已能自动裁决与清理；生产侧尚未启用 `--model-auto`，
 积压与 13.4 天 SLA 是当前最大运行风险。
 

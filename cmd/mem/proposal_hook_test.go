@@ -43,9 +43,9 @@ func installCountProc(t *testing.T) *int {
 	return &n
 }
 
-// TestDistillProcArgs 守单轨 argv：所有自动写侧都走 proposal，规则由链尾 executor 兜底。
+// TestDistillProcArgs 守自动写侧 argv：maintain 一条路完成发窗 + model-auto 裁决。
 func TestDistillProcArgs(t *testing.T) {
-	want := []string{"distill", "--proposal", "--executor", "auto", "--max-bundles", "1"}
+	want := []string{"maintain", "--model-auto", "--max-bundles", "20"}
 	if got := distillProcArgs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("distillProcArgs() = %v, want %v", got, want)
 	}
