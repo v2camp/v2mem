@@ -183,6 +183,9 @@ ci 红项判 tag，也不得用 prod 绿灯掩盖当前行违例。
 - eval 两面口径写入 `design-eval-flows`：ci 用于夹具/tag，prod 用于生产健康。
 - 仍然存在的是**积压存量**：代码已能追，生产仍有 181 源 / 14,261 序号 /
   13.5 天，需要后续会话或一次有界 catch-up 实际消化；这不属于代码缺口。
+- **P4 前置（本轮开始）**：Judge verdict revision CAS、一输入一输出完整性、
+  revision/task_state/evidence 摘要进入 prompt 已落地；existing memories 上下文
+  与标定样本仍待补。
 
 ## 8. 未决 / 下一轮
 
