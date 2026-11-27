@@ -215,6 +215,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 · `mem eval write --session <文件> [--gold 文件]`（记录是否准：漏记/多记/疑似碎片）
 · `mem eval activity [--scope period\|task\|session] [--since D] [--session S] [--project P] [--top N]`
 （**用量视图**：一段时间/会话/任务内的读/写活动 + 空命中查询 + 四态结论。任务收尾由此产出，写进 `.mem/report.md`）
+· `scripts/eval-prod-gate.sh [--db 路径] [--json]`（低频准出对账门禁，周级/灰度签字时跑、不进 12h 巡检：包装 `mem eval flow --profile=prod --json`，汇总 G8–G12 + manual_rate（诊断项）；eval flow 业务只读但 store.Open 有元数据写副作用（建表 / db_meta.written_by / mem_sigs），故复制 mem.db/-wal/-shm 到临时副本运行、退出即清理，绝不写生产库；G7 红须先排除 run_id/last_run_id 恒空的已知假红）
 
 **同义词词库**：`mem lexicon init --project <X> [--terms "词A,词B"]`（从该工程记忆提取同义词写入 `synonyms.txt`：以既有检索为
 "行为 oracle"算命中集、按 Jaccard 相似度聚簇，泛词护栏 + `[0.40,0.5)` 复核区间防止跨概念误合；`--dry-run` 只预览不写）
