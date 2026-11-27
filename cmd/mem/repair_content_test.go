@@ -412,6 +412,36 @@ func TestRepairContentOneToOneViolations(t *testing.T) {
 	}
 }
 
+// TestRepairContentSkipsChangedSinceSelection 验证模型调用期间人工修正正文后，
+// 模型稿不会覆盖人工结果：该条记 skipped（content_changed_since_selection），不计 failed。
+func TestRepairContentSkipsChangedSinceSelection(t *testing.T) {
+	db, st := newEnhanceDB(t)
+	id := addEnhanceMemory(t, st, "我刚才尝试了命令 A，报错了", "p", "fact")
+	const humanContent = "人工修正：遇到此报错先看日志"
+	installFakeEnhance(t, func(prompt string) (string, error) {
+		// 模拟「选择后、写库前」人工修正：content_hash 已变。
+		correctEnhanceMemory(t, st, id, humanContent)
+		return enhanceOutputFor(enhanceInputIDs(t, prompt), func(string) string {
+			return "模型改写稿不应落库"
+		}), nil
+	})
+
+	rep, _, err := runRepairContentJSON(t, "--db", db, "--json", "--model-tag", testEnhanceTag)
+	if err != nil {
+		t.Fatalf("skipped 不应让命令失败: %v", err)
+	}
+	if rep.SkippedOther != 1 || rep.Rewritten != 0 || rep.Failed != 0 || rep.Conflict != 0 {
+		t.Fatalf("应跳过 1 条且零改写/零失败，got %+v", rep)
+	}
+	content, _, state, _ := enhanceMemoryRow(t, st, id)
+	if content != humanContent || state != store.ReviewStateCorrected {
+		t.Fatalf("人工正文不得被覆盖，got content=%q state=%q", content, state)
+	}
+	if rep.Archive != "" {
+		t.Errorf("零改写不应产生归档，got %q", rep.Archive)
+	}
+}
+
 // TestRepairContentBatchCallCount 验证 12 条 candidate、batch=10 恰好 2 次模型调用。
 func TestRepairContentBatchCallCount(t *testing.T) {
 	db, st := newEnhanceDB(t)

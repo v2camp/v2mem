@@ -601,8 +601,13 @@ func applyEnhanceRewrites(st *store.Store, rep *enhanceReport, batches []enhance
 		for _, c := range b.Candidates {
 			newContent := b.Rewrites[c.ID]
 			item := enhanceItem{ID: c.ID, Kind: c.Kind, Project: c.Project, ReviewState: c.ReviewState}
-			res, err := st.RewriteMemoryContent(c.ID, newContent, tag, time.Now().Unix())
+			res, err := st.RewriteMemoryContent(c.ID, newContent, tag, c.ContentHash, time.Now().Unix())
 			switch {
+			case errors.Is(err, store.ErrMemoryContentChanged):
+				// 选择到写库之间人工改过：模型稿不得覆盖，跳过并报告。
+				item.Status = "skipped"
+				item.Error = "content_changed_since_selection"
+				rep.SkippedOther++
 			case err != nil:
 				item.Error = err.Error()
 				if strings.Contains(err.Error(), "内容相同") {
@@ -777,8 +782,9 @@ func readEnhanceArchive(path string) ([]enhanceArchiveRecord, error) {
 }
 
 func enhanceArchivePath(dbPath string, unix int64, tag string) string {
+	// 文件名带 pid：同一秒内两个进程跑同一 tag 时不能混写同一个文件。
 	return filepath.Join(filepath.Dir(dbPath), "enhance",
-		fmt.Sprintf("%d-%s.jsonl", unix, sanitizeEnhanceTag(tag)))
+		fmt.Sprintf("%d-%d-%s.jsonl", unix, os.Getpid(), sanitizeEnhanceTag(tag)))
 }
 
 // enhanceTagUnsafe 把 tag 里可能逃出 db 目录或破坏 glob 的字符统一替换掉。
