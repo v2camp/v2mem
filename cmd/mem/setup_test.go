@@ -754,7 +754,7 @@ func TestSetupEnablesAutoSpawnAndExplainsIt(t *testing.T) {
 		t.Fatalf("cmdSetup: %v", err)
 	}
 	c, err := distill.LoadModelConfig(p)
-	if err != nil || !c.AutoSpawn {
+	if err != nil || c.AutoSpawn == nil || !*c.AutoSpawn {
 		t.Fatalf("setup 成功后应写入 auto_spawn=true，got %+v err=%v", c, err)
 	}
 	for _, want := range []string{"已开启", "关闭", "mem setup --mode off", "影子"} {
@@ -783,7 +783,7 @@ func TestSetupModeAPIEnablesAutoSpawn(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := distill.LoadModelConfig(p)
-	if err != nil || !c.AutoSpawn {
+	if err != nil || c.AutoSpawn == nil || !*c.AutoSpawn {
 		t.Fatalf("--mode api 也应写 auto_spawn=true，got %+v err=%v", c, err)
 	}
 }
@@ -801,13 +801,13 @@ func TestSetupModeOffDisablesAutoSpawn(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := distill.LoadModelConfig(p)
-	if err != nil || c.AutoSpawn {
-		t.Fatalf("--mode off 应写 auto_spawn=false，got %+v err=%v", c, err)
+	if err != nil || c.AutoSpawn == nil || *c.AutoSpawn {
+		t.Fatalf("--mode off 应写显式 auto_spawn=false，got %+v err=%v", c, err)
 	}
 }
 
 // 存量配置（升级前写的、没有 auto_spawn 字段）默认流程必须逐字节不动 ——
-// 幂等契约不能被「升级补写」悄悄打破；要开启走显式 --mode。
+// 幂等契约不能被「升级补写」悄悄打破；缺省态的开启由 AutoSpawnEnabled 在读取时决定。
 func TestSetupLeavesLegacyConfigUntouched(t *testing.T) {
 	p := setupHome(t)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -843,18 +843,19 @@ func TestSetupExplicitRewriteEnablesAutoSpawnOnLegacy(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := distill.LoadModelConfig(p)
-	if err != nil || !c.AutoSpawn {
+	if err != nil || c.AutoSpawn == nil || !*c.AutoSpawn {
 		t.Fatalf("显式重写应补上 auto_spawn=true，got %+v err=%v", c, err)
 	}
 }
 
 // --status 要能看到自动触发状态，让用户不必打开 model.json 确认。
+// 存量配置没有 auto_spawn 字段：P4 起缺省即有模型即开，status 必须显示生效态「开」。
 func TestSetupStatusShowsAutoSpawn(t *testing.T) {
 	p := setupHome(t)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(p, []byte(`{"mode":"cli","cli":"codebuddy","model_tag":"codebuddy@1+tpl2","auto_spawn":true}`), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte(`{"mode":"cli","cli":"codebuddy","model_tag":"codebuddy@1+tpl2"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	out, err := captureStdout(t, func() error { return cmdSetup([]string{"--status"}) })

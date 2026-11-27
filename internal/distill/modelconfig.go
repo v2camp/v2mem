@@ -27,13 +27,40 @@ type ModelConfig struct {
 	Model    string `json:"model,omitempty"`
 	BaseURL  string `json:"base_url,omitempty"`
 	APIKey   string `json:"api_key,omitempty"`
-	// AutoSpawn 是「配好模型后自动触发判定」的持久化授权。
+	// AutoSpawn 是「配好模型后自动触发判定」的三态授权：nil=缺省，*true=开，*false=关。
 	//
 	// 为什么写进文件而不是只靠 MEM_JUDGE_SPAWN 环境变量：钩子由宿主进程启动，
 	// 不继承用户交互 shell 的 export（GUI 宿主尤其）。只提示用户 export 等于没说。
-	// 老文件没有这个字段 → false：升级后不会突然开始烧 API。
+	// 为什么是 *bool 而不是 bool：缺省必须与「显式关」可区分 —— 老配置升级后
+	// 只要有可用模型就默认开，而用户写下的 false 要被尊重。见 AutoSpawnEnabled。
 	// 它只开「跑判定」，不开「改库」——判定器本身没有任何改状态入口。
-	AutoSpawn bool `json:"auto_spawn,omitempty"`
+	AutoSpawn *bool `json:"auto_spawn,omitempty"`
+}
+
+// BoolPtr 是写三态字段的构造器：只有指针才能区分「没有这个字段」与「写了 false」。
+func BoolPtr(b bool) *bool { return &b }
+
+// AutoSpawnEnabled 是文件层面的自动判定授权（不含环境变量覆盖）：
+//   - mode=off 一律关（关掉模型来源就该停止一切外发）；
+//   - 显式 auto_spawn=false 关，显式 true 开；
+//   - 缺省（nil）时按「有可用模型配置即开」——老配置升级后默认启用，不必重跑 mem setup。
+func (c ModelConfig) AutoSpawnEnabled() bool {
+	if c.Mode == "off" {
+		return false
+	}
+	if c.AutoSpawn != nil {
+		return *c.AutoSpawn
+	}
+	return c.hasModelSource()
+}
+
+// hasModelSource 判断配置里是否有可执行的模型来源。零值（没有 model.json）不算：
+// 没有模型就无从判定，不能因为「缺省即开」而在裸机上凭空拉起。
+func (c ModelConfig) hasModelSource() bool {
+	if strings.TrimSpace(c.CLI) != "" && strings.TrimSpace(c.ModelTag) != "" {
+		return true
+	}
+	return strings.TrimSpace(c.Provider) != "" || strings.TrimSpace(c.Model) != ""
 }
 
 // DefaultModelConfigPath 返回 ~/.v2mem/model.json。

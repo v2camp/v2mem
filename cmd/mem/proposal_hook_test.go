@@ -43,11 +43,18 @@ func installCountProc(t *testing.T) *int {
 	return &n
 }
 
-// TestDistillProcArgs 守自动写侧 argv：maintain 一条路完成发窗 + model-auto 裁决。
+// TestDistillProcArgs 守自动写侧 argv：Judge 接手裁决后 SessionStart 只发窗，
+// 不再自带 --model-auto（否则 maintain 会在 Judge 之前抢先自动裁决）。
 func TestDistillProcArgs(t *testing.T) {
-	want := []string{"maintain", "--model-auto", "--max-bundles", "20"}
-	if got := distillProcArgs(); !reflect.DeepEqual(got, want) {
+	want := []string{"maintain", "--stage=proposal", "--max-bundles", "20"}
+	got := distillProcArgs()
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("distillProcArgs() = %v, want %v", got, want)
+	}
+	for _, a := range got {
+		if a == "--model-auto" {
+			t.Fatalf("SessionStart 的 proposal 子进程不得含 --model-auto，got %v", got)
+		}
 	}
 }
 
