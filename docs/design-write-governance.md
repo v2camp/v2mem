@@ -51,7 +51,7 @@
 |:---|:---|:---|:---|
 | 观测 | hooks（失败则 spool） | `observations` | 默认否；`--layer observation` 或 `both` 可搜 |
 | 蒸馏 | `mem distill`（规则或可选本地模型） | `candidates`，`status=pending`，`source=distill` | 否 |
-| 采纳 | `mem accept` / `mem batch --plan` | `memories`，`source=distill-accept`，并写 `edges.rel=derived_from`（dst 是候选 id）；批量落的 `actor=human-reviewed-llm` | 是 |
+| 采纳 | `mem accept` / `mem batch --plan` | `memories`，`source=distill-accept`，记忆沿用候选 id；仅链接已有记忆时写 `edges.rel=derived_from`（dst 是候选 id）；批量落的 `actor=human-reviewed-llm` | 是 |
 
 - `mem distill` / `mem reject` / `import-transcript` **禁止** `INSERT memories`。LLM 超时或 JSON 不合规：写 `distill_runs` 失败行，不写候选，默认退出码 0；`--strict` 才非零。
 - 同一会话的同一批观测只蒸馏一次（`distill_runs.window_key`）。Stop 每轮都触发时不会放大噪声。

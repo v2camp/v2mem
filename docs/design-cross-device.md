@@ -14,11 +14,18 @@
 
 ### 7.1 身份键 = `(content_hash, project)`，不是 `id`
 
-`id` 由 `newID()` 随机生成，两台设备独立写下同一事实必然得到不同 id；而唯一索引 `ux_mem_hash`（`content_hash, project`）只允许一条。**按 id 归并必然漏合**，导入还可能撞唯一索引。因此：
+`id` 随机生成（本地采纳时沿用候选 id，跨设备仍各不相同），两台设备独立写下同一事实必然得到不同 id；而唯一索引 `ux_mem_hash`（`content_hash, project`）只允许一条。**按 id 归并必然漏合**，导入还可能撞唯一索引。因此：
 
 - 导入时忽略远端 `id`，只按 `(content_hash, project)` 定位
 - 本地不存在 → 插入并生成**本地** id，`origin_device` 记远端设备（溯源）
 - 同一事实落在不同工程 → 视为两条独立记忆，不互相归并
+
+> **已知边界：人工修正（`mem review correct`）会重算 `content_hash`**。语义上必须如此——
+> hash 是内容指纹，正文换了还留着旧 hash 会让「同内容不重复」按旧文本判定。代价是
+> 跨设备归并把它看成一条新事实：另一台设备仍持有旧 hash 的行，同步时会出现两条。
+> 原始 hash 记在 `provenance.original_hash`，但 sync **目前不读**该字段，收敛需人工
+> （撤回旧条或 `merge`）。当前单机使用，未实际触发；多设备前必须补齐这一步，
+> 彻底做法是把身份拆成独立列 `origin_hash`，让 `content_hash` 只做指纹。
 
 ### 7.2 字段级归并规则
 

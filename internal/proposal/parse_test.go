@@ -2,6 +2,7 @@ package proposal
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -48,6 +49,48 @@ func TestParseDraftsMatrix(t *testing.T) {
 		if len(got.Drafts) != tc.valid || got.Invalid != tc.invalid {
 			t.Errorf("%s: valid=%d invalid=%d，want %d/%d", tc.name,
 				len(got.Drafts), got.Invalid, tc.valid, tc.invalid)
+		}
+	}
+}
+
+// 叙述体不得进候选：正文落库时被预算截断，过程叙述的结局是既无完整原文、
+// 又无可执行规则（见 isProcessNarrative 注释）。task 描述未完成状态，不拦。
+func TestParseDraftsRejectsProcessNarrative(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		content string
+		valid   int
+	}{
+		{"第一人称过程", "pitfall", "这个链接需要登录，我无法读取，尝试用 git 拉取报错", 0},
+		{"会话指代", "decision", "这个报错说明缺少凭证，应配置 token", 0},
+		{"时点相对", "decision", "本次巡检发现三个 WARN，无 FAIL", 0},
+		{"规则形态", "pitfall", "访问 Codeup 私有仓库时 WebFetch 返回登录页、git 报 could not read Username，说明缺凭证；应配置 token 或改用带凭证的地址", 1},
+		{"事实形态", "fact", "记忆库默认落在 ~/.v2mem，不放代码目录", 1},
+		{"task 不拦时点词", "task", "目前还没有跑完迁移，下一步补 dry-run", 1},
+	}
+	for _, tc := range cases {
+		raw := fmt.Sprintf(`{"kind":%q,"content":%q,"evidence_idx":[1]}`, tc.kind, tc.content)
+		got, err := ParseDrafts(raw, 1)
+		if err != nil {
+			t.Errorf("%s: 不应报错: %v", tc.name, err)
+			continue
+		}
+		if len(got.Drafts) != tc.valid {
+			t.Errorf("%s: valid=%d，want %d（invalid=%d）", tc.name,
+				len(got.Drafts), tc.valid, got.Invalid)
+		}
+	}
+}
+
+// 提示词必须把「规则形态」写死，否则模型会继续摘录过程叙述。
+func TestBuildPromptRequiresRuleShape(t *testing.T) {
+	p := BuildPrompt([]evidence.Ref{
+		{Summary: "证据", EventType: "stop", SessionID: "s", ProposalEligible: true},
+	})
+	for _, want := range []string{"可复用规则", "触发场景", "禁止第一人称", "120 字"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("提示词缺少规则化约束 %q:\n%s", want, p)
 		}
 	}
 }
@@ -264,8 +307,19 @@ func TestBuildPromptPayloadShortAndScrubUnchanged(t *testing.T) {
 	if !strings.Contains(p, "[redacted]") || strings.Contains(p, "supersecret") {
 		t.Fatalf("投影必须保留脱敏: %s", p)
 	}
-	if strings.Contains(p, "…") {
-		t.Fatalf("短文本不应加省略标记: %s", p)
+	// 只检查证据行：提示词正文里的反例自带「……」，不能代表投影被截断。
+	var evLine string
+	for _, line := range strings.Split(p, "\n") {
+		if strings.HasPrefix(line, "[1] ") {
+			evLine = line
+			break
+		}
+	}
+	if evLine == "" {
+		t.Fatalf("未找到证据行: %s", p)
+	}
+	if strings.Contains(evLine, "…") {
+		t.Fatalf("短文本不应加省略标记: %s", evLine)
 	}
 }
 
