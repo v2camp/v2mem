@@ -7,10 +7,18 @@ set -euo pipefail
 #   G9/G10/G11/G12  候选→裁决→记忆→终态对账（G12 准出率 100%）
 #   manual_rate  人工介入率（目标 <1%，超标给 WARN，不阻断对账）
 #
-# 只读边界：mem eval flow 不写业务表，但 store.Open 会建表 / 迁移 / 写 db_meta
-# 版本戳（cmd/mem/eval_flow.go:3、internal/store/store.go:82/93）。因此本脚本
-# 先把 mem.db 及其 -wal/-shm 复制到 mktemp -d 副本，在副本上跑，退出即清理；
-# 生产库、审计日志、宿主配置全程不碰。
+# 只读边界：业务上纯读（cmd/mem/eval_flow.go:31-47、flow_snapshot.go:142-220、
+# flow_check.go:69-138 全 SELECT），但 store.Open 有元数据副作用——schemaSQL、
+# 每次覆盖 db_meta.written_by（writer_stamp.go:79-105）、ALTER/CREATE INDEX、
+# backfillSigs 写 mem_sigs、review 首次补列回填（internal/store/store.go:82/93/98-169）。
+# 因此先把 mem.db/-wal/-shm 复制到 mktemp -d 副本再跑，退出即清理；生产库、
+# 审计日志、宿主配置全程不碰（acceptance-automation.md:3-4 既有做法）。
+#
+# 已知假红：candidates.run_id / evidence_bundles.last_run_id 在当前 main 恒空
+# （internal/proposal/runner.go:226 赋值被 :239 覆盖），flow_check.go:471-474 的
+# G7 对 fail/partial/backlog 窗口要求 LastRunID 非空，会假报「失败无运行账」；
+# prod 13/13 只因 16 个 Bundle 全 noop 才未暴露。输出会标注该来源，不把 G7 红
+# 直接判成真实故障。
 #
 # 用法: eval-prod-gate.sh [--db <path>] [--json] [--help]
 # 环境: MEM_BIN 可指定 mem 二进制（默认 <仓库>/bin/mem，缺失则临时构建）
@@ -110,6 +118,12 @@ SUMMARY="$(jq -c --argjson rc "$EVAL_RC" --arg db "$DB" --arg raw "$RAW" '
       manual_rate_warn: (.manual_rate >= 0.01),
       legacy_exempt: .legacy_exempt,
       window_seconds: .window_seconds,
+      g7_pass: ([ .checks[] | select(.id == "G7") | .pass ] | .[0] // null),
+      known_false_red: {
+        check: "G7",
+        source: "candidates.run_id / evidence_bundles.last_run_id 在当前 main 恒空（internal/proposal/runner.go:226 赋值被 :239 覆盖）；flow_check.go:471-474 对 fail/partial/backlog 窗口要求 LastRunID 非空，会假报「失败无运行账」；prod 13/13 仅因 16 个 Bundle 全 noop 才未暴露",
+        policy: "G7 红须先排除该假红，不直接判真实故障；G7 不在本门禁判据内"
+      },
       db: $db,
       raw_json: $raw,
       note: "只读门禁：mem.db/-wal/-shm 复制到 mktemp 副本运行，退出即清理"
@@ -136,6 +150,12 @@ else
     "$(printf '%s' "$SUMMARY" | jq -r '.legacy_exempt')" \
     "$DB"
   printf '%s' "$SUMMARY" | jq -r '.gate_checks[] | "  \(.id)  \(if .pass then "PASS" else "FAIL" end)  \(.detail)"'
+  G7_PASS="$(printf '%s' "$SUMMARY" | jq -r '.g7_pass // "n/a"')"
+  if [ "$G7_PASS" = "false" ]; then
+    printf '  WARN: G7=FAIL —— 先排除已知假红（run_id/last_run_id 恒空，internal/proposal/runner.go:226/239），不直接判真实故障\n'
+  else
+    printf '  NOTE: G7 已知假红来源已登记（run_id/last_run_id 恒空，internal/proposal/runner.go:226/239）；G7 红不直接判真实故障\n'
+  fi
   printf '  raw_json: %s（临时副本，脚本退出即清理）\n' "$RAW"
   if [ "$RESULT" = "FAIL" ] && [ -s "$ERR" ]; then
     printf '  eval flow stderr:\n' >&2
