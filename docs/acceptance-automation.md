@@ -171,16 +171,29 @@ ci 红项判 tag，也不得用 prod 绿灯掩盖当前行违例。
 - `make perf`：`ok test/perf 11.804s`。
 - `make test-watch`：90/90；`test-watch-sync` 21 判据一致。
 
-## 7. 未决 / 下一轮
+## 7. 运行缺口补强（2026-11-27）
+
+- 钩子自动写侧 argv 改为 `maintain --model-auto --max-bundles 20`：一次会话
+  完成发窗 + model-auto 裁决，不再停在候选；预算从 1 窗提到 20 窗。
+  真机 hook 集成：SessionStart 后落 1 条 `model-auto/auto_commit` 未审核记忆，
+  `spawn.log` 无错误。
+- 发窗改为短积压优先（`evidenceSourcesWithBacklog`），避免大 transcript 源
+  长期霸占队头；新增长短积压源调度用例。
+- `maintainRun` 对 SQLITE_BUSY 做 3 次小步重试，避免一遇锁就整轮早停。
+- eval 两面口径写入 `design-eval-flows`：ci 用于夹具/tag，prod 用于生产健康。
+- 仍然存在的是**积压存量**：代码已能追，生产仍有 181 源 / 14,261 序号 /
+  13.5 天，需要后续会话或一次有界 catch-up 实际消化；这不属于代码缺口。
+
+## 8. 未决 / 下一轮
 
 > 已关闭：run_id 联动（见 §3.2）——`candidates.run_id` /
 > `evidence_bundles.last_run_id` 现在指向真实 `distill_runs` 行。
 
-1. **吞吐/SLA**（D 发现）：钩子预算 1 窗、transcript 队头饥饿、BUSY 早停；需要单独任务，
-   建议优先于继续扩大自动裁决。
-2. **生产启用**：`maintain --model-auto` 默认仍关；先在单项目灰度，观察
-   auto_commit/withdraw/correct 与 manual_rate，再开 hooks 默认。
-3. **accept/reject 最终删除**：等生产灰度签字；本轮仅标记 deprecated。
-4. **P4 Judge 扩权**：未启动；需先补标定样本、CAS、输入输出完整性与上下文。
+1. **积压存量**（D 发现）：短积压优先 + 20 窗/次已落地；仍需观察实际 drain
+   曲线，必要时做一次有界 catch-up。
+2. **生产启用观察**：钩子已接线 model-auto；下一轮看真实 auto_commit /
+   withdraw / correct 与 manual_rate，再决定是否删除 accept/reject。
+3. **accept/reject 最终删除**：等生产灰度签字。
+4. **P4 Judge 扩权**：前置项尚未齐（CAS、输入输出完整性、上下文）；本轮开始补。
 5. **已知限制**：真实整机睡眠未测；进程组信号会带走子进程；consolidate dry-run 无预览；
    历史 memories.scope 未回填；`cursors` JSON 字段改名需外部脚本同步。
