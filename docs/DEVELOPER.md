@@ -22,6 +22,17 @@ make cover-update # 用当前实测值刷新下限（棘轮：只允许上调；
 维护入口示例：`mem maintain --stage=proposal,adjudicate --model-auto --model-tag dev@v1`
 （阶段顺序固定 proposal→adjudicate→consolidate→gc；`--dry-run` 全阶段零写）。
 
+正文提炼（`mem repair content`）示例，细节见 [design-content-enhance.md](./design-content-enhance.md)：
+
+```bash
+mem repair content --dry-run                  # 只列过程叙述候选，不调模型、不写库
+mem repair content --preview --limit 5        # 调模型出 before/after，不写库
+mem repair content --filter=all --limit 20    # 正式改写并归档到 <db 目录>/enhance/
+mem repair content --rollback <tag|file> --dry-run   # 核对可还原条目，再摘掉 --dry-run
+```
+
+`--model-tag` 缺省取 `model.json` 的 `model_tag`；缺失即报错，不静默兜底。
+
 ## 安装 / 更新 / 部署
 
 ### 本地调试部署（开发时推荐）

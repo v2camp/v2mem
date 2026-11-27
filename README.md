@@ -283,6 +283,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`docs/design-write-governance.md`](./docs/design-write-governance.md) | 所有者 / 开发者 | **写侧治理**：三态（观测/候选/采纳）、写必由 LLM 决策、channel 与来源标记；§12 候选裁决自动化闭环（触发点、MCP 显式裁决、R8 分组、采纳率前提） |
 | [`docs/design-admission.md`](./docs/design-admission.md) | 所有者 / 开发者 | **准入判定**：判定器实现（理由码、模型/CLI 接入、批量回滚）；事前门槛已由 `design-data-lifecycle` §6 取代，影子期降级为标定工具 |
 | [`docs/design-data-lifecycle.md`](./docs/design-data-lifecycle.md) | 所有者 / 开发者 | **数据动线与统一维护**：准入→准出唯一证据流、`mem maintain`、Harness 唤醒拓扑、处理 SLA、模型自动裁决 + 人工后审核、引用保护与终态出口、命令面简化、P0–P4 实施顺序（改生命周期/GC/提交矩阵/命令面前先读） |
+| [`docs/design-content-enhance.md`](./docs/design-content-enhance.md) | 所有者 / 开发者 | **正文提炼**：`mem repair content` 的选择器、enhance-v2 提示词、改写写路径与状态语义、归档与按 tag 回滚、`VALUE.md` 例外三条件与未决（改 `repair content` 前先读） |
 | [`docs/design-eval-flows.md`](./docs/design-eval-flows.md) | 开发者 | **动线级 e2e 评测（TDD）**：准出率 100% 与严密度口径、U1–U8 用户动线矩阵、逐跳内容流转 case、账本对账形态、随 P 阶段交付节奏 |
 | [`docs/acceptance-automation.md`](./docs/acceptance-automation.md) | 所有者 / 开发者 | **自动化闭环多波验收**：maintain 自动裁决、scope、eval prod 剖面、`--stage`、detach、cursor 回收的实测证据、灰度指标与未决项 |
 | [`docs/design-write-batch.md`](./docs/design-write-batch.md) | 所有者 / 开发者 | **写侧延迟治本**：批量归档方案 B 的实证依据、契约核查、账本/幂等设计与分阶段灰度（改 `writeArchive` 前先读） |

@@ -50,6 +50,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem reject <id|前缀>             拒绝候选
   mem review ls [选项]             复核队列（只读四态）：pending 待判定 / summary 未审核摘要 / quarantined 隔离 / failed 失败
   mem repair evidence [id...]     补证据链（幂等）：单条/批量/--all；--dry-run 只报告
+  mem repair content [id...]      正文提炼：过程叙述改写成可执行规则；按归档可回滚
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
   mem harness [--json]              列出各工具的接入方式与检测结果
