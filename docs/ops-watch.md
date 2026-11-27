@@ -95,6 +95,7 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
 | **R14** | 归档体量 | `~/.v2mem/evidence` 下文件数与总字节（`find` / `du`，只读）；detail 附 `mem stats --json` 的 `size_bytes` 作对照 | ≤512MiB | >512MiB | —（不设 FAIL，见依据） |
 | **R15** | 候选 TTL | `mem review ls --state all --json` 的 pending 项 `created_at` 超过 **14 天**的条数；**只报不处置**：超期报 WARN 并给手工命令与复核提示，状态迁移/删除归维护入口或人工（终态物理删除走 `mem gc --retention`，S13） | 0 条超期 | 有超期（只报不处置） | — |
 | **R16** | 维护可见性 | `mem stats --json` 顶层 `backlog` 的 `open_bundles` / `last_maintain_ok_age_seconds` / `bundles_isolated`（复用同一次 stats 调用，不额外读写）；只判级不处置 | 无积压，或有积压但 24h 内维护成功 | 有积压且（从未维护或 `last_maintain_ok_age_seconds` > **24h**），或 `bundles_isolated` > 0；detail 给 `mem maintain --catch-up` | —（不设 FAIL，维护滞后不是数据损失） |
+| **R17** | 证据准入 SLA | `mem stats --json` 顶层 `backlog` 的 `evidence_backlog_sources` / `oldest_unconsumed_evidence_age_seconds`（复用同一次 stats 调用，不新增 sqlite 调用或 CLI）；只判级不处置 | 无未消费源，或最老未消费证据 ≤ **15 天** | > 15 天（1296000 秒）；detail 给 `mem maintain --catch-up` | —（不设 FAIL，休眠期豁免） |
 
 阈值依据（不凭空定）：
 
@@ -237,6 +238,10 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
   - 裁决活性（`accept` / `reject` 计数）与 `mem eval activity --json` 的 `verdict`
     （含「有观测无采纳」）只作 detail，不判级：零裁决已由 R8 的积压判级承接，避免重复告警。
     `eval activity` 读不到或不可解析时 R12 判级不受影响。
+  - **`by_actor` 自动化率只作 detail（2026-11-27）**：`mem stats --json` 顶层 `by_actor`（actor → 数量）存在时，
+    detail 末尾追加分布（如 `model-auto N / human N / review_action N`）；`model-auto=0` 可能是自动化默认关闭
+    而非故障，与上面「不判 FAIL」同源。字段缺失（旧二进制）只写「旧二进制无 by_actor」，
+    **不改变 R12 级别、不新增阈值**。
   - **采集只读**：`audit.jsonl` + `mem eval activity --json`（`cmdEvalActivity` 不开库），
     不执行 `mem distill` / `accept` / `reject` / `gc`。`distill_runs` 的 `status` / `error` /
     `attempt` 与 `evidence_bundles` 积压留作 §5 的深挖命令，不进脚本采集，避免引入 sqlite 依赖。
@@ -322,6 +327,19 @@ mem eval activity --since 12h   # 窗口用量视图 + 空命中查询清单
     体量同一取舍——把「还没跑」判成 FAIL 会让告警失去区分度。真正的数据风险
     由 §8 的引用保护与备份承接，不由巡检承接。
   - **不随冷启动降级**：它量的是调度水位，与库里有多少条记忆无关（见 §4）。
+  - **detail 附 R17 未消费证据读数**：backlog 可读时带一句源数与最老年龄，只作交叉观察，不改变 R16 级别。
+
+- **R17 的 15 天与「不设 FAIL」（2026-11-27 新增）**：阈值不是新定的——照抄
+  [`design-data-lifecycle.md`](./design-data-lifecycle.md) §5 的处理 SLA：活跃期证据从准入到准出不积压超过
+  **15 天（1296000 秒）**。同一节明确**休眠期（无会话/宿主退出/关机）不计入承诺**，唤醒后追赶并可如实显示超期，
+  故与 R16 同一取舍：只设 PASS / WARN，**不设 FAIL**（数据风险由 §8 与备份承接，不由巡检承接）。
+  - **单一只读来源**：`evidence_backlog_sources` / `oldest_unconsumed_evidence_age_seconds` 都取自同一次
+    `mem stats --json` 顶层 `backlog`，**不新增 sqlite 调用或 CLI**，不写库、不改配置。
+  - **无未消费源判 PASS**：即使年龄字段残留旧值也以源数为准；有源但年龄字段读不到时按 WARN 未核查，
+    绝不静默判 PASS（同 R16）。
+  - **detail 给人工命令**：报未消费源数、最老年龄（天/小时）与 `mem maintain --catch-up`；
+    巡检只报不执行，超期时按 §5 R17 由人工追账。
+  - **不随冷启动降级**：它量的是证据流水位，与库里有多少条记忆无关（见 §4）。
 
 > 积压原始读数见 `mem stats --json` 顶层 `backlog`，口径见 `design-data-lifecycle.md` §3.2；巡检只判级。
 
@@ -343,10 +361,10 @@ B 工程刚起步」不会被混算成一个 FAIL。
 
 判据必须阶段化，否则「符合预期」这四个字没有定义。跨过 20 条后自动启用完整阈值。
 
-**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13、R14、R15、R16 不降级：候选载荷残留是输入过滤失效、写侧延迟
+**例外只覆盖 R2 / R4。** R9、R10、R11、R12、R13、R14、R15、R16、R17 不降级：候选载荷残留是输入过滤失效、写侧延迟
 是同步 hook 的耗时、WAL 高水位是文件量级、写侧决策断链是自动链路没推进、注入体量是
-单次注入的字节数、归档体量是累计落盘量、候选 TTL 是「到期未过期」的机制失效、维护可见性是调度水位与最后成功时间的差，
-都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
+单次注入的字节数、归档体量是累计落盘量、候选 TTL 是「到期未过期」的机制失效、维护可见性是调度水位与最后成功时间的差、
+证据准入 SLA 是休眠期豁免后的墙钟水位，都与库里有多少条记忆无关，冷启动期同样应报。R12 的 `INFO` 是「窗口内无 `obs-append` 样本」，
 与 R3 / R10 / R13 的「无样本」同类，**不是**本节的降级。
 
 ---
@@ -372,6 +390,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 | R14 归档体量越线 | 归档增长快于观测保留策略 | 先分因：① **量增长**（文件数与字节同步涨）→ 按下面两步回收，再裁决保留策略；② **单条体积异常**（字节涨、文件数不涨）→ 查 `observeRawMaxRunes`（`cmd/mem/observe.go:34`，32000 rune 上限）是否被抬高，或单条 transcript 本身变大。**回收只有一条路**：先 `mem gc --obs`（删观测行）再 `mem gc --evidence`（删已无观测引用的段与磁盘文件），两条合跑即同一轮生效；`--evidence` 有 1h 写入保护期。单跑 `--evidence` 在观测未回收时释放 0 字节——**不要**据此认为功能失效。**不要**直接删 `~/.v2mem/evidence`：里面是 `memory_evidence` 的溯源目标，删了记忆的证据链就指向空处。确认接受现状就上调阈值并在提交信息里写明原因 |
 | R15 候选超期 | TTL 从未被执行 | 巡检**只报不处置**。先复核 90 天前的已采纳行：`sqlite3 -readonly ~/.v2mem/mem.db "SELECT id,created_at,project,substr(content,1,60) FROM candidates WHERE status='accepted' AND created_at < strftime('%s','now','-90 days');"`——`gc --candidates` 会连带删除它们、不可逆；确认后再手工执行 `mem gc --candidates -db ~/.v2mem/mem.db`（pending → expired，行仍在库）。终态**物理删除**是另一条路：`mem gc --retention`（S13，默认关；rejected 90 天 / 完成 Bundle 30 天 / 孤立决策账 / 超龄 plans，删前自动备份）。**不要**为了消掉 WARN 去删 `candidates` 行——`expired` 是可查状态，删了不可逆 |
 | R16 维护滞后 / 有积压且有隔离 | `mem maintain` 没被触发，或持续故障后没人追账 | 巡检**只报不处置**。先看 backlog 的 `open_bundles` 与 `bundles_isolated`：有隔离则按 §5 R12 查 `evidence_bundles` 的失败原因、修复后 `mem distill --quarantined` 查看；随后执行 `mem maintain --catch-up` 连续追账（幂等，重复跑不会重复提交），再 `mem stats --json` 确认 `last_maintain_ok_age_seconds` 回落。**不要**为了消掉 WARN 去删 Bundle 行或改 `maintain:last_ok`——前者会跳过证据，后者会把「没维护」伪装成「维护过」 |
+| R17 证据准入超 SLA | 活跃期证据未在 15 天内消费；或休眠唤醒后尚未追赶（超期可如实显示，不承诺无人运行时消灭） | 巡检**只报不处置**。先看 backlog 的 `evidence_backlog_sources` 与 `oldest_unconsumed_evidence_age_seconds`：确认项目近期是否有会话（休眠期豁免，见 §3 R17）；活跃期超期则执行 `mem maintain --catch-up` 追账（幂等），再 `mem stats --json` 确认最老年龄回落。**不要**为消掉 WARN 手工删证据归档或改水位；不设 FAIL 的依据见 §3 R17 |
 
 处置完成后重跑一次脚本确认级别回落，**不要**在未确认前反复改配置。
 
@@ -390,6 +409,8 @@ B 工程刚起步」不会被混算成一个 FAIL。
   巡检不替人做不可逆决策；只读是默认且唯一的行为，没有需要关掉的写路径。
 - R16 同样只报：detail 里的 `mem maintain --catch-up` 是给人执行的命令，巡检不调用它；
   积压与最后维护时间都取自同一次 `mem stats --json`，不额外开库、不写状态。
+- R17 同样只报：detail 里的 `mem maintain --catch-up` 是给人执行的命令，巡检不调用它；
+  未消费源数与最老年龄取自同一次 `mem stats --json` 的 `backlog`，不新增 sqlite 调用或 CLI、不写状态。
 - 告警口径：只有 `FAIL` 需要人介入；`WARN` 观察，`INFO` 忽略。
 
 ---
@@ -406,7 +427,7 @@ B 工程刚起步」不会被混算成一个 FAIL。
 |:---|:---|:---|
 | 阈值集中在单一对象、可覆盖 | `agentmemory/src/health/thresholds.ts` 的 `DEFAULTS` | 本文第三节 + 脚本常量 |
 | 三态 `healthy/degraded/critical` | 同上 `evaluateHealth` | PASS / WARN / FAIL |
-| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R16） |
+| 诊断项固定枚举，便于长期统计同类问题频次 | `doctor-diagnostics.ts` 的 `DIAGNOSTIC_IDS` | 判据 ID（I1…I5 / R1…R17） |
 | 机器可读 alert token 与人类可读 note 分离 | 同上 `alerts[]` / `notes[]` | `--json` 的 `items[]` |
 
 | 不借鉴 | 理由 |

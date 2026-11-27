@@ -208,4 +208,59 @@ printf '%s' "$r16_action" | grep -q 'mem maintain --catch-up' \
 sed -n '/^## 4\./,/^## 5\./p' "$DOC" | grep -q 'R16' \
   || fail "§4 冷启动例外未把 R16 列入「不降级」"
 
-echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与「只报不处置」的只读边界同步；R15 S13 终态出口（mem gc --retention）两处同步且 TTL_DAYS 定值不漂移；R16 维护可见性 24h 阈值与处置命令同步；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"
+# ⑬ R17 证据准入 SLA：15 天（1296000 秒）阈值两侧一致；数据源只用同一次 stats --json；
+# 不设 FAIL；§5 给人工命令但巡检仍只读。设计依据：design-data-lifecycle.md §5 休眠期豁免。
+r17_row="$(grep -E '^\| \*\*R17\*\*' "$DOC" | head -1 || true)"
+[ -n "$r17_row" ] || fail "§3 找不到 R17 行"
+printf '%s' "$r17_row" | grep -Fq '15 天'     || fail "§3 R17 的 SLA 不是 15 天"
+printf '%s' "$r17_row" | grep -Fq '1296000'   || fail "§3 R17 的秒数不是 1296000"
+grep -Fq 'R17_MAX_AGE_S=$(( 15 * 86400 ))' "$SCRIPT" \
+  || fail "脚本 R17 的 SLA 常量不是 15*86400（1296000 秒）"
+grep -Fq '1296000 秒' "$SCRIPT" || fail "脚本 R17 detail 未报 1296000 秒"
+# 数据源两侧同名，且脚本只读同一份 STATS_JSON 的 backlog，不许另起 sqlite / CLI。
+for field in evidence_backlog_sources oldest_unconsumed_evidence_age_seconds; do
+  printf '%s' "$r17_row" | grep -Fq "$field" || fail "§3 R17 未写明读 backlog.$field"
+  grep -Fq ".backlog.$field" "$SCRIPT" || fail "脚本 R17 未从 backlog.$field 取数"
+done
+stats_calls="$(grep -Fc '"$MEM_BIN" stats --json' "$SCRIPT")"
+[ "$stats_calls" -eq 1 ] || fail "mem stats --json 应只调用一次（R17 必须复用），实际 ${stats_calls} 次"
+if grep -q 'sqlite3' "$SCRIPT"; then
+  fail "脚本引入 sqlite3 调用（R17 必须只用 stats --json）"
+fi
+# 无 FAIL 档：文档 FAIL 列是「—...」，脚本也无 add R17 FAIL。
+r17_fail_col="$(printf '%s' "$r17_row" | awk -F'|' '{gsub(/[ \t]/,"",$7); print $7}')"
+case "$r17_fail_col" in
+  —*) ;;
+  *) fail "§3 R17 的 FAIL 档应为空（—），实际: ${r17_fail_col}" ;;
+esac
+if grep -q 'add R17 FAIL' "$SCRIPT"; then
+  fail "脚本 R17 设了 FAIL 档（休眠期豁免，参照 R16 不设 FAIL）"
+fi
+r17_action="$(sed -n '/^## 5\./,/^## 6\./p' "$DOC" | grep -E '^\| R17 ' || true)"
+[ -n "$r17_action" ] || fail "§5 缺 R17 处置行"
+printf '%s' "$r17_action" | grep -Fq 'mem maintain --catch-up' \
+  || fail "§5 R17 处置未给 mem maintain --catch-up"
+sed -n '/^## 4\./,/^## 5\./p' "$DOC" | grep -Fq 'R17' \
+  || fail "§4 冷启动例外未把 R17 列入「不降级」"
+sed -n '/^## 6\./,/^## 7\./p' "$DOC" | grep -Fq 'R17' \
+  || fail "§6 只读说明未覆盖 R17"
+grep -Fq '未消费证据见 R17' "$SCRIPT" || fail "脚本 R16 detail 未指向 R17 读数"
+# 只读边界：处置命令只出现在文案里，脚本不得自己调用。
+if grep -q -- '"$MEM_BIN" maintain' "$SCRIPT"; then
+  fail "脚本调用了 mem maintain（R17 巡检必须只读）"
+fi
+if grep -q -- '"$MEM_BIN" gc' "$SCRIPT"; then
+  fail "脚本调用了 mem gc（R17 巡检必须只读）"
+fi
+
+# ⑭ R12 的 by_actor 自动化率只作 detail：新字段有分布与「默认关闭」提示，
+# 旧字段只写一行说明；两侧文档/脚本都要有，且不得新增阈值或改级别。
+grep -Fq 'by_actor' "$DOC" || fail "§3 R12 依据段未说明 by_actor 自动化率只作 detail"
+grep -Fq '旧二进制无 by_actor' "$SCRIPT" || fail "脚本 R12 缺「旧二进制无 by_actor」分支"
+grep -Fq 'model-auto=0 可能是默认关闭而非故障' "$SCRIPT" \
+  || fail "脚本 R12 缺「model-auto=0 可能是默认关闭」提示"
+if grep -q 'add R12 .*by_actor.*FAIL' "$SCRIPT"; then
+  fail "脚本 R12 把 by_actor 用于判级（只能作 detail）"
+fi
+
+echo "ok  watch-sync: $(printf '%s\n' "$doc_ids" | wc -l | tr -d ' ') 个判据 ID 双向一致；R8 阈值 5/15 与「只数可裁决」口径同步；R12 阈值 >3 与断链分支同步、by_actor 只作 detail；R13 阈值 3600/8000 与无样本分支同步；§5 含 R3 处置行；R15 TTL 14 天与「只报不处置」的只读边界同步；R15 S13 终态出口（mem gc --retention）两处同步且 TTL_DAYS 定值不漂移；R16 维护可见性 24h 阈值与处置命令同步；R17 证据准入 SLA 15 天/1296000 秒两侧同步、无 FAIL 档、只读单一 stats 来源；R3 端到端/纯检索口径与副本对照法两处同步；R11 高水位口径（帧数≠滞留）两处同步；枚举到 R${max_r}"

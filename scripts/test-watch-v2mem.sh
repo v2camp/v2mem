@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # 回归：R3 越线文案与分段变量边界 / R8 候选积压 / R9 载荷残留 / R10 写侧延迟 /
-# R11 WAL 堆积 / R12 写侧自动决策链路 / R13 注入体量 / R14 归档体量 / R15 候选 TTL /
-# R16 维护可见性 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
+# R11 WAL 堆积 / R12 写侧自动决策链路（含 by_actor 只作 detail）/ R13 注入体量 /
+# R14 归档体量 / R15 候选 TTL / R16 维护可见性 / R17 证据准入 SLA
+# 的分级边界，逐格对应 docs/ops-watch.md §3 判据表。
 # 用临时 V2MEM_DIR + mem stub，不触碰生产库；只断言 --json 输出的级别。
 # 重点守住四条口径：R8 按工程分组取最大值（跨工程不相加）、R10 只取 stop
 # （不与 obs-append 双计）、无样本记 INFO 而非 PASS、R12 判级只依赖 audit
@@ -488,6 +489,62 @@ assert_r16 r16_backlog_stale   "$(r16_stats 3 90000)"               WARN '24h'
 assert_r16 r16_isolated        "$(r16_stats 3 3600 2)"              WARN '隔离 2'
 # backlog 不可读（旧二进制 / 非 JSON）→ WARN，不许静默判 PASS。
 assert_r16 r16_unreadable      'not-json'                           WARN '未核查'
+
+# ---------- R17 证据准入 SLA：15 天只读判级，不设 FAIL ----------
+# 数据只来自同一次 stats --json 的 backlog；WARN 的 detail 给人工命令但脚本不执行。
+r17_stats() { # <sources> <oldest_age|空串=无读数>
+  jq -nc --argjson s "$1" --arg a "$2" \
+    '{size_bytes:0,
+      backlog:({open_bundles:0, bundles_isolated:0, evidence_backlog_sources:$s}
+               + (if $a == "" then {} else {oldest_unconsumed_evidence_age_seconds:($a|tonumber)} end))}'
+}
+assert_r17() { # <名称> <stats_json> <want_level> [detail 子串]
+  local name="$1" stats="$2" want="$3" needle="${4:-}"
+  local d="$TMP/$name" out got detail
+  build_fixture "$d" 100 0 no
+  out="$(run_watch "$d" "$EMPTY" '' '' '' "$stats")"
+  got="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R17") | .level')"
+  detail="$(printf '%s' "$out" | jq -r '.items[] | select(.id=="R17") | .detail')"
+  if [ "$got" != "$want" ]; then
+    echo "FAIL $name: R17 want=$want got=$got" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  if [ -n "$needle" ] && [[ "$detail" != *"$needle"* ]]; then
+    echo "FAIL $name: R17 detail 缺 '${needle}'，got: ${detail}" >&2
+    exit 1
+  fi
+  N=$((N+1))
+  printf 'ok  %-26s R17=%-4s\n' "$name" "$want"
+}
+
+# 无未消费源 → PASS，即使年龄残留旧值也不判超期（分支顺序：先源数）。
+assert_r17 r17_no_source       "$(r17_stats 0 2000000)" PASS '未消费源 0 个，最老未消费证据 23 天 3 小时'
+# 恰好 15 天（1296000 秒）→ PASS（≤），detail 报天/小时与人工命令。
+assert_r17 r17_at_sla          "$(r17_stats 2 1296000)"  PASS '15 天 0 小时'
+# 15 天 + 1 秒 → WARN（不设 FAIL），detail 给 mem maintain --catch-up。
+assert_r17 r17_over_sla        "$(r17_stats 2 1296001)"  WARN 'mem maintain --catch-up'
+# 有源但年龄字段缺失 / backlog 不可读 → WARN 未核查，绝不静默判 PASS。
+assert_r17 r17_no_age          "$(r17_stats 2 '')"       WARN '未核查'
+assert_r17 r17_unreadable      'not-json'                WARN '未核查'
+
+# R12 的 by_actor 只作 detail：有字段报分布 +「默认关闭」提示；缺字段只写一行。
+ACTOR_STATS='{"size_bytes":0,"backlog":{"open_bundles":0,"bundles_isolated":0},"by_actor":{"model-auto":3,"human":5,"review_action":2}}'
+actor_out="$(run_case r12_by_actor 100 0 yes "$EMPTY" "$(dline proposal rules ok false)" '' '' '' '' '' "$ACTOR_STATS")"
+actor_detail="$(printf '%s' "$actor_out" | jq -r '.items[] | select(.id=="R12") | .detail')"
+if [[ "$actor_detail" != *'model-auto 3 / human 5 / review_action 2'* ]] \
+   || [[ "$actor_detail" != *'model-auto=0 可能是默认关闭而非故障'* ]]; then
+  echo "FAIL r12_by_actor: detail 缺 actor 分布或默认关闭提示，got: ${actor_detail}" >&2
+  exit 1
+fi
+N=$((N+1)); printf 'ok  %-26s R12 actor detail\n' "r12_by_actor"
+no_actor_out="$(run_case r12_no_by_actor 100 0 yes "$EMPTY" "$(dline proposal rules ok false)")"
+no_actor_detail="$(printf '%s' "$no_actor_out" | jq -r '.items[] | select(.id=="R12") | .detail')"
+if [[ "$no_actor_detail" != *'旧二进制无 by_actor'* ]]; then
+  echo "FAIL r12_no_by_actor: detail 缺旧二进制说明，got: ${no_actor_detail}" >&2
+  exit 1
+fi
+N=$((N+1)); printf 'ok  %-26s R12 old binary\n' "r12_no_by_actor"
 
 # R2 按工程口径：只有「该工程库内 ≥20 条」的样本才进命中率分母。
 # 旧实现用全局 empty/A_PROMPT 算，窗口内提问全落在空库工程上时会稳定误判 FAIL。
