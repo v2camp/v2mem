@@ -11,6 +11,23 @@ import (
 	"github.com/v2camp/v2mem/internal/commit"
 )
 
+func TestJudgeRejectWritesModelTag(t *testing.T) {
+	s := newTestStore(t)
+	c := newCandidate(t, s, "fact", "p", "Judge 驳回必须带 model_tag")
+	if _, err := s.JudgeReject(c.Candidate.ID, -1, "deepseek:flash@judge-v4", "judge:process_narrative"); err != nil {
+		t.Fatalf("JudgeReject: %v", err)
+	}
+	var actor, action, tag string
+	if err := s.db.QueryRow(`SELECT actor, action, model_tag FROM commit_decisions
+		WHERE candidate_id = ?`, c.Candidate.ID).Scan(&actor, &action, &tag); err != nil {
+		t.Fatal(err)
+	}
+	if actor != commit.ActorJudge || action != string(commit.ActionReject) ||
+		tag != "deepseek:flash@judge-v4" {
+		t.Fatalf("Judge 驳回归因错: actor=%q action=%q tag=%q", actor, action, tag)
+	}
+}
+
 func TestJudgeAutoCommitMatrixAndAttribution(t *testing.T) {
 	s := newTestStore(t)
 	ev := captureEvidence(t, s, "uid-judge", "s", "p", "A 级直接证据日志")
