@@ -186,7 +186,7 @@ func cmdJudge(args []string) error {
 		return printJSON(map[string]any{
 			"provider": providerName, "model": modelTag, "mode": mode,
 			"count": len(verdicts), "accept": res.Accept, "reject": res.Reject,
-			"unsure": res.Unsure, "downgraded": res.Downgraded, "skipped": res.Skipped,
+			"unsure": res.Unsure, "skipped": res.Skipped,
 			"applied_accept": res.AppliedAccept, "applied_reject": res.AppliedReject,
 		})
 	}
@@ -197,9 +197,6 @@ func cmdJudge(args []string) error {
 	}
 	if res.Skipped > 0 {
 		fmt.Printf("  其中 %d 条未落库（revision 已变化、已关闭或冲突类跳过）\n", res.Skipped)
-	}
-	if res.Downgraded > 0 {
-		fmt.Printf("  其中 %d 条因 kind/scope 不允许自动采纳而降级 unsure\n", res.Downgraded)
 	}
 	return nil
 }
@@ -247,8 +244,8 @@ func judgeModelTag(providerName, flagModel, resolvedModel string) string {
 // Skipped 的口径是「判定已记下、但没改变状态」：CAS stale、候选已关闭、
 // 冲突类跳过、矩阵判 Defer/Conflict 都算在内。
 type judgeResult struct {
-	Accept, Reject, Unsure, Downgraded, Skipped int
-	AppliedAccept, AppliedReject                int
+	Accept, Reject, Unsure, Skipped int
+	AppliedAccept, AppliedReject    int
 }
 
 // applyJudgments 把判定写进候选：先写痕迹（MarkJudgeVerdictCAS），
@@ -262,12 +259,8 @@ func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVer
 			continue
 		}
 		verdict := v.Verdict
-		// 模型的 accept 还要过结构判据：拿不准就不许授予，只能降级成 unsure。
-		// 这不是防模型犯错，是防「模型权限比矩阵还大」——矩阵对这些类是 human_accept。
-		if verdict == "accept" && !mayAutoAccept(cand) {
-			verdict = "unsure"
-			r.Downgraded++
-		}
+		// P4 起不再在 Judge 侧预降级：accept 是否落库由 JudgeAutoCommit 的提交矩阵裁决
+		// （manualKinds/global 在 AllowModelAuto 下可自动，Defer/Conflict 仍保留）。
 		switch verdict {
 		case "accept":
 			r.Accept++
@@ -345,24 +338,6 @@ func (r *judgeResult) applyAccept(st *store.Store, cand *store.Candidate, modelT
 	}
 	r.Skipped++
 	return nil
-}
-
-// mayAutoAccept 是模型的权限边界，与 internal/commit/policy.go 的矩阵保持一致：
-// 矩阵判 human_accept 的类，判定器不得越过。宁可漏（留给人看），不可越权。
-func mayAutoAccept(cand *store.Candidate) bool {
-	switch strings.ToLower(strings.TrimSpace(cand.Kind)) {
-	case "fact", "task":
-	default:
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(cand.Scope)) {
-	case "global", "cross_project":
-		return false
-	}
-	if strings.TrimSpace(cand.Project) == "" {
-		return false // 无工程归属 = 全局知识，矩阵同样判人工
-	}
-	return true
 }
 
 // judgeNeighborLookup 用候选正文在已有记忆里检索相似条目，只取正文摘要。
