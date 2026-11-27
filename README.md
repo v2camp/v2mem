@@ -3,11 +3,8 @@
 **个人 Agent 记忆系统** —— 一个本地 CLI（命令名 `mem`），存"跨会话该记住的东西"，
 让 AI 工具在**需要时**查得到，而不是把它们塞进每轮注入的上下文里。
 
-**轻量** —— 单文件二进制约 **17 MB**（各平台 16.7–17.9 MB）：零 CGO、零外部服务、零常驻进程，直接依赖只有 1 个
-（`modernc.org/sqlite`，纯 Go 转译）
-**快** —— 200 条记忆库检索平均 **~9 ms/次**（FTS5 + bm25：精确优先、空手才放宽）
-**多工具** —— 原生接入 **12 个 AI 工具**（Claude Code / Codex / Cursor / TraeCode / WorkBuddy / CodeBuddy / Qoder …），
-另提供 **MCP server**，任何支持 MCP 的工具一行配置即接入
+**轻量** —— 单文件二进制约 **17 MB**（各平台 16.7–17.9 MB）：零 CGO、零外部服务、零常驻进程，直接依赖只有 1 个（`modernc.org/sqlite`，纯 Go 转译）；**快** —— 200 条记忆库检索平均 **~9 ms/次**（FTS5 + bm25：精确优先、空手才放宽）
+**多工具** —— 原生接入 **12 个 AI 工具**（Claude Code / Codex / Cursor / TraeCode / WorkBuddy / CodeBuddy / Qoder …），另提供 **MCP server**，任何支持 MCP 的工具一行配置即接入
 **跨会话** —— 记忆持久在本地 SQLite，会话之间、工程之间共享，不依赖任何云服务
 **跨平台** —— mac / linux / windows 预编译单文件，同一套记忆三端通用（Windows 路径尚未在 runner 实测，见安装节）
 
@@ -97,8 +94,6 @@ bash /tmp/v2mem-install.sh
 
 `--dry-run` 只打印将使用的 URL、校验清单 URL 与安装目录，不联网、不建目录。源码回退同样需要 `git` + `go` 且要能访问 GitHub；机器没有 Go 时，优先保证预编译下载通道可达，或从 Release 页面手动下载对应平台的二进制，改名为 `mem` 放进 PATH。
 
----
-
 ## 快速开始
 
 ```bash
@@ -114,8 +109,6 @@ mem init              # 扫描本机 AI 工具 → 选择要注入钩子的工�
 
 > ⚠️ **选项必须写在位置参数之前**：`mem search --json "查询"`，不是 `mem search "查询" --json`。
 > Go 的 flag 在首个非选项参数处停止解析，写反了会把选项当成查询内容（v2mem 会直接报错拦下）。
-
----
 
 ## 三种接入方式
 
@@ -215,6 +208,7 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 · `mem eval write --session <文件> [--gold 文件]`（记录是否准：漏记/多记/疑似碎片）
 · `mem eval activity [--scope period\|task\|session] [--since D] [--session S] [--project P] [--top N]`
 （**用量视图**：一段时间/会话/任务内的读/写活动 + 空命中查询 + 四态结论。任务收尾由此产出，写进 `.mem/report.md`）
+· `scripts/eval-prod-gate.sh [--db 路径] [--json]`（低频准出对账门禁，周级/灰度签字时跑、不进 12h 巡检：包装 `mem eval flow --profile=prod --json`，汇总 G8–G12 + manual_rate；因 mem 建表会写库，先把 mem.db/-wal/-shm 复制到临时副本运行、退出即清理，绝不写生产库）
 
 **同义词词库**：`mem lexicon init --project <X> [--terms "词A,词B"]`（从该工程记忆提取同义词写入 `synonyms.txt`：以既有检索为
 "行为 oracle"算命中集、按 Jaccard 相似度聚簇，泛词护栏 + `[0.40,0.5)` 复核区间防止跨概念误合；`--dry-run` 只预览不写）
@@ -295,13 +289,9 @@ MCP 的检索与写入和 CLI 共享审计埋点，会一并计入 `mem eval act
 | [`contracts/storage-layering.md`](./contracts/storage-layering.md) | 开发者 | **存储分层 P0 契约**：ref 格式、两类写入顺序、`summary` / `summary_idx` 一律外置（其他字段 2 KB）、Markdown 只读边界与 `RefHealth` 巡检范围 |
 | [`docs/superpowers/specs/2026-11-23-model-provider-setup-design.md`](./docs/superpowers/specs/2026-11-23-model-provider-setup-design.md) | 所有者 / 开发者 | **模型来源配置设计**：api canonical + CLI 便利路径、`mem setup` 零填写向导、install.md S6 落地（第一份 spec；更新能力另立） |
 
-设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 ·
-`design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 ·
-`design-capture` 多 harness 捕获层与事件契约 · `design-speaker-attribution` 说话人归属与分源提炼 ·
-`design-workbuddy` WorkBuddy 结合 ·
-`design-eval` 激活与评测 · `design-maintenance` 收尾运维 ·
-`design-write-governance` 写侧治理与短/跨会话记忆分配 · `design-provenance` 记忆溯源 ·
-`design-write-batch` 写侧延迟治本（批量归档） · `design-db-stamp` 库版本台账与降级守卫 · `design-storage-layering` 运转逻辑留库、知识内容外置。
+设计专题：`design-cross-device` 跨设备归集 · `design-tech-arch` CLI与技术选型 · `design-dedup-merge` 相似归并与模糊检索 · `design-harness` Harness 集成 · `design-capture` 多 harness 捕获层与事件契约 · `design-speaker-attribution` 说话人归属与分源提炼 · `design-workbuddy` WorkBuddy 结合 ·
+`design-eval` 激活与评测 · `design-maintenance` 收尾运维 · `design-write-governance` 写侧治理与短/跨会话记忆分配 · `design-provenance` 记忆溯源 · `design-write-batch` 写侧延迟治本（批量归档） ·
+`design-db-stamp` 库版本台账与降级守卫 · `design-storage-layering` 运转逻辑留库、知识内容外置。
 「见 §N」这类跨章节引用按 DESIGN 索引页的专题地图定位文件。
 
 ---
