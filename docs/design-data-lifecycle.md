@@ -318,7 +318,9 @@ candidates: pending
 **定位**：Proposal/候选的语义建议器。`maintain` 与提交矩阵是确定性控制者。
 Judge 可以给 verdict 与理由建议，**不承担**调度、幂等、重试、GC、引用保护、提交权限。
 
-现状差距（扩权前必须补齐，来自审计勘误）：
+现状差距（扩权前必须补齐，来自审计勘误）——**P4 已落地（2026-11-27）**：
+CAS / 一输入一输出 / 上下文 / 标定 / 按 model-tag 回滚已补齐；Judge 自动 reject +
+矩阵门控 accept 默认启用（见 `acceptance-automation.md` §9）。
 
 1. 按 `judge_model`（含 prompt 版本）分组的标定统计——现有聚合无法按模型版本独立验证；
 2. `status`/`revision` CAS，防并发裁决覆盖；

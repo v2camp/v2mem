@@ -183,9 +183,8 @@ ci 红项判 tag，也不得用 prod 绿灯掩盖当前行违例。
 - eval 两面口径写入 `design-eval-flows`：ci 用于夹具/tag，prod 用于生产健康。
 - 仍然存在的是**积压存量**：代码已能追，生产仍有 181 源 / 14,261 序号 /
   13.5 天，需要后续会话或一次有界 catch-up 实际消化；这不属于代码缺口。
-- **P4 前置（本轮开始）**：Judge verdict revision CAS、一输入一输出完整性、
-  revision/task_state/evidence 摘要进入 prompt 已落地；existing memories 上下文
-  与标定样本仍待补。
+- **P4 已完成（2026-11-27）**：Judge verdict CAS、一输入一输出、已有记忆上下文、
+  按 judge_model 标定、reject/accept 落库与按 model-tag 回滚；详见 §9。
 
 ## 8. 未决 / 下一轮
 
@@ -197,6 +196,33 @@ ci 红项判 tag，也不得用 prod 绿灯掩盖当前行违例。
 2. **生产启用观察**：钩子已接线 model-auto；下一轮看真实 auto_commit /
    withdraw / correct 与 manual_rate，再决定是否删除 accept/reject。
 3. **accept/reject 最终删除**：等生产灰度签字。
-4. **P4 Judge 扩权**：前置项尚未齐（CAS、输入输出完整性、上下文）；本轮开始补。
+4. **P4 已收口**（§9）：CAS/完整性/上下文/标定/回滚与 reject+accept 默认启用已落地；
+   下一轮看真实模型的 accept/reject 一致率与误 reject 回滚率。
 5. **已知限制**：真实整机睡眠未测；进程组信号会带走子进程；consolidate dry-run 无预览；
    历史 memories.scope 未回填；`cursors` JSON 字段改名需外部脚本同步。
+
+## 9. P4 Judge 扩权（2026-11-27）
+
+| 波 | 内容 | 提交/合并 |
+|:--|:--|:--|
+| A | 已有记忆上下文（judge-v4） | `03c288b` / merge `b24041d` |
+| B | Judge 默认接管；maintain 退为 proposal-only；auto_spawn 三态 | `6a6245f` / merge `1280c1b` |
+| C | `review stats --judge` 标定（verdicts/reject/applied/reopened） | `ea42bb7` / merge `35b68d6` |
+| D | Judge reject/accept 落库，矩阵门控；移除影子预降级 | `961da51`、`3bf5b40` / merge `ae15679` |
+| D-fix | Judge reject 裁决账写 `model_tag`（按版本回滚命中） | `42f5a08` / merge `fa08c16` |
+| E | Judge reject 按 model-tag 回滚 | `c10c1d1` / merge `4172d2e` |
+
+- 钩子链路：SessionStart `maintain --stage=proposal --max-bundles 20`；
+  Stop/SessionEnd `judge --apply-reject --apply-accept`（仍受 20 条/24h 节流）。
+- 手动 `mem judge` 默认影子；自动子进程才带 apply flags。
+- accept 走 `JudgeAutoCommit`（Matrix AllowModelAuto），只有 auto_commit 写记忆；
+  reject 走 `JudgeReject`，冲突类跳过，裁决账带 `model_tag`。
+- 临时库集成（假 CLI）：
+  - 3 候选 → `applied_accept=2`、`applied_reject=1`；
+  - fact 与 decision 落未审核记忆，过程叙述 rejected；
+  - `review stats --judge` = verdicts 3 / reject 1 / applied 3；
+  - `review rollback --model-tag` dry-run `matched 2 + judge_reopened 1`，实跑记忆 withdrawn、
+    Judge reject 候选回 pending。
+- 回退开关：`MEM_JUDGE_SPAWN=0`、`model.json auto_spawn:false`、`MEM_NO_AUTOMATION=1`。
+- 未决：真实模型标定样本；自动 Judge 的误 reject/误 accept 需观察
+  `review stats --judge` 与回滚率；生产积压存量仍按 §7 处理。

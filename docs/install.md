@@ -183,10 +183,12 @@ mem setup --undo       # 回退到上一次写盘前
 `--dry-run` 走同样流程但不写盘。
 
 配好模型后**积压自动判定默认开启**：候选 ≥20 条时，在会话结束时由钩子后台拉起一次判定，
-默认影子（只记判定、不改记忆），有 24h 冷却。开关写在 `model.json` 的 `auto_spawn`，
+子进程默认带 `--apply-reject --apply-accept`：reject 直接落库（冲突类跳过），accept 仍过提交矩阵。
+有 24h 冷却。开关写在 `model.json` 的 `auto_spawn`（缺省=开，显式 false=关），
 `mem setup --status` 能看到；关闭用 `mem setup --mode off`，临时关闭可设 `MEM_JUDGE_SPAWN=0`。
 不要依赖 `export MEM_JUDGE_SPAWN=1` 来开启——宿主钩子不继承交互 shell 的环境变量。
-详见 [`design-admission.md`](./design-admission.md) §3.1。
+手动 `mem judge` 默认仍是影子；回滚用 `mem review rollback --model-tag <tag>`。
+详见 [`design-admission.md`](./design-admission.md) §3 / [`design-data-lifecycle.md`](./design-data-lifecycle.md) §7。
 
 完成判据：`mem setup --status` 显示 `mode`（`cli` / `api` / `off`）、`api_key` 掩码与
 `auto_spawn`（开 / 关）；真正的 `mem judge` 不再报「判定器不可用」。
