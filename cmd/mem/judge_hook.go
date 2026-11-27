@@ -22,10 +22,11 @@ import (
 //   - 不落库：子进程只写 verdict，没有任何改状态的参数——落库入口要等回滚与标定门槛一起交付。
 //
 // 自动触发的开关有两层：
-//   - model.json 的 auto_spawn：mem setup 配好模型后写入，是常态授权；
-//   - MEM_JUDGE_SPAWN：显式总闸。=1 强制开（脚本/CI），=0 强制关（GUI 宿主关不掉 export 时的退路）。
+//   - MEM_JUDGE_SPAWN：显式总闸，优先级最高。=1 强制开（脚本/CI），=0 强制关（GUI 宿主关不掉 export 时的退路）。
+//   - model.json 的 auto_spawn：三态。缺省=有可用模型配置就开（升级后默认启用），
+//     显式 false=用户明确拒绝，mode=off=关掉模型来源。
 //
-// 两层都不开就不发。老配置没有 auto_spawn，升级后不会突然开始烧 API。
+// P4 起默认启用：无需额外授权，但仍受 20 条 pending / 24h 冷却约束。
 
 const (
 	judgeDefaultMinPending = 20 // 低于 R8 的 FAIL 线（>15）留一点余量，避免刚 WARN 就烧一次调用
@@ -115,10 +116,10 @@ func judgeAutoSpawnEnabled() bool {
 		return false
 	}
 	cfg, err := distill.LoadModelConfig("")
-	if err != nil || cfg.Mode == "off" {
+	if err != nil {
 		return false
 	}
-	return cfg.AutoSpawn
+	return cfg.AutoSpawnEnabled()
 }
 
 // shouldSpawnJudge 是触发判据本身，抽成纯函数才可测：
