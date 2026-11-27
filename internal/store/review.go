@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/commit"
+	"github.com/v2camp/v2mem/internal/similarity"
 )
 
 // 记忆的人工后审核状态。” 表示未审核（直写来源之外的默认值）。
@@ -625,6 +626,15 @@ func (s *Store) ApplyMemoryReview(in MemoryReviewInput) (*MemoryReviewReport, er
 				SET content = ?, content_idx = ?, review_state = ?, reviewed_at = ?, reviewed_by = ?, updated_at = ?
 				WHERE id = ?`, after.Content, indexText(after.Content), after.ReviewState,
 				after.ReviewedAt, after.ReviewedBy, in.Now, in.MemoryID); err != nil {
+				return err
+			}
+			// 签名与正文同事务更新。sync.go 头部约定「凡是改 content 的分支都会同步
+			// mem_sigs 签名与 content_idx」，这里此前漏了签名：修正过的记忆仍拿旧文本
+			// 的 MinHash 参与模糊检索，改完反而搜不到。content_hash 不动——它是身份键，
+			// 人工换写法不改变「这是哪条事实」。
+			if _, err := q.ExecContext(ctx,
+				`INSERT OR REPLACE INTO mem_sigs(memory_id, sig) VALUES (?, ?)`,
+				in.MemoryID, encodeSig(similarity.Sign(after.Content))); err != nil {
 				return err
 			}
 		} else if _, err := q.ExecContext(ctx, `UPDATE memories

@@ -7,12 +7,14 @@ package store
 // MarkJudgeInvalidOutput / ModelAutoCommit 在本包内也有覆盖率与回归保护。
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/v2camp/v2mem/internal/commit"
+	"github.com/v2camp/v2mem/internal/similarity"
 )
 
 // seedRollbackTarget 造一条「model-auto 采纳 + 候选 accepted」的回滚标的，
@@ -84,6 +86,14 @@ func TestApplyMemoryReviewFourActions(t *testing.T) {
 	}
 	if content != "人工修订后的正文" || idx != indexText(content) {
 		t.Fatalf("correct 应同步正文与 content_idx，got %q / %q", content, idx)
+	}
+	// 签名必须跟着正文换：否则模糊检索仍用旧文本的 MinHash 比对，修正后反而搜不到。
+	var sig []byte
+	if err := s.db.QueryRow(`SELECT sig FROM mem_sigs WHERE memory_id = ?`, memID).Scan(&sig); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sig, encodeSig(similarity.Sign("人工修订后的正文"))) {
+		t.Fatal("correct 必须同步重算 mem_sigs 签名")
 	}
 	var reasons string
 	if err := s.db.QueryRow(`SELECT reason_codes_json FROM commit_decisions

@@ -14,7 +14,7 @@
 
 ### 7.1 身份键 = `(content_hash, project)`，不是 `id`
 
-`id` 由 `newID()` 随机生成，两台设备独立写下同一事实必然得到不同 id；而唯一索引 `ux_mem_hash`（`content_hash, project`）只允许一条。**按 id 归并必然漏合**，导入还可能撞唯一索引。因此：
+`id` 随机生成（本地采纳时沿用候选 id，跨设备仍各不相同），两台设备独立写下同一事实必然得到不同 id；而唯一索引 `ux_mem_hash`（`content_hash, project`）只允许一条。**按 id 归并必然漏合**，导入还可能撞唯一索引。因此：
 
 - 导入时忽略远端 `id`，只按 `(content_hash, project)` 定位
 - 本地不存在 → 插入并生成**本地** id，`origin_device` 记远端设备（溯源）

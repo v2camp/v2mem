@@ -13,7 +13,7 @@ import (
 )
 
 // 候选是蒸馏 / 导入的隔离区。默认不进 fts_mem，mem search 看不见。
-// 只有 AcceptCandidate 才把正文写进 memories，并记一条 derived_from 边。
+// 只有 AcceptCandidate 才把正文写进 memories，且记忆沿用候选 id（派生关系由 id 同值表达）。
 
 // ErrAlreadyDistilled 表示这个会话窗口已经成功蒸馏过。
 var ErrAlreadyDistilled = errors.New("该会话窗口已蒸馏")
@@ -414,8 +414,8 @@ func (s *Store) ResolveCandidate(idOrPrefix string) (*Candidate, error) {
 	}
 }
 
-// AcceptCandidate 把 pending 候选写进 memories（source=distill-accept），并记 derived_from。
-// 已采纳的再调用是幂等的：只补证据链/派生边/provenance，不重复计数。
+// AcceptCandidate 把 pending 候选写进 memories（source=distill-accept），记忆沿用候选 id。
+// 已采纳的再调用是幂等的：只补证据链/provenance，不重复计数。
 // 拒绝、过期或 revision 已变化的候选不能采纳。
 //
 // 实际提交逻辑在 commit.go：这里保留旧签名，供未感知 revision 的调用方继续使用。

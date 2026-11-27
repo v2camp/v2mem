@@ -428,7 +428,7 @@ func (s *Store) AutoCommitCandidate(idOrPrefix string, expectedRevision int) (*C
 //   - 裁决 actor 写 commit.ActorModelAuto、modelTag 落 commit_decisions，
 //     记忆留未审核态（upsertAcceptedMemory 默认 review_state=”），复核摘要从此有真实数据。
 //
-// 自动 accept 一律走 commitAcceptView：revision CAS、幂等键、edges.derived_from、
+// 自动 accept 一律走 commitAcceptView：revision CAS、幂等键、记忆 id 继承候选、
 // memory_evidence 绑定全部保留；Judge accept 不得绕过提交矩阵（§7 第 7 条）。
 // 非 auto_commit 的动作只记一条裁决（同样带 modelTag），不写记忆、不推进候选状态。
 func (s *Store) ModelAutoCommit(idOrPrefix string, expectedRevision int, modelTag string) (*CommitResult, error) {
@@ -533,10 +533,14 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 		if err := writeMemoryEvidence(ctx, q, memoryID, rows, now); err != nil {
 			return err
 		}
-		if _, err := q.ExecContext(ctx,
-			`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
-			memoryID, cur.ID); err != nil {
-			return err
+		// 记忆沿用候选 id 后 src 与 dst 同值，自环不表达任何派生关系，跳过；
+		// 「记忆 ← 候选」由 candidates.memory_id 与 id 同值本身表达。
+		if memoryID != cur.ID {
+			if _, err := q.ExecContext(ctx,
+				`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
+				memoryID, cur.ID); err != nil {
+				return err
+			}
 		}
 		// 只允许 pending → accepted：并发唯一赢家由 revision CAS 保证，
 		// 第二个写者会看到 0 行而不是覆盖先到者的 memory_id。
@@ -605,10 +609,13 @@ func (s *Store) replayAccepted(ctx context.Context, q sqlQuerier, cur *CommitCan
 		WHERE id = ?`, prov, cur.MemoryID); err != nil {
 		return nil, err
 	}
-	if _, err := q.ExecContext(ctx,
-		`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
-		cur.MemoryID, cur.ID); err != nil {
-		return nil, err
+	// 与首次采纳同规则：记忆沿用候选 id 时 src==dst，自环不表达派生关系。
+	if cur.MemoryID != cur.ID {
+		if _, err := q.ExecContext(ctx,
+			`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
+			cur.MemoryID, cur.ID); err != nil {
+			return nil, err
+		}
 	}
 	// 重放不是「又新建了一条」：created_memory 必须为 0，否则按版本回滚会误删别人的记忆。
 	if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash, action, actor, reasons,
@@ -679,7 +686,11 @@ func (s *Store) upsertAcceptedMemory(ctx context.Context, q sqlQuerier, cur *Com
 		}
 	case errors.Is(err, sql.ErrNoRows):
 		created = true
-		id = newID()
+		// 记忆沿用候选 id：候选与记忆是同一条知识的两个落点，各发一个随机 id
+		// 会让「这条记忆由谁提出、依据哪批证据」必须再反查两张表才能对上。
+		// 候选 id 与记忆 id 同为 32 位 hex，复用不损唯一性；跨设备身份仍是
+		// (content_hash, project)（见 sync.go 头部），不受本地 id 影响。
+		id = cur.ID
 		if _, err := q.ExecContext(ctx, `INSERT INTO memories
 			(id, content, content_idx, kind, content_hash, project, salience,
 			 created_at, updated_at, last_seen_at, expires_at,

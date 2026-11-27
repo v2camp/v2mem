@@ -238,7 +238,7 @@ candidates: pending
 | `ActionConflict` | **保留**：冲突优先于一切 |
 | actor 集合 `auto` / `human` / `human-reviewed-llm` / `judge` | 新增 `model-auto`（模型自动采纳）；后审核动作记 `human` + `review_action` |
 
-- 自动 accept 仍走 `CommitAccept`：revision CAS、幂等键、`edges.derived_from`、
+- 自动 accept 仍走 `CommitAccept`：revision CAS、幂等键、记忆 id 继承候选、
   `memory_evidence` 绑定全部保留。
 - 幂等键纳入提示词版本（或独立 `prompt_hash` 维度），避免换提示词后误判重放。
 
