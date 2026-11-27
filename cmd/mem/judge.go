@@ -22,9 +22,15 @@ import (
 // 回滚命令与 ≥95%/≥200 的标定门槛都还没落地，所以 --apply 入口一并撤掉，
 // 判定器目前没有任何改库路径。要恢复落库，必须先把这两件事同批交付。
 const (
-	judgePromptVersion = "judge-v3"
+	judgePromptVersion = "judge-v4"
 	judgeDefaultBatch  = 20
 	judgeContentRunes  = 600
+	// 已有记忆上下文：每条候选最多带 3 条相似记忆摘要，用候选正文前 80 rune 检索，
+	// 只送正文前 200 rune。上限的意义是把「重复/更新」的判断依据给到模型，而不是
+	// 把整库塞进提示词——提示词越长，候选本身的权重越低。
+	judgeNeighborLimit      = 3
+	judgeNeighborQueryRunes = 80
+	judgeNeighborRunes      = 200
 )
 
 // judgeReasons 是 reason_code 的闭集。自由文本无法聚合，也挡不住提示词漂移。
@@ -49,6 +55,7 @@ unsure：以上都不是，或信息不足以判断。
 - unsure 只用于「可能是知识，但信息不足」或「既不像知识也不像噪音」。能明确判为过程叙述的，不要给 unsure。
 - 只判断「是否值得长期记住」，不判断内容是否正确。
 - evidence 是候选引用的原始证据摘要；task_state/revision 仅作上下文，不要回显。
+- neighbor_memories 是已有记忆，用于判断重复/更新，不要回显。
 
 候选：
 %s
@@ -128,7 +135,7 @@ func cmdJudge(args []string) error {
 	raw, err := complete(ctx, fmt.Sprintf(judgePrompt, judgeCandidatesJSON(list, func(id string) []string {
 		ev, _ := st.CandidateEvidenceSummaries(id)
 		return ev
-	})))
+	}, judgeNeighborLookup(st))))
 	if err != nil {
 		return fmt.Errorf("模型调用失败: %w", err)
 	}
@@ -277,7 +284,40 @@ func mayAutoAccept(cand *store.Candidate) bool {
 	return true
 }
 
-func judgeCandidatesJSON(list []store.Candidate, evidence func(string) []string) string {
+// judgeNeighborLookup 用候选正文在已有记忆里检索相似条目，只取正文摘要。
+//
+// 为什么要给判定器看邻居：单条候选无从判断「这是新知识还是已有知识的重复/更新」，
+// 结果是同一条事实被反复 accept 成多条记忆。邻居只送正文，不带 ID/工程/分数——
+// 判定只需要语义，多给的元数据只会诱导模型复述。
+//
+// 检索失败按空上下文处理，不阻断判定：上下文缺失只会让判断更保守，
+// 不该因为一次 FTS/库错误让整批候选卡住。
+func judgeNeighborLookup(st *store.Store) func(store.Candidate) []string {
+	return func(c store.Candidate) []string {
+		q := store.SearchQuery{
+			Query:   truncateRunes(c.Content, judgeNeighborQueryRunes),
+			Project: c.Project,
+			Limit:   judgeNeighborLimit,
+		}
+		if strings.TrimSpace(c.Project) == "" {
+			// 无工程归属的候选属于全局知识，只在本题工程里检索等于看不到重复。
+			q.Scope = "all"
+		}
+		hits, err := st.Search(q)
+		if err != nil {
+			return nil
+		}
+		out := make([]string, 0, len(hits))
+		for _, h := range hits {
+			out = append(out, truncateRunes(h.Content, judgeNeighborRunes))
+		}
+		return out
+	}
+}
+
+// judgeCandidatesJSON 把候选投影成送模型的 JSON。evidence / neighbors 为 nil 时对应字段省略，
+// 空切片也省略：给模型一个空数组只会换来一行回显。
+func judgeCandidatesJSON(list []store.Candidate, evidence func(string) []string, neighbors func(store.Candidate) []string) string {
 	type item struct {
 		ID        string   `json:"id"`
 		Kind      string   `json:"kind"`
@@ -287,13 +327,17 @@ func judgeCandidatesJSON(list []store.Candidate, evidence func(string) []string)
 		Revision  int      `json:"revision"`
 		TaskState string   `json:"task_state,omitempty"`
 		Evidence  []string `json:"evidence,omitempty"`
+		Neighbors []string `json:"neighbor_memories,omitempty"`
 	}
 	out := make([]item, 0, len(list))
 	for _, c := range list {
 		it := item{c.ID[:8], c.Kind, c.Scope, c.Project, truncateRunes(c.Content, judgeContentRunes),
-			c.Revision, c.TaskState, nil}
+			c.Revision, c.TaskState, nil, nil}
 		if evidence != nil {
 			it.Evidence = evidence(c.ID)
+		}
+		if neighbors != nil {
+			it.Neighbors = neighbors(c)
 		}
 		out = append(out, it)
 	}
