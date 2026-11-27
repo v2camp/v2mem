@@ -778,6 +778,16 @@ func rejectReasonCode(actor string) string {
 
 // CommitReject 拒绝候选。expectedRevision < 0 表示按当前 revision 执行。
 func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, reason string) (*CommitResult, error) {
+	return s.commitReject(idOrPrefix, expectedRevision, actor, "", reason)
+}
+
+// JudgeReject 是 Judge 自动 reject 的入口：与 CommitReject 同一条状态机，
+// 区别是把 judge_model（model@promptver）写进裁决账，供按版本回滚。
+func (s *Store) JudgeReject(idOrPrefix string, expectedRevision int, modelTag, reason string) (*CommitResult, error) {
+	return s.commitReject(idOrPrefix, expectedRevision, commit.ActorJudge, modelTag, reason)
+}
+
+func (s *Store) commitReject(idOrPrefix string, expectedRevision int, actor, modelTag, reason string) (*CommitResult, error) {
 	view, err := s.CommitCandidate(idOrPrefix)
 	if err != nil {
 		return nil, err
@@ -806,7 +816,7 @@ func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, rea
 					ErrRevisionConflict, cur.ID, cur.Revision, expectedRevision)
 			}
 			if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash,
-				commit.ActionReject, actor, reasons, "", "", false); err != nil {
+				commit.ActionReject, actor, reasons, "", modelTag, false); err != nil {
 				return err
 			}
 			out = &CommitResult{Action: commit.ActionReject, Actor: actor,
@@ -834,7 +844,7 @@ func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, rea
 			return fmt.Errorf("%w: 候选 %s", ErrRevisionConflict, cur.ID)
 		}
 		if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash,
-			commit.ActionReject, actor, reasons, "", "", false); err != nil {
+			commit.ActionReject, actor, reasons, "", modelTag, false); err != nil {
 			return err
 		}
 		out = &CommitResult{Action: commit.ActionReject, Actor: actor,

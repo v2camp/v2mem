@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
-	"github.com/v2camp/v2mem/internal/commit"
 	"github.com/v2camp/v2mem/internal/distill"
 	"github.com/v2camp/v2mem/internal/store"
 )
@@ -287,7 +286,7 @@ func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVer
 		switch verdict {
 		case "reject":
 			if applyReject {
-				if err := r.applyReject(st, cand, reason); err != nil {
+				if err := r.applyReject(st, cand, modelTag, reason); err != nil {
 					return r, err
 				}
 			}
@@ -305,12 +304,12 @@ func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVer
 
 // applyReject 把一条 reject 落库。冲突类跳过：冲突要留给人看，
 // 自动否决掉就等于替人消灭了「两条结论互斥」这个信号。
-func (r *judgeResult) applyReject(st *store.Store, cand *store.Candidate, reason string) error {
+func (r *judgeResult) applyReject(st *store.Store, cand *store.Candidate, modelTag, reason string) error {
 	if strings.EqualFold(strings.TrimSpace(cand.ReviewClass), "conflict") {
 		r.Skipped++
 		return nil
 	}
-	if _, err := st.CommitReject(cand.ID, cand.Revision, commit.ActorJudge, "judge:"+reason); err != nil {
+	if _, err := st.JudgeReject(cand.ID, cand.Revision, modelTag, "judge:"+reason); err != nil {
 		if errors.Is(err, store.ErrCandidateClosed) || errors.Is(err, store.ErrRevisionConflict) {
 			r.Skipped++
 			return nil
