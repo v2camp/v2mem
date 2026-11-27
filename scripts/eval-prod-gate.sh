@@ -5,7 +5,7 @@ set -euo pipefail
 # 包装 `mem eval flow --profile=prod --json`，汇总 docs/design-eval-flows.md §3.1：
 #   G8  超 15 天 SLA 仍 pending 的悬空候选必须为 0
 #   G9/G10/G11/G12  候选→裁决→记忆→终态对账（G12 准出率 100%）
-#   manual_rate  人工介入率（目标 <1%，超标给 WARN，不阻断对账）
+#   manual_rate  人工介入率（诊断项，不判级）
 #
 # 只读边界：业务上纯读（cmd/mem/eval_flow.go:31-47、flow_snapshot.go:142-220、
 # flow_check.go:69-138 全 SELECT），但 store.Open 有元数据副作用——schemaSQL、
@@ -37,7 +37,7 @@ usage() {
   --help        显示本帮助并退出 0
 
 判据：G8/G9/G10/G11/G12 全 PASS、profile=prod 且 eval flow 退出 0 → PASS，否则 FAIL。
-manual_rate 目标 <1%，超标仅 WARN（对账门禁不因运营指标阻断）。
+manual_rate 仅作诊断输出，不判级。
 只读：mem.db/-wal/-shm 复制到 mktemp -d 副本后运行，退出即清理。
 EOF
 }
@@ -114,8 +114,6 @@ SUMMARY="$(jq -c --argjson rc "$EVAL_RC" --arg db "$DB" --arg raw "$RAW" '
       gate_checks: $gc,
       gate_passed: ($gc | map(select(.pass)) | length),
       manual_rate: .manual_rate,
-      manual_rate_target: 0.01,
-      manual_rate_warn: (.manual_rate >= 0.01),
       legacy_exempt: .legacy_exempt,
       window_seconds: .window_seconds,
       g7_pass: ([ .checks[] | select(.id == "G7") | .pass ] | .[0] // null),
@@ -132,7 +130,6 @@ SUMMARY="$(jq -c --argjson rc "$EVAL_RC" --arg db "$DB" --arg raw "$RAW" '
 
 RESULT="$(printf '%s' "$SUMMARY" | jq -r '.result')"
 MR_PCT="$(printf '%s' "$SUMMARY" | jq -r '.manual_rate' | awk '{printf "%.1f", $1 * 100}')"
-MR_WARN="$(printf '%s' "$SUMMARY" | jq -r '.manual_rate_warn')"
 
 if [ "$JSON_OUT" -eq 1 ]; then
   printf '%s\n' "$SUMMARY"
@@ -140,13 +137,13 @@ if [ "$JSON_OUT" -eq 1 ]; then
     cat "$ERR" >&2 || true
   fi
 else
-  printf '[prod-gate] %s  profile=%s  G8-G12=%s/5  passed=%s/%s  manual_rate=%s%% (目标<1%%%s)  legacy_exempt=%s  db=%s\n' \
+  printf '[prod-gate] %s  profile=%s  G8-G12=%s/5  passed=%s/%s  manual_rate=%s%%（诊断项，不判级）  legacy_exempt=%s  db=%s\n' \
     "$RESULT" \
     "$(printf '%s' "$SUMMARY" | jq -r '.profile')" \
     "$(printf '%s' "$SUMMARY" | jq -r '.gate_passed')" \
     "$(printf '%s' "$SUMMARY" | jq -r '.passed')" \
     "$(printf '%s' "$SUMMARY" | jq -r '.failed + .passed')" \
-    "$MR_PCT" "$([ "$MR_WARN" = "true" ] && printf ', WARN' || printf '')" \
+    "$MR_PCT" \
     "$(printf '%s' "$SUMMARY" | jq -r '.legacy_exempt')" \
     "$DB"
   printf '%s' "$SUMMARY" | jq -r '.gate_checks[] | "  \(.id)  \(if .pass then "PASS" else "FAIL" end)  \(.detail)"'

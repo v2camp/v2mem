@@ -69,7 +69,7 @@ fi
 if ! printf '%s\n' "$OUT1" | grep -q 'G7 已知假红来源已登记'; then
   echo "FAIL case1: 缺 G7 假红来源标注" >&2; exit 1
 fi
-echo "PASS case1: 全绿退出 0（G8-G12=5/5，准出率 100%，manual_rate 0%）"
+echo "PASS case1: 全绿退出 0（G8-G12=5/5，准出率 100%，manual_rate 0% 仅诊断）"
 
 # ---------- Case 2：制造 G8 红（超 15 天 SLA 仍 pending）→ 退出非 0 ----------
 BAD="$TMPD/bad.db"
