@@ -171,8 +171,9 @@ mem repair content [id...] [选项]
 1. 读当前记忆；**当前 `content_hash` 必须等于归档里的 `new_hash`** 才还原成 `old_content`。
    不等说明它已被人工修正、被再次改写或已删除——**跳过并报告**，绝不覆盖。
 2. 还原时同样重算 `content_hash` / `content_idx` / `mem_sigs`。
-3. 清理本次改写留下的 `enhance_tag` / `enhanced_at`；`provenance.original_hash` 仅当它等于
-   本条 `old_hash` 时一并清理，否则（来自更早的人工改写）保留。
+3. 回滚只追加 `provenance.enhance_restored_at` 作为回滚时间戳，**保留** `enhance_tag` /
+   `enhanced_at` 作为「这条曾被哪版模型改写过」的审计痕迹；`original_hash` 继续保留，供
+   跨设备追溯最初身份。
 4. **只还原正文，不删行、不碰证据链与 kind/scope**；配 `--dry-run` 时只报告
    matched / skipped，零写入（沿用 `review rollback` 口径）。
 5. 幂等：第二次回滚时 `new_hash` 已不匹配，全部计 skipped。
