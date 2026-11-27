@@ -145,7 +145,7 @@ func TestMayAutoAccept(t *testing.T) {
 func TestJudgeCandidatesJSONTruncates(t *testing.T) {
 	long := strings.Repeat("很长的事实", 300)
 	list := []store.Candidate{{ID: "abcdef123456", Kind: "fact", Project: "p", Content: long}}
-	out := judgeCandidatesJSON(list)
+	out := judgeCandidatesJSON(list, nil)
 	if !strings.Contains(out, "abcdef12") || strings.Contains(out, "abcdef123456") {
 		t.Errorf("应只送 8 位前缀，got %s", out[:60])
 	}
@@ -161,6 +161,48 @@ func TestJudgeCandidatesJSONTruncates(t *testing.T) {
 	}
 	if !strings.HasSuffix(parsed[0].Content, "…") {
 		t.Error("截断后应带省略号")
+	}
+}
+
+// 一输入一输出：未知 id、缺失、重复都算坏输出。
+func TestValidateJudgeVerdicts(t *testing.T) {
+	list := []store.Candidate{{ID: "aaaaaaaa1111"}, {ID: "bbbbbbbb2222"}}
+	cases := []struct {
+		name string
+		vs   []judgeVerdict
+		ok   bool
+	}{
+		{"完整", []judgeVerdict{{ID: "aaaaaaaa", Verdict: "reject"}, {ID: "bbbbbbbb", Verdict: "unsure"}}, true},
+		{"缺失", []judgeVerdict{{ID: "aaaaaaaa", Verdict: "reject"}}, false},
+		{"重复", []judgeVerdict{{ID: "aaaaaaaa", Verdict: "reject"}, {ID: "aaaaaaaa", Verdict: "unsure"}, {ID: "bbbbbbbb", Verdict: "unsure"}}, false},
+		{"未知", []judgeVerdict{{ID: "cccccccc", Verdict: "reject"}, {ID: "aaaaaaaa", Verdict: "reject"}, {ID: "bbbbbbbb", Verdict: "unsure"}}, false},
+	}
+	for _, c := range cases {
+		err := validateJudgeVerdicts(list, c.vs)
+		if (err == nil) != c.ok {
+			t.Errorf("%s: err=%v, want ok=%v", c.name, err, c.ok)
+		}
+	}
+}
+
+// 上下文补齐：revision / task_state / evidence 摘要进入送模型 JSON。
+func TestJudgeCandidatesJSONIncludesContext(t *testing.T) {
+	list := []store.Candidate{{
+		ID: "abcdef123456", Kind: "task", Project: "p", Content: "待办",
+		Revision: 3, TaskState: "in_progress",
+	}}
+	out := judgeCandidatesJSON(list, func(string) []string { return []string{"原始证据摘要"} })
+	var parsed []struct {
+		Revision  int      `json:"revision"`
+		TaskState string   `json:"task_state"`
+		Evidence  []string `json:"evidence"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed[0].Revision != 3 || parsed[0].TaskState != "in_progress" ||
+		len(parsed[0].Evidence) != 1 || parsed[0].Evidence[0] != "原始证据摘要" {
+		t.Fatalf("上下文未进入 JSON: %+v", parsed[0])
 	}
 }
 
@@ -194,11 +236,11 @@ func TestJudgeModelTag(t *testing.T) {
 	cases := []struct {
 		provider, flagModel, resolved, want string
 	}{
-		{"cli:claude@1+tpl1", "", "", "cli:claude@1+tpl1@judge-v2"},
-		{"cli:m1@1+tpl1", "m1", "", "cli:m1@1+tpl1@judge-v2"}, // 模型已在 cli: 前缀里，不能再拼一次
-		{"deepseek", "", "deepseek-flash", "deepseek:deepseek-flash@judge-v2"},
-		{"deepseek", "m1", "", "deepseek:m1@judge-v2"},
-		{"ollama", "", "", "ollama@judge-v2"}, // ollama 的默认模型是运行期兜底，不写进归因
+		{"cli:claude@1+tpl1", "", "", "cli:claude@1+tpl1@judge-v3"},
+		{"cli:m1@1+tpl1", "m1", "", "cli:m1@1+tpl1@judge-v3"}, // 模型已在 cli: 前缀里，不能再拼一次
+		{"deepseek", "", "deepseek-flash", "deepseek:deepseek-flash@judge-v3"},
+		{"deepseek", "m1", "", "deepseek:m1@judge-v3"},
+		{"ollama", "", "", "ollama@judge-v3"}, // ollama 的默认模型是运行期兜底，不写进归因
 	}
 	for _, tc := range cases {
 		if got := judgeModelTag(tc.provider, tc.flagModel, tc.resolved); got != tc.want {

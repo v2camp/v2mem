@@ -3,7 +3,35 @@ package store
 // 准入判定的存储侧只有三件事可验证：痕迹可写、pending 可数、按 verdict 可聚合。
 // 它们的分母口径直接决定「影子期人工一致率」是否可信，所以断言必须落在库上。
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
+
+// P4 前置：revision CAS。并发自动裁决推进 revision 后，Judge 不得覆盖。
+func TestMarkJudgeVerdictCASRejectsStaleRevision(t *testing.T) {
+	s := newTestStore(t)
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Project: "p", Kind: "fact", Content: "CAS 样本", Source: "distill",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := res.Candidate.ID
+	if err := s.MarkJudgeVerdictCAS(id, "reject", "m@v1", "process_narrative", 1); !errors.Is(err, ErrJudgeVerdictStale) {
+		t.Fatalf("过期 revision 应报 ErrJudgeVerdictStale, got %v", err)
+	}
+	var verdict string
+	if err := s.db.QueryRow(`SELECT judge_verdict FROM candidates WHERE id = ?`, id).Scan(&verdict); err != nil {
+		t.Fatal(err)
+	}
+	if verdict != "" {
+		t.Fatalf("CAS 失败不得写入判定，got %q", verdict)
+	}
+	if err := s.MarkJudgeVerdictCAS(id, "reject", "m@v1", "process_narrative", 0); err != nil {
+		t.Fatalf("正确 revision 应成功: %v", err)
+	}
+}
 
 // MarkJudgeVerdict 只写痕迹，不动 status：影子期零风险的全部依据在此。
 // 覆盖「重复判定覆盖上一次」也在这里——同一候选换模型重判时，verdict 与 model 必须同源。

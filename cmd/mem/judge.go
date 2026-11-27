@@ -22,7 +22,7 @@ import (
 // 回滚命令与 ≥95%/≥200 的标定门槛都还没落地，所以 --apply 入口一并撤掉，
 // 判定器目前没有任何改库路径。要恢复落库，必须先把这两件事同批交付。
 const (
-	judgePromptVersion = "judge-v2"
+	judgePromptVersion = "judge-v3"
 	judgeDefaultBatch  = 20
 	judgeContentRunes  = 600
 )
@@ -48,6 +48,7 @@ unsure：以上都不是，或信息不足以判断。
 - scope 为 global 或 cross_project 不能 accept；同样是「不能要」，不是「不能否」。
 - unsure 只用于「可能是知识，但信息不足」或「既不像知识也不像噪音」。能明确判为过程叙述的，不要给 unsure。
 - 只判断「是否值得长期记住」，不判断内容是否正确。
+- evidence 是候选引用的原始证据摘要；task_state/revision 仅作上下文，不要回显。
 
 候选：
 %s
@@ -124,7 +125,10 @@ func cmdJudge(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	raw, err := complete(ctx, fmt.Sprintf(judgePrompt, judgeCandidatesJSON(list)))
+	raw, err := complete(ctx, fmt.Sprintf(judgePrompt, judgeCandidatesJSON(list, func(id string) []string {
+		ev, _ := st.CandidateEvidenceSummaries(id)
+		return ev
+	})))
 	if err != nil {
 		return fmt.Errorf("模型调用失败: %w", err)
 	}
@@ -139,6 +143,13 @@ func cmdJudge(args []string) error {
 				err, truncateRunes(raw, 200), markErr)
 		}
 		return fmt.Errorf("模型输出无法解析: %w（原文前 200 字节：%s）", err, truncateRunes(raw, 200))
+	}
+	// 一输入一输出：少一条/多一条/未知 id 都按坏输出处理，不能静默丢候选。
+	if err := validateJudgeVerdicts(list, verdicts); err != nil {
+		if markErr := markJudgeInvalid(st, list, err.Error()); markErr != nil {
+			return fmt.Errorf("判定输出不完整: %w；候选留痕失败: %v", err, markErr)
+		}
+		return fmt.Errorf("判定输出不完整: %w", err)
 	}
 
 	// 归因要能按模型分组：flag > 解析出的实际模型 > 只记 provider（cli 的版本分量在 providerName 里）。
@@ -163,11 +174,14 @@ func cmdJudge(args []string) error {
 		return printJSON(map[string]any{
 			"provider": providerName, "model": modelTag, "mode": mode,
 			"count": len(verdicts), "accept": res.Accept, "reject": res.Reject,
-			"unsure": res.Unsure, "downgraded": res.Downgraded,
+			"unsure": res.Unsure, "downgraded": res.Downgraded, "skipped": res.Skipped,
 		})
 	}
 	fmt.Printf("judge: %d 条 → accept %d / reject %d / unsure %d；模式=%s\n",
 		len(verdicts), res.Accept, res.Reject, res.Unsure, mode)
+	if res.Skipped > 0 {
+		fmt.Printf("  其中 %d 条 revision 已变化，跳过（不覆盖并发裁决）\n", res.Skipped)
+	}
 	if res.Downgraded > 0 {
 		fmt.Printf("  其中 %d 条因 kind/scope 不允许自动采纳而降级 unsure\n", res.Downgraded)
 	}
@@ -200,7 +214,7 @@ func judgeModelTag(providerName, flagModel, resolvedModel string) string {
 // judgeResult 是落库循环的计数。抽出来是为了让「影子不改状态」这件事可测 ——
 // 它不可能靠读代码相信，只能靠断言。
 type judgeResult struct {
-	Accept, Reject, Unsure, Downgraded int
+	Accept, Reject, Unsure, Downgraded, Skipped int
 }
 
 // applyJudgments 把判定写进候选：只写痕迹，不动 status。
@@ -233,7 +247,12 @@ func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVer
 		if verdict == "unsure" || reason == "" || !judgeReasons[reason] {
 			reason = "unsure"
 		}
-		if err := st.MarkJudgeVerdict(cand.ID, verdict, modelTag, reason); err != nil {
+		if err := st.MarkJudgeVerdictCAS(cand.ID, verdict, modelTag, reason, cand.Revision); err != nil {
+			if errors.Is(err, store.ErrJudgeVerdictStale) {
+				// 并发自动裁决/人工动作已推进 revision：跳过，不覆盖别人的结果。
+				r.Skipped++
+				continue
+			}
 			return r, err
 		}
 	}
@@ -258,17 +277,25 @@ func mayAutoAccept(cand *store.Candidate) bool {
 	return true
 }
 
-func judgeCandidatesJSON(list []store.Candidate) string {
+func judgeCandidatesJSON(list []store.Candidate, evidence func(string) []string) string {
 	type item struct {
-		ID      string `json:"id"`
-		Kind    string `json:"kind"`
-		Scope   string `json:"scope,omitempty"`
-		Project string `json:"project,omitempty"`
-		Content string `json:"content"`
+		ID        string   `json:"id"`
+		Kind      string   `json:"kind"`
+		Scope     string   `json:"scope,omitempty"`
+		Project   string   `json:"project,omitempty"`
+		Content   string   `json:"content"`
+		Revision  int      `json:"revision"`
+		TaskState string   `json:"task_state,omitempty"`
+		Evidence  []string `json:"evidence,omitempty"`
 	}
 	out := make([]item, 0, len(list))
 	for _, c := range list {
-		out = append(out, item{c.ID[:8], c.Kind, c.Scope, c.Project, truncateRunes(c.Content, judgeContentRunes)})
+		it := item{c.ID[:8], c.Kind, c.Scope, c.Project, truncateRunes(c.Content, judgeContentRunes),
+			c.Revision, c.TaskState, nil}
+		if evidence != nil {
+			it.Evidence = evidence(c.ID)
+		}
+		out = append(out, it)
 	}
 	b, _ := json.Marshal(out)
 	return string(b)
@@ -292,6 +319,29 @@ func parseJudgeVerdicts(raw string) ([]judgeVerdict, error) {
 		}
 	}
 	return out, nil
+}
+
+// validateJudgeVerdicts 强制一输入一输出：每个送入的候选恰好一条判定，
+// 不允许未知 id / 重复 / 缺失。坏输出按 markJudgeInvalid 统一留痕重试。
+func validateJudgeVerdicts(list []store.Candidate, verdicts []judgeVerdict) error {
+	count := make(map[string]int, len(verdicts))
+	for _, v := range verdicts {
+		cand := findByPrefix(list, v.ID)
+		if cand == nil {
+			return fmt.Errorf("未知候选 id %q", v.ID)
+		}
+		count[cand.ID]++
+	}
+	for _, c := range list {
+		switch count[c.ID] {
+		case 0:
+			return fmt.Errorf("候选 %s 缺少判定", shortID(c.ID))
+		case 1:
+		default:
+			return fmt.Errorf("候选 %s 重复判定", shortID(c.ID))
+		}
+	}
+	return nil
 }
 
 // markJudgeInvalid 把一次非法输出落到本批全部候选：failed → 超上限 quarantined。

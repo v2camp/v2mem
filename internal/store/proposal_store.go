@@ -650,6 +650,29 @@ func mergeCandidateEvidenceTx(tx *sql.Tx, candidateID string, evs []CandidateEvi
 }
 
 // ListCandidateEvidence 按创建顺序读候选的证据引用。
+// CandidateEvidenceSummaries 取候选引用的原始证据摘要（最多 3 条），
+// 供 Judge 上下文使用；没有 candidate_evidence 的 legacy 行返回空。
+func (s *Store) CandidateEvidenceSummaries(candidateID string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT o.summary FROM candidate_evidence ce
+		JOIN observations o ON o.id = ce.evidence_id
+		WHERE ce.candidate_id = ? AND o.summary <> ''
+		ORDER BY ce.created_at ASC, ce.evidence_id ASC LIMIT 3`, candidateID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var summary string
+		if err := rows.Scan(&summary); err != nil {
+			return nil, err
+		}
+		out = append(out, summary)
+	}
+	return out, rows.Err()
+}
+
+// ListCandidateEvidence 返回候选绑定的证据行（按创建时间正序）。
 func (s *Store) ListCandidateEvidence(candidateID string) ([]CandidateEvidence, error) {
 	rows, err := s.db.Query(`SELECT candidate_id, evidence_id, event_uid, source_id,
 			source_seq, archive_hash, raw_record_hash, evidence_role, quote_hash, created_at
