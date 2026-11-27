@@ -160,11 +160,20 @@ func cmdReviewRollback(args []string) error {
 	}
 	fmt.Printf("回滚 %s%s：matched %d / withdrawn %d / skipped %d / already %d / reopened %d\n",
 		rep.ModelTag, dry, rep.Matched, rep.Withdrawn, rep.Skipped, rep.Already, rep.Reopened)
+	if rep.JudgeReopened > 0 || rep.JudgeSkipped > 0 {
+		fmt.Printf("  Judge 驳回：回 pending %d / 跳过 %d\n", rep.JudgeReopened, rep.JudgeSkipped)
+	}
 	if len(rep.SkippedIDs) > 0 {
 		fmt.Printf("  跳过（人工已确认/修正）: %s\n", joinShort(rep.SkippedIDs))
 	}
 	if len(rep.WithdrawnIDs) > 0 {
 		fmt.Printf("  撤回: %s\n", joinShort(rep.WithdrawnIDs))
+	}
+	if len(rep.JudgeReopenedIDs) > 0 {
+		fmt.Printf("  Judge 驳回回 pending: %s\n", joinShort(rep.JudgeReopenedIDs))
+	}
+	if len(rep.JudgeSkippedIDs) > 0 {
+		fmt.Printf("  Judge 跳过（人工已接手）: %s\n", joinShort(rep.JudgeSkippedIDs))
 	}
 	return nil
 }
