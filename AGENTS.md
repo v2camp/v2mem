@@ -36,6 +36,15 @@ curl 发布版或 `make install` 落地的是真实文件，重建仓库不影�
 4. **判据错误自查**（以本仓库当前提交为准，发布版行为可能不同）：`session-start` 的 `empty` 恒为 false，
    只有 `prompt-submit` 的 `empty` 反映检索质量。
 
+## 自动记忆写入（v2mem）
+
+1. 钩子会自动裁决并写入**未审核**记忆；“已入库”不等于“已验收”，不要跳过复核。
+2. 改提示词/模型/提交矩阵后，先看 `mem review stats` 的 confirm/correct/withdraw 与
+   `manual_rate`；异常时先 `MEM_NO_AUTOMATION=1` 停自动写侧，再改配置。
+3. 错误记忆用 `mem review withdraw <id>`；整批回滚先跑
+   `mem review rollback --model-tag <tag> --dry-run` 核对 matched/skipped。
+4. 积压接近 15 天 SLA 时优先处理吞吐/drain，不扩大自动采纳范围。
+
 ## 文档纪律（AI 友好，硬约束）
 
 文档通常会被整体读入 AI 上下文，越长越容易超限、丢弃或稀释关键信息。以下为硬下限之外的硬上限：
