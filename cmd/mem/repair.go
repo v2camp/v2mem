@@ -23,17 +23,23 @@ const repairAllThreshold = 100
 
 func cmdRepair(args []string) error {
 	if len(args) == 0 {
-		return usageError{msg: "缺少子命令，用法: mem repair evidence [id...] [--all] [--dry-run]"}
+		return usageError{msg: "缺少子命令，用法: mem repair evidence|content [选项]；详见 mem repair help"}
 	}
 	switch args[0] {
 	case "evidence":
 		return cmdRepairEvidence(args[1:])
+	case "content":
+		return cmdRepairContent(args[1:])
 	case "help", "-h", "--help":
 		fmt.Println("用法: mem repair <子命令> [选项]")
 		fmt.Println("  evidence [id...] [--all] [--dry-run] [--json]")
 		fmt.Println("      为记忆补证据链（幂等）：传 id 修单条或批量，--all 修全部；")
 		fmt.Printf("      不带参数时，库内少于 %d 条记忆按全量执行，否则要求显式 --all。\n", repairAllThreshold)
 		fmt.Println("      --dry-run 只报告哪些记忆待修复，不写库。")
+		fmt.Println("  content [id...] [--filter=narrative|overlong|all] [--dry-run|--preview] [--json]")
+		fmt.Println("      用模型把过程叙述提炼成「触发场景 → 判断依据 → 处置」；")
+		fmt.Println("      --dry-run 只列候选；--preview 出 before/after；默认改写并归档到 <db 目录>/enhance/。")
+		fmt.Println("      --rollback <tag|file> [--dry-run] 按归档逐条校验后还原。")
 		return nil
 	default:
 		return usageError{msg: fmt.Sprintf("未知子命令 %q，用法见 mem repair help", args[0])}
