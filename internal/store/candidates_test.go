@@ -58,14 +58,17 @@ func TestCandidateNotSearchableUntilAccept(t *testing.T) {
 	if source != "distill-accept" {
 		t.Fatalf("source=%s", source)
 	}
-	var edges int
+	// 记忆沿用候选 id：派生关系由 id 同值表达，不再写 src==dst 的自环边。
+	if acc.MemoryID != res.Candidate.ID {
+		t.Fatalf("记忆应继承候选 id，got memory=%s candidate=%s", acc.MemoryID, res.Candidate.ID)
+	}
+	var selfLoops int
 	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM edges WHERE src=? AND dst=? AND rel='derived_from'`,
-		acc.MemoryID, res.Candidate.ID).Scan(&edges); err != nil {
+		`SELECT COUNT(*) FROM edges WHERE src=dst AND rel='derived_from'`).Scan(&selfLoops); err != nil {
 		t.Fatal(err)
 	}
-	if edges != 1 {
-		t.Fatalf("应有 1 条 derived_from，got %d", edges)
+	if selfLoops != 0 {
+		t.Fatalf("id 继承后不得写自环边，got %d", selfLoops)
 	}
 	hits, err = s.Search(SearchQuery{Query: "用户目录", Limit: 5})
 	if err != nil || len(hits) != 1 {
@@ -194,6 +197,13 @@ func TestGCCandidatesRollsBackWhenEdgeCleanupFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.AcceptCandidate(accepted.Candidate.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 采纳沿用候选 id，不再写自环边；这里手工补一条旧模型留下的跨 id 派生边，
+	// GC 清边失败仍必须整轮回滚。
+	otherMem := mustAdd(t, s, "旧模型留下的派生记忆")
+	if _, err := s.db.Exec(`INSERT INTO edges(src,dst,rel) VALUES(?,?, 'derived_from')`,
+		otherMem, accepted.Candidate.ID); err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().Add(-100 * 24 * time.Hour).Unix()
@@ -497,8 +507,8 @@ func TestSearchUnaffectedByCandidateVolume(t *testing.T) {
 }
 
 // 采纳必须在单事务里完成：任一步失败都不能留下半状态。
-// 这里让「插 derived_from 边」失败（前面的写记忆、回填候选都已执行），
-// 断言整笔回滚；去掉故障后重试必须一次成功，且不产生重复记忆或悬空边。
+// 这里让最后一步「写 mem_sigs 签名」失败（前面的写记忆、回填候选都已执行），
+// 断言整笔回滚；去掉故障后重试必须一次成功，且不产生重复记忆或自环边。
 func TestAcceptRollsBackOnMidFailureAndIsRepairable(t *testing.T) {
 	s := newTestStore(t)
 	res, err := s.InsertCandidate(CandidateInput{
@@ -509,12 +519,12 @@ func TestAcceptRollsBackOnMidFailureAndIsRepairable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(
-		`CREATE TRIGGER fail_edges BEFORE INSERT ON edges
+		`CREATE TRIGGER fail_sigs BEFORE INSERT ON mem_sigs
 		 BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.AcceptCandidate(res.Candidate.ID); err == nil {
-		t.Fatal("补边失败时采纳必须报错")
+		t.Fatal("写签名失败时采纳必须报错")
 	}
 	var memories, edges int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&memories); err != nil {
@@ -534,7 +544,7 @@ func TestAcceptRollsBackOnMidFailureAndIsRepairable(t *testing.T) {
 		t.Fatalf("回滚后候选应仍是 pending 且无 memory_id，got %+v", c)
 	}
 
-	if _, err := s.db.Exec(`DROP TRIGGER fail_edges`); err != nil {
+	if _, err := s.db.Exec(`DROP TRIGGER fail_sigs`); err != nil {
 		t.Fatal(err)
 	}
 	acc, err := s.AcceptCandidate(res.Candidate.ID)
@@ -547,13 +557,16 @@ func TestAcceptRollsBackOnMidFailureAndIsRepairable(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&memories); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM edges WHERE src=? AND dst=? AND rel='derived_from'`,
-		acc.MemoryID, res.Candidate.ID).Scan(&edges); err != nil {
+	if memories != 1 || acc.MemoryID != res.Candidate.ID {
+		t.Fatalf("应恰好 1 条记忆且 id 继承候选，memories=%d memory=%s candidate=%s",
+			memories, acc.MemoryID, res.Candidate.ID)
+	}
+	var selfLoops int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM edges WHERE src=dst`).Scan(&selfLoops); err != nil {
 		t.Fatal(err)
 	}
-	if memories != 1 || edges != 1 {
-		t.Fatalf("应恰好 1 条记忆 1 条边，memories=%d edges=%d", memories, edges)
+	if selfLoops != 0 {
+		t.Fatalf("不得写自环边，got %d", selfLoops)
 	}
 	// 悬空边：每条 derived_from 的 src 都必须能在 memories 里找到。
 	var dangling int
@@ -567,21 +580,20 @@ func TestAcceptRollsBackOnMidFailureAndIsRepairable(t *testing.T) {
 	}
 }
 
-// 已采纳的候选再次调用必须补回缺失的边。
-// 旧实现直接 return，边一旦丢失就永久缺失，且因为状态已是 accepted 再也修不回来。
-func TestAcceptAlreadyRepairsMissingEdge(t *testing.T) {
+// 已采纳的候选再次调用必须幂等：不新建记忆、不重复计数、不写自环边。
+// 旧实现靠补 derived_from 边修复丢失的派生关系；记忆继承候选 id 后关系由
+// id 同值表达，已没有可补的边，重放职责收敛为补证据链与裁决账
+// （由 TestCommitAcceptReplayOnlyRepairsLinks 覆盖）。
+func TestAcceptReplayIsIdempotentWithoutSelfLoop(t *testing.T) {
 	s := newTestStore(t)
 	res, err := s.InsertCandidate(CandidateInput{
-		SessionID: "s", Kind: "pitfall", Content: "报错：边丢了就补回来", Source: "distill",
+		SessionID: "s", Kind: "pitfall", Content: "报错：重放不得改变身份", Source: "distill",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	first, err := s.AcceptCandidate(res.Candidate.ID)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Exec(`DELETE FROM edges WHERE src=?`, first.MemoryID); err != nil {
 		t.Fatal(err)
 	}
 	again, err := s.AcceptCandidate(res.Candidate.ID)
@@ -591,14 +603,18 @@ func TestAcceptAlreadyRepairsMissingEdge(t *testing.T) {
 	if !again.Already || again.MemoryID != first.MemoryID {
 		t.Fatalf("重复采纳应幂等，got %+v", again)
 	}
-	var edges int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM edges WHERE src=? AND dst=? AND rel='derived_from'`,
-		first.MemoryID, res.Candidate.ID).Scan(&edges); err != nil {
+	if first.MemoryID != res.Candidate.ID {
+		t.Fatalf("记忆 id 应等于候选 id，got %s want %s", first.MemoryID, res.Candidate.ID)
+	}
+	var memories, selfLoops int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM memories`).Scan(&memories); err != nil {
 		t.Fatal(err)
 	}
-	if edges != 1 {
-		t.Fatalf("重放应补回边，got %d", edges)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM edges WHERE src=dst`).Scan(&selfLoops); err != nil {
+		t.Fatal(err)
+	}
+	if memories != 1 || selfLoops != 0 {
+		t.Fatalf("重放不得新建记忆或写自环边，memories=%d selfLoops=%d", memories, selfLoops)
 	}
 }
 

@@ -428,7 +428,7 @@ func (s *Store) AutoCommitCandidate(idOrPrefix string, expectedRevision int) (*C
 //   - 裁决 actor 写 commit.ActorModelAuto、modelTag 落 commit_decisions，
 //     记忆留未审核态（upsertAcceptedMemory 默认 review_state=”），复核摘要从此有真实数据。
 //
-// 自动 accept 一律走 commitAcceptView：revision CAS、幂等键、edges.derived_from、
+// 自动 accept 一律走 commitAcceptView：revision CAS、幂等键、记忆 id 继承候选、
 // memory_evidence 绑定全部保留；Judge accept 不得绕过提交矩阵（§7 第 7 条）。
 // 非 auto_commit 的动作只记一条裁决（同样带 modelTag），不写记忆、不推进候选状态。
 func (s *Store) ModelAutoCommit(idOrPrefix string, expectedRevision int, modelTag string) (*CommitResult, error) {
@@ -492,6 +492,24 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 		if err != nil {
 			return err
 		}
+		// 老候选（规则蒸馏路径）只有 obs_ids_json，采纳前补一次证据链：
+		// 否则 memory_evidence 为空、provenance 退化成 preview，溯源断在候选上。
+		if len(rows) == 0 {
+			var rawObs string
+			if qerr := q.QueryRowContext(ctx,
+				`SELECT obs_ids_json FROM candidates WHERE id = ?`, cur.ID).Scan(&rawObs); qerr != nil &&
+				!errors.Is(qerr, sql.ErrNoRows) {
+				return qerr
+			}
+			if obsIDs := unmarshalObsIDs(rawObs); len(obsIDs) > 0 {
+				if _, err := s.candidateEvidenceFromObs(ctx, q, cur.ID, obsIDs, time.Now().Unix()); err != nil {
+					return err
+				}
+				if rows, err = s.loadCandidateEvidence(ctx, q, cur.ID); err != nil {
+					return err
+				}
+			}
+		}
 		items := evidenceItems(rows)
 		evidenceHash := commit.HashEvidence(items)
 		// model_tag 纳入幂等维度：换提示词后同候选的新裁决不被旧键挡成重放（§6.3）。
@@ -530,13 +548,17 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 			WHERE id = ?`, prov, memoryID); err != nil {
 			return err
 		}
-		if err := writeMemoryEvidence(ctx, q, memoryID, rows, now); err != nil {
+		if _, err := writeMemoryEvidence(ctx, q, memoryID, rows, now); err != nil {
 			return err
 		}
-		if _, err := q.ExecContext(ctx,
-			`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
-			memoryID, cur.ID); err != nil {
-			return err
+		// 记忆沿用候选 id 后 src 与 dst 同值，自环不表达任何派生关系，跳过；
+		// 「记忆 ← 候选」由 candidates.memory_id 与 id 同值本身表达。
+		if memoryID != cur.ID {
+			if _, err := q.ExecContext(ctx,
+				`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
+				memoryID, cur.ID); err != nil {
+				return err
+			}
 		}
 		// 只允许 pending → accepted：并发唯一赢家由 revision CAS 保证，
 		// 第二个写者会看到 0 行而不是覆盖先到者的 memory_id。
@@ -596,7 +618,7 @@ func (s *Store) replayAccepted(ctx context.Context, q sqlQuerier, cur *CommitCan
 		return nil, fmt.Errorf("候选 %s 的 memory_id %s 已不存在，不能重放", cur.ID, cur.MemoryID)
 	}
 	now := time.Now().Unix()
-	if err := writeMemoryEvidence(ctx, q, cur.MemoryID, rows, now); err != nil {
+	if _, err := writeMemoryEvidence(ctx, q, cur.MemoryID, rows, now); err != nil {
 		return nil, err
 	}
 	prov := commitProvenance(rows, cur.ID)
@@ -605,10 +627,13 @@ func (s *Store) replayAccepted(ctx context.Context, q sqlQuerier, cur *CommitCan
 		WHERE id = ?`, prov, cur.MemoryID); err != nil {
 		return nil, err
 	}
-	if _, err := q.ExecContext(ctx,
-		`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
-		cur.MemoryID, cur.ID); err != nil {
-		return nil, err
+	// 与首次采纳同规则：记忆沿用候选 id 时 src==dst，自环不表达派生关系。
+	if cur.MemoryID != cur.ID {
+		if _, err := q.ExecContext(ctx,
+			`INSERT OR IGNORE INTO edges(src, dst, rel) VALUES (?, ?, 'derived_from')`,
+			cur.MemoryID, cur.ID); err != nil {
+			return nil, err
+		}
 	}
 	// 重放不是「又新建了一条」：created_memory 必须为 0，否则按版本回滚会误删别人的记忆。
 	if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash, action, actor, reasons,
@@ -679,7 +704,11 @@ func (s *Store) upsertAcceptedMemory(ctx context.Context, q sqlQuerier, cur *Com
 		}
 	case errors.Is(err, sql.ErrNoRows):
 		created = true
-		id = newID()
+		// 记忆沿用候选 id：候选与记忆是同一条知识的两个落点，各发一个随机 id
+		// 会让「这条记忆由谁提出、依据哪批证据」必须再反查两张表才能对上。
+		// 候选 id 与记忆 id 同为 32 位 hex，复用不损唯一性；跨设备身份仍是
+		// (content_hash, project)（见 sync.go 头部），不受本地 id 影响。
+		id = cur.ID
 		if _, err := q.ExecContext(ctx, `INSERT INTO memories
 			(id, content, content_idx, kind, content_hash, project, salience,
 			 created_at, updated_at, last_seen_at, expires_at,
@@ -701,21 +730,201 @@ func (s *Store) upsertAcceptedMemory(ctx context.Context, q sqlQuerier, cur *Com
 	return id, created, nil
 }
 
-func writeMemoryEvidence(ctx context.Context, q sqlQuerier, memoryID string, rows []candidateEvidenceRow, now int64) error {
+// MemoryRepairReport 是一次证据链修复的汇总（CLI --json 直接输出）。
+type MemoryRepairReport struct {
+	Scanned       int                `json:"scanned"`
+	Repaired      int                `json:"repaired"`
+	Skipped       int                `json:"skipped"`
+	Failed        int                `json:"failed"`
+	AddedEvidence int                `json:"added_evidence"`
+	DryRun        bool               `json:"dry_run"`
+	Items         []MemoryRepairItem `json:"items,omitempty"`
+}
+
+// MemoryRepairItem 是单条记忆的修复结果。
+type MemoryRepairItem struct {
+	MemoryID      string `json:"memory_id"`
+	Status        string `json:"status"` // repaired | skipped | failed | pending
+	AddedEvidence int    `json:"added_evidence,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+// RepairAllMemoryEvidence 遍历库内全部记忆补证据链。
+//
+// dryRun 只报告「哪些记忆缺证据且能从候选的 obs_ids 补」，不写库；执行态逐条
+// 调 RepairMemoryEvidence（每条一个事务，失败不阻断其余条目）。
+// 规模阈值不在这里卡：调用方决定是否该走全量（CLI 的 100 条约定）。
+func (s *Store) RepairAllMemoryEvidence(dryRun bool) (*MemoryRepairReport, error) {
+	rows, err := s.db.Query(`SELECT id FROM memories ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	rep := &MemoryRepairReport{Scanned: len(ids), DryRun: dryRun}
+	for _, id := range ids {
+		if dryRun {
+			needs, err := s.memoryNeedsEvidenceRepair(id)
+			if err != nil {
+				rep.Failed++
+				rep.Items = append(rep.Items, MemoryRepairItem{MemoryID: id, Status: "failed", Error: err.Error()})
+				continue
+			}
+			if needs {
+				rep.Items = append(rep.Items, MemoryRepairItem{MemoryID: id, Status: "pending"})
+			} else {
+				rep.Skipped++
+			}
+			continue
+		}
+		n, err := s.RepairMemoryEvidence(id)
+		switch {
+		case err != nil:
+			rep.Failed++
+			rep.Items = append(rep.Items, MemoryRepairItem{MemoryID: id, Status: "failed", Error: err.Error()})
+		case n > 0:
+			rep.Repaired++
+			rep.AddedEvidence += n
+			rep.Items = append(rep.Items, MemoryRepairItem{MemoryID: id, Status: "repaired", AddedEvidence: n})
+		default:
+			rep.Skipped++
+		}
+	}
+	return rep, nil
+}
+
+// MemoryNeedsEvidenceRepair 报告一条记忆是否「缺证据且补得回来」，供 --dry-run。
+func (s *Store) MemoryNeedsEvidenceRepair(idOrPrefix string) (bool, error) {
+	id, err := s.resolveID(idOrPrefix)
+	if err != nil {
+		return false, err
+	}
+	return s.memoryNeedsEvidenceRepair(id)
+}
+
+// memoryNeedsEvidenceRepair 判断一条记忆是否「缺证据但补得回来」：
+// memory_evidence 为空，且它的候选还留着 obs_ids_json。两者都成立才算待修，
+// 否则是无来源的直写记忆，补不了也不该报成失败。
+func (s *Store) memoryNeedsEvidenceRepair(memoryID string) (bool, error) {
+	var haveEvidence, haveObs int
+	err := s.db.QueryRow(`SELECT
+		  (SELECT COUNT(*) FROM memory_evidence e WHERE e.memory_id = ?),
+		  (SELECT COUNT(*) FROM candidates c
+		     WHERE c.memory_id = ? AND c.obs_ids_json NOT IN ('', '[]'))`,
+		memoryID, memoryID).Scan(&haveEvidence, &haveObs)
+	if err != nil {
+		return false, err
+	}
+	return haveEvidence == 0 && haveObs > 0, nil
+}
+
+// RepairMemoryEvidence 为已落库的记忆补齐证据链（幂等）。
+//
+// 历史缺口：规则蒸馏路径的候选只写 obs_ids_json，candidate_evidence 为空，
+// 采纳时 writeMemoryEvidence 读不到行，memory_evidence 与 provenance 双双退化
+// （2026-11-27 实例：库内唯一一条记忆只能追到 provenance.preview）。
+// 这里按候选的 obs_ids 重建两表并刷新 provenance；已有行不动，可重复执行。
+func (s *Store) RepairMemoryEvidence(memoryID string) (int, error) {
+	id, err := s.resolveID(memoryID)
+	if err != nil {
+		return 0, err
+	}
+	added := 0
+	err = s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
+		var candID, rawObs string
+		err := q.QueryRowContext(ctx, `SELECT id, obs_ids_json
+			FROM candidates WHERE memory_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`,
+			id).Scan(&candID, &rawObs)
+		if errors.Is(err, sql.ErrNoRows) {
+			// 没有候选背书的直写记忆：没有可补的来源，幂等返回 0。
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var oldProv string
+		if err := q.QueryRowContext(ctx,
+			`SELECT COALESCE(provenance, '') FROM memories WHERE id = ?`, id).Scan(&oldProv); err != nil {
+			return err
+		}
+		obsIDs := unmarshalObsIDs(rawObs)
+		if len(obsIDs) == 0 {
+			return nil
+		}
+		now := time.Now().Unix()
+		if _, err := s.candidateEvidenceFromObs(ctx, q, candID, obsIDs, now); err != nil {
+			return err
+		}
+		rows, err := s.loadCandidateEvidence(ctx, q, candID)
+		if err != nil {
+			return err
+		}
+		// 计数以「记忆侧实际新增的证据行」为准：候选证据可能早已存在，
+		// 只有 memory_evidence 缺失，这种修复同样应算修好了一条。
+		n, err := writeMemoryEvidence(ctx, q, id, rows, now)
+		if err != nil {
+			return err
+		}
+		if _, err := q.ExecContext(ctx, `UPDATE memories SET provenance = ? WHERE id = ?`,
+			keepOriginalHash(oldProv, commitProvenance(rows, candID)), id); err != nil {
+			return err
+		}
+		added = n
+		return nil
+	})
+	return added, err
+}
+
+// keepOriginalHash 用新 provenance 覆盖旧的，但保留其中已有的 original_hash。
+// 修正过的记忆靠这个字段记住「改写前是哪条」，不能被一次证据补链抹掉。
+func keepOriginalHash(old, next string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(old), &m); err != nil {
+		return next
+	}
+	h, _ := m["original_hash"].(string)
+	if h == "" {
+		return next
+	}
+	return provenanceWithOriginalHash(next, h)
+}
+
+// writeMemoryEvidence 把候选证据绑定到记忆上，返回本次新增的行数。
+// 用 RowsAffected 而不是 len(rows)：重复绑定是幂等的，计入条数会让
+// RepairMemoryEvidence 把「已修过」误报成「又修了一次」。
+func writeMemoryEvidence(ctx context.Context, q sqlQuerier, memoryID string, rows []candidateEvidenceRow, now int64) (int, error) {
+	added := 0
 	for _, e := range rows {
 		if strings.TrimSpace(e.EvidenceID) == "" && strings.TrimSpace(e.EventUID) == "" {
 			continue
 		}
-		if _, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO memory_evidence(
+		res, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO memory_evidence(
 			memory_id, evidence_id, event_uid, archive_hash, raw_locator, grade,
 			seq, occurred_at_ns, created_at
 		) VALUES (?,?,?,?,?,?,?,?,?)`,
 			memoryID, e.EvidenceID, e.EventUID, e.ArchiveHash, e.RawLocator,
-			string(e.Grade), e.Seq, e.OccurredAtNS, now); err != nil {
-			return err
+			string(e.Grade), e.Seq, e.OccurredAtNS, now)
+		if err != nil {
+			return added, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			added += int(n)
 		}
 	}
-	return nil
+	return added, nil
 }
 
 // recordDecision 写一条裁决账。

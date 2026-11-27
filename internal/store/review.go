@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/commit"
+	"github.com/v2camp/v2mem/internal/similarity"
 )
 
 // 记忆的人工后审核状态。” 表示未审核（直写来源之外的默认值）。
@@ -547,18 +548,47 @@ type MemoryReviewReport struct {
 
 type memoryReviewRow struct {
 	content, state, by string
+	hash, provenance   string
 	at                 int64
 }
 
 func (s *Store) memoryReviewByID(ctx context.Context, q sqlQuerier, id string) (memoryReviewRow, error) {
 	var r memoryReviewRow
 	err := q.QueryRowContext(ctx,
-		`SELECT content, review_state, reviewed_at, reviewed_by FROM memories WHERE id = ?`, id).
-		Scan(&r.content, &r.state, &r.at, &r.by)
+		`SELECT content, review_state, reviewed_at, reviewed_by,
+		        content_hash, COALESCE(provenance, '') FROM memories WHERE id = ?`, id).
+		Scan(&r.content, &r.state, &r.at, &r.by, &r.hash, &r.provenance)
 	if errors.Is(err, sql.ErrNoRows) {
 		return r, fmt.Errorf("未找到记忆: %s", id)
 	}
 	return r, err
+}
+
+// provenanceWithOriginalHash 把「修正前的 content_hash」并入 provenance。
+//
+// content_hash 同时是跨设备归并的身份键（sync.go 头部），人工修正会让本机换一个
+// 身份；original_hash 让 sync 与排障还能回答「这条是哪条改写来的」。只写一次：
+// 连续修正保留最初那次的 hash，而不是被上一次的中间值覆盖。
+func provenanceWithOriginalHash(raw, originalHash string) string {
+	originalHash = strings.TrimSpace(originalHash)
+	if originalHash == "" {
+		return raw
+	}
+	m := map[string]any{}
+	if s := strings.TrimSpace(raw); s != "" {
+		if err := json.Unmarshal([]byte(s), &m); err != nil {
+			// 旧行可能是非 JSON 的自由文本：不丢它，包一层保留。
+			m = map[string]any{"legacy": s}
+		}
+	}
+	if _, ok := m["original_hash"]; !ok {
+		m["original_hash"] = originalHash
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return string(b)
 }
 
 // ApplyMemoryReview 在单事务里完成一次人工后审核动作：状态迁移 +（withdraw）候选
@@ -569,6 +599,13 @@ func (s *Store) ApplyMemoryReview(in MemoryReviewInput) (*MemoryReviewReport, er
 	if in.MemoryID == "" {
 		return nil, errors.New("缺少记忆 id")
 	}
+	// 与其他读入口一致支持前缀：mem ls 默认只展示前 8 位，复核动作必须能直接接住它，
+	// 否则用户得先 mem show 拿全 id 才能动作——这正是「不便于追踪」的一处断裂。
+	resolved, err := s.resolveID(in.MemoryID)
+	if err != nil {
+		return nil, err
+	}
+	in.MemoryID = resolved
 	switch in.Action {
 	case ReviewActionConfirm, ReviewActionCorrect, ReviewActionWithdraw, ReviewActionRestore:
 	default:
@@ -585,7 +622,7 @@ func (s *Store) ApplyMemoryReview(in MemoryReviewInput) (*MemoryReviewReport, er
 	}
 
 	var rep *MemoryReviewReport
-	err := s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
+	err = s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
 		cur, err := s.memoryReviewByID(ctx, q, in.MemoryID)
 		if err != nil {
 			return err
@@ -620,11 +657,38 @@ func (s *Store) ApplyMemoryReview(in MemoryReviewInput) (*MemoryReviewReport, er
 		}
 
 		if in.Action == ReviewActionCorrect {
-			// 人工修订正文：content_idx 必须同步，FTS 触发器据此重建索引。
+			// 修正后的正文是新的内容指纹：content_hash 必须跟着变。否则
+			// 「同 (content_hash, project) 不重复」仍按旧文本判定，库里会同时存在
+			// 「旧 hash + 新正文」和「新 hash 的同内容候选」两个身份。
+			// 原始 hash 留在 provenance.original_hash，跨设备仍能认出这是哪一条。
+			newHash := HashOf(after.Content)
+			var conflict string
+			switch err := q.QueryRowContext(ctx, `SELECT id FROM memories
+				WHERE content_hash = ? AND id <> ?
+				  AND project = (SELECT project FROM memories WHERE id = ?)`,
+				newHash, in.MemoryID, in.MemoryID).Scan(&conflict); {
+			case err == nil:
+				return fmt.Errorf("修正后的正文与记忆 %s 内容相同，应先撤回本条再合并到该条", conflict)
+			case errors.Is(err, sql.ErrNoRows):
+			default:
+				return err
+			}
+			// content_idx 必须同步，FTS 触发器据此重建索引。
 			if _, err := q.ExecContext(ctx, `UPDATE memories
-				SET content = ?, content_idx = ?, review_state = ?, reviewed_at = ?, reviewed_by = ?, updated_at = ?
-				WHERE id = ?`, after.Content, indexText(after.Content), after.ReviewState,
-				after.ReviewedAt, after.ReviewedBy, in.Now, in.MemoryID); err != nil {
+				SET content = ?, content_idx = ?, content_hash = ?, provenance = ?,
+				    review_state = ?, reviewed_at = ?, reviewed_by = ?, updated_at = ?
+				WHERE id = ?`, after.Content, indexText(after.Content), newHash,
+				provenanceWithOriginalHash(cur.provenance, cur.hash),
+				after.ReviewState, after.ReviewedAt, after.ReviewedBy, in.Now, in.MemoryID); err != nil {
+				return err
+			}
+			// 签名与正文同事务更新。sync.go 头部约定「凡是改 content 的分支都会同步
+			// mem_sigs 签名与 content_idx」，这里此前漏了签名：修正过的记忆仍拿旧文本
+			// 的 MinHash 参与模糊检索，改完反而搜不到。content_hash 不动——它是身份键，
+			// 人工换写法不改变「这是哪条事实」。
+			if _, err := q.ExecContext(ctx,
+				`INSERT OR REPLACE INTO mem_sigs(memory_id, sig) VALUES (?, ?)`,
+				in.MemoryID, encodeSig(similarity.Sign(after.Content))); err != nil {
 				return err
 			}
 		} else if _, err := q.ExecContext(ctx, `UPDATE memories
