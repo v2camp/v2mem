@@ -21,6 +21,8 @@ func TestParseDraftsMatrix(t *testing.T) {
 		{"空数组", "[]", 2, 0, 0, false},
 		{"JSON 数组", `[{"kind":"decision","content":"a","evidence_idx":[1]}]`, 2, 1, 0, false},
 		{"JSONL", "{\"kind\":\"pitfall\",\"content\":\"b\",\"evidence_idx\":[2]}\n{\"kind\":\"task\",\"content\":\"c\",\"evidence_idx\":[1,2]}", 2, 2, 0, false},
+		{"美化多行对象", "{\n  \"kind\": \"pitfall\",\n  \"content\": \"b\",\n  \"evidence_idx\": [1]\n}", 2, 1, 0, false},
+		{"美化多对象串联", "{\n  \"kind\": \"decision\",\n  \"content\": \"a\",\n  \"evidence_idx\": [1]\n}\n{\n  \"kind\": \"task\",\n  \"content\": \"c\",\n  \"evidence_idx\": [2]\n}", 2, 2, 0, false},
 		{"部分无效", "{\"kind\":\"decision\",\"content\":\"a\",\"evidence_idx\":[1]}\n{\"kind\":\"nope\",\"content\":\"b\",\"evidence_idx\":[1]}", 2, 1, 1, false},
 		{"坏 JSON", `{"kind":`, 2, 0, 0, true},
 		{"纯散文", "这是一段解释，不是 JSON", 2, 0, 0, true},

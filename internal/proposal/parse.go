@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
@@ -215,6 +216,17 @@ func ParseDrafts(raw string, evidenceCount int) (parseResult, error) {
 		}
 		return validateAll(arr, evidenceCount)
 	}
+	if strings.HasPrefix(raw, "{") {
+		// CLI 执行器常把「一行一个 JSON」渲染成多行美化 JSON：按行拆会把每一行
+		// 都当成缺半边的碎片，整窗被误判为非法。先按 JSON 值序列解析整段输出；
+		// 解析不了（例如夹了散文）再回退到逐行 JSONL。
+		if res, ok := parseJSONValues(raw, evidenceCount); ok {
+			if len(res.Drafts) == 0 && res.Invalid == 0 {
+				return parseResult{}, nil
+			}
+			return res, nil
+		}
+	}
 
 	var out parseResult
 	for _, line := range strings.Split(raw, "\n") {
@@ -249,6 +261,40 @@ func ParseDrafts(raw string, evidenceCount int) (parseResult, error) {
 		return parseResult{}, fmt.Errorf("%w: 响应里没有可解析的 JSON 行", ErrBadOutput)
 	}
 	return out, nil
+}
+
+// parseJSONValues 把整段输出当作连续的 JSON 值解析：单个对象、数组，或
+// 多个对象直接串联（美化 JSONL）。返回 ok=false 表示这不是纯 JSON 值序列，
+// 调用方应回退到逐行 JSONL 解析。
+func parseJSONValues(raw string, evidenceCount int) (parseResult, bool) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	var out parseResult
+	for {
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, true
+			}
+			return parseResult{}, false
+		}
+		var w wireDraft
+		if err := json.Unmarshal(v, &w); err == nil {
+			if d, ok := validateDraft(w, evidenceCount); ok {
+				out.Drafts = append(out.Drafts, d)
+			} else {
+				out.Invalid++
+			}
+			continue
+		}
+		var arr []wireDraft
+		if err := json.Unmarshal(v, &arr); err == nil {
+			res, _ := validateAll(arr, evidenceCount)
+			out.Drafts = append(out.Drafts, res.Drafts...)
+			out.Invalid += res.Invalid
+			continue
+		}
+		return parseResult{}, false
+	}
 }
 
 func validateAll(arr []wireDraft, evidenceCount int) (parseResult, error) {
