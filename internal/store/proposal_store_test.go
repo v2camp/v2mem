@@ -449,6 +449,31 @@ func TestListProposalBundlesFiltersAndOrders(t *testing.T) {
 	}
 }
 
+// Judge 上下文：候选引用的证据摘要按创建顺序取回，最多 3 条。
+func TestCandidateEvidenceSummaries(t *testing.T) {
+	s := newTestStore(t)
+	rec := mustCaptureEvidence(t, s, evidenceInput("uid-sum-1", 0))
+	in := ProposalCandidateInput{
+		SessionID: "s", Project: "p", BundleID: "b", RunID: "r", ProposalIdx: 1,
+		Kind: "decision", Scope: "project", Content: "决定：证据摘要",
+		ObsIDs: []string{rec.ID},
+		Evidence: []CandidateEvidence{{
+			EvidenceID: rec.ID, EventUID: rec.EventUID, SourceID: "src-a", SourceSeq: 1,
+		}},
+	}
+	res, err := s.InsertProposalCandidate(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries, err := s.CandidateEvidenceSummaries(res.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0] != "summary-uid-sum-1" {
+		t.Fatalf("证据摘要不对: %+v", summaries)
+	}
+}
+
 func TestInsertProposalCandidateAndMergeEvidence(t *testing.T) {
 	s := newTestStore(t)
 	ev := []CandidateEvidence{

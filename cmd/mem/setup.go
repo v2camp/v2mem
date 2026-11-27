@@ -117,7 +117,7 @@ func cmdSetup(args []string) error {
 	case "off":
 		next := cfg
 		next.Mode = "off"
-		next.AutoSpawn = false // 关掉模型来源就不能留着自动外发的开关
+		next.AutoSpawn = distill.BoolPtr(false) // 关掉模型来源就不能留着自动外发的开关
 		if *dryRun {
 			fmt.Printf("dry-run：将写入 mode=off（不写盘）\npath      %s\n", path)
 			return nil
@@ -143,7 +143,7 @@ func cmdSetup(args []string) error {
 		if err != nil {
 			return err
 		}
-		next.AutoSpawn = true
+		next.AutoSpawn = distill.BoolPtr(true)
 		// 第 3 步：真实调用一次 judge 端点；没通过就不把密钥落盘。
 		if err := apiDryRun(next); err != nil {
 			return fmt.Errorf("API dry-run 未通过，未写入 %s: %w", path, err)
@@ -204,7 +204,7 @@ func cmdSetup(args []string) error {
 	next.Mode = "cli"
 	next.CLI = name
 	next.ModelTag = tag
-	next.AutoSpawn = true
+	next.AutoSpawn = distill.BoolPtr(true)
 
 	if *dryRun {
 		fmt.Printf("dry-run 通过：%s（%s）。将写入 auto_spawn=true。未写盘。\npath      %s\n", name, tag, path)
@@ -382,7 +382,9 @@ func printSetupStatus(path string) error {
 	} else {
 		fmt.Printf("api_key    %s（来自 model.json）\n", redactKey(cfg.APIKey))
 	}
-	fmt.Printf("auto_spawn %s\n", setupOnOff(cfg.AutoSpawn))
+	// 显示生效状态而不是原始字段：缺省（无 auto_spawn）在有模型时即开，
+	// 用户查 --status 想知道的是「现在会不会跑」，不是 JSON 里有没有这个键。
+	fmt.Printf("auto_spawn %s\n", setupOnOff(cfg.AutoSpawnEnabled()))
 	fmt.Printf("perm       %s\n", perm)
 	if cfg.Mode == "" || cfg.Mode == "off" {
 		fmt.Println("下一步：mem setup 配置模型来源（--dry-run 只验证不写盘）。")

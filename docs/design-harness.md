@@ -373,11 +373,11 @@ stderr 落 `spawn.log`；父进程退出后子进程被 reparent 到 launchd/ini
    （只有 stderr 落盘），排障时只能查库。
 4. 大 Bundle、长事务与睡眠、GC、`--retention` 的交互未覆盖。
 
-**附带发现（非 detach 语义，未改代码）**：实验里所有 `candidates.run_id` 与
-`evidence_bundles.last_run_id` 恒为空。原因：`internal/proposal/runner.go:226` 先给
-`out.RunID` 赋值，`:239` 的 `out.Result = res` 又把嵌入的 `Result.RunID` 覆盖成空串，
-`:257` / `:405` 随后按空值落库。后果是运行账与候选无法按 run_id 关联，
-`FinishProposalBundle` 的重复完成幂等分支（`internal/store/proposal_store.go:225`）也
-永不命中。复现：任意 `mem distill --proposal --bundle <id> --db <tmp>` 后
-`select run_id from candidates`。
+**附带发现（已修复）**：实验里曾出现所有 `candidates.run_id` 与
+`evidence_bundles.last_run_id` 恒为空。原因：`internal/proposal/runner.go` 先给
+`out.RunID` 赋值，随后的 `out.Result = res` 又把嵌入的 `Result.RunID` 覆盖成空串。
+后续修复让 RunID 在 `runClaimed` 入口生成、执行结果保留同一值，并以该 ID 写
+`distill_runs.id`；候选/Bundle 的 run_id 因此指向真实运行账，`FinishProposalBundle`
+的重复完成幂等分支也恢复命中。回归用例
+`TestRunnerRunIDLinksCandidateLedgerAndBundle` / `TestRunnerNoopRunIDLinksLedger`。
 

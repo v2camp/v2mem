@@ -432,6 +432,20 @@ func (s *Store) AutoCommitCandidate(idOrPrefix string, expectedRevision int) (*C
 // memory_evidence 绑定全部保留；Judge accept 不得绕过提交矩阵（§7 第 7 条）。
 // 非 auto_commit 的动作只记一条裁决（同样带 modelTag），不写记忆、不推进候选状态。
 func (s *Store) ModelAutoCommit(idOrPrefix string, expectedRevision int, modelTag string) (*CommitResult, error) {
+	return s.matrixAutoCommit(idOrPrefix, expectedRevision, commit.ActorModelAuto, modelTag)
+}
+
+// JudgeAutoCommit 是 Judge accept 的唯一落库入口（P4 §7 第 7 条）。
+//
+// 与 ModelAutoCommit 同一条矩阵路径（AllowModelAuto），只有 auto_commit 才写记忆；
+// Defer/Conflict 只记一条 actor=judge 的裁决。绝不允许直接 CommitAccept——
+// 那会让判定器绕过矩阵成为特权通道。
+func (s *Store) JudgeAutoCommit(idOrPrefix string, expectedRevision int, modelTag string) (*CommitResult, error) {
+	return s.matrixAutoCommit(idOrPrefix, expectedRevision, commit.ActorJudge, modelTag)
+}
+
+// matrixAutoCommit 是 model-auto / judge 两条自动采纳的公共实现。
+func (s *Store) matrixAutoCommit(idOrPrefix string, expectedRevision int, actor, modelTag string) (*CommitResult, error) {
 	c, err := s.CommitCandidate(idOrPrefix)
 	if err != nil {
 		return nil, err
@@ -446,10 +460,10 @@ func (s *Store) ModelAutoCommit(idOrPrefix string, expectedRevision int, modelTa
 		return nil, err
 	}
 	if d.Action == commit.ActionAutoCommit {
-		return s.commitAcceptView(c, expectedRevision, commit.ActorModelAuto, d.Action, d.ReasonCodes, modelTag)
+		return s.commitAcceptView(c, expectedRevision, actor, d.Action, d.ReasonCodes, modelTag)
 	}
 	res := &CommitResult{
-		Action: d.Action, Actor: commit.ActorModelAuto, EvidenceHash: d.EvidenceHash,
+		Action: d.Action, Actor: actor, EvidenceHash: d.EvidenceHash,
 		EvidenceCount: len(rows), ReasonCodes: d.ReasonCodes, IdempotencyKey: d.IdempotencyKey,
 	}
 	err = s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
@@ -458,7 +472,7 @@ func (s *Store) ModelAutoCommit(idOrPrefix string, expectedRevision int, modelTa
 			return err
 		}
 		return recordDecision(ctx, q, cur.ID, cur.Revision, d.EvidenceHash, d.Action,
-			commit.ActorModelAuto, d.ReasonCodes, cur.MemoryID, modelTag, false)
+			actor, d.ReasonCodes, cur.MemoryID, modelTag, false)
 	})
 	if err != nil {
 		return nil, err
@@ -958,8 +972,31 @@ func recordDecision(ctx context.Context, q sqlQuerier, candidateID string, revis
 	return err
 }
 
+// rejectReasonCode 是拒绝理由码按 actor 的分档：回滚与标定都靠它区分
+// 「谁否决的」。新 actor 默认落 human_reject，宁可少分一档也不误记成自动。
+func rejectReasonCode(actor string) string {
+	switch actor {
+	case commit.ActorJudge:
+		return "judge_reject"
+	case commit.ActorModelAuto:
+		return "model_reject"
+	default:
+		return "human_reject"
+	}
+}
+
 // CommitReject 拒绝候选。expectedRevision < 0 表示按当前 revision 执行。
 func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, reason string) (*CommitResult, error) {
+	return s.commitReject(idOrPrefix, expectedRevision, actor, "", reason)
+}
+
+// JudgeReject 是 Judge 自动 reject 的入口：与 CommitReject 同一条状态机，
+// 区别是把 judge_model（model@promptver）写进裁决账，供按版本回滚。
+func (s *Store) JudgeReject(idOrPrefix string, expectedRevision int, modelTag, reason string) (*CommitResult, error) {
+	return s.commitReject(idOrPrefix, expectedRevision, commit.ActorJudge, modelTag, reason)
+}
+
+func (s *Store) commitReject(idOrPrefix string, expectedRevision int, actor, modelTag, reason string) (*CommitResult, error) {
 	view, err := s.CommitCandidate(idOrPrefix)
 	if err != nil {
 		return nil, err
@@ -967,7 +1004,7 @@ func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, rea
 	if actor == "" {
 		actor = commit.ActorHuman
 	}
-	reasons := []string{"human_reject"}
+	reasons := []string{rejectReasonCode(actor)}
 	if strings.TrimSpace(reason) != "" {
 		reasons = append(reasons, strings.TrimSpace(reason))
 	}
@@ -988,7 +1025,7 @@ func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, rea
 					ErrRevisionConflict, cur.ID, cur.Revision, expectedRevision)
 			}
 			if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash,
-				commit.ActionReject, actor, reasons, "", "", false); err != nil {
+				commit.ActionReject, actor, reasons, "", modelTag, false); err != nil {
 				return err
 			}
 			out = &CommitResult{Action: commit.ActionReject, Actor: actor,
@@ -1016,7 +1053,7 @@ func (s *Store) CommitReject(idOrPrefix string, expectedRevision int, actor, rea
 			return fmt.Errorf("%w: 候选 %s", ErrRevisionConflict, cur.ID)
 		}
 		if err := recordDecision(ctx, q, cur.ID, cur.Revision, evidenceHash,
-			commit.ActionReject, actor, reasons, "", "", false); err != nil {
+			commit.ActionReject, actor, reasons, "", modelTag, false); err != nil {
 			return err
 		}
 		out = &CommitResult{Action: commit.ActionReject, Actor: actor,

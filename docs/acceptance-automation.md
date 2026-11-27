@@ -111,9 +111,11 @@ proposal ok(processed=1) → adjudicate ok(committed=1) → consolidate ok(0) �
 - 结论：父正常退出/单 PID SIGKILL 下子进程存活并按租约恢复；重复触发只消费一次。
 - 已知限制：未设 `Setpgid`，`killpg`/Ctrl-C 会带走子进程；真实整机睡眠未测；
   子进程 stdout 丢弃。
-- **附带发现（未修）**：`candidates.run_id` 与 `evidence_bundles.last_run_id` 恒空。
-  `internal/proposal/runner.go:226` 赋值后被 `:239 out.Result = res` 覆盖，
-  `:257/:405` 按空值落库，`FinishProposalBundle` 幂等分支失效。下一轮修复。
+- **附带发现（已修复）**：`candidates.run_id` 与 `evidence_bundles.last_run_id` 曾恒空。
+  `internal/proposal/runner.go` 先给 `out.RunID` 赋值，随后 `out.Result = res` 又把它覆盖成空串；
+  修复后 RunID 在 `runClaimed` 入口生成、执行结果保留同一值，并作为 `distill_runs.id` 写入，
+  让候选/Bundle 的 run_id 指向真实运行账；回归用例
+  `TestRunnerRunIDLinksCandidateLedgerAndBundle` / `TestRunnerNoopRunIDLinksLedger`。
 
 ### 3.3 H：transcript cursor 终态回收（`2d00fb2` → merge `daf7bf9`）
 
@@ -153,6 +155,9 @@ proposal ok(processed=1) → adjudicate ok(committed=1) → consolidate ok(0) �
 | memories | reviewed 11 + 未审核 7 |
 | eval flow（库副本） | ci 8/13；prod 13/13（legacy_exempt 343） |
 
+口径：`ci` 只用于干净夹具/tag 判据；生产健康检查用 `prod`，不得用生产库的
+ci 红项判 tag，也不得用 prod 绿灯掩盖当前行违例。
+
 解释：机制侧已能自动裁决与清理；生产侧尚未启用 `--model-auto`，
 积压与 13.4 天 SLA 是当前最大运行风险。
 
@@ -166,14 +171,58 @@ proposal ok(processed=1) → adjudicate ok(committed=1) → consolidate ok(0) �
 - `make perf`：`ok test/perf 11.804s`。
 - `make test-watch`：90/90；`test-watch-sync` 21 判据一致。
 
-## 7. 未决 / 下一轮
+## 7. 运行缺口补强（2026-11-27）
 
-1. **run_id 修复**（G 发现）：`internal/proposal/runner.go:226/239`，影响候选—运行账关联与幂等分支。
-2. **吞吐/SLA**（D 发现）：钩子预算 1 窗、transcript 队头饥饿、BUSY 早停；需要单独任务，
-   建议优先于继续扩大自动裁决。
-3. **生产启用**：`maintain --model-auto` 默认仍关；先在单项目灰度，观察
-   auto_commit/withdraw/correct 与 manual_rate，再开 hooks 默认。
-4. **accept/reject 最终删除**：等生产灰度签字；本轮仅标记 deprecated。
-5. **P4 Judge 扩权**：未启动；需先补标定样本、CAS、输入输出完整性与上下文。
-6. **已知限制**：真实整机睡眠未测；进程组信号会带走子进程；consolidate dry-run 无预览；
+- 钩子自动写侧 argv 改为 `maintain --model-auto --max-bundles 20`：一次会话
+  完成发窗 + model-auto 裁决，不再停在候选；预算从 1 窗提到 20 窗。
+  真机 hook 集成：SessionStart 后落 1 条 `model-auto/auto_commit` 未审核记忆，
+  `spawn.log` 无错误。
+- 发窗改为短积压优先（`evidenceSourcesWithBacklog`），避免大 transcript 源
+  长期霸占队头；新增长短积压源调度用例。
+- `maintainRun` 对 SQLITE_BUSY 做 3 次小步重试，避免一遇锁就整轮早停。
+- eval 两面口径写入 `design-eval-flows`：ci 用于夹具/tag，prod 用于生产健康。
+- 仍然存在的是**积压存量**：代码已能追，生产仍有 181 源 / 14,261 序号 /
+  13.5 天，需要后续会话或一次有界 catch-up 实际消化；这不属于代码缺口。
+- **P4 已完成（2026-11-27）**：Judge verdict CAS、一输入一输出、已有记忆上下文、
+  按 judge_model 标定、reject/accept 落库与按 model-tag 回滚；详见 §9。
+
+## 8. 未决 / 下一轮
+
+> 已关闭：run_id 联动（见 §3.2）——`candidates.run_id` /
+> `evidence_bundles.last_run_id` 现在指向真实 `distill_runs` 行。
+
+1. **积压存量**（D 发现）：短积压优先 + 20 窗/次已落地；仍需观察实际 drain
+   曲线，必要时做一次有界 catch-up。
+2. **生产启用观察**：钩子已接线 model-auto；下一轮看真实 auto_commit /
+   withdraw / correct 与 manual_rate，再决定是否删除 accept/reject。
+3. **accept/reject 最终删除**：等生产灰度签字。
+4. **P4 已收口**（§9）：CAS/完整性/上下文/标定/回滚与 reject+accept 默认启用已落地；
+   下一轮看真实模型的 accept/reject 一致率与误 reject 回滚率。
+5. **已知限制**：真实整机睡眠未测；进程组信号会带走子进程；consolidate dry-run 无预览；
    历史 memories.scope 未回填；`cursors` JSON 字段改名需外部脚本同步。
+
+## 9. P4 Judge 扩权（2026-11-27）
+
+| 波 | 内容 | 提交/合并 |
+|:--|:--|:--|
+| A | 已有记忆上下文（judge-v4） | `03c288b` / merge `b24041d` |
+| B | Judge 默认接管；maintain 退为 proposal-only；auto_spawn 三态 | `6a6245f` / merge `1280c1b` |
+| C | `review stats --judge` 标定（verdicts/reject/applied/reopened） | `ea42bb7` / merge `35b68d6` |
+| D | Judge reject/accept 落库，矩阵门控；移除影子预降级 | `961da51`、`3bf5b40` / merge `ae15679` |
+| D-fix | Judge reject 裁决账写 `model_tag`（按版本回滚命中） | `42f5a08` / merge `fa08c16` |
+| E | Judge reject 按 model-tag 回滚 | `c10c1d1` / merge `4172d2e` |
+
+- 钩子链路：SessionStart `maintain --stage=proposal --max-bundles 20`；
+  Stop/SessionEnd `judge --apply-reject --apply-accept`（仍受 20 条/24h 节流）。
+- 手动 `mem judge` 默认影子；自动子进程才带 apply flags。
+- accept 走 `JudgeAutoCommit`（Matrix AllowModelAuto），只有 auto_commit 写记忆；
+  reject 走 `JudgeReject`，冲突类跳过，裁决账带 `model_tag`。
+- 临时库集成（假 CLI）：
+  - 3 候选 → `applied_accept=2`、`applied_reject=1`；
+  - fact 与 decision 落未审核记忆，过程叙述 rejected；
+  - `review stats --judge` = verdicts 3 / reject 1 / applied 3；
+  - `review rollback --model-tag` dry-run `matched 2 + judge_reopened 1`，实跑记忆 withdrawn、
+    Judge reject 候选回 pending。
+- 回退开关：`MEM_JUDGE_SPAWN=0`、`model.json auto_spawn:false`、`MEM_NO_AUTOMATION=1`。
+- 未决：真实模型标定样本；自动 Judge 的误 reject/误 accept 需观察
+  `review stats --judge` 与回滚率；生产积压存量仍按 §7 处理。

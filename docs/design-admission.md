@@ -34,19 +34,21 @@
 **模型永远不会独占地「要」一条东西；它只能「不要」，或「问你」。** 这是 C 方案在
 「更自动化」与「推测不回写」之间的切分点：判错的代价偏向可回收的一侧。
 
-## 3. 影子期（默认，不可跳过）
+## 3. 影子期与 P4 自动落库
 
 ```
-mem judge                 # 只写 verdict，status 不动，memories 零写入
-mem judge --stats         # 人工一致率：verdict=accept 看人工也采纳的比例，reject 看人工也否决的比例
+mem judge                         # 手动默认影子：只写 verdict，status 不动
+mem judge --apply-reject          # 显式落库 reject（冲突类跳过）
+mem judge --apply-reject --apply-accept  # reject + accept（accept 仍过提交矩阵）
 ```
 
-- 影子期数据落 `candidates.judge_verdict` / `judge_model`（含 prompt 版本），`rationale` 记理由码。
-- 一致率的**分母是人工裁决**；判定器本身没有任何改库入口（`--apply` 已撤），分母不会被自己的产出污染。
-- 转正门槛：`accept` 一致率 ≥95%，且样本 ≥200 条。未达标不放开，不因着急下调。
-- **`--apply` 仍不开放**：恢复它必须与 `mem judge --rollback <judge_model>` 同批交付（§4 例外条款 (c)）。
-  批量清积压走 §3.2 的 `mem batch`——它由人授权、有回滚凭证，与「模型自裁」是两回事。
-- 每轮只取 `judge_verdict=''` 的 pending：影子不改 status，按「最旧的 pending」取会永远重判同一批。
+- P4 起自动子进程默认带 `--apply-reject --apply-accept`；手动命令保持影子，必须显式开。
+- 判定数据落 `candidates.judge_verdict` / `judge_model`（含 prompt 版本），`rationale` 记理由码。
+- accept 不直接 `CommitAccept`：走 `JudgeAutoCommit` 的 `Matrix{AllowModelAuto:true}`，
+  Defer/Conflict 只记裁决；reject 走 `JudgeReject`，写 `model_tag` 供按版本回滚。
+- 回滚：`mem review rollback --model-tag <judge_model>` 同时撤自动记忆与 Judge reject
+  （候选回 pending），人工后续动作过的跳过。
+- 每轮只取 `judge_verdict=''` 的 pending；判定器不承担调度/GC/提交权限。
 
 ## 3.1 积压触发（配好模型后自动开，可一键关）
 
@@ -56,15 +58,14 @@ mem judge --stats         # 人工一致率：verdict=accept 看人工也采纳�
 
 | 入口 | 默认 | 作用 |
 |:---|:---|:---|
-| `model.json` 的 `auto_spawn` | 关 | `mem setup` / `--mode api` 配好模型后写入 `true`；`--mode off` 写回 `false`。钩子由宿主进程启动、不继承 shell 环境，所以授权必须落在文件上 |
+| `model.json` 的 `auto_spawn` | 开（有模型配置时） | 三态：缺省=开，显式 `false`=关，`mode=off`=关。`mem setup` 写显式值；升级后老配置只要有可用模型就默认开 |
 | `MEM_JUDGE_SPAWN` | 未设 | 显式总闸：`1` 强制开（脚本/CI），`0` 强制关（一键关闭，GUI 宿主无法 export 时的退路）。其它值退回文件判断 |
 | `MEM_JUDGE_MIN_PENDING` | 20 | 全库**未判定**的 pending ≥ 该值才触发。取值略高于 R8 的 FAIL 线（>15），避免刚 WARN 就烧一次调用 |
 | `MEM_JUDGE_COOLDOWN_H` | 24 | 冷却小时数。一个会话能 Stop 几十次，没有冷却等于每轮都跑 |
 
-为什么从「默认关」改为「配好模型就开」：用户**主动执行** `mem setup` 已构成显式授权，
-关着却只提示 `export MEM_JUDGE_SPAWN=1` 是死路——宿主钩子读不到交互 shell 的变量。
-升级后的老用户不受影响：老 `model.json` 没有 `auto_spawn` 字段，读出来就是 `false`。
-`auto_spawn` 只开「跑判定」，**不开「改库」**——判定器本身没有改状态入口，影子期的红线不动。
+默认开启不等于每次 Stop 都跑：仍受 20 条 pending / 24h 冷却约束。自动子进程带
+`--apply-reject --apply-accept`；手动 `mem judge` 默认影子。`auto_spawn` 开的是
+「跑判定」，落库仍由 `JudgeReject` / `JudgeAutoCommit` 的矩阵与冲突守卫决定。
 
 - 只挂 `Stop` / `SessionEnd`。**读路径（PromptSubmit / SessionStart）永不触发**——判定要走网络，
   进了注入链路就直接违约。

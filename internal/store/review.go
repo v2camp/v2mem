@@ -828,26 +828,37 @@ func (s *Store) recoverCandidatesForMemory(ctx context.Context, q sqlQuerier,
 
 // RollbackReport 是按 model@promptver 回滚的完整回报（--json 直接输出）。
 // 计数是数字，明细在 *_ids；matched = withdrawn + skipped + already。
+//
+// JudgeReopened/JudgeSkipped 是第二段（Judge 驳回）的计数，与上面记忆级口径并列：
+// judge 驳回不新建记忆，只能把候选退回 pending，混进 matched 会让两件事都没法解释。
 type RollbackReport struct {
-	ModelTag     string   `json:"model_tag"`
-	Matched      int      `json:"matched"`
-	Withdrawn    int      `json:"withdrawn"`
-	Skipped      int      `json:"skipped"`
-	Already      int      `json:"already"`
-	Reopened     int      `json:"reopened"`
-	DryRun       bool     `json:"dry_run"`
-	WithdrawnIDs []string `json:"withdrawn_ids"`
-	SkippedIDs   []string `json:"skipped_ids"`
-	AlreadyIDs   []string `json:"already_ids"`
-	ReopenedIDs  []string `json:"reopened_ids"`
+	ModelTag         string   `json:"model_tag"`
+	Matched          int      `json:"matched"`
+	Withdrawn        int      `json:"withdrawn"`
+	Skipped          int      `json:"skipped"`
+	Already          int      `json:"already"`
+	Reopened         int      `json:"reopened"`
+	JudgeReopened    int      `json:"judge_reopened"`
+	JudgeSkipped     int      `json:"judge_skipped"`
+	DryRun           bool     `json:"dry_run"`
+	WithdrawnIDs     []string `json:"withdrawn_ids"`
+	SkippedIDs       []string `json:"skipped_ids"`
+	AlreadyIDs       []string `json:"already_ids"`
+	ReopenedIDs      []string `json:"reopened_ids"`
+	JudgeReopenedIDs []string `json:"judge_reopened_ids"`
+	JudgeSkippedIDs  []string `json:"judge_skipped_ids"`
 }
 
-// RollbackModelTag 撤回某个 model@promptver 新建的自动记忆（只撤回、不删行）。
+// RollbackModelTag 撤回某个 model@promptver 的自动产物（只撤回、不删行）。
 //
-// 单事务；只命中 created_memory=1 且 model_tag 精确相等的行，不碰别的版本。
-// 人工已确认/修正的跳过并报告（不得盲目删除），已撤回的计入 already；
-// 其余标 withdrawn + 候选回 rejected + 写一条 reopen 决策（保 G9 口径）。
-// dryRun 时只算报告、零业务写入；重跑因状态已是 withdrawn 而天然幂等。
+// 两段命中，同一事务语义、同一份报告：
+//  1. 记忆级：created_memory=1 且 model_tag 精确相等的自动记忆。人工已确认/修正的跳过
+//     并报告（不得盲目删除），已撤回的计入 already；其余标 withdrawn + 候选回 rejected
+//     + 写一条 reopen 决策（保 G9 口径）。
+//  2. 候选级：该 tag 下 actor=judge 的 reject 且候选仍 rejected。人工之后接手过
+//     （reopen/accept/reject）的跳过并报告；其余退回 pending 并记 reopen。
+//
+// dryRun 时两段都只算报告、零业务写入；重跑因状态已变（withdrawn / pending）天然幂等。
 func (s *Store) RollbackModelTag(modelTag string, dryRun bool, now int64) (*RollbackReport, error) {
 	modelTag = strings.TrimSpace(modelTag)
 	if modelTag == "" {
@@ -859,6 +870,7 @@ func (s *Store) RollbackModelTag(modelTag string, dryRun bool, now int64) (*Roll
 	rep := &RollbackReport{
 		ModelTag: modelTag, DryRun: dryRun,
 		WithdrawnIDs: []string{}, SkippedIDs: []string{}, AlreadyIDs: []string{}, ReopenedIDs: []string{},
+		JudgeReopenedIDs: []string{}, JudgeSkippedIDs: []string{},
 	}
 	err := s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
 		rows, err := q.QueryContext(ctx, `SELECT d.memory_id, d.candidate_id
@@ -936,7 +948,82 @@ func (s *Store) RollbackModelTag(modelTag string, dryRun bool, now int64) (*Roll
 	if err != nil {
 		return nil, err
 	}
+
+	// 第二段：Judge 驳回的候选退回 pending。这类裁决 created_memory=0、没有 memory_id，
+	// 进不了上面的记忆口径；回滚方式是 RollbackCandidate（不删记忆、expectedRevision CAS）。
+	hits, err := s.judgeRejectHits(modelTag)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range hits {
+		touched, err := s.humanTouchedAfter(h.candID, h.decidedAt)
+		if err != nil {
+			return nil, err
+		}
+		if touched {
+			rep.JudgeSkipped++
+			rep.JudgeSkippedIDs = append(rep.JudgeSkippedIDs, h.candID)
+			continue // 人工已经接手，批量回滚不得覆盖
+		}
+		rep.JudgeReopened++
+		rep.JudgeReopenedIDs = append(rep.JudgeReopenedIDs, h.candID)
+		if dryRun {
+			continue
+		}
+		if _, err := s.RollbackCandidate(h.candID, commit.ActorHuman, false, h.revision); err != nil {
+			return nil, err
+		}
+	}
 	return rep, nil
+}
+
+// judgeRejectHit 是一条待回滚的 Judge 驳回：candID 当前 revision 与最后一次
+// judge reject 的时间（判断人工是否在其后接手）。
+type judgeRejectHit struct {
+	candID    string
+	revision  int
+	decidedAt int64
+}
+
+// judgeRejectHits 取该 tag 下「actor=judge 的 reject + 候选仍 rejected」的候选。
+// 只认候选当前仍 rejected：已回滚成 pending / 人工改判过的不再出现，重跑天然幂等。
+func (s *Store) judgeRejectHits(modelTag string) ([]judgeRejectHit, error) {
+	rows, err := s.db.Query(`SELECT c.id, c.revision, MAX(d.created_at)
+		FROM commit_decisions d
+		JOIN candidates c ON c.id = d.candidate_id
+		WHERE d.action = ? AND d.actor = ? AND d.model_tag = ? AND c.status = 'rejected'
+		GROUP BY c.id, c.revision
+		ORDER BY c.id`, string(commit.ActionReject), commit.ActorJudge, modelTag)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []judgeRejectHit
+	for rows.Next() {
+		var h judgeRejectHit
+		if err := rows.Scan(&h.candID, &h.revision, &h.decidedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// humanTouchedAfter 判断候选在 judge 驳回之后是否有人工动作（reopen/accept/reject）。
+//
+// 用 >= 而不是 >：同秒内的先后无法从整数时间戳分辨，宁可跳过（少撤一条），
+// 也不能把人工已经处理过的候选退回 pending。
+func (s *Store) humanTouchedAfter(candID string, after int64) (bool, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM commit_decisions
+		WHERE candidate_id = ? AND actor = ? AND action IN (?,?,?) AND created_at >= ?`,
+		candID, commit.ActorHuman,
+		string(commit.ActionReopen), string(commit.ActionHumanAccept),
+		string(commit.ActionReject), after).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // ---------- 标定统计（§6.2 / §7 第 1 条） ----------
@@ -1039,4 +1126,49 @@ func (s *Store) ReviewStats() ([]ReviewStatsRow, error) {
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+// JudgeCalibrationRow 是按 candidates.judge_model 分组的 Judge 标定行。
+//
+// 与 ReviewStatsRow 并列而不是合并：后者衡量「自动采纳的记忆后来被人工怎么处理」，
+// 这一行衡量「判定器自己判了多少、否了多少、是否被落库/重开」。分组键带 prompt
+// 版本（judge_model），提示词一改历史即可分段比较；阈值只观察，不做任何动作。
+type JudgeCalibrationRow struct {
+	JudgeModel string `json:"judge_model"`
+	Verdicts   int    `json:"verdicts"` // judge_verdict 非空的候选数
+	Reject     int    `json:"reject"`   // judge_verdict = 'reject'
+	Applied    int    `json:"applied"`  // 该组候选上 actor='judge' 的 accept/reject 裁决数
+	Reopened   int    `json:"reopened"` // 该组候选后续被 reopen 的裁决数
+}
+
+// JudgeCalibrationStats 按 judge_model 汇总判定器的裁决面。
+//
+// 只读单次聚合；judge_model 为空表示尚未判定，不成组。applied 取 actor='judge'
+// 且动作为 accept/reject 的裁决账，与 Wave 2 的落库路径（actor=judge）同源。
+func (s *Store) JudgeCalibrationStats() ([]JudgeCalibrationRow, error) {
+	rows, err := s.db.Query(`SELECT c.judge_model, COUNT(*),
+		SUM(CASE WHEN c.judge_verdict = 'reject' THEN 1 ELSE 0 END),
+		SUM((SELECT COUNT(*) FROM commit_decisions d
+			WHERE d.candidate_id = c.id AND d.actor = 'judge' AND d.action IN (?, ?, ?))),
+		SUM((SELECT COUNT(*) FROM commit_decisions d
+			WHERE d.candidate_id = c.id AND d.action = ?))
+		FROM candidates c
+		WHERE c.judge_model <> ''
+		GROUP BY c.judge_model
+		ORDER BY c.judge_model`,
+		string(commit.ActionAutoCommit), string(commit.ActionHumanAccept),
+		string(commit.ActionReject), string(commit.ActionReopen))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []JudgeCalibrationRow{}
+	for rows.Next() {
+		var r JudgeCalibrationRow
+		if err := rows.Scan(&r.JudgeModel, &r.Verdicts, &r.Reject, &r.Applied, &r.Reopened); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
