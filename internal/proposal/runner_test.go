@@ -205,6 +205,73 @@ func TestRunnerPersistsCandidatesAndEvidence(t *testing.T) {
 	}
 }
 
+// run_id 联动：candidates.run_id、evidence_bundles.last_run_id 必须指向
+// distill_runs 里真实存在的一条运行账，不再被 Result 覆盖成空串。
+func TestRunnerRunIDLinksCandidateLedgerAndBundle(t *testing.T) {
+	e := newEnv(t)
+	e.capture(t, "u1", "s1", "决定：run_id 联动", true)
+	b := e.bundle(t)
+	var now int64 = 1000
+	g, _ := gen("fake", func(GenerateRequest, int) (string, error) {
+		return `{"kind":"decision","content":"run_id 联动","evidence_idx":[1]}`, nil
+	})
+	r := newRunner(e, []Executor{NewExecutor(e.ev, g)}, &now)
+	out, err := r.Step(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.RunID == "" {
+		t.Fatal("Step 应返回非空 RunID")
+	}
+	var candRun, bundleRun string
+	if err := e.st.DB().QueryRow(`SELECT run_id FROM candidates WHERE bundle_id = ?`, b.ID).Scan(&candRun); err != nil {
+		t.Fatalf("读 candidates.run_id: %v", err)
+	}
+	if err := e.st.DB().QueryRow(`SELECT last_run_id FROM evidence_bundles WHERE id = ?`, b.ID).Scan(&bundleRun); err != nil {
+		t.Fatalf("读 evidence_bundles.last_run_id: %v", err)
+	}
+	if candRun != out.RunID || bundleRun != out.RunID {
+		t.Fatalf("run_id 未联动: out=%q candidate=%q bundle=%q", out.RunID, candRun, bundleRun)
+	}
+	var n int
+	if err := e.st.DB().QueryRow(`SELECT COUNT(*) FROM distill_runs WHERE id = ?`, out.RunID).Scan(&n); err != nil {
+		t.Fatalf("查运行账: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("last_run_id 应指向 1 条真实运行账，got %d", n)
+	}
+}
+
+// 同上，但走 noop 分支：即使没有候选，Bundle 的 last_run_id 也必须指向真实运行账。
+func TestRunnerNoopRunIDLinksLedger(t *testing.T) {
+	e := newEnv(t)
+	e.capture(t, "u1", "s1", "无提案事件", false)
+	b := e.bundle(t)
+	var now int64 = 1000
+	r := newRunner(e, nil, &now)
+	out, err := r.Step(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != StatusNoop {
+		t.Fatalf("应为 noop: %+v", out)
+	}
+	var bundleRun string
+	if err := e.st.DB().QueryRow(`SELECT last_run_id FROM evidence_bundles WHERE id = ?`, b.ID).Scan(&bundleRun); err != nil {
+		t.Fatalf("读 last_run_id: %v", err)
+	}
+	if bundleRun != out.RunID {
+		t.Fatalf("noop 的 last_run_id 未联动: out=%q bundle=%q", out.RunID, bundleRun)
+	}
+	var n int
+	if err := e.st.DB().QueryRow(`SELECT COUNT(*) FROM distill_runs WHERE id = ?`, out.RunID).Scan(&n); err != nil {
+		t.Fatalf("查运行账: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("noop 的 last_run_id 应指向 1 条真实运行账，got %d", n)
+	}
+}
+
 func TestRunnerDuplicateMergesEvidenceWithoutNewRow(t *testing.T) {
 	e := newEnv(t)
 	e.capture(t, "u1", "s1", "决定：同一条", true)

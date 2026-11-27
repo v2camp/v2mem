@@ -49,6 +49,7 @@ const usageText = `v2mem (mem) — 个人 Agent 记忆系统
   mem accept <id|前缀>             采纳候选，写入 memories（source=distill-accept）
   mem reject <id|前缀>             拒绝候选
   mem review ls [选项]             复核队列（只读四态）：pending 待判定 / summary 未审核摘要 / quarantined 隔离 / failed 失败
+  mem repair evidence [id...]     补证据链（幂等）：单条/批量/--all；--dry-run 只报告
   mem sync   <远端url> [分支]       跨设备 git 同步：pull → 三方合并 → push（冲突可 --abort 复原）
   mem hook   [选项]                 harness 钩子入口（读 stdin JSON，输出注入内容）
   mem harness [--json]              列出各工具的接入方式与检测结果
@@ -154,7 +155,7 @@ var knownSubcommands = []string{
 	"gc", "consolidate", "maintain", "export", "import", "import-transcript", "sync", "hook", "harness",
 	"init", "uninstall", "ingest", "budget", "audit", "eval", "mcp", "help",
 	"distill", "accept", "reject", "judge", "setup",
-	"review",
+	"review", "repair",
 }
 
 func main() {
@@ -268,6 +269,8 @@ func dispatch(args []string) error {
 		return usageError{msg: "命令 candidates 已下线：用 mem review ls --state pending|all"}
 	case "review":
 		err = cmdReview(args[1:])
+	case "repair":
+		err = cmdRepair(args[1:])
 	case "sync":
 		err = cmdSync(args[1:])
 	case "hook":

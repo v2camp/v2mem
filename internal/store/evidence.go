@@ -531,10 +531,12 @@ func (s *Store) NextEvidenceBundle(limit int, maxBytes int64) (*EvidenceBundleRe
 }
 
 func (s *Store) evidenceSourcesWithBacklog(limit int) ([]EvidenceSourceState, error) {
+	// 短积压优先：只按 created_at 排序会让一个巨大的 transcript 源长期霸占队头，
+	// 堵住其它小源。积压量相同再按创建时间/ID 兜底，保证确定性。
 	rows, err := s.db.Query(`SELECT id, generation, last_seq, cursor_seq, source_tip
 		FROM evidence_sources
 		WHERE status = 'active' AND last_seq > cursor_seq
-		ORDER BY created_at ASC, id ASC LIMIT ?`, limit)
+		ORDER BY (last_seq - cursor_seq) ASC, created_at ASC, id ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}

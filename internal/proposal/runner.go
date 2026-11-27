@@ -205,6 +205,9 @@ func (r *Runner) Peek(_ context.Context, bundleID string) (*Outcome, error) {
 
 func (r *Runner) runClaimed(b *store.ProposalBundle, dry bool) (*Outcome, error) {
 	out := &Outcome{BundleID: b.ID, Attempt: b.Attempt}
+	// RunID 必须在任何 finish 分支之前生成：证据读取失败、条目数不一致、
+	// noop 都要写运行账，Bundle.last_run_id 才能指向一条真实账目。
+	out.Result.RunID = newRunID()
 	refs, err := r.Reader.ListEvidence(b.ID)
 	if err != nil {
 		out.Status = StatusFail
@@ -223,7 +226,6 @@ func (r *Runner) runClaimed(b *store.ProposalBundle, dry bool) (*Outcome, error)
 		return r.finish(b, out, "fail", 0)
 	}
 	out.SessionID = bundleSession(refs)
-	out.RunID = newRunID()
 
 	if countEligible(refs) == 0 {
 		// 没有可提案的证据（例如 Proposal 子会话事件）：合法空结果。
@@ -236,6 +238,9 @@ func (r *Runner) runClaimed(b *store.ProposalBundle, dry bool) (*Outcome, error)
 	}
 
 	res, lastErr, used := r.execute(b.ID)
+	// 执行器返回的 Result 不带 RunID；先保留本轮账目 ID，再整体赋值，
+	// 否则 candidates.run_id / Bundle.last_run_id 会被覆盖成空串。
+	res.RunID = out.Result.RunID
 	out.Result = res
 	if !used {
 		// 所有 provider 都不可用：这是 backlog，不是 empty。
@@ -386,11 +391,19 @@ func (r *Runner) finish(b *store.ProposalBundle, out *Outcome, bundleStatus stri
 	}
 	out.BundleStatus = bundleStatus
 	out.NotBefore = notBefore
+	// 运行账 ID 与 Bundle.last_run_id / candidates.run_id 必须是同一个值：
+	// 先落账，再让 Bundle 指向它；缺失时补一个，避免任一早退路径留下空指针。
+	runID := out.RunID
+	if runID == "" {
+		runID = newRunID()
+		out.RunID = runID
+	}
 	runStatus := out.Status
 	if runStatus == StatusWouldGenerate {
 		runStatus = StatusOK
 	}
 	err := r.St.SaveProposalRun(store.ProposalRunRecord{
+		ID:        runID,
 		SessionID: out.SessionID, Provider: out.Executor, Status: runStatus,
 		Error: out.Error, CandCount: out.Inserted,
 		StartedAt: now.Unix(), FinishedAt: r.now().Unix(),
@@ -402,7 +415,7 @@ func (r *Runner) finish(b *store.ProposalBundle, out *Outcome, bundleStatus stri
 	if err != nil {
 		return out, err
 	}
-	if err := r.St.FinishProposalBundle(b.ID, r.owner(), bundleStatus, notBefore, out.RunID); err != nil {
+	if err := r.St.FinishProposalBundle(b.ID, r.owner(), bundleStatus, notBefore, runID); err != nil {
 		return out, err
 	}
 	return out, nil

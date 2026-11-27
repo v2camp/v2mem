@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -119,7 +121,14 @@ func BuildPrompt(refs []evidence.Ref) string {
 	var b strings.Builder
 	b.WriteString("从下面的会话证据提炼长期记忆。只允许新增（ADD-only），不要改写或删除已有记忆。\n")
 	b.WriteString("输出一行一个 JSON，不要任何解释；没有可提炼的事实就输出 []。\n")
-	b.WriteString(`字段：{"kind":"decision|pitfall|preference|task","scope":"session|project|global","content":"原子事实","rationale":"一句话","attributed_to":"user|assistant","subject_key":"可选","task_state":"可选","evidence_idx":[1]}` + "\n")
+	b.WriteString(`字段：{"kind":"decision|pitfall|preference|task","scope":"session|project|global","content":"可复用规则","rationale":"一句话","attributed_to":"user|assistant","subject_key":"可选","task_state":"可选","evidence_idx":[1]}` + "\n")
+	b.WriteString("content 写「下次遇到同类情况能照做的规则」，不是过程记录：\n")
+	b.WriteString("- decision/pitfall/preference/fact：写「触发场景 → 判断依据 → 处置」，一句话说清什么情况下该怎么做。\n")
+	b.WriteString("- task：只写未完成事项的当前状态（做什么、卡在哪、下一步）。\n")
+	b.WriteString("- 禁止第一人称与过程叙述（我/我们、尝试了、发现了、目前还没有）；禁止用「这个/那个」指代会话内的链接、报错、文件。\n")
+	b.WriteString("- 好：「访问 Codeup 私有仓库时 WebFetch 返回登录页、git 报 could not read Username，说明缺凭证；应配置 token 或改用带凭证的地址」。\n")
+	b.WriteString("  坏：「这个链接需要登录，我无法读取，尝试 git 拉取报错……」。\n")
+	b.WriteString("- content 不超过 120 字。\n")
 	b.WriteString("evidence_idx 必须是下面证据的序号，且每条候选至少引用一条。序号不连续属正常（被跳过或重复的条目保留空位）。\n")
 	b.WriteString("证据按说话人分组，必须遵守：\n")
 	b.WriteString("1. 用户原话是主来源；偏好、约束、意图、身份类事实只从 USER 组提取。\n")
@@ -215,6 +224,17 @@ func ParseDrafts(raw string, evidenceCount int) (parseResult, error) {
 		}
 		return validateAll(arr, evidenceCount)
 	}
+	if strings.HasPrefix(raw, "{") {
+		// CLI 执行器常把「一行一个 JSON」渲染成多行美化 JSON：按行拆会把每一行
+		// 都当成缺半边的碎片，整窗被误判为非法。先按 JSON 值序列解析整段输出；
+		// 解析不了（例如夹了散文）再回退到逐行 JSONL。
+		if res, ok := parseJSONValues(raw, evidenceCount); ok {
+			if len(res.Drafts) == 0 && res.Invalid == 0 {
+				return parseResult{}, nil
+			}
+			return res, nil
+		}
+	}
 
 	var out parseResult
 	for _, line := range strings.Split(raw, "\n") {
@@ -251,6 +271,40 @@ func ParseDrafts(raw string, evidenceCount int) (parseResult, error) {
 	return out, nil
 }
 
+// parseJSONValues 把整段输出当作连续的 JSON 值解析：单个对象、数组，或
+// 多个对象直接串联（美化 JSONL）。返回 ok=false 表示这不是纯 JSON 值序列，
+// 调用方应回退到逐行 JSONL 解析。
+func parseJSONValues(raw string, evidenceCount int) (parseResult, bool) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	var out parseResult
+	for {
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			if errors.Is(err, io.EOF) {
+				return out, true
+			}
+			return parseResult{}, false
+		}
+		var w wireDraft
+		if err := json.Unmarshal(v, &w); err == nil {
+			if d, ok := validateDraft(w, evidenceCount); ok {
+				out.Drafts = append(out.Drafts, d)
+			} else {
+				out.Invalid++
+			}
+			continue
+		}
+		var arr []wireDraft
+		if err := json.Unmarshal(v, &arr); err == nil {
+			res, _ := validateAll(arr, evidenceCount)
+			out.Drafts = append(out.Drafts, res.Drafts...)
+			out.Invalid += res.Invalid
+			continue
+		}
+		return parseResult{}, false
+	}
+}
+
 func validateAll(arr []wireDraft, evidenceCount int) (parseResult, error) {
 	var out parseResult
 	for _, w := range arr {
@@ -274,6 +328,11 @@ func validateDraft(w wireDraft, evidenceCount int) (Draft, bool) {
 	}
 	content := strings.TrimSpace(w.Content)
 	if content == "" {
+		return Draft{}, false
+	}
+	// task 描述的是未完成状态，天然带「目前/还没」这类时点词，不做叙述体拦截；
+	// 其余 kind 必须是可复用规则，过程叙述整条丢弃。
+	if kind != "task" && isProcessNarrative(content) {
 		return Draft{}, false
 	}
 	scope := strings.ToLower(strings.TrimSpace(w.Scope))
@@ -319,6 +378,32 @@ func validateDraft(w wireDraft, evidenceCount int) (Draft, bool) {
 		AttributedTo: attributedTo,
 		EvidenceIdx:  idx,
 	}, true
+}
+
+// processNarrative 判定正文是否仍是「过程叙述」而不是可复用规则。
+//
+// 为什么在解析层拦而不是只靠提示词：候选正文落库时会被 240 rune 预算截断，
+// 过程叙述的结局是「既没有完整原文，也没有提炼后的规则」——2026-11-27 库里
+// 唯一的记忆就是这种残句（断在 `- 本机在 /Users`）。提示词负责引导，解析层
+// 负责不让它进库。
+//
+// 判据只取三类高置信特征，宁漏不误杀：
+//   - 第一人称 + 动作（我无法 / 我们尝试）：过程叙述的主语形态；
+//   - 会话内指代（这个链接 / 那个报错）：脱离本次会话就没有指称对象；
+//   - 时点相对词（本次 / 刚才 / 目前还没有）：换会话即失效。
+//
+// 代价：像「这个报错说明缺凭证」这类缺场景但结论正确的句子也会被拒。它本该
+// 改写成「遇到 X 报错时…」，让模型重写一次比入库一句无法执行的话更划算。
+var (
+	narrativeFirstPerson = regexp.MustCompile(`(^|[。；！？，、\s])(我|我们)(无法|不能|尝试|发现|准备|需要|已经|还没|没有|打不开|读不到)`)
+	narrativeDeictic     = regexp.MustCompile(`(这个|那个)(链接|页面|文件|仓库|报错|问题|任务)`)
+	narrativeTemporal    = regexp.MustCompile(`本次|刚才|截至目前|目前还(没有|没)`)
+)
+
+func isProcessNarrative(s string) bool {
+	return narrativeFirstPerson.MatchString(s) ||
+		narrativeDeictic.MatchString(s) ||
+		narrativeTemporal.MatchString(s)
 }
 
 func oneLine(s string) string {

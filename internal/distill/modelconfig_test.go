@@ -132,18 +132,46 @@ func TestResolveOptionsEmptyConfigIsAPI(t *testing.T) {
 	}
 }
 
-// auto_spawn 持久化在配置里：宿主钩子不继承 shell 环境，只提示用户 export
-// 等于没说。老配置没有这个字段时必须默认 false —— 升级后不得突然开始烧 API。
-func TestLoadModelConfigAutoSpawn(t *testing.T) {
-	p := writeJSON(t, `{"mode":"cli","cli":"claude","model_tag":"claude@1+tpl1","auto_spawn":true}`)
-	c, err := LoadModelConfig(p)
-	if err != nil || !c.AutoSpawn {
-		t.Fatalf("auto_spawn 应读回 true，got %+v err=%v", c, err)
+// auto_spawn 是三态：缺省（nil）与显式 false 必须可区分，否则「老配置升级后默认开」
+// 与「用户显式关掉」会塌成同一个值。老配置没有这个字段时必须读回 nil。
+func TestLoadModelConfigAutoSpawnTriState(t *testing.T) {
+	on := writeJSON(t, `{"mode":"cli","cli":"claude","model_tag":"claude@1+tpl1","auto_spawn":true}`)
+	c, err := LoadModelConfig(on)
+	if err != nil || c.AutoSpawn == nil || !*c.AutoSpawn {
+		t.Fatalf("auto_spawn 应读回 true 指针，got %+v err=%v", c, err)
+	}
+	off := writeJSON(t, `{"mode":"cli","cli":"claude","model_tag":"claude@1+tpl1","auto_spawn":false}`)
+	offCfg, err := LoadModelConfig(off)
+	if err != nil || offCfg.AutoSpawn == nil || *offCfg.AutoSpawn {
+		t.Fatalf("显式 false 应读回 false 指针，got %+v err=%v", offCfg, err)
 	}
 	legacy := writeJSON(t, `{"provider":"deepseek","api_key":"k"}`)
 	old, err := LoadModelConfig(legacy)
-	if err != nil || old.AutoSpawn {
-		t.Fatalf("老配置 auto_spawn 应默认 false，got %+v err=%v", old, err)
+	if err != nil || old.AutoSpawn != nil {
+		t.Fatalf("老配置缺省 auto_spawn 应为 nil，got %+v err=%v", old, err)
+	}
+}
+
+// AutoSpawnEnabled 是文件层面的授权判定：缺省时只要有可用模型就开。
+// 这是「升级后默认启用」的唯一实现点，别在调用点各判一次。
+func TestAutoSpawnEnabled(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  ModelConfig
+		want bool
+	}{
+		{"cli 缺省开", ModelConfig{Mode: "cli", CLI: "claude", ModelTag: "claude@1+tpl1"}, true},
+		{"api 缺省开", ModelConfig{Mode: "api", Provider: "deepseek", Model: "deepseek-flash"}, true},
+		{"老文件 api 缺省开", ModelConfig{Provider: "deepseek", APIKey: "k"}, true},
+		{"空配置关", ModelConfig{}, false},
+		{"显式 false 关", ModelConfig{Mode: "cli", CLI: "claude", ModelTag: "claude@1+tpl1", AutoSpawn: BoolPtr(false)}, false},
+		{"显式 true 开", ModelConfig{Mode: "cli", CLI: "claude", ModelTag: "claude@1+tpl1", AutoSpawn: BoolPtr(true)}, true},
+		{"mode off 压过显式 true", ModelConfig{Mode: "off", AutoSpawn: BoolPtr(true)}, false},
+	}
+	for _, c := range cases {
+		if got := c.cfg.AutoSpawnEnabled(); got != c.want {
+			t.Errorf("%s: AutoSpawnEnabled() = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
