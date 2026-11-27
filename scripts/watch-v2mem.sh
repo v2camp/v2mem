@@ -26,6 +26,9 @@
 # R16 把 stats --json 的 backlog（open_bundles / last_maintain_ok_age_seconds /
 # bundles_isolated）合成「维护可见性」判级：有积压不等于有故障，但积压 + 24h 没成功
 # 维护、或有隔离，就需要人跑 mem maintain --catch-up。巡检只报不执行。
+# R17 只读同一份 stats --json 的 backlog（evidence_backlog_sources /
+# oldest_unconsumed_evidence_age_seconds）判证据准入 SLA：15 天来自设计文档，
+# 休眠期豁免故不设 FAIL；处置命令只写进 detail，不调用。不新增 sqlite / CLI。
 # 判据定义以 docs/ops-watch.md §3 为准。
 # 退出码: 0=无 FAIL  1=有 FAIL
 
@@ -97,7 +100,8 @@ proj_total() {
   esac
 }
 
-# stats --json 只取一次：R14 读 size_bytes、R16 读 backlog，共用同一份读数。
+# stats --json 只取一次：R12 读 by_actor、R14 读 size_bytes、R16/R17 读 backlog，
+# 共用同一份读数。
 # 与上面 STATS_RAW 分开是刻意的：文本行是既有解析契约（总条数/按工程），
 # 不能为了省一次调用把巡检的行解析改成 JSON——旧二进制与既有护栏都按行读。
 STATS_JSON=$( "$MEM_BIN" stats --json 2>/dev/null )
@@ -622,6 +626,17 @@ fi
 A_DISTILL_OTHER=$(( A_DISTILL - A_DISTILL_RULES ))
 D12="观测 ${A_OBS} / 蒸馏 ${A_DISTILL}（rules ${A_DISTILL_RULES} · 其他 ${A_DISTILL_OTHER}） / 合法空 ${A_DISTILL_EMPTY} / 失败 ${A_DISTILL_FAIL} / 裁决 accept ${A_DECIDE_A} reject ${A_DECIDE_R}"
 if [ -n "$ACT_VERDICT" ]; then D12="${D12}；结论: ${ACT_VERDICT}"; fi
+# 自动化率只作观察：by_actor 是 stats --json 的顶层对象（actor → 数量）。
+# 字段缺失（旧二进制）只写一行说明，不改变 R12 级别、不新增阈值。
+# model-auto=0 可能是默认关闭而非故障，与 R12 的 MEM_NO_AUTOMATION 取舍同源。
+if printf '%s' "$STATS_JSON" | jq -e '.by_actor | type == "object"' >/dev/null 2>&1; then
+  D12_ACTORS=$(printf '%s' "$STATS_JSON" | jq -r '
+    .by_actor | to_entries | map("\(.key) \(.value)") | join(" / ")' 2>/dev/null)
+  [ -n "$D12_ACTORS" ] || D12_ACTORS="无"
+  D12="${D12}；actor 分布: ${D12_ACTORS}（model-auto=0 可能是默认关闭而非故障）"
+else
+  D12="${D12}；旧二进制无 by_actor"
+fi
 if [ "$A_OBS" -eq 0 ]; then
   add R12 INFO "无观测样本" "窗口内无 obs-append，无法评估写侧决策链路（无样本，非冷启动降级）；${D12}"
 elif [ "$A_DISTILL_FAIL" -gt 3 ]; then
@@ -729,16 +744,54 @@ else
   R16_MAINT_TXT="从未成功维护（无 maintain:last_ok）"
 fi
 
+# R17 证据准入 SLA：只读同一份 STATS_JSON 的 backlog，不新增 sqlite / CLI。
+# 15 天 = 1296000 秒，来自 docs/design-data-lifecycle.md §5 的处理 SLA；
+# 休眠期不计入承诺（同 §5），故与 R16 一样不设 FAIL。
+R17_MAX_AGE_S=$(( 15 * 86400 ))
+R17_SOURCES=0; R17_AGE=""; R17_READ_FAIL=$R16_READ_FAIL
+if [ "$R17_READ_FAIL" -eq 0 ]; then
+  R17_SOURCES=$(printf '%s' "$STATS_JSON" | jq -r '.backlog.evidence_backlog_sources // 0' 2>/dev/null)
+  R17_AGE=$(printf '%s' "$STATS_JSON" | jq -r '.backlog.oldest_unconsumed_evidence_age_seconds // empty' 2>/dev/null)
+fi
+case "$R17_SOURCES" in ''|*[!0-9]*) R17_SOURCES=0 ;; esac
+case "$R17_AGE" in ''|*[!0-9]*) R17_AGE="" ;; esac
+if [ -n "$R17_AGE" ]; then
+  R17_AGE_TXT="$(( R17_AGE / 86400 )) 天 $(( (R17_AGE % 86400) / 3600 )) 小时（${R17_AGE} 秒）"
+else
+  R17_AGE_TXT="无读数"
+fi
+# R16 的 detail 只在 backlog 可读时附一句 R17 读数，不改变 R16 判级。
+R17_HINT=""
+if [ "$R16_READ_FAIL" -eq 0 ]; then
+  R17_HINT="；未消费证据见 R17：源 ${R17_SOURCES} 个、最老 ${R17_AGE_TXT}"
+fi
+
 if [ "$R16_READ_FAIL" -eq 1 ]; then
   add R16 WARN "维护可见性未核查" "维护可见性未核查：mem stats --json 无 backlog 对象（旧二进制或读取失败）；按 WARN 观察，勿据此判 PASS"
 elif [ "$R16_OPEN" -eq 0 ]; then
-  add R16 PASS "无维护积压" "无维护积压：open_bundles 0；${R16_MAINT_TXT}；Bundle 隔离 ${R16_ISO}"
+  add R16 PASS "无维护积压" "无维护积压：open_bundles 0；${R16_MAINT_TXT}；Bundle 隔离 ${R16_ISO}${R17_HINT}"
 elif [ "$R16_ISO" -gt 0 ]; then
-  add R16 WARN "维护积压 ${R16_OPEN} 且隔离 ${R16_ISO}" "open_bundles ${R16_OPEN}，Bundle 隔离 ${R16_ISO}，${R16_MAINT_TXT}；隔离不会自动重放，人工修复后执行 mem maintain --catch-up 追账（巡检只报）"
+  add R16 WARN "维护积压 ${R16_OPEN} 且隔离 ${R16_ISO}" "open_bundles ${R16_OPEN}，Bundle 隔离 ${R16_ISO}，${R16_MAINT_TXT}；隔离不会自动重放，人工修复后执行 mem maintain --catch-up 追账（巡检只报）${R17_HINT}"
 elif [ -z "$R16_AGE" ] || [ "$R16_AGE" -gt $(( R16_MAINTAIN_MAX_AGE_H * 3600 )) ]; then
-  add R16 WARN "维护滞后（积压 ${R16_OPEN}）" "open_bundles ${R16_OPEN}，${R16_MAINT_TXT}，已超 ${R16_MAINTAIN_MAX_AGE_H}h 阈值；执行 mem maintain --catch-up 追账（巡检只报，不执行）"
+  add R16 WARN "维护滞后（积压 ${R16_OPEN}）" "open_bundles ${R16_OPEN}，${R16_MAINT_TXT}，已超 ${R16_MAINTAIN_MAX_AGE_H}h 阈值；执行 mem maintain --catch-up 追账（巡检只报，不执行）${R17_HINT}"
 else
-  add R16 PASS "维护正常（积压 ${R16_OPEN}）" "open_bundles ${R16_OPEN}，${R16_MAINT_TXT}，未超 ${R16_MAINTAIN_MAX_AGE_H}h"
+  add R16 PASS "维护正常（积压 ${R16_OPEN}）" "open_bundles ${R16_OPEN}，${R16_MAINT_TXT}，未超 ${R16_MAINTAIN_MAX_AGE_H}h${R17_HINT}"
+fi
+
+# R17 判级：无未消费源 / 最老 ≤ 15 天 → PASS；> 15 天 → WARN；不设 FAIL。
+# backlog 或两个字段读不到时按 WARN 未核查（同 R16），绝不静默判 PASS。
+# 只读边界：mem maintain --catch-up 只写进 detail 给人执行，巡检不调用。
+R17_DETAIL="未消费源 ${R17_SOURCES} 个，最老未消费证据 ${R17_AGE_TXT}；SLA 15 天（1296000 秒，design-data-lifecycle.md §5），休眠期豁免故不设 FAIL；人工命令 mem maintain --catch-up（巡检只报，不执行）"
+if [ "$R17_READ_FAIL" -eq 1 ]; then
+  add R17 WARN "证据准入 SLA 未核查" "证据准入 SLA 未核查：mem stats --json 无 backlog 对象（旧二进制或读取失败）；按 WARN 观察，勿据此判 PASS"
+elif [ "$R17_SOURCES" -eq 0 ]; then
+  add R17 PASS "无未消费证据源" "${R17_DETAIL}"
+elif [ -z "$R17_AGE" ]; then
+  add R17 WARN "证据准入 SLA 未核查" "证据准入 SLA 未核查：有未消费源但最老年龄不可读（旧二进制缺字段）；按 WARN 观察，勿据此判 PASS；${R17_DETAIL}"
+elif [ "$R17_AGE" -le "$R17_MAX_AGE_S" ]; then
+  add R17 PASS "最老未消费证据 ${R17_AGE_TXT}" "${R17_DETAIL}"
+else
+  add R17 WARN "证据准入超 SLA" "${R17_DETAIL}；已超 15 天，按 §5 R17 由人工追账"
 fi
 
 # ---------- 输出 ----------
