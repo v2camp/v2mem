@@ -976,3 +976,48 @@ func (s *Store) ReviewStats() ([]ReviewStatsRow, error) {
 	}
 	return out, nil
 }
+
+// JudgeCalibrationRow 是按 candidates.judge_model 分组的 Judge 标定行。
+//
+// 与 ReviewStatsRow 并列而不是合并：后者衡量「自动采纳的记忆后来被人工怎么处理」，
+// 这一行衡量「判定器自己判了多少、否了多少、是否被落库/重开」。分组键带 prompt
+// 版本（judge_model），提示词一改历史即可分段比较；阈值只观察，不做任何动作。
+type JudgeCalibrationRow struct {
+	JudgeModel string `json:"judge_model"`
+	Verdicts   int    `json:"verdicts"` // judge_verdict 非空的候选数
+	Reject     int    `json:"reject"`   // judge_verdict = 'reject'
+	Applied    int    `json:"applied"`  // 该组候选上 actor='judge' 的 accept/reject 裁决数
+	Reopened   int    `json:"reopened"` // 该组候选后续被 reopen 的裁决数
+}
+
+// JudgeCalibrationStats 按 judge_model 汇总判定器的裁决面。
+//
+// 只读单次聚合；judge_model 为空表示尚未判定，不成组。applied 取 actor='judge'
+// 且动作为 accept/reject 的裁决账，与 Wave 2 的落库路径（actor=judge）同源。
+func (s *Store) JudgeCalibrationStats() ([]JudgeCalibrationRow, error) {
+	rows, err := s.db.Query(`SELECT c.judge_model, COUNT(*),
+		SUM(CASE WHEN c.judge_verdict = 'reject' THEN 1 ELSE 0 END),
+		SUM((SELECT COUNT(*) FROM commit_decisions d
+			WHERE d.candidate_id = c.id AND d.actor = 'judge' AND d.action IN (?, ?, ?))),
+		SUM((SELECT COUNT(*) FROM commit_decisions d
+			WHERE d.candidate_id = c.id AND d.action = ?))
+		FROM candidates c
+		WHERE c.judge_model <> ''
+		GROUP BY c.judge_model
+		ORDER BY c.judge_model`,
+		string(commit.ActionAutoCommit), string(commit.ActionHumanAccept),
+		string(commit.ActionReject), string(commit.ActionReopen))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []JudgeCalibrationRow{}
+	for rows.Next() {
+		var r JudgeCalibrationRow
+		if err := rows.Scan(&r.JudgeModel, &r.Verdicts, &r.Reject, &r.Applied, &r.Reopened); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
