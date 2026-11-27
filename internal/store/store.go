@@ -1309,6 +1309,7 @@ type Stats struct {
 	Superseded  int            `json:"superseded"`
 	ByKind      map[string]int `json:"by_kind"`
 	ByProject   map[string]int `json:"by_project"`
+	ByActor     map[string]int `json:"by_actor"`
 	ExpiredLive int            `json:"expired_pending_gc"`
 	ByTable     map[string]int `json:"by_table"`
 }
@@ -1519,7 +1520,7 @@ var statsDataTables = []string{
 func (s *Store) Stats() (*Stats, error) {
 	st := &Stats{
 		Path: s.path, ByKind: map[string]int{}, ByProject: map[string]int{},
-		ByTable: map[string]int{},
+		ByActor: map[string]int{}, ByTable: map[string]int{},
 	}
 
 	if fi, err := os.Stat(s.path); err == nil {
@@ -1577,6 +1578,18 @@ func (s *Store) Stats() (*Stats, error) {
 					p = "(global)"
 				}
 				st.ByProject[p] = n
+			}
+		}
+	}
+	// by_actor 是 commit_decisions 的裁决来源分布，供 12h 巡检算自动化率。
+	// 与 ByKind/ByProject 同风格：空表保留空 map（JSON 输出 {} 而非 null）。
+	if rows, err := s.db.Query(`SELECT actor, COUNT(*) FROM commit_decisions GROUP BY actor`); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var actor string
+			var n int
+			if err := rows.Scan(&actor, &n); err == nil {
+				st.ByActor[actor] = n
 			}
 		}
 	}

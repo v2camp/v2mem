@@ -981,6 +981,60 @@ func TestStatsCountsKindsProjectsAndLive(t *testing.T) {
 	}
 }
 
+func TestStatsByActor(t *testing.T) {
+	s := newTestStore(t)
+
+	// 空表：by_actor 是非 nil 空 map（JSON {} 而非 null），与 ByKind/ByProject 同风格。
+	empty, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats(empty): %v", err)
+	}
+	if empty.ByActor == nil || len(empty.ByActor) != 0 {
+		t.Errorf("空表 ByActor = %+v，期望非 nil 空 map", empty.ByActor)
+	}
+
+	// 三类 actor 的裁决各插几行；只统计 commit_decisions，不碰其它表。
+	for _, tc := range []struct{ id, actor string }{
+		{"d1", "model-auto"}, {"d2", "model-auto"}, {"d3", "model-auto"},
+		{"d4", "human"}, {"d5", "human"},
+		{"d6", "review_action"},
+	} {
+		if _, err := s.db.Exec(`INSERT INTO commit_decisions
+			(id, candidate_id, revision, action, actor, idempotency_key, created_at)
+			VALUES (?, ?, 0, 'auto_commit', ?, ?, ?)`,
+			tc.id, "c-"+tc.id, tc.actor, "key-"+tc.id, time.Now().Unix()); err != nil {
+			t.Fatalf("insert decision %s: %v", tc.id, err)
+		}
+	}
+
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	want := map[string]int{"model-auto": 3, "human": 2, "review_action": 1}
+	if len(st.ByActor) != len(want) {
+		t.Fatalf("ByActor = %+v，期望 %+v", st.ByActor, want)
+	}
+	for actor, n := range want {
+		if st.ByActor[actor] != n {
+			t.Errorf("ByActor[%q] = %d，期望 %d；完整 %+v", actor, st.ByActor[actor], n, st.ByActor)
+		}
+	}
+
+	// JSON key 必须精确为顶层 by_actor，值为 object。
+	raw, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if _, ok := obj["by_actor"]; !ok {
+		t.Errorf("Stats JSON 缺少顶层键 by_actor：%s", raw)
+	}
+}
+
 // ---------- 溯源（provenance） ----------
 
 func TestAddWritesProvenanceJSON(t *testing.T) {
