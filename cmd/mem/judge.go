@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/audit"
+	"github.com/v2camp/v2mem/internal/commit"
 	"github.com/v2camp/v2mem/internal/distill"
 	"github.com/v2camp/v2mem/internal/store"
 )
@@ -18,9 +19,10 @@ import (
 // 准入判定（docs/design-admission.md）。
 //
 // 定位：判定器只回答「这条要不要」，不回答「这条该怎么写」——后者是蒸馏的活。
-// 权限：只写痕迹，不改状态。VALUE.md 的红线要求「未标定 + 不可回滚的推测不回写主库」；
-// 回滚命令与 ≥95%/≥200 的标定门槛都还没落地，所以 --apply 入口一并撤掉，
-// 判定器目前没有任何改库路径。要恢复落库，必须先把这两件事同批交付。
+// 权限：默认只写痕迹，不改状态；显式 --apply-reject/--apply-accept 才落库。
+// 落库仍走 CommitReject / JudgeAutoCommit（提交矩阵），不是判定器的特权通道：
+// 冲突类不自动 reject，accept 只有矩阵判 auto_commit 才写记忆。回滚用
+// `mem review rollback --model-tag`，判定与裁决都带 model_tag，可按版本批量撤。
 const (
 	judgePromptVersion = "judge-v4"
 	judgeDefaultBatch  = 20
@@ -79,6 +81,9 @@ func cmdJudge(args []string) error {
 	timeout := fs.Duration("timeout", 90*time.Second, "单次模型调用超时")
 	limit := fs.Int("limit", judgeDefaultBatch, "本批判定条数上限")
 	project := fs.String("project", "", "只判这个工程的候选（空=不过滤）")
+	// 手动 judge 仍默认影子：只有显式开这两个开关才改状态。
+	applyReject := fs.Bool("apply-reject", false, "把 reject 判定落库（冲突类仍跳过）")
+	applyAccept := fs.Bool("apply-accept", false, "把 accept 判定交给提交矩阵落库（Defer/Conflict 只记裁决）")
 	// S12 退役（§12.1）：--stats 保留注册只为给出一句话引导，统计面已并入 review stats。
 	stats := fs.Bool("stats", false, "（已退役）标定统计请用 mem review stats")
 	auditFile := fs.String("audit-file", "", "审计日志路径（默认 ~/.v2mem/audit.jsonl；- 关闭）")
@@ -162,12 +167,12 @@ func cmdJudge(args []string) error {
 	// 归因要能按模型分组：flag > 解析出的实际模型 > 只记 provider（cli 的版本分量在 providerName 里）。
 	modelTag := judgeModelTag(providerName, *model, opt.Model)
 
-	res, err := applyJudgments(st, list, verdicts, modelTag)
+	res, err := applyJudgments(st, list, verdicts, modelTag, *applyReject, *applyAccept)
 	if err != nil {
 		return err
 	}
 
-	const mode = "影子（未改状态）"
+	mode := judgeMode(*applyReject, *applyAccept)
 	if *auditFile != "-" {
 		if err := audit.Append(auditPath(*auditFile), audit.Record{
 			TS: time.Now().Unix(), Event: "candidate-judge", Provider: providerName,
@@ -182,17 +187,35 @@ func cmdJudge(args []string) error {
 			"provider": providerName, "model": modelTag, "mode": mode,
 			"count": len(verdicts), "accept": res.Accept, "reject": res.Reject,
 			"unsure": res.Unsure, "downgraded": res.Downgraded, "skipped": res.Skipped,
+			"applied_accept": res.AppliedAccept, "applied_reject": res.AppliedReject,
 		})
 	}
 	fmt.Printf("judge: %d 条 → accept %d / reject %d / unsure %d；模式=%s\n",
 		len(verdicts), res.Accept, res.Reject, res.Unsure, mode)
+	if res.AppliedAccept > 0 || res.AppliedReject > 0 {
+		fmt.Printf("  落库：accept %d / reject %d\n", res.AppliedAccept, res.AppliedReject)
+	}
 	if res.Skipped > 0 {
-		fmt.Printf("  其中 %d 条 revision 已变化，跳过（不覆盖并发裁决）\n", res.Skipped)
+		fmt.Printf("  其中 %d 条未落库（revision 已变化、已关闭或冲突类跳过）\n", res.Skipped)
 	}
 	if res.Downgraded > 0 {
 		fmt.Printf("  其中 %d 条因 kind/scope 不允许自动采纳而降级 unsure\n", res.Downgraded)
 	}
 	return nil
+}
+
+// judgeMode 是审计与输出里的模式标签：必须让人一眼看出这次到底改没改库。
+func judgeMode(applyReject, applyAccept bool) string {
+	switch {
+	case applyReject && applyAccept:
+		return "落库（reject+accept）"
+	case applyReject:
+		return "落库（仅 reject）"
+	case applyAccept:
+		return "落库（仅 accept）"
+	default:
+		return "影子（未改状态）"
+	}
 }
 
 // judgeModelTag 拼 judge_model：<provider>[:<model>]@<prompt 版本>。
@@ -218,14 +241,20 @@ func judgeModelTag(providerName, flagModel, resolvedModel string) string {
 	return providerName + ":" + m + "@" + judgePromptVersion
 }
 
-// judgeResult 是落库循环的计数。抽出来是为了让「影子不改状态」这件事可测 ——
-// 它不可能靠读代码相信，只能靠断言。
+// judgeResult 是落库循环的计数。抽出来是为了让「默认影子 / 显式落库」都靠断言，
+// 而不是靠读代码相信。
+//
+// Skipped 的口径是「判定已记下、但没改变状态」：CAS stale、候选已关闭、
+// 冲突类跳过、矩阵判 Defer/Conflict 都算在内。
 type judgeResult struct {
 	Accept, Reject, Unsure, Downgraded, Skipped int
+	AppliedAccept, AppliedReject                int
 }
 
-// applyJudgments 把判定写进候选：只写痕迹，不动 status。
-func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVerdict, modelTag string) (judgeResult, error) {
+// applyJudgments 把判定写进候选：先写痕迹（MarkJudgeVerdictCAS），
+// 只有显式 applyReject/applyAccept 时才继续走裁决路径。
+func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVerdict, modelTag string,
+	applyReject, applyAccept bool) (judgeResult, error) {
 	var r judgeResult
 	for _, v := range verdicts {
 		cand := findByPrefix(list, v.ID)
@@ -262,8 +291,60 @@ func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVer
 			}
 			return r, err
 		}
+		switch verdict {
+		case "reject":
+			if applyReject {
+				if err := r.applyReject(st, cand, reason); err != nil {
+					return r, err
+				}
+			}
+		case "accept":
+			if applyAccept {
+				if err := r.applyAccept(st, cand, modelTag); err != nil {
+					return r, err
+				}
+			}
+		}
+		// unsure 不改状态：没有足够信息就不该替人做决定。
 	}
 	return r, nil
+}
+
+// applyReject 把一条 reject 落库。冲突类跳过：冲突要留给人看，
+// 自动否决掉就等于替人消灭了「两条结论互斥」这个信号。
+func (r *judgeResult) applyReject(st *store.Store, cand *store.Candidate, reason string) error {
+	if strings.EqualFold(strings.TrimSpace(cand.ReviewClass), "conflict") {
+		r.Skipped++
+		return nil
+	}
+	if _, err := st.CommitReject(cand.ID, cand.Revision, commit.ActorJudge, "judge:"+reason); err != nil {
+		if errors.Is(err, store.ErrCandidateClosed) || errors.Is(err, store.ErrRevisionConflict) {
+			r.Skipped++
+			return nil
+		}
+		return err
+	}
+	r.AppliedReject++
+	return nil
+}
+
+// applyAccept 走 JudgeAutoCommit：矩阵判 auto_commit 才写记忆，
+// Defer/Conflict 只记裁决，绝不直接 CommitAccept。
+func (r *judgeResult) applyAccept(st *store.Store, cand *store.Candidate, modelTag string) error {
+	res, err := st.JudgeAutoCommit(cand.ID, cand.Revision, modelTag)
+	if err != nil {
+		if errors.Is(err, store.ErrCandidateClosed) || errors.Is(err, store.ErrRevisionConflict) {
+			r.Skipped++
+			return nil
+		}
+		return err
+	}
+	if res.Committed {
+		r.AppliedAccept++
+		return nil
+	}
+	r.Skipped++
+	return nil
 }
 
 // mayAutoAccept 是模型的权限边界，与 internal/commit/policy.go 的矩阵保持一致：

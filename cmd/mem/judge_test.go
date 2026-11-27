@@ -40,7 +40,7 @@ func TestJudgeShadowKeepsStateUntouched(t *testing.T) {
 
 	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
 		{ID: c.ID[:8], Verdict: "reject", Reason: "process_narrative"},
-	}, "ollama@judge-v1")
+	}, "ollama@judge-v1", false, false)
 	if err != nil {
 		t.Fatalf("applyJudgments: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestJudgeDowngradesKindsMatrixKeepsForHumans(t *testing.T) {
 
 	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
 		{ID: c.ID[:8], Verdict: "accept", Reason: "durable"},
-	}, "ollama@judge-v1")
+	}, "ollama@judge-v1", false, false)
 	if err != nil {
 		t.Fatalf("applyJudgments: %v", err)
 	}
