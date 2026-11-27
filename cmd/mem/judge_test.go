@@ -40,7 +40,7 @@ func TestJudgeShadowKeepsStateUntouched(t *testing.T) {
 
 	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
 		{ID: c.ID[:8], Verdict: "reject", Reason: "process_narrative"},
-	}, "ollama@judge-v1")
+	}, "ollama@judge-v1", false, false)
 	if err != nil {
 		t.Fatalf("applyJudgments: %v", err)
 	}
@@ -56,19 +56,19 @@ func TestJudgeShadowKeepsStateUntouched(t *testing.T) {
 	}
 }
 
-// 模型的 accept 不得授予 pitfall/preference/decision：矩阵对这些类是 human_accept。
-func TestJudgeDowngradesKindsMatrixKeepsForHumans(t *testing.T) {
+// P4 起 Judge 不再预降级 manualKinds/global：accept 由提交矩阵裁决是否落库。
+func TestJudgeAcceptKeepsVerdictForMatrix(t *testing.T) {
 	st := newJudgeStore(t)
 	c := seedCandidate(t, st, "pitfall", "iPad 三栏布局的触控坐标错位，根因在 UIView 手势层")
 
 	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
 		{ID: c.ID[:8], Verdict: "accept", Reason: "durable"},
-	}, "ollama@judge-v1")
+	}, "ollama@judge-v1", false, false)
 	if err != nil {
 		t.Fatalf("applyJudgments: %v", err)
 	}
-	if r.Accept != 0 || r.Downgraded != 1 || r.Unsure != 1 {
-		t.Fatalf("应降级为 unsure，got %+v", r)
+	if r.Accept != 1 || r.Unsure != 0 || r.AppliedAccept != 0 {
+		t.Fatalf("影子模式应保留 accept 判定、不改状态，got %+v", r)
 	}
 }
 
@@ -112,32 +112,6 @@ func TestJudgeStatsCountsHumanAgreement(t *testing.T) {
 	}
 	if !strings.Contains(stats[0].Verdict, "reject") {
 		t.Errorf("verdict 分组异常: %+v", stats[0])
-	}
-}
-
-// 权限边界是纯函数，用表把它钉住：改判据时这里先红。
-func TestMayAutoAccept(t *testing.T) {
-	cases := []struct {
-		name    string
-		kind    string
-		scope   string
-		project string
-		want    bool
-	}{
-		{"项目事实", "fact", "project", "v2mem", true},
-		{"项目任务", "task", "", "v2mem", true},
-		{"踩坑必须人工", "pitfall", "project", "v2mem", false},
-		{"偏好必须人工", "preference", "project", "v2mem", false},
-		{"决策必须人工", "decision", "project", "v2mem", false},
-		{"全局作用域", "fact", "global", "v2mem", false},
-		{"跨工程作用域", "fact", "cross_project", "v2mem", false},
-		{"无工程归属", "fact", "", "", false},
-	}
-	for _, c := range cases {
-		got := mayAutoAccept(&store.Candidate{Kind: c.kind, Scope: c.scope, Project: c.project})
-		if got != c.want {
-			t.Errorf("%s: mayAutoAccept(%s/%s/%q) = %v, want %v", c.name, c.kind, c.scope, c.project, got, c.want)
-		}
 	}
 }
 

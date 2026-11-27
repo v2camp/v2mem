@@ -260,9 +260,9 @@ func TestMaybeSpawnJudgeConfigDoesNotTouchReadPath(t *testing.T) {
 	}
 }
 
-// 自动拉起的参数里永远不能出现改库开关：落库入口已撤，这条要可断言。
-func TestJudgeArgsNeverCarryApply(t *testing.T) {
-	if got := strings.Join(judgeArgs(20), " "); got != "judge --limit 20" {
+// 自动拉起的参数必须显式带落库开关：手动 judge 仍默认影子，自动侧由这里决定。
+func TestJudgeArgsCarryApplyFlags(t *testing.T) {
+	if got := strings.Join(judgeArgs(20), " "); got != "judge --limit 20 --apply-reject --apply-accept" {
 		t.Fatalf("自动拉起参数异常: %q", got)
 	}
 }

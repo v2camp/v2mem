@@ -42,6 +42,8 @@ type Candidate struct {
 	// Revision / TaskState 是 Judge 上下文（P4 §7 第 4 条）与裁决 CAS 的依据。
 	Revision  int    `json:"revision"`
 	TaskState string `json:"task_state,omitempty"`
+	// ReviewClass 供 Judge 的冲突守卫使用：conflict 类不得自动 reject。
+	ReviewClass string `json:"review_class,omitempty"`
 }
 
 // normalizeAttributedTo 收敛写入值，避免第三类来源悄悄进库。
@@ -219,7 +221,7 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 func (s *Store) candidateByID(id string) (*Candidate, error) {
 	row := s.db.QueryRow(`SELECT id, session_id, project, kind, content, content_hash,
 		status, source, channel, salience, obs_ids_json, 		created_at, decided_at, memory_id,
-		attributed_to, scope, revision, task_state
+		attributed_to, scope, revision, task_state, review_class
 		FROM candidates WHERE id = ?`, id)
 	return scanCandidate(row)
 }
@@ -235,7 +237,7 @@ func scanCandidate(row rowScanner) (*Candidate, error) {
 	var memory sql.NullString
 	if err := row.Scan(&c.ID, &c.SessionID, &c.Project, &c.Kind, &c.Content, &c.Hash,
 		&c.Status, &c.Source, &c.Channel, &c.Salience, &obsJSON, &c.CreatedAt, &decided, &memory,
-		&c.AttributedTo, &c.Scope, &c.Revision, &c.TaskState); err != nil {
+		&c.AttributedTo, &c.Scope, &c.Revision, &c.TaskState, &c.ReviewClass); err != nil {
 		return nil, err
 	}
 	c.ObsIDs = unmarshalObsIDs(obsJSON)
@@ -304,7 +306,7 @@ func (s *Store) ListPendingCandidatesByBundles(bundleIDs []string, limit int) ([
 // candidateSelect 是候选行列表的统一读法，避免两处查询的列顺序漂移。
 const candidateSelect = `SELECT id, session_id, project, kind, content, content_hash,
 	status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id,
-	attributed_to, scope, revision, task_state
+	attributed_to, scope, revision, task_state, review_class
 	FROM candidates`
 
 func (s *Store) queryCandidates(q string, args ...any) ([]Candidate, error) {

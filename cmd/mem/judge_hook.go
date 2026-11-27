@@ -19,7 +19,7 @@ import (
 // 三条硬约束（都来自 VALUE.md §4）：
 //   - 不在读路径上：只挂 Stop / SessionEnd，绝不影响 PromptSubmit 的注入延迟。
 //   - 钩子不等待：spawn 后立即返回，判定在子进程里跑完，失败只写 spawn 日志。
-//   - 不落库：子进程只写 verdict，没有任何改状态的参数——落库入口要等回滚与标定门槛一起交付。
+//   - 落库由子进程裁决：judgeArgs 显式带 --apply-reject/--apply-accept，冲突类仍跳过。
 //
 // 自动触发的开关有两层：
 //   - MEM_JUDGE_SPAWN：显式总闸，优先级最高。=1 强制开（脚本/CI），=0 强制关（GUI 宿主关不掉 export 时的退路）。
@@ -46,9 +46,10 @@ func defaultStartJudge(db string, limit int) error {
 	return startMemProc(db, judgeArgs(limit))
 }
 
-// judgeArgs 抽成纯函数：自动拉起的参数里永远不能出现改库开关，这条要可断言。
+// judgeArgs 抽成纯函数：自动子进程必须显式打开落库开关（手动 judge 默认影子），
+// 这条要可断言。
 func judgeArgs(limit int) []string {
-	return []string{"judge", "--limit", strconv.Itoa(limit)}
+	return []string{"judge", "--limit", strconv.Itoa(limit), "--apply-reject", "--apply-accept"}
 }
 
 // maybeSpawnJudge 在写侧事件末尾按阈值拉起判定。所有失败都静默（只写 stderr）。
@@ -96,8 +97,9 @@ func maybeSpawnJudge(db string, event harness.Event) {
 	}
 	apply := strings.TrimSpace(os.Getenv("MEM_JUDGE_APPLY")) == "1"
 	if apply {
-		// 旧环境变量残留时明确说一句：不报错（不能阻断写侧钩子），但不再有任何改库效果。
-		fmt.Fprintln(os.Stderr, "v2mem hook: MEM_JUDGE_APPLY 已废弃（--apply 入口已撤），本次仍按影子运行")
+		// 旧环境变量残留时明确说一句：不报错（不能阻断写侧钩子），但落库已由
+		// --apply-reject/--apply-accept 决定，旧开关不再有任何作用。
+		fmt.Fprintln(os.Stderr, "v2mem hook: MEM_JUDGE_APPLY 已废弃（落库由 --apply-reject/--apply-accept 决定）")
 	}
 	if err := startJudgeProc(db, minPending); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 judge 失败，已放过:", err)
