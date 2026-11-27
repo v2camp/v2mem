@@ -310,7 +310,7 @@ candidates: pending
 
 三者**分别授权，不捆绑开启**：shadow Judge 自动 reject（可回捞，风险低）可单独开；
 候选正文外发到远端模型已在 `VALUE.md` §4 例外边界内；**候选与裁决账的跨设备同步默认关**
-（先定冲突与归并语义再开）。
+（先定冲突与归并语义再开）。已入库正文的语义提炼（`mem repair content`）与回滚归入后审核治理，见 [`design-content-enhance.md`](./design-content-enhance.md)。
 
 ---
 
