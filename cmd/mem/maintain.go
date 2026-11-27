@@ -33,9 +33,10 @@ import (
 	"github.com/v2camp/v2mem/internal/store"
 )
 
-// maintainDefaultMaxBundles 是一次唤醒的默认预算：Hook 唤醒应该短命，
-// 剩下的留给下一轮；显式 `--max-bundles 0` 也落回默认，而不是变成「不处理」。
-const maintainDefaultMaxBundles = 20
+// maintainDefaultMaxBundles 是一次唤醒的默认预算。600 按每窗最多 50 条证据估算，
+// 单轮可推进约 3 万条序号，足以覆盖 transcript 存量；仍只处理有限窗口，剩下的
+// 留给下一轮。显式 `--max-bundles 0` 也落回默认，而不是变成「不处理」。
+const maintainDefaultMaxBundles = 600
 
 // maintainDefaultMaxAdjudications 是单次自动裁决的默认上限：
 // 与 accept --all-pending 的 1000 不同，maintain 是常驻小步，200 条足够一轮灰度，

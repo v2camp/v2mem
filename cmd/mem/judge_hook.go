@@ -90,19 +90,21 @@ func maybeSpawnJudge(db string, event harness.Event) {
 	if !shouldSpawnJudge(pending, last, time.Now().Unix(), minPending, cooldown) {
 		return
 	}
-	// 先写状态再拉起：宁可少跑一次，也不要在 spawn 成功后因写状态失败而反复重跑。
-	if err := writeJudgeState(path, time.Now().Unix()); err != nil {
-		fmt.Fprintln(os.Stderr, "v2mem hook: 判定触发写状态失败，已放过:", err)
-		return
-	}
 	apply := strings.TrimSpace(os.Getenv("MEM_JUDGE_APPLY")) == "1"
 	if apply {
 		// 旧环境变量残留时明确说一句：不报错（不能阻断写侧钩子），但落库已由
 		// --apply-reject/--apply-accept 决定，旧开关不再有任何作用。
 		fmt.Fprintln(os.Stderr, "v2mem hook: MEM_JUDGE_APPLY 已废弃（落库由 --apply-reject/--apply-accept 决定）")
 	}
+	// 拉起成功后才写冷却：spawn 失败（fork/exec/临时资源）不该占掉 24h 窗口，
+	// 否则一次瞬时失败会让积压整整一天无人处理。写状态失败仍只记 stderr：
+	// 宁可下次多跑一次，也不阻断写侧钩子。
 	if err := startJudgeProc(db, minPending); err != nil {
 		fmt.Fprintln(os.Stderr, "v2mem hook: 拉起 judge 失败，已放过:", err)
+		return
+	}
+	if err := writeJudgeState(path, time.Now().Unix()); err != nil {
+		fmt.Fprintln(os.Stderr, "v2mem hook: 判定触发写状态失败，已放过:", err)
 	}
 }
 

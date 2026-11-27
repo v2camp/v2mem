@@ -46,7 +46,7 @@ func installCountProc(t *testing.T) *int {
 // TestDistillProcArgs 守自动写侧 argv：Judge 接手裁决后 SessionStart 只发窗，
 // 不再自带 --model-auto（否则 maintain 会在 Judge 之前抢先自动裁决）。
 func TestDistillProcArgs(t *testing.T) {
-	want := []string{"maintain", "--stage=proposal", "--max-bundles", "20"}
+	want := []string{"maintain", "--stage=proposal", "--max-bundles", "600"}
 	got := distillProcArgs()
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("distillProcArgs() = %v, want %v", got, want)
