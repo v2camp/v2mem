@@ -384,6 +384,21 @@ func cmdMaintain(args []string) (retErr error) {
 	return stageErr
 }
 
+// stepWithBusyRetry 对 SQLITE_BUSY 做小步重试：短命维护进程被锁时
+// 直接整轮早停会让积压永远消化不动；非瞬时错误仍如实返回。
+func stepWithBusyRetry(ctx context.Context, runner *proposal.Runner) (*proposal.Outcome, error) {
+	var out *proposal.Outcome
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		out, err = runner.Step(ctx)
+		if err == nil || !isTransientDBError(err) {
+			return out, err
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	return out, err
+}
+
 // maintainRetentionStage 执行 gc 阶段：先备份（§8.1），再走终态保留回收。
 //
 // dry-run 不备份、不删；非 dry-run 备份失败即整阶段失败，后续阶段不再执行。
@@ -523,7 +538,7 @@ func maintainRun(st *store.Store, runner *proposal.Runner, rep *maintainReport, 
 	ctx := context.Background()
 	var stepErrs []error
 	for i := 0; i < limit; i++ {
-		out, err := runner.Step(ctx)
+		out, err := stepWithBusyRetry(ctx, runner)
 		if err != nil {
 			stepErrs = append(stepErrs, err)
 			rep.Blocked = "处理中断: " + err.Error()

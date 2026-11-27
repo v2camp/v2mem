@@ -14,7 +14,22 @@ import (
 // 零风险积累样本；改 status 必须走 CommitAccept / CommitReject，与人工裁决同一条路径，
 // 这样审计、revision 冲突、唯一索引的行为完全一致——判定器不是特权通道。
 
-// MarkJudgeVerdict 记录一次判定，不动 status。
+// ErrJudgeVerdictStale 表示候选 revision 已变化或已离开 pending：
+// 判定结果不能再覆盖当前行（P4 §7 第 2 条 status/revision CAS）。
+var ErrJudgeVerdictStale = errors.New("候选 revision 已变化或已离开 pending")
+
+// MarkJudgeVerdict 是旧调用方的兼容入口：先读当前 revision 再做 CAS。
+// 生产批量判定直接用 MarkJudgeVerdictCAS(cand.Revision)，避免多一次读。
+func (s *Store) MarkJudgeVerdict(id, verdict, model, reason string) error {
+	var rev int
+	if err := s.db.QueryRow(`SELECT revision FROM candidates WHERE id = ?`, id).Scan(&rev); err != nil {
+		return err
+	}
+	return s.MarkJudgeVerdictCAS(id, verdict, model, reason, rev)
+}
+
+// MarkJudgeVerdictCAS 记录一次判定，不动 status；只有 revision 与 pending 状态
+// 都没变时才写入，防止 Judge 覆盖并发的自动裁决。
 //
 // 重复判定会覆盖上一次的 verdict（同一个候选可能换模型重判），judge_model 一起覆盖，
 // 否则「谁判的」与「判成什么」会分属两个模型，事后无法归因。
@@ -22,11 +37,22 @@ import (
 // 理由写进独立的 judge_reason，**不覆盖 rationale**：后者是提案自己给的理由，
 // 是「模型为什么这么提」的唯一记录，覆盖掉就再也无法比较判定与提案的分歧
 // （docs/design-data-lifecycle.md §7 第 5 条）。
-func (s *Store) MarkJudgeVerdict(id, verdict, model, reason string) error {
-	_, err := s.db.Exec(`UPDATE candidates
+func (s *Store) MarkJudgeVerdictCAS(id, verdict, model, reason string, expectedRevision int) error {
+	res, err := s.db.Exec(`UPDATE candidates
 		SET judge_verdict = ?, judge_model = ?, judge_reason = ?
-		WHERE id = ?`, verdict, model, reason, id)
-	return err
+		WHERE id = ? AND revision = ? AND status = 'pending'`,
+		verdict, model, reason, id, expectedRevision)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrJudgeVerdictStale
+	}
+	return nil
 }
 
 // CountPending 统计全库「还没被判定」的 pending 候选数，供积压触发判定用。

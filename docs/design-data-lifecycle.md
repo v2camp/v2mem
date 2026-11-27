@@ -238,7 +238,7 @@ candidates: pending
 | `ActionConflict` | **保留**：冲突优先于一切 |
 | actor 集合 `auto` / `human` / `human-reviewed-llm` / `judge` | 新增 `model-auto`（模型自动采纳）；后审核动作记 `human` + `review_action` |
 
-- 自动 accept 仍走 `CommitAccept`：revision CAS、幂等键、`edges.derived_from`、
+- 自动 accept 仍走 `CommitAccept`：revision CAS、幂等键、记忆 id 继承候选、
   `memory_evidence` 绑定全部保留。
 - 幂等键纳入提示词版本（或独立 `prompt_hash` 维度），避免换提示词后误判重放。
 
@@ -291,7 +291,8 @@ candidates: pending
 >   `--json`、错误如实退出码 1，二级路由在 `cmd/mem/review.go` 内 switch）。
 >   撤回恢复候选 `rejected` + `status_reason` 明确终态；每次动作记一条
 >   `commit_decisions`（action=`review_action`，actor=`human`），correct 的
->   before/after（模型原提案与人工修订）进 `reason_codes_json`，不新增 schema 列。
+>   before/after（模型原提案与人工修订）进 `reason_codes_json`，不新增 schema 列；
+>   正文变更同时重算 `content_hash` 与 `mem_sigs`，原始 hash 记入 `provenance.original_hash`。
 > - **按版本回滚** `mem review rollback --model-tag <model@promptver> [--dry-run]`：
 >   只命中 `created_memory=1` 且该 tag 的决策；人工已确认/修正的跳过并报告，
 >   已撤回计 already，其余撤回 + 候选回 rejected + 记一条 `reopen` 决策（保 G9
@@ -318,7 +319,9 @@ candidates: pending
 **定位**：Proposal/候选的语义建议器。`maintain` 与提交矩阵是确定性控制者。
 Judge 可以给 verdict 与理由建议，**不承担**调度、幂等、重试、GC、引用保护、提交权限。
 
-现状差距（扩权前必须补齐，来自审计勘误）：
+现状差距（扩权前必须补齐，来自审计勘误）——**P4 已落地（2026-11-27）**：
+CAS / 一输入一输出 / 上下文 / 标定 / 按 model-tag 回滚已补齐；Judge 自动 reject +
+矩阵门控 accept 默认启用（见 `acceptance-automation.md` §9）。
 
 1. 按 `judge_model`（含 prompt 版本）分组的标定统计——现有聚合无法按模型版本独立验证；
 2. `status`/`revision` CAS，防并发裁决覆盖；

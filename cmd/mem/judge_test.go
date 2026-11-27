@@ -40,7 +40,7 @@ func TestJudgeShadowKeepsStateUntouched(t *testing.T) {
 
 	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
 		{ID: c.ID[:8], Verdict: "reject", Reason: "process_narrative"},
-	}, "ollama@judge-v1")
+	}, "ollama@judge-v1", false, false)
 	if err != nil {
 		t.Fatalf("applyJudgments: %v", err)
 	}
@@ -56,19 +56,19 @@ func TestJudgeShadowKeepsStateUntouched(t *testing.T) {
 	}
 }
 
-// 模型的 accept 不得授予 pitfall/preference/decision：矩阵对这些类是 human_accept。
-func TestJudgeDowngradesKindsMatrixKeepsForHumans(t *testing.T) {
+// P4 起 Judge 不再预降级 manualKinds/global：accept 由提交矩阵裁决是否落库。
+func TestJudgeAcceptKeepsVerdictForMatrix(t *testing.T) {
 	st := newJudgeStore(t)
 	c := seedCandidate(t, st, "pitfall", "iPad 三栏布局的触控坐标错位，根因在 UIView 手势层")
 
 	r, err := applyJudgments(st, []store.Candidate{c}, []judgeVerdict{
 		{ID: c.ID[:8], Verdict: "accept", Reason: "durable"},
-	}, "ollama@judge-v1")
+	}, "ollama@judge-v1", false, false)
 	if err != nil {
 		t.Fatalf("applyJudgments: %v", err)
 	}
-	if r.Accept != 0 || r.Downgraded != 1 || r.Unsure != 1 {
-		t.Fatalf("应降级为 unsure，got %+v", r)
+	if r.Accept != 1 || r.Unsure != 0 || r.AppliedAccept != 0 {
+		t.Fatalf("影子模式应保留 accept 判定、不改状态，got %+v", r)
 	}
 }
 
@@ -115,37 +115,11 @@ func TestJudgeStatsCountsHumanAgreement(t *testing.T) {
 	}
 }
 
-// 权限边界是纯函数，用表把它钉住：改判据时这里先红。
-func TestMayAutoAccept(t *testing.T) {
-	cases := []struct {
-		name    string
-		kind    string
-		scope   string
-		project string
-		want    bool
-	}{
-		{"项目事实", "fact", "project", "v2mem", true},
-		{"项目任务", "task", "", "v2mem", true},
-		{"踩坑必须人工", "pitfall", "project", "v2mem", false},
-		{"偏好必须人工", "preference", "project", "v2mem", false},
-		{"决策必须人工", "decision", "project", "v2mem", false},
-		{"全局作用域", "fact", "global", "v2mem", false},
-		{"跨工程作用域", "fact", "cross_project", "v2mem", false},
-		{"无工程归属", "fact", "", "", false},
-	}
-	for _, c := range cases {
-		got := mayAutoAccept(&store.Candidate{Kind: c.kind, Scope: c.scope, Project: c.project})
-		if got != c.want {
-			t.Errorf("%s: mayAutoAccept(%s/%s/%q) = %v, want %v", c.name, c.kind, c.scope, c.project, got, c.want)
-		}
-	}
-}
-
 // 送进模型的只有短 id、kind、scope、project 与截断后的正文；长正文必须截断。
 func TestJudgeCandidatesJSONTruncates(t *testing.T) {
 	long := strings.Repeat("很长的事实", 300)
 	list := []store.Candidate{{ID: "abcdef123456", Kind: "fact", Project: "p", Content: long}}
-	out := judgeCandidatesJSON(list)
+	out := judgeCandidatesJSON(list, nil, nil)
 	if !strings.Contains(out, "abcdef12") || strings.Contains(out, "abcdef123456") {
 		t.Errorf("应只送 8 位前缀，got %s", out[:60])
 	}
@@ -161,6 +135,163 @@ func TestJudgeCandidatesJSONTruncates(t *testing.T) {
 	}
 	if !strings.HasSuffix(parsed[0].Content, "…") {
 		t.Error("截断后应带省略号")
+	}
+}
+
+// 一输入一输出：未知 id、缺失、重复都算坏输出。
+func TestValidateJudgeVerdicts(t *testing.T) {
+	list := []store.Candidate{{ID: "aaaaaaaa1111"}, {ID: "bbbbbbbb2222"}}
+	cases := []struct {
+		name string
+		vs   []judgeVerdict
+		ok   bool
+	}{
+		{"完整", []judgeVerdict{{ID: "aaaaaaaa", Verdict: "reject"}, {ID: "bbbbbbbb", Verdict: "unsure"}}, true},
+		{"缺失", []judgeVerdict{{ID: "aaaaaaaa", Verdict: "reject"}}, false},
+		{"重复", []judgeVerdict{{ID: "aaaaaaaa", Verdict: "reject"}, {ID: "aaaaaaaa", Verdict: "unsure"}, {ID: "bbbbbbbb", Verdict: "unsure"}}, false},
+		{"未知", []judgeVerdict{{ID: "cccccccc", Verdict: "reject"}, {ID: "aaaaaaaa", Verdict: "reject"}, {ID: "bbbbbbbb", Verdict: "unsure"}}, false},
+	}
+	for _, c := range cases {
+		err := validateJudgeVerdicts(list, c.vs)
+		if (err == nil) != c.ok {
+			t.Errorf("%s: err=%v, want ok=%v", c.name, err, c.ok)
+		}
+	}
+}
+
+// 上下文补齐：revision / task_state / evidence 摘要进入送模型 JSON。
+func TestJudgeCandidatesJSONIncludesContext(t *testing.T) {
+	list := []store.Candidate{{
+		ID: "abcdef123456", Kind: "task", Project: "p", Content: "待办",
+		Revision: 3, TaskState: "in_progress",
+	}}
+	out := judgeCandidatesJSON(list, func(string) []string { return []string{"原始证据摘要"} }, nil)
+	var parsed []struct {
+		Revision  int      `json:"revision"`
+		TaskState string   `json:"task_state"`
+		Evidence  []string `json:"evidence"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed[0].Revision != 3 || parsed[0].TaskState != "in_progress" ||
+		len(parsed[0].Evidence) != 1 || parsed[0].Evidence[0] != "原始证据摘要" {
+		t.Fatalf("上下文未进入 JSON: %+v", parsed[0])
+	}
+}
+
+// ---------- 已有记忆上下文（judge-v4） ----------
+//
+// 判定「重复/更新」需要看到库里相似的既有条目；没有它，模型只能凭单条正文猜。
+
+// 种子记忆必须出现在送模型的 JSON 里。
+func TestJudgeCandidatesJSONIncludesNeighborMemories(t *testing.T) {
+	st := newJudgeStore(t)
+	if _, err := st.Add(store.AddInput{
+		Content: "v2mem 的 MCP 通道与 hook 注入相互独立", Project: "v2mem", Source: "human",
+	}); err != nil {
+		t.Fatalf("seed memory: %v", err)
+	}
+	list := []store.Candidate{{
+		ID: "abcdef123456", Kind: "fact", Project: "v2mem",
+		Content: "v2mem 的 MCP 通道与 hook 注入相互独立",
+	}}
+	out := judgeCandidatesJSON(list, nil, judgeNeighborLookup(st))
+	var parsed []struct {
+		Neighbors []string `json:"neighbor_memories"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("送模型的 JSON 必须可解析: %v（%s）", err, out)
+	}
+	if len(parsed) != 1 || len(parsed[0].Neighbors) == 0 {
+		t.Fatalf("应带出已有记忆摘要，got %s", out)
+	}
+	if !strings.Contains(parsed[0].Neighbors[0], "MCP 通道") {
+		t.Errorf("邻居摘要应是已有记忆正文，got %+v", parsed[0].Neighbors)
+	}
+}
+
+// 邻居检索不能跨工程串味：Project 非空时只看本工程（全局记忆另行按 Scope 规则处理）。
+func TestJudgeNeighborsDoNotLeakAcrossProjects(t *testing.T) {
+	st := newJudgeStore(t)
+	if _, err := st.Add(store.AddInput{
+		Content: "SSH 端口转发的默认配置记录", Project: "other", Source: "human",
+	}); err != nil {
+		t.Fatalf("seed memory: %v", err)
+	}
+	res := judgeNeighborLookup(st)(store.Candidate{
+		ID: "abcdef123456", Kind: "fact", Project: "v2mem", Content: "SSH 端口转发的默认配置记录",
+	})
+	for _, s := range res {
+		if strings.Contains(s, "SSH 端口转发") {
+			t.Fatalf("其他工程的记忆不应进入邻居，got %+v", res)
+		}
+	}
+}
+
+// 候选没有工程归属时按全库检索，否则全局知识永远看不到自己的重复。
+func TestJudgeNeighborsUseAllScopeWhenProjectEmpty(t *testing.T) {
+	st := newJudgeStore(t)
+	if _, err := st.Add(store.AddInput{
+		Content: "提交前跑 make cover-gate 是硬约束", Project: "", Source: "human",
+	}); err != nil {
+		t.Fatalf("seed memory: %v", err)
+	}
+	res := judgeNeighborLookup(st)(store.Candidate{
+		ID: "abcdef123456", Kind: "fact", Content: "提交前跑 make cover-gate 是硬约束",
+	})
+	if len(res) == 0 {
+		t.Fatal("无工程候选应能在全库找到已有记忆")
+	}
+}
+
+// 邻居正文只取摘要：过长会挤掉候选本身，也把无关细节塞进提示词。
+func TestJudgeNeighborsAreTruncated(t *testing.T) {
+	st := newJudgeStore(t)
+	long := strings.Repeat("邻居记忆的正文", 100)
+	if _, err := st.Add(store.AddInput{Content: long, Project: "v2mem", Source: "human"}); err != nil {
+		t.Fatalf("seed memory: %v", err)
+	}
+	res := judgeNeighborLookup(st)(store.Candidate{
+		ID: "abcdef123456", Kind: "fact", Project: "v2mem", Content: long,
+	})
+	if len(res) != 1 {
+		t.Fatalf("应命中 1 条邻居，got %d", len(res))
+	}
+	if n := len([]rune(res[0])); n > 201 {
+		t.Errorf("邻居摘要应截断到 200 rune（含省略号 201），got %d", n)
+	}
+	if !strings.HasSuffix(res[0], "…") {
+		t.Error("截断后应带省略号")
+	}
+}
+
+// 空上下文省略字段：没有邻居时不要给模型一个空数组去「回显」。
+func TestJudgeCandidatesJSONOmitsEmptyNeighbors(t *testing.T) {
+	list := []store.Candidate{{ID: "abcdef123456", Kind: "fact", Content: "无邻近记忆"}}
+	out := judgeCandidatesJSON(list, nil, func(store.Candidate) []string { return nil })
+	if strings.Contains(out, "neighbor_memories") {
+		t.Errorf("空上下文应省略字段，got %s", out)
+	}
+}
+
+// 检索失败不阻断判定：库坏了是上下文的损失，不是判定失败的理由。
+func TestJudgeNeighborLookupFailureIsEmpty(t *testing.T) {
+	st := newJudgeStore(t)
+	st.Close()
+	res := judgeNeighborLookup(st)(store.Candidate{ID: "abcdef123456", Kind: "fact", Content: "任意"})
+	if len(res) != 0 {
+		t.Fatalf("检索失败应退化为空上下文，got %+v", res)
+	}
+}
+
+// 提示词必须解释 neighbor_memories 的用途且禁止回显；版本随之升级。
+func TestJudgePromptMentionsNeighborMemories(t *testing.T) {
+	if judgePromptVersion != "judge-v4" {
+		t.Errorf("prompt 版本应升到 judge-v4，got %q", judgePromptVersion)
+	}
+	if !strings.Contains(judgePrompt, "neighbor_memories") || !strings.Contains(judgePrompt, "不要回显") {
+		t.Errorf("提示词应说明 neighbor_memories 是已有记忆且不要回显")
 	}
 }
 
@@ -194,11 +325,11 @@ func TestJudgeModelTag(t *testing.T) {
 	cases := []struct {
 		provider, flagModel, resolved, want string
 	}{
-		{"cli:claude@1+tpl1", "", "", "cli:claude@1+tpl1@judge-v2"},
-		{"cli:m1@1+tpl1", "m1", "", "cli:m1@1+tpl1@judge-v2"}, // 模型已在 cli: 前缀里，不能再拼一次
-		{"deepseek", "", "deepseek-flash", "deepseek:deepseek-flash@judge-v2"},
-		{"deepseek", "m1", "", "deepseek:m1@judge-v2"},
-		{"ollama", "", "", "ollama@judge-v2"}, // ollama 的默认模型是运行期兜底，不写进归因
+		{"cli:claude@1+tpl1", "", "", "cli:claude@1+tpl1@judge-v4"},
+		{"cli:m1@1+tpl1", "m1", "", "cli:m1@1+tpl1@judge-v4"}, // 模型已在 cli: 前缀里，不能再拼一次
+		{"deepseek", "", "deepseek-flash", "deepseek:deepseek-flash@judge-v4"},
+		{"deepseek", "m1", "", "deepseek:m1@judge-v4"},
+		{"ollama", "", "", "ollama@judge-v4"}, // ollama 的默认模型是运行期兜底，不写进归因
 	}
 	for _, tc := range cases {
 		if got := judgeModelTag(tc.provider, tc.flagModel, tc.resolved); got != tc.want {

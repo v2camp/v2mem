@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -13,7 +14,7 @@ import (
 )
 
 // 候选是蒸馏 / 导入的隔离区。默认不进 fts_mem，mem search 看不见。
-// 只有 AcceptCandidate 才把正文写进 memories，并记一条 derived_from 边。
+// 只有 AcceptCandidate 才把正文写进 memories，且记忆沿用候选 id（派生关系由 id 同值表达）。
 
 // ErrAlreadyDistilled 表示这个会话窗口已经成功蒸馏过。
 var ErrAlreadyDistilled = errors.New("该会话窗口已蒸馏")
@@ -39,6 +40,11 @@ type Candidate struct {
 	// Scope 只给准入判定用（global / cross_project 一律不许自动 accept）。
 	// 它是 WHERE 之外的额外列，不影响 ListCandidates 的空值语义。
 	Scope string `json:"scope,omitempty"`
+	// Revision / TaskState 是 Judge 上下文（P4 §7 第 4 条）与裁决 CAS 的依据。
+	Revision  int    `json:"revision"`
+	TaskState string `json:"task_state,omitempty"`
+	// ReviewClass 供 Judge 的冲突守卫使用：conflict 类不得自动 reject。
+	ReviewClass string `json:"review_class,omitempty"`
 }
 
 // normalizeAttributedTo 收敛写入值，避免第三类来源悄悄进库。
@@ -206,6 +212,10 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 		}
 		return nil, err
 	}
+	// 证据链统一落 candidate_evidence：obs_ids_json 只是快照，采纳侧只读表。
+	if _, err := s.candidateEvidenceFromObs(context.Background(), s.db, id, in.ObsIDs, now); err != nil {
+		return nil, err
+	}
 	c, err := s.candidateByID(id)
 	if err != nil {
 		return nil, err
@@ -213,10 +223,44 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 	return &CandidateResult{Candidate: *c, Created: true}, nil
 }
 
+// candidateEvidenceFromObs 把 obs_ids_json 里的观测展开成 candidate_evidence 行。
+//
+// 为什么需要：候选证据此前有两个载体——规则蒸馏路径（InsertCandidate）只写
+// obs_ids_json，proposal 路径才写 candidate_evidence。采纳侧只读表，于是规则路径
+// 的候选采纳后 memory_evidence 为空、provenance 退化成 candidate:<短 id>
+// （2026-11-27 库内唯一一条记忆就是这个状态，溯源断在 preview）。
+//
+// 这里统一口径：落候选时就把 obs_ids 展开成表行，obs_ids_json 退化为快照；
+// 老候选在采纳前由 commitAcceptView 调同一函数自愈。
+func (s *Store) candidateEvidenceFromObs(ctx context.Context, q sqlQuerier, candidateID string, obsIDs []string, now int64) (int, error) {
+	added := 0
+	for _, obsID := range obsIDs {
+		if strings.TrimSpace(obsID) == "" {
+			continue
+		}
+		// evidence_id 用观测主键（ev_<32hex>），与 proposal 路径的 CandidateEvidence
+		// 同一命名空间；观测不存在时 SELECT 不产出行，不会留下无来源的引用。
+		res, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO candidate_evidence(
+			candidate_id, evidence_id, event_uid, source_id, source_seq,
+			archive_hash, raw_record_hash, evidence_role, quote_hash, created_at
+		)
+		SELECT ?, o.id, o.event_uid, o.source_id, o.source_seq,
+		       o.archive_hash, o.raw_record_hash, 'direct', '', ?
+		FROM observations o WHERE o.id = ?`, candidateID, now, obsID)
+		if err != nil {
+			return added, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			added += int(n)
+		}
+	}
+	return added, nil
+}
+
 func (s *Store) candidateByID(id string) (*Candidate, error) {
 	row := s.db.QueryRow(`SELECT id, session_id, project, kind, content, content_hash,
 		status, source, channel, salience, obs_ids_json, 		created_at, decided_at, memory_id,
-		attributed_to, scope
+		attributed_to, scope, revision, task_state, review_class
 		FROM candidates WHERE id = ?`, id)
 	return scanCandidate(row)
 }
@@ -232,7 +276,7 @@ func scanCandidate(row rowScanner) (*Candidate, error) {
 	var memory sql.NullString
 	if err := row.Scan(&c.ID, &c.SessionID, &c.Project, &c.Kind, &c.Content, &c.Hash,
 		&c.Status, &c.Source, &c.Channel, &c.Salience, &obsJSON, &c.CreatedAt, &decided, &memory,
-		&c.AttributedTo, &c.Scope); err != nil {
+		&c.AttributedTo, &c.Scope, &c.Revision, &c.TaskState, &c.ReviewClass); err != nil {
 		return nil, err
 	}
 	c.ObsIDs = unmarshalObsIDs(obsJSON)
@@ -301,7 +345,7 @@ func (s *Store) ListPendingCandidatesByBundles(bundleIDs []string, limit int) ([
 // candidateSelect 是候选行列表的统一读法，避免两处查询的列顺序漂移。
 const candidateSelect = `SELECT id, session_id, project, kind, content, content_hash,
 	status, source, channel, salience, obs_ids_json, created_at, decided_at, memory_id,
-	attributed_to, scope
+	attributed_to, scope, revision, task_state, review_class
 	FROM candidates`
 
 func (s *Store) queryCandidates(q string, args ...any) ([]Candidate, error) {
@@ -414,8 +458,8 @@ func (s *Store) ResolveCandidate(idOrPrefix string) (*Candidate, error) {
 	}
 }
 
-// AcceptCandidate 把 pending 候选写进 memories（source=distill-accept），并记 derived_from。
-// 已采纳的再调用是幂等的：只补证据链/派生边/provenance，不重复计数。
+// AcceptCandidate 把 pending 候选写进 memories（source=distill-accept），记忆沿用候选 id。
+// 已采纳的再调用是幂等的：只补证据链/provenance，不重复计数。
 // 拒绝、过期或 revision 已变化的候选不能采纳。
 //
 // 实际提交逻辑在 commit.go：这里保留旧签名，供未感知 revision 的调用方继续使用。

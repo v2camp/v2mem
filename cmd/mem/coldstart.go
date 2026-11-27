@@ -24,7 +24,7 @@ func defaultColdStartDistill(db, session string) error {
 	return startMemProc(db, coldStartProcArgs())
 }
 
-// coldStartProcArgs 单列一层，便于测试断言冷启动确实走 proposal。
+// coldStartProcArgs 单列一层，便于测试断言冷启动确实走 maintain 自动裁决。
 func coldStartProcArgs() []string { return distillProcArgs() }
 
 func coldStartMetaKey(project string) string { return coldStartMetaPrefix + project }

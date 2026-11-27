@@ -1,7 +1,7 @@
 package main
 
 // 积压触发是自动链路里最容易失控的一处：判定跑多了就烧钱，跑少了积压还在。
-// 所以两条判据（阈值、冷却）都单独测，且默认必须是关的。
+// 所以两条判据（阈值、冷却）都单独测；开关三态（缺省开 / 显式关 / env 覆盖）也要分别钉住。
 
 import (
 	"io"
@@ -64,7 +64,7 @@ func seedPending(t *testing.T, st *store.Store, n int) {
 	}
 }
 
-// 默认必须是关的：升级后自己开始烧 API 是最坏的一种「惊喜」。
+// 没有任何可用模型配置（没有 model.json / 配了也跑不了）时不拉起：没有模型就无从判定。
 func TestMaybeSpawnJudgeOffByDefault(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("MEM_JUDGE_SPAWN", "")
@@ -171,7 +171,7 @@ func seedPendingAndSpy(t *testing.T) (*int, string) {
 
 // setup 配好模型后写进 model.json 的 auto_spawn，应让钩子在没有环境变量时也拉起判定。
 func TestMaybeSpawnJudgeFromModelConfig(t *testing.T) {
-	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: distill.BoolPtr(true)})
 	t.Setenv("MEM_JUDGE_SPAWN", "")
 	called, db := seedPendingAndSpy(t)
 
@@ -181,9 +181,45 @@ func TestMaybeSpawnJudgeFromModelConfig(t *testing.T) {
 	}
 }
 
+// 缺省（老配置没有 auto_spawn 字段）：有可用模型即开，升级后不再需要重跑 mem setup。
+func TestMaybeSpawnJudgeDefaultsOnWithModelConfig(t *testing.T) {
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2"})
+	t.Setenv("MEM_JUDGE_SPAWN", "")
+	called, db := seedPendingAndSpy(t)
+
+	maybeSpawnJudge(db, harness.EventStop)
+	if *called != 1 {
+		t.Fatalf("auto_spawn 缺省且有模型配置时应拉起一次，called=%d", *called)
+	}
+}
+
+// 显式 false 是用户的拒绝：与「缺省」必须可区分，不能因为默认开就拉起。
+func TestMaybeSpawnJudgeExplicitFalseVetoes(t *testing.T) {
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: distill.BoolPtr(false)})
+	t.Setenv("MEM_JUDGE_SPAWN", "")
+	called, db := seedPendingAndSpy(t)
+
+	maybeSpawnJudge(db, harness.EventStop)
+	if *called != 0 {
+		t.Fatalf("显式 auto_spawn=false 不应拉起判定，called=%d", *called)
+	}
+}
+
+// MEM_JUDGE_SPAWN=1 仍是最优先的强制开：脚本/CI 可以无视文件里的关闭。
+func TestMaybeSpawnJudgeEnvOneOverridesExplicitFalse(t *testing.T) {
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: distill.BoolPtr(false)})
+	t.Setenv("MEM_JUDGE_SPAWN", "1")
+	called, db := seedPendingAndSpy(t)
+
+	maybeSpawnJudge(db, harness.EventStop)
+	if *called != 1 {
+		t.Fatalf("MEM_JUDGE_SPAWN=1 应压过显式 false，called=%d", *called)
+	}
+}
+
 // 显式 0 是总闸：即使配置文件开了也要能一键关掉（GUI 宿主没法 export，这是主要关闭方式之一）。
 func TestMaybeSpawnJudgeEnvZeroVetoesConfig(t *testing.T) {
-	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: distill.BoolPtr(true)})
 	t.Setenv("MEM_JUDGE_SPAWN", "0")
 	called, db := seedPendingAndSpy(t)
 
@@ -195,7 +231,7 @@ func TestMaybeSpawnJudgeEnvZeroVetoesConfig(t *testing.T) {
 
 // mode=off 时即使残留 auto_spawn=true 也不得拉起：关掉模型来源就该停止一切外发。
 func TestMaybeSpawnJudgeOffModeVetoesConfig(t *testing.T) {
-	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "off", AutoSpawn: true})
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "off", AutoSpawn: distill.BoolPtr(true)})
 	t.Setenv("MEM_JUDGE_SPAWN", "")
 	called, db := seedPendingAndSpy(t)
 
@@ -207,7 +243,7 @@ func TestMaybeSpawnJudgeOffModeVetoesConfig(t *testing.T) {
 
 // 配置里的 auto_spawn 不得成为读路径的额外 I/O：读路径在读文件之前就返回。
 func TestMaybeSpawnJudgeConfigDoesNotTouchReadPath(t *testing.T) {
-	p := setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
+	p := setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: distill.BoolPtr(true)})
 	t.Setenv("MEM_JUDGE_SPAWN", "")
 	called, db := seedPendingAndSpy(t)
 
@@ -224,16 +260,16 @@ func TestMaybeSpawnJudgeConfigDoesNotTouchReadPath(t *testing.T) {
 	}
 }
 
-// 自动拉起的参数里永远不能出现改库开关：落库入口已撤，这条要可断言。
-func TestJudgeArgsNeverCarryApply(t *testing.T) {
-	if got := strings.Join(judgeArgs(20), " "); got != "judge --limit 20" {
+// 自动拉起的参数必须显式带落库开关：手动 judge 仍默认影子，自动侧由这里决定。
+func TestJudgeArgsCarryApplyFlags(t *testing.T) {
+	if got := strings.Join(judgeArgs(20), " "); got != "judge --limit 20 --apply-reject --apply-accept" {
 		t.Fatalf("自动拉起参数异常: %q", got)
 	}
 }
 
 // 旧的 MEM_JUDGE_APPLY 残留只警告、不生效：用户不能以为它还在自动改库。
 func TestMaybeSpawnJudgeWarnsDeprecatedApply(t *testing.T) {
-	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: true})
+	setupAutoSpawnHome(t, distill.ModelConfig{Mode: "cli", CLI: "codebuddy", ModelTag: "codebuddy@1+tpl2", AutoSpawn: distill.BoolPtr(true)})
 	t.Setenv("MEM_JUDGE_SPAWN", "")
 	t.Setenv("MEM_JUDGE_APPLY", "1")
 	called, db := seedPendingAndSpy(t)

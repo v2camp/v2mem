@@ -618,3 +618,89 @@ func TestAcceptModelAutoIdempotentReplay(t *testing.T) {
 		t.Fatalf("稳定后重放不得新增裁决: %v", decisionCounts)
 	}
 }
+
+// R3（Wave 2/E）：review rollback 同时回滚该 tag 的 Judge 驳回（候选回 pending），
+// JSON 增 judge_reopened/judge_skipped 且旧字段不变；文本输出要能看懂这件事。
+func TestReviewRollbackJudgeRejectByModelTag(t *testing.T) {
+	st := newJudgeStore(t)
+	res, err := st.InsertCandidate(store.CandidateInput{
+		SessionID: "s", Project: "p", Kind: "fact",
+		Content: "巡检已完成，报告已输出", Source: "distill",
+	})
+	if err != nil {
+		t.Fatalf("InsertCandidate: %v", err)
+	}
+	candID := res.Candidate.ID
+	if _, err := st.DB().Exec(`UPDATE candidates
+		SET status = 'rejected', status_reason = 'judge_reject', decided_at = 1700000100
+		WHERE id = ?`, candID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().Exec(`INSERT INTO commit_decisions
+		(id, candidate_id, revision, evidence_hash, action, actor, reason_codes_json,
+		 memory_id, model_tag, created_memory, idempotency_key, created_at)
+		VALUES (?,?,0,'','reject','judge','["judge_reject"]','',?,0,?,1700000100)`,
+		"dec-"+candID, candID, "judge@prompt-v4", "key-"+candID); err != nil {
+		t.Fatal(err)
+	}
+	db := st.Path()
+	st.Close()
+
+	candStatus := func() string {
+		s2, err := store.Open(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s2.Close()
+		var status string
+		_ = s2.DB().QueryRow(`SELECT status FROM candidates WHERE id = ?`, candID).Scan(&status)
+		return status
+	}
+
+	// dry-run：JSON 报计划动作且零写入。
+	out, err := captureStdout(t, func() error {
+		return cmdReview([]string{"rollback", "--model-tag", "judge@prompt-v4", "--dry-run", "--db", db, "--json"})
+	})
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, out)
+	}
+	got := decodeActionJSON(t, out)
+	if jnum(got, "judge_reopened") != 1 || jnum(got, "judge_skipped") != 0 {
+		t.Fatalf("dry-run 应报 judge_reopened=1，got %v", got)
+	}
+	// 旧字段仍在，计数为零而不是缺键。
+	for _, k := range []string{"matched", "withdrawn", "skipped", "already", "reopened"} {
+		if _, ok := got[k]; !ok {
+			t.Fatalf("旧字段 %q 不得缺失: %v", k, got)
+		}
+	}
+	if status := candStatus(); status != "rejected" {
+		t.Fatalf("--dry-run 不得改候选状态，got %q", status)
+	}
+
+	// 文本输出要能看懂 Judge 驳回这一段。
+	out, err = captureStdout(t, func() error {
+		return cmdReview([]string{"rollback", "--model-tag", "judge@prompt-v4", "--db", db})
+	})
+	if err != nil {
+		t.Fatalf("文本输出: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Judge 驳回") {
+		t.Fatalf("文本输出应说明 Judge 驳回回滚，got %q", out)
+	}
+	if status := candStatus(); status != "pending" {
+		t.Fatalf("judge 驳回候选应回 pending，got %q", status)
+	}
+
+	// 重跑幂等：JSON 计数归零。
+	out, err = captureStdout(t, func() error {
+		return cmdReview([]string{"rollback", "--model-tag", "judge@prompt-v4", "--db", db, "--json"})
+	})
+	if err != nil {
+		t.Fatalf("重跑: %v\n%s", err, out)
+	}
+	got = decodeActionJSON(t, out)
+	if jnum(got, "judge_reopened") != 0 || jnum(got, "judge_skipped") != 0 {
+		t.Fatalf("重跑不得重复动作，got %v", got)
+	}
+}
