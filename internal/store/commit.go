@@ -492,6 +492,24 @@ func (s *Store) commitAcceptView(view *CommitCandidate, expectedRevision int, ac
 		if err != nil {
 			return err
 		}
+		// 老候选（规则蒸馏路径）只有 obs_ids_json，采纳前补一次证据链：
+		// 否则 memory_evidence 为空、provenance 退化成 preview，溯源断在候选上。
+		if len(rows) == 0 {
+			var rawObs string
+			if qerr := q.QueryRowContext(ctx,
+				`SELECT obs_ids_json FROM candidates WHERE id = ?`, cur.ID).Scan(&rawObs); qerr != nil &&
+				!errors.Is(qerr, sql.ErrNoRows) {
+				return qerr
+			}
+			if obsIDs := unmarshalObsIDs(rawObs); len(obsIDs) > 0 {
+				if _, err := s.candidateEvidenceFromObs(ctx, q, cur.ID, obsIDs, time.Now().Unix()); err != nil {
+					return err
+				}
+				if rows, err = s.loadCandidateEvidence(ctx, q, cur.ID); err != nil {
+					return err
+				}
+			}
+		}
 		items := evidenceItems(rows)
 		evidenceHash := commit.HashEvidence(items)
 		// model_tag 纳入幂等维度：换提示词后同候选的新裁决不被旧键挡成重放（§6.3）。
@@ -710,6 +728,75 @@ func (s *Store) upsertAcceptedMemory(ctx context.Context, q sqlQuerier, cur *Com
 		return "", false, err
 	}
 	return id, created, nil
+}
+
+// RepairMemoryEvidence 为已落库的记忆补齐证据链（幂等）。
+//
+// 历史缺口：规则蒸馏路径的候选只写 obs_ids_json，candidate_evidence 为空，
+// 采纳时 writeMemoryEvidence 读不到行，memory_evidence 与 provenance 双双退化
+// （2026-11-27 实例：库内唯一一条记忆只能追到 provenance.preview）。
+// 这里按候选的 obs_ids 重建两表并刷新 provenance；已有行不动，可重复执行。
+func (s *Store) RepairMemoryEvidence(memoryID string) (int, error) {
+	id, err := s.resolveID(memoryID)
+	if err != nil {
+		return 0, err
+	}
+	added := 0
+	err = s.withImmediateTx(func(ctx context.Context, q sqlQuerier) error {
+		var candID, rawObs string
+		err := q.QueryRowContext(ctx, `SELECT id, obs_ids_json
+			FROM candidates WHERE memory_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`,
+			id).Scan(&candID, &rawObs)
+		if errors.Is(err, sql.ErrNoRows) {
+			// 没有候选背书的直写记忆：没有可补的来源，幂等返回 0。
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var oldProv string
+		if err := q.QueryRowContext(ctx,
+			`SELECT COALESCE(provenance, '') FROM memories WHERE id = ?`, id).Scan(&oldProv); err != nil {
+			return err
+		}
+		obsIDs := unmarshalObsIDs(rawObs)
+		if len(obsIDs) == 0 {
+			return nil
+		}
+		now := time.Now().Unix()
+		n, err := s.candidateEvidenceFromObs(ctx, q, candID, obsIDs, now)
+		if err != nil {
+			return err
+		}
+		rows, err := s.loadCandidateEvidence(ctx, q, candID)
+		if err != nil {
+			return err
+		}
+		if err := writeMemoryEvidence(ctx, q, id, rows, now); err != nil {
+			return err
+		}
+		if _, err := q.ExecContext(ctx, `UPDATE memories SET provenance = ? WHERE id = ?`,
+			keepOriginalHash(oldProv, commitProvenance(rows, candID)), id); err != nil {
+			return err
+		}
+		added = n
+		return nil
+	})
+	return added, err
+}
+
+// keepOriginalHash 用新 provenance 覆盖旧的，但保留其中已有的 original_hash。
+// 修正过的记忆靠这个字段记住「改写前是哪条」，不能被一次证据补链抹掉。
+func keepOriginalHash(old, next string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(old), &m); err != nil {
+		return next
+	}
+	h, _ := m["original_hash"].(string)
+	if h == "" {
+		return next
+	}
+	return provenanceWithOriginalHash(next, h)
 }
 
 func writeMemoryEvidence(ctx context.Context, q sqlQuerier, memoryID string, rows []candidateEvidenceRow, now int64) error {

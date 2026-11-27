@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -206,11 +207,49 @@ func (s *Store) InsertCandidate(in CandidateInput) (*CandidateResult, error) {
 		}
 		return nil, err
 	}
+	// 证据链统一落 candidate_evidence：obs_ids_json 只是快照，采纳侧只读表。
+	if _, err := s.candidateEvidenceFromObs(context.Background(), s.db, id, in.ObsIDs, now); err != nil {
+		return nil, err
+	}
 	c, err := s.candidateByID(id)
 	if err != nil {
 		return nil, err
 	}
 	return &CandidateResult{Candidate: *c, Created: true}, nil
+}
+
+// candidateEvidenceFromObs 把 obs_ids_json 里的观测展开成 candidate_evidence 行。
+//
+// 为什么需要：候选证据此前有两个载体——规则蒸馏路径（InsertCandidate）只写
+// obs_ids_json，proposal 路径才写 candidate_evidence。采纳侧只读表，于是规则路径
+// 的候选采纳后 memory_evidence 为空、provenance 退化成 candidate:<短 id>
+// （2026-11-27 库内唯一一条记忆就是这个状态，溯源断在 preview）。
+//
+// 这里统一口径：落候选时就把 obs_ids 展开成表行，obs_ids_json 退化为快照；
+// 老候选在采纳前由 commitAcceptView 调同一函数自愈。
+func (s *Store) candidateEvidenceFromObs(ctx context.Context, q sqlQuerier, candidateID string, obsIDs []string, now int64) (int, error) {
+	added := 0
+	for _, obsID := range obsIDs {
+		if strings.TrimSpace(obsID) == "" {
+			continue
+		}
+		// evidence_id 用观测主键（ev_<32hex>），与 proposal 路径的 CandidateEvidence
+		// 同一命名空间；观测不存在时 SELECT 不产出行，不会留下无来源的引用。
+		res, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO candidate_evidence(
+			candidate_id, evidence_id, event_uid, source_id, source_seq,
+			archive_hash, raw_record_hash, evidence_role, quote_hash, created_at
+		)
+		SELECT ?, o.id, o.event_uid, o.source_id, o.source_seq,
+		       o.archive_hash, o.raw_record_hash, 'direct', '', ?
+		FROM observations o WHERE o.id = ?`, candidateID, now, obsID)
+		if err != nil {
+			return added, err
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			added += int(n)
+		}
+	}
+	return added, nil
 }
 
 func (s *Store) candidateByID(id string) (*Candidate, error) {
