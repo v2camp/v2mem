@@ -247,6 +247,27 @@ type judgeResult struct {
 	AppliedAccept, AppliedReject    int
 }
 
+const (
+	// judgeBusyAttempts/judgeBusyBackoff 与 stepWithBusyRetry 同口径：3 次、
+	// 100/200/300ms 递增。Judge 是短命进程，撞上长事务时整批判定直接失败，
+	// 积压就要再等一个冷却周期（24h）——这个代价远高于多等 600ms。
+	judgeBusyAttempts = 3
+	judgeBusyBackoff  = 100 * time.Millisecond
+)
+
+// busyRetry 只重试 SQLITE_BUSY 一类瞬时错误；判定冲突、候选已关闭这类语义错误
+// 立即返回，重试没有意义还会掩盖真实原因。
+func busyRetry(fn func() error) error {
+	var err error
+	for attempt := 0; attempt < judgeBusyAttempts; attempt++ {
+		if err = fn(); err == nil || !isTransientDBError(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * judgeBusyBackoff)
+	}
+	return err
+}
+
 // applyJudgments 把判定写进候选：先写痕迹（MarkJudgeVerdictCAS），
 // 只有显式 applyReject/applyAccept 时才继续走裁决路径。
 func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVerdict, modelTag string,
@@ -275,7 +296,9 @@ func applyJudgments(st *store.Store, list []store.Candidate, verdicts []judgeVer
 		if verdict == "unsure" || reason == "" || !judgeReasons[reason] {
 			reason = "unsure"
 		}
-		if err := st.MarkJudgeVerdictCAS(cand.ID, verdict, modelTag, reason, cand.Revision); err != nil {
+		if err := busyRetry(func() error {
+			return st.MarkJudgeVerdictCAS(cand.ID, verdict, modelTag, reason, cand.Revision)
+		}); err != nil {
 			if errors.Is(err, store.ErrJudgeVerdictStale) {
 				// 并发自动裁决/人工动作已推进 revision：跳过，不覆盖别人的结果。
 				r.Skipped++
@@ -309,7 +332,10 @@ func (r *judgeResult) applyReject(st *store.Store, cand *store.Candidate, modelT
 		r.Skipped++
 		return nil
 	}
-	if _, err := st.JudgeReject(cand.ID, cand.Revision, modelTag, "judge:"+reason); err != nil {
+	if err := busyRetry(func() error {
+		_, err := st.JudgeReject(cand.ID, cand.Revision, modelTag, "judge:"+reason)
+		return err
+	}); err != nil {
 		if errors.Is(err, store.ErrCandidateClosed) || errors.Is(err, store.ErrRevisionConflict) {
 			r.Skipped++
 			return nil
@@ -323,8 +349,12 @@ func (r *judgeResult) applyReject(st *store.Store, cand *store.Candidate, modelT
 // applyAccept 走 JudgeAutoCommit：矩阵判 auto_commit 才写记忆，
 // Defer/Conflict 只记裁决，绝不直接 CommitAccept。
 func (r *judgeResult) applyAccept(st *store.Store, cand *store.Candidate, modelTag string) error {
-	res, err := st.JudgeAutoCommit(cand.ID, cand.Revision, modelTag)
-	if err != nil {
+	var res *store.CommitResult
+	if err := busyRetry(func() error {
+		got, err := st.JudgeAutoCommit(cand.ID, cand.Revision, modelTag)
+		res = got
+		return err
+	}); err != nil {
 		if errors.Is(err, store.ErrCandidateClosed) || errors.Is(err, store.ErrRevisionConflict) {
 			r.Skipped++
 			return nil

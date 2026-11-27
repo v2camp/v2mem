@@ -17,10 +17,10 @@ var startDistillProc = defaultStartDistill
 // distillProcArgs 是自动写侧的固定 argv：只发窗，不裁决。
 // P4 起 Judge 接手自动裁决：maintain 带 --model-auto 会在 SessionStart 抢在 Judge 前
 // 自动落库，所以这里显式只跑 proposal；accept/reject 由 Stop/SessionEnd 的 judge 子进程负责。
-// --max-bundles 20 是短命子进程的单次上限；避免每次会话只消费 1 窗。
-// 函数名保留 distill 是历史称呼，实际入口已是 maintain。
+// --max-bundles 600 是短命子进程的单次上限：按每窗最多 50 条证据估算，单轮可推进
+// 约 3 万条序号，足以覆盖当前 transcript 存量；仍受宿主退出的进程组语义约束。
 func distillProcArgs() []string {
-	return []string{"maintain", "--stage=proposal", "--max-bundles", "20"}
+	return []string{"maintain", "--stage=proposal", "--max-bundles", "600"}
 }
 
 func defaultStartDistill(db string) error {

@@ -4,6 +4,7 @@ package main
 // 所以两条判据（阈值、冷却）都单独测；开关三态（缺省开 / 显式关 / env 覆盖）也要分别钉住。
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -280,6 +281,60 @@ func TestMaybeSpawnJudgeWarnsDeprecatedApply(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "已废弃") {
 		t.Fatalf("旧环境变量应给出废弃警告，got %q", stderr)
+	}
+}
+
+// 拉起失败不得写冷却：fork/exec 偶发失败（临时资源、被系统拦一次）如果也占掉
+// 24h 窗口，积压就会整整一天无人处理。这里断言「状态未写 + 下次仍会尝试」。
+func TestMaybeSpawnJudgeKeepsCooldownOnSpawnFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("MEM_JUDGE_SPAWN", "1")
+	t.Setenv("MEM_JUDGE_MIN_PENDING", "20")
+	db := filepath.Join(t.TempDir(), "mem.db")
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	seedPending(t, st, 25)
+	st.Close()
+
+	calls := 0
+	startJudgeProc = func(string, int) error { calls++; return errors.New("fork: resource temporarily unavailable") }
+	t.Cleanup(func() { startJudgeProc = defaultStartJudge })
+
+	stderr := captureStderr(t, func() { maybeSpawnJudge(db, harness.EventStop) })
+	if calls != 1 {
+		t.Fatalf("应尝试拉起一次，calls=%d", calls)
+	}
+	if !strings.Contains(stderr, "拉起 judge 失败") {
+		t.Fatalf("失败应记 stderr，got %q", stderr)
+	}
+	statePath := filepath.Join(home, ".v2mem", judgeStateFile)
+	if got := readJudgeState(statePath); got != 0 {
+		t.Fatalf("拉起失败不应写冷却，state ts=%d", got)
+	}
+	// 关键断言：下一轮没有冷却挡路，仍会再试一次（而不是等 24h）。
+	maybeSpawnJudge(db, harness.EventStop)
+	if calls != 2 {
+		t.Fatalf("失败后下一轮应重试，calls=%d", calls)
+	}
+}
+
+// 拉起成功后写冷却：否则一个会话的几十次 Stop 会反复拉起判定。
+func TestMaybeSpawnJudgeWritesCooldownOnSuccess(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("MEM_JUDGE_SPAWN", "1")
+	t.Setenv("MEM_JUDGE_MIN_PENDING", "20")
+	called, db := seedPendingAndSpy(t)
+
+	maybeSpawnJudge(db, harness.EventStop)
+	if *called != 1 {
+		t.Fatalf("应拉起一次，called=%d", *called)
+	}
+	if got := readJudgeState(filepath.Join(home, ".v2mem", judgeStateFile)); got <= 0 {
+		t.Fatalf("成功后应写冷却，state ts=%d", got)
 	}
 }
 

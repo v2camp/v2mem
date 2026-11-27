@@ -270,8 +270,12 @@ func TestNextEvidenceBundleWindowsAndLimits(t *testing.T) {
 	}
 }
 
-// 短积压优先：老的大 transcript 源不能靠 created_at 长期霸占队头。
-func TestNextEvidenceBundlePrefersShorterBacklog(t *testing.T) {
+// 最老源优先：发窗顺序必须与「谁等得最久」一致。
+//
+// 反向的设计（短积压优先）实测会把长期积压的 transcript 源饿死：活跃项目的 hook
+// 源每轮都在新增、积压恒为个位数，永远排在队头；86 个 transcript 源 cursor 恒为 0，
+// 一个 Bootstrap 都没生成。单轮预算足够时大源会在本轮内连续推进，不存在霸占队头。
+func TestNextEvidenceBundlePrefersOldestSource(t *testing.T) {
 	s := newTestStore(t)
 	for i := 0; i < 5; i++ {
 		in := evidenceInput("uid-old-"+itoa(i), 0)
@@ -281,16 +285,48 @@ func TestNextEvidenceBundlePrefersShorterBacklog(t *testing.T) {
 	inNew := evidenceInput("uid-new-0", 0)
 	inNew.SourceID = "src-new"
 	mustCaptureEvidence(t, s, inNew)
-	// 老源更早创建；只按 created_at 排序时旧实现会选它。
-	if _, err := s.db.Exec(`UPDATE evidence_sources SET created_at = created_at - 1000 WHERE id = 'src-old'`); err != nil {
+	// 显式拉开创建时间：同一秒内创建会退化到 id 兜底，测不出排序意图。
+	if _, err := s.db.Exec(`UPDATE evidence_sources SET created_at = 1000 WHERE id = 'src-old'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE evidence_sources SET created_at = 2000 WHERE id = 'src-new'`); err != nil {
 		t.Fatal(err)
 	}
 	b, err := s.NextEvidenceBundle(10, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b == nil || b.SourceID != "src-new" {
-		t.Fatalf("应优先短积压源 src-new，got %+v", b)
+	if b == nil || b.SourceID != "src-old" {
+		t.Fatalf("应优先最老源 src-old，got %+v", b)
+	}
+}
+
+// 老的大源不得被新源挤出候选集：候选集只有 8 个位置（evidenceSourcesWithBacklog(8)），
+// 按积压量排序时 12 个新小源会把它挡在外面，一挡就是永久。
+func TestNextEvidenceBundleOldSourceNotCrowdedOut(t *testing.T) {
+	s := newTestStore(t)
+	for i := 0; i < 40; i++ {
+		in := evidenceInput("uid-big-"+itoa(i), 0)
+		in.SourceID = "src-big"
+		mustCaptureEvidence(t, s, in)
+	}
+	for src := 0; src < 12; src++ {
+		in := evidenceInput("uid-small-"+itoa(src), 0)
+		in.SourceID = "src-small-" + itoa(src)
+		mustCaptureEvidence(t, s, in)
+	}
+	if _, err := s.db.Exec(`UPDATE evidence_sources SET created_at = 1000 WHERE id = 'src-big'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE evidence_sources SET created_at = 2000 WHERE id LIKE 'src-small-%'`); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.NextEvidenceBundle(10, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b == nil || b.SourceID != "src-big" {
+		t.Fatalf("老的大源应排在最前，got %+v", b)
 	}
 }
 

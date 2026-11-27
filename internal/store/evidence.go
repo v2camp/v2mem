@@ -531,12 +531,16 @@ func (s *Store) NextEvidenceBundle(limit int, maxBytes int64) (*EvidenceBundleRe
 }
 
 func (s *Store) evidenceSourcesWithBacklog(limit int) ([]EvidenceSourceState, error) {
-	// 短积压优先：只按 created_at 排序会让一个巨大的 transcript 源长期霸占队头，
-	// 堵住其它小源。积压量相同再按创建时间/ID 兜底，保证确定性。
+	// 最老源优先：与 NextRunnableProposalBundle 的「全局最老 + 按源公平」语义一致。
+	// 不能按积压量升序（短积压优先）：活跃项目的 hook 源每轮都在新增，会长期占满
+	// 队头，把 created_at 更早、积压几千条的 transcript 源永久挤出候选集——实测
+	// 86 个 transcript 源 cursor 恒为 0，一个 Bootstrap 都没生成。单轮预算
+	// （--max-bundles 600）足够时，大源会在本轮内连续推进，不存在「霸占队头」；
+	// 积压相同再按 id 兜底，保证确定性。
 	rows, err := s.db.Query(`SELECT id, generation, last_seq, cursor_seq, source_tip
 		FROM evidence_sources
 		WHERE status = 'active' AND last_seq > cursor_seq
-		ORDER BY (last_seq - cursor_seq) ASC, created_at ASC, id ASC LIMIT ?`, limit)
+		ORDER BY created_at ASC, id ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
