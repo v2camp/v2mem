@@ -14,11 +14,12 @@ import (
 // 钩子不等待它，也不把候选写进 memories。
 var startDistillProc = defaultStartDistill
 
-// distillProcArgs 是自动写侧的固定 argv：单轨后只有 proposal 一条路，
-// 规则抽取由链尾 executor（--executor auto 的规则兜底）完成。
-// 抽成纯函数便于直接断言，不靠拉起子进程间接验证参数。
+// distillProcArgs 是自动写侧的固定 argv：单轨后走 maintain 一条路：
+// proposal 发窗 → model-auto 裁决，规则由链尾 executor 兜底。
+// --max-bundles 20 是短命子进程的单次上限；避免每次会话只消费 1 窗。
+// 函数名保留 distill 是历史称呼，实际入口已是 maintain。
 func distillProcArgs() []string {
-	return []string{"distill", "--proposal", "--executor", "auto", "--max-bundles", "1"}
+	return []string{"maintain", "--model-auto", "--max-bundles", "20"}
 }
 
 func defaultStartDistill(db string) error {

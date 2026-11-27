@@ -174,5 +174,8 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
   （准出率/重复率/悬空/严密度违例）；`make test-watch` 判据回归不变。
   P1 起每次合入都跑逐跳验收，任一 G 项失败 `make test` 即非零。
   黑盒 U1–U8 脚本与 `eval-gate` 的接入沿用后续阶段交付。
+- **两面口径**：`make test-flow` / tag 判据在干净夹具上跑 `--profile=ci`（严格）；
+  生产健康检查用 `--profile=prod`（legacy 豁免 + 无样本降级）。不得用生产库的
+  ci 红项判 tag，也不得用 prod 绿灯掩盖当前行违例。
 - case 随 P 阶段交付：P1 交付 §3 证据链 case，P2 交付 U1/U2/U4/U5 与裁决→记忆 case，
   P3 交付 GC/终态 case，U3/U6/U7/U8 在对应能力落地时同批。

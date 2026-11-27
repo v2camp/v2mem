@@ -270,6 +270,30 @@ func TestNextEvidenceBundleWindowsAndLimits(t *testing.T) {
 	}
 }
 
+// 短积压优先：老的大 transcript 源不能靠 created_at 长期霸占队头。
+func TestNextEvidenceBundlePrefersShorterBacklog(t *testing.T) {
+	s := newTestStore(t)
+	for i := 0; i < 5; i++ {
+		in := evidenceInput("uid-old-"+itoa(i), 0)
+		in.SourceID = "src-old"
+		mustCaptureEvidence(t, s, in)
+	}
+	inNew := evidenceInput("uid-new-0", 0)
+	inNew.SourceID = "src-new"
+	mustCaptureEvidence(t, s, inNew)
+	// 老源更早创建；只按 created_at 排序时旧实现会选它。
+	if _, err := s.db.Exec(`UPDATE evidence_sources SET created_at = created_at - 1000 WHERE id = 'src-old'`); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.NextEvidenceBundle(10, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b == nil || b.SourceID != "src-new" {
+		t.Fatalf("应优先短积压源 src-new，got %+v", b)
+	}
+}
+
 func TestNextEvidenceBundleByteCap(t *testing.T) {
 	s := newTestStore(t)
 	for i := 0; i < 20; i++ {
