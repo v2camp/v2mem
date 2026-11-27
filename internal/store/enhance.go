@@ -69,12 +69,20 @@ type RewriteMemoryResult struct {
 	Changed    bool   `json:"changed"`
 }
 
+// ErrMemoryContentChanged 表示选择候选后正文已被改动（人工修正、再次改写等）。
+// CLI 据此跳过该条，而不是用模型稿覆盖期间发生的决定。
+var ErrMemoryContentChanged = errors.New("记忆正文在选择后被修改")
+
 // RewriteMemoryContent 用模型产出替换正文。
+//
+// expectHash 是选择候选时读到的 content_hash（CAS 守卫）：非空且与当前值不等时
+// 返回 ErrMemoryContentChanged，不写库；传空串表示调用方不做选择时校验。
+// 模型调用耗时数秒，期间人工修正/再次改写必须优先于模型稿。
 //
 // 与 ApplyMemoryReview(correct) 共用同一套写路径：content/content_idx/content_hash
 // 同步重算、mem_sigs 重签名、provenance 只在第一次改写时留 original_hash（跨设备
 // 身份追溯）。差别只在状态：模型改写必须回到未审核，reviewed_* 清零。
-func (s *Store) RewriteMemoryContent(idOrPrefix, content, enhanceTag string, now int64) (*RewriteMemoryResult, error) {
+func (s *Store) RewriteMemoryContent(idOrPrefix, content, enhanceTag, expectHash string, now int64) (*RewriteMemoryResult, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return nil, errors.New("改写后的正文为空")
@@ -97,6 +105,9 @@ func (s *Store) RewriteMemoryContent(idOrPrefix, content, enhanceTag string, now
 		res.OldContent = curContent
 		res.OldHash = curHash
 		res.NewHash = curHash
+		if expectHash != "" && curHash != expectHash {
+			return ErrMemoryContentChanged
+		}
 		if state == ReviewStateWithdrawn {
 			return fmt.Errorf("记忆 %s 已撤回，不能改写正文", id)
 		}

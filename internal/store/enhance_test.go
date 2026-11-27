@@ -7,6 +7,7 @@ package store
 //   - 回滚只在「改写后没人再动过」（content_hash 匹配）时生效，且不得撞同工程其它记忆。
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -108,7 +109,7 @@ func TestRewriteMemoryContentHappyPath(t *testing.T) {
 	}
 
 	const now int64 = 1700000000
-	res, err := s.RewriteMemoryContent(added.ID, "  新正文：可复用规则  ", "test@v1", now)
+	res, err := s.RewriteMemoryContent(added.ID, "  新正文：可复用规则  ", "test@v1", "", now)
 	if err != nil {
 		t.Fatalf("RewriteMemoryContent: %v", err)
 	}
@@ -154,7 +155,7 @@ func TestRewriteMemoryContentUnchangedIsNoop(t *testing.T) {
 	setColumn(t, s, added.ID, "updated_at", 111)
 
 	// 仅空白差异不算改写。
-	res, err := s.RewriteMemoryContent(added.ID, "  "+oldContent+"\n", "test@v1", 222)
+	res, err := s.RewriteMemoryContent(added.ID, "  "+oldContent+"\n", "test@v1", "", 222)
 	if err != nil {
 		t.Fatalf("RewriteMemoryContent: %v", err)
 	}
@@ -174,7 +175,7 @@ func TestRewriteMemoryContentResolvesPrefixAndDefaultsNow(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 	before := time.Now().Unix()
-	res, err := s.RewriteMemoryContent(added.ID[:8], "改写后正文", "test@v1", 0)
+	res, err := s.RewriteMemoryContent(added.ID[:8], "改写后正文", "test@v1", "", 0)
 	if err != nil {
 		t.Fatalf("短 id 应可解析: %v", err)
 	}
@@ -201,15 +202,41 @@ func TestRewriteMemoryContentErrors(t *testing.T) {
 		t.Fatalf("withdraw: %v", err)
 	}
 
-	if _, err := s.RewriteMemoryContent(withdrawn.ID, "新正文", "test@v1", 1); err == nil ||
+	if _, err := s.RewriteMemoryContent(withdrawn.ID, "新正文", "test@v1", "", 1); err == nil ||
 		!strings.Contains(err.Error(), "已撤回") {
 		t.Fatalf("已撤回应报错，got %v", err)
 	}
-	if _, err := s.RewriteMemoryContent(added.ID, "   ", "test@v1", 1); err == nil {
+	if _, err := s.RewriteMemoryContent(added.ID, "   ", "test@v1", "", 1); err == nil {
 		t.Fatal("空正文应报错")
 	}
-	if _, err := s.RewriteMemoryContent("ffffffffffffffffffffffffffffffff", "新正文", "test@v1", 1); err == nil {
+	if _, err := s.RewriteMemoryContent("ffffffffffffffffffffffffffffffff", "新正文", "test@v1", "", 1); err == nil {
 		t.Fatal("未知 id 应报错")
+	}
+}
+
+func TestRewriteMemoryContentRejectsChangedSinceSelection(t *testing.T) {
+	s := newTestStore(t)
+	added, err := s.Add(AddInput{Content: "选择时正文", Project: "p"})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	before := readEnhanceRow(t, s, added.ID)
+
+	// 选择后正文被人工改动（hash 已变）：expectHash 不匹配必须拒绝，不写库。
+	_, err = s.RewriteMemoryContent(added.ID, "模型改写稿", "tag", "stale-hash", 1000)
+	if !errors.Is(err, ErrMemoryContentChanged) {
+		t.Fatalf("expectHash 不匹配应返回 ErrMemoryContentChanged，got %v", err)
+	}
+	if after := readEnhanceRow(t, s, added.ID); after != before {
+		t.Fatalf("CAS 拒绝时不得写库: before=%+v after=%+v", before, after)
+	}
+
+	// 传入选择时的 hash 时正常改写；空 expectHash 保持兼容行为。
+	if _, err := s.RewriteMemoryContent(added.ID, "模型改写稿", "tag", before.hash, 1000); err != nil {
+		t.Fatalf("expectHash 匹配应允许改写: %v", err)
+	}
+	if got := readEnhanceRow(t, s, added.ID); got.content != "模型改写稿" {
+		t.Fatalf("正文未改写: %q", got.content)
 	}
 }
 
@@ -223,7 +250,7 @@ func TestRewriteMemoryContentRejectsDuplicateInProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	_, err = s.RewriteMemoryContent(second.ID, "已被占用的正文", "test@v1", 1)
+	_, err = s.RewriteMemoryContent(second.ID, "已被占用的正文", "test@v1", "", 1)
 	if err == nil || !strings.Contains(err.Error(), first.ID[:8]) {
 		t.Fatalf("撞同工程正文应报错并指出冲突 id，got %v", err)
 	}
@@ -239,10 +266,10 @@ func TestRewriteMemoryContentKeepsFirstOriginalHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if _, err := s.RewriteMemoryContent(added.ID, "第一次改写", "tag1", 1000); err != nil {
+	if _, err := s.RewriteMemoryContent(added.ID, "第一次改写", "tag1", "", 1000); err != nil {
 		t.Fatalf("first rewrite: %v", err)
 	}
-	if _, err := s.RewriteMemoryContent(added.ID, "第二次改写", "tag2", 2000); err != nil {
+	if _, err := s.RewriteMemoryContent(added.ID, "第二次改写", "tag2", "", 2000); err != nil {
 		t.Fatalf("second rewrite: %v", err)
 	}
 	r := readEnhanceRow(t, s, added.ID)
@@ -260,7 +287,7 @@ func TestRewritePreservesLegacyProvenance(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 	setColumn(t, s, added.ID, "provenance", "非 JSON 的自由文本")
-	if _, err := s.RewriteMemoryContent(added.ID, "新正文", "tag", 1000); err != nil {
+	if _, err := s.RewriteMemoryContent(added.ID, "新正文", "tag", "", 1000); err != nil {
 		t.Fatalf("RewriteMemoryContent: %v", err)
 	}
 	r := readEnhanceRow(t, s, added.ID)
@@ -281,7 +308,7 @@ func TestRestoreMemoryContentHappyPath(t *testing.T) {
 	if err := s.SetMemoryReviewState(added.ID, ReviewStateConfirmed, "human", 1); err != nil {
 		t.Fatalf("confirm: %v", err)
 	}
-	res, err := s.RewriteMemoryContent(added.ID[:8], "新正文", "tag", 1000)
+	res, err := s.RewriteMemoryContent(added.ID[:8], "新正文", "tag", "", 1000)
 	if err != nil {
 		t.Fatalf("RewriteMemoryContent: %v", err)
 	}
@@ -315,7 +342,7 @@ func TestRestoreMemoryContentRejectsChangedContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	res, err := s.RewriteMemoryContent(added.ID, "新正文", "tag", 1000)
+	res, err := s.RewriteMemoryContent(added.ID, "新正文", "tag", "", 1000)
 	if err != nil {
 		t.Fatalf("RewriteMemoryContent: %v", err)
 	}
@@ -336,7 +363,7 @@ func TestRestoreMemoryContentRejectsConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	res, err := s.RewriteMemoryContent(victim.ID, "提升后正文", "tag", 1000)
+	res, err := s.RewriteMemoryContent(victim.ID, "提升后正文", "tag", "", 1000)
 	if err != nil {
 		t.Fatalf("RewriteMemoryContent: %v", err)
 	}
@@ -376,7 +403,7 @@ func TestRestorePreservesLegacyProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	res, err := s.RewriteMemoryContent(added.ID, "新正文", "tag", 1000)
+	res, err := s.RewriteMemoryContent(added.ID, "新正文", "tag", "", 1000)
 	if err != nil {
 		t.Fatalf("RewriteMemoryContent: %v", err)
 	}

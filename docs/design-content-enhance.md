@@ -30,7 +30,7 @@
 | 目标 | 结构不变式：`memory_evidence` 补齐 | 语义形态：正文可执行、去会话指代 |
 | 确定性 | 确定性、幂等、无模型 | 模型、非确定性、每次归档 |
 | 写路径 | 只加证据行 | 改 `memories.content` 及派生列 |
-| 审核语义 | 不改 `review_state` | 回到未审核，`reviewed_by=enhance:<tag>` |
+| 审核语义 | 不改 `review_state` | 回到未审核，`reviewed_by` 留空；归因在 `provenance.enhance_tag` |
 | 回滚 | 不需要（补链可重复） | 按归档逐条校验后还原 |
 | 失败面 | 只影响溯源 | 直接影响检索命中的正文 |
 
@@ -70,7 +70,7 @@ mem repair content [id...] [选项]
 2. **无 id 时按选择器**：
    - `narrative`（默认）：正文命中过程叙述判据（`IsProcessNarrative`）。
    - `overlong`：正文超过实现定义的长度阈值。阈值未在冻结契约里，**以命令输出为准**；本文不另立数字。
-   - `all`：以上二者并集。
+   - `all`：不过滤，全部存活候选（`--all` 等价；以实现为准）。
 3. **默认跳过**：`review_state=withdrawn` 一律跳过；`confirmed` / `corrected` 默认跳过，
    除非显式 `--include-confirmed`（连人工确认过的也改，风险由操作者承担）。
 4. **`--limit`** 是本次总量上限（默认 20），`--batch` 是单次模型调用的条数（默认 10），
@@ -128,17 +128,19 @@ mem repair content [id...] [选项]
 **复用 `review correct` 的核心**（`internal/store/review.go` 的 `ApplyMemoryReview` 修正分支），
 逐条事务内完成：
 
-1. **CAS 前置**：只有当前 `content_hash` 仍等于选择时读到的 `old_hash` 才写；
-   期间被人修正 / 撤回 / 再次改写过的条目跳过并报告，不覆盖他人决定。
+1. **CAS 前置**：只有当前 `content_hash` 仍等于选择时读到的 `old_hash` 才写。
+   CLI 把该值作为 `expectHash` 传给 `RewriteMemoryContent`；不等时返回
+   `ErrMemoryContentChanged`，报告为 `skipped`（error=`content_changed_since_selection`），
+   不覆盖人工修改。期间被人修正 / 撤回 / 再次改写过的条目同样跳过并报告。
 2. **正文字段**：`content`、`content_idx`（FTS 触发器据此重建索引）、`content_hash`、
    `mem_sigs`（MinHash 签名，否则模糊检索仍拿旧文本）一并重算。
 3. **`provenance.original_hash` 只在首次改写时写入**：连续改写保留最初那次的 hash，
    不被上一次的中间值覆盖（与 `provenanceWithOriginalHash` 同语义）。
 4. **另记 `enhance_tag` / `enhanced_at`**：随 `provenance` JSON 落档，不新增 schema 列。
    `enhance_tag` 是回滚与归因的唯一键。
-5. **状态回到未审核**：`review_state` 置空，`reviewed_by` 记 `enhance:<model_tag>`。
-   空状态即「未审核」（S10a 口径），可被 `mem review ls` / `mem show` 识别为模型改写产物，
-   **不冒充人工确认**。
+5. **状态回到未审核**：`review_state` 置空，`reviewed_by` 同样留空——模型不是人工复核者，
+   改写归因记录在 `provenance.enhance_tag` 与 `enhanced_at`。空状态即「未审核」（S10a 口径），
+   可被 `mem review ls` / `mem show` 识别为模型改写产物，**不冒充人工确认**。
 6. **冲突守卫**：新正文与同工程另一条撞 `content_hash` 时整条跳过、记 `skipped`，
    不自动合并——合并是 `consolidate` 的职责。
 
@@ -151,8 +153,9 @@ mem repair content [id...] [选项]
 
 ### 5.1 归档
 
-- 路径：`<db 目录>/enhance/<unix>-<tag>.jsonl`，一次运行一个文件；写入 db 目录的理由与
-  `plans/*.jsonl` 一致——回滚凭证必须与库同生命周期。
+- 路径：`<db 目录>/enhance/<unix>-<pid>-<tag>.jsonl`，一次运行一个文件；文件名带 pid，
+  同一秒内两个进程跑同一 tag 也不会混写。写入 db 目录的理由与 `plans/*.jsonl` 一致——
+  回滚凭证必须与库同生命周期。
 - 字段（冻结）：`id` / `kind` / `project` / `old_content` / `old_hash` / `new_content` /
   `new_hash` / `enhance_tag` / `at`。
 - 部分失败也归档：成功写入的行必须有对应记录，否则回滚会出现无凭证的改写。
@@ -183,7 +186,7 @@ mem repair content [id...] [选项]
 | 条件 | 本功能的可执行形态 | 失效后果 |
 |:---|:---|:---|
 | (a) 版本可归因 | 归档与 `provenance.enhance_tag` 必须能回答「哪个模型 + 哪版提示词」；`--model-tag` 缺失即报错 | 无法按版本定位一批坏改写 |
-| (b) 未审核可识别 | `review_state` 置空 + `reviewed_by=enhance:<tag>`；人工确认/修正后才离开未审核 | 模型改写被误认为人工已验收 |
+| (b) 未审核可识别 | `review_state` 置空 + `reviewed_by` 留空；归因在 `provenance.enhance_tag` / `enhanced_at`；人工确认/修正后才离开未审核 | 模型改写被误认为人工已验收 |
 | (c) 可回滚 | 归档 + 按 tag/文件逐条校验回滚；人工已改过的条目自动跳过 | 错误正文永久污染检索 |
 
 三条补充：
