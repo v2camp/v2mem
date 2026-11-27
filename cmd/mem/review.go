@@ -46,7 +46,7 @@ func cmdReview(args []string) error {
 		fmt.Println("  withdraw <memoryID> [--reason TEXT]  撤回（退出检索，行与证据保留）")
 		fmt.Println("  restore <memoryID>                    撤回的逆动作")
 		fmt.Println("  rollback --model-tag TAG [--dry-run]  按版本回滚自动记忆")
-		fmt.Println("  stats                                 按版本标定统计（只读，阈值只提示）")
+		fmt.Println("  stats [--judge]                      按版本标定统计（只读，阈值只提示；--judge 看判定器维度）")
 		return nil
 	default:
 		return fmt.Errorf("未知子命令 %q；只读入口 mem review ls，动作面见 mem review help", args[0])
@@ -175,6 +175,7 @@ func cmdReviewStats(args []string) error {
 	var c common
 	fs := flag.NewFlagSet("review stats", flag.ContinueOnError)
 	c.register(fs)
+	judge := fs.Bool("judge", false, "按 judge_model 输出判定器标定（只读）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -183,6 +184,9 @@ func cmdReviewStats(args []string) error {
 		return err
 	}
 	defer st.Close()
+	if *judge {
+		return renderJudgeStats(st, c.json)
+	}
 	rows, err := st.ReviewStats()
 	if err != nil {
 		return err
@@ -203,6 +207,28 @@ func cmdReviewStats(args []string) error {
 		fmt.Printf("%-30s %4d %5d %5d %5d  %5.0f%%  %5.0f%%  %5.0f%% %5d%s\n",
 			r.ModelTag, r.Samples, r.Confirmed, r.Corrected, r.Withdrawn,
 			r.ConfirmRate*100, r.CorrectRate*100, r.WithdrawRate*100, r.Recovered, warn)
+	}
+	return nil
+}
+
+// renderJudgeStats 输出按 judge_model 分组的判定器标定。
+// JSON 字段固定（judge_model/verdicts/reject/applied/reopened），空样本输出 []；
+// 文本形态与旧表分开，方便与 ReviewStats 并列阅读。
+func renderJudgeStats(st *store.Store, asJSON bool) error {
+	rows, err := st.JudgeCalibrationStats()
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		return printJSON(rows)
+	}
+	if len(rows) == 0 {
+		fmt.Println("（暂无 Judge 判定样本）")
+		return nil
+	}
+	fmt.Println("判定器                              裁决  否决  落库  重开")
+	for _, r := range rows {
+		fmt.Printf("%-34s %4d %5d %5d %5d\n", r.JudgeModel, r.Verdicts, r.Reject, r.Applied, r.Reopened)
 	}
 	return nil
 }
