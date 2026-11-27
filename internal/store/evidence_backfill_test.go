@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/v2camp/v2mem/internal/commit"
+	"github.com/v2camp/v2mem/internal/testkit"
 )
 
 func TestInsertCandidateDerivesEvidenceFromObs(t *testing.T) {
@@ -176,5 +177,86 @@ func TestRepairMemoryEvidenceIsIdempotent(t *testing.T) {
 	}
 	if again != 0 {
 		t.Fatalf("重复修复不应再新增证据，got %d", again)
+	}
+}
+
+func TestMemoryNeedsEvidenceRepairDetectsGap(t *testing.T) {
+	s := newTestStore(t)
+	ev := captureEvidence(t, s, "uid-needs", "s", "p", "待诊断的证据")
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Project: "p", Kind: "fact",
+		Content: "诊断入口应识别历史缺口", Source: "distill",
+		ObsIDs: []string{ev.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _ := s.CommitCandidate(res.Candidate.ID)
+	out, err := s.CommitAccept(res.Candidate.ID, view.Revision, commit.ActorHuman)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 证据链完整：不需要修复，前缀可定位。
+	if needs, err := s.MemoryNeedsEvidenceRepair(out.MemoryID[:8]); err != nil || needs {
+		t.Fatalf("证据完整时不应待修，got needs=%v err=%v", needs, err)
+	}
+	// 制造历史缺口：证据链清空，候选仍留 obs_ids_json。
+	if _, err := s.db.Exec(`DELETE FROM memory_evidence WHERE memory_id = ?`, out.MemoryID); err != nil {
+		t.Fatal(err)
+	}
+	if needs, err := s.MemoryNeedsEvidenceRepair(out.MemoryID); err != nil || !needs {
+		t.Fatalf("缺证据且可补时应待修，got needs=%v err=%v", needs, err)
+	}
+	// 定位不到的记忆应报错，而不是静默返回 false。
+	if _, err := s.MemoryNeedsEvidenceRepair("no-such-memory"); err == nil {
+		t.Fatal("未知记忆应返回错误")
+	}
+}
+
+// 单条修复失败不阻断其余：全量修复每条一个事务，坏的记 failed，好的照常补链。
+func TestRepairAllMemoryEvidenceFailureIsolated(t *testing.T) {
+	s := newTestStore(t)
+	gap := func(uid, content string) string {
+		t.Helper()
+		ev := captureEvidence(t, s, uid, "s", "p", content)
+		res, err := s.InsertCandidate(CandidateInput{
+			SessionID: "s", Project: "p", Kind: "fact", Content: content, Source: "distill",
+			ObsIDs: []string{ev.ID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		view, _ := s.CommitCandidate(res.Candidate.ID)
+		out, err := s.CommitAccept(res.Candidate.ID, view.Revision, commit.ActorHuman)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(`DELETE FROM memory_evidence WHERE memory_id = ?`, out.MemoryID); err != nil {
+			t.Fatal(err)
+		}
+		return out.MemoryID
+	}
+	bad := gap("uid-bad", "坏的那条：证据写不进去")
+	good := gap("uid-good", "好的那条：应照常补链")
+	undo, err := testkit.FailWritesWhere(s.DB(), "memory_evidence", "INSERT",
+		"NEW.memory_id = '"+bad+"'")
+	if err != nil {
+		t.Fatalf("注入写失败: %v", err)
+	}
+	rep, err := s.RepairAllMemoryEvidence(false)
+	if err != nil {
+		t.Fatalf("单条失败不应中断整批: %v", err)
+	}
+	if rep.Failed != 1 || rep.Repaired != 1 || rep.Scanned != 2 {
+		t.Fatalf("应 2 扫描 / 1 失败 / 1 修复，got %+v", rep)
+	}
+	if err := undo(); err != nil {
+		t.Fatal(err)
+	}
+	if n := countMemoryEvidence(t, s, good); n != 1 {
+		t.Fatalf("好的记忆应补回证据，got %d", n)
+	}
+	if n := countMemoryEvidence(t, s, bad); n != 0 {
+		t.Fatalf("失败的记忆不应有证据，got %d", n)
 	}
 }

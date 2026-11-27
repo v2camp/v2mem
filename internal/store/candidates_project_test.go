@@ -111,6 +111,11 @@ func TestListPendingCandidatesByBundles(t *testing.T) {
 		t.Fatalf("空列表应立即返回空集，got %d err=%v", len(empty), err)
 	}
 
+	// limit<=0 走默认上限（50），不能退化成 0 条。
+	if def, err := s.ListPendingCandidatesByBundles([]string{"bnd-1", "bnd-2"}, 0); err != nil || len(def) != 3 {
+		t.Fatalf("limit<=0 应走默认上限：got %d err=%v", len(def), err)
+	}
+
 	if _, err := s.DB().Exec(`UPDATE candidates SET status = 'rejected' WHERE id = ?`, a1); err != nil {
 		t.Fatalf("标记 rejected: %v", err)
 	}

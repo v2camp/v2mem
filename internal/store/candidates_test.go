@@ -10,6 +10,40 @@ import (
 	"github.com/v2camp/v2mem/internal/testkit"
 )
 
+// InsertCandidate 的入参校验与「观测不存在」降级：坏输入要直接报错，
+// 未知观测只跳过证据展开，不能把候选一起丢掉。
+func TestInsertCandidateValidation(t *testing.T) {
+	s := newTestStore(t)
+	cases := []struct {
+		name string
+		in   CandidateInput
+	}{
+		{"空正文", CandidateInput{SessionID: "s", Kind: "fact", Content: "  "}},
+		{"未知 kind", CandidateInput{SessionID: "s", Kind: "rumor", Content: "x"}},
+		{"非法 channel", CandidateInput{SessionID: "s", Kind: "fact", Content: "x", Channel: "carrier-pigeon"}},
+	}
+	for _, tc := range cases {
+		if _, err := s.InsertCandidate(tc.in); err == nil {
+			t.Errorf("%s 应报错", tc.name)
+		}
+	}
+	res, err := s.InsertCandidate(CandidateInput{
+		SessionID: "s", Project: "p", Kind: "fact",
+		Content: "观测失效时仍可落候选", ObsIDs: []string{"ev_missing"},
+	})
+	if err != nil || !res.Created {
+		t.Fatalf("未知观测应忽略而非失败: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM candidate_evidence WHERE candidate_id = ?`,
+		res.Candidate.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("未知观测不应展开证据，got %d", n)
+	}
+}
+
 func TestCandidateNotSearchableUntilAccept(t *testing.T) {
 	s := newTestStore(t)
 	if _, err := s.AppendObservation(ObsInput{
