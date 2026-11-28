@@ -25,10 +25,23 @@ import (
 // ParserVersion 是当前归档记录格式版本。格式变更必须递增，旧字节仍可解。
 const ParserVersion = "evidence/v1"
 
-// 默认窗口参数：约 50 条 / 64KB（见 NextEvidenceBundle）。
+// 默认窗口参数：50 条 / 1MiB（见 NextEvidenceBundle）。
+//
+// 字节上限按「归档段大小」计，不是提示词成本：进模型的正文由
+// ProposalPayloadRunes(400) × DefaultBundleLimit(50) 约束，最坏 20k rune，
+// 与 maxBytes 无关。所以 byte cap 的真实作用是「一窗代表多少原始语料」，
+// 调大只增加单窗覆盖的证据条数，不增加单次调用成本。
+//
+// 64KB 在 hook 源（p50 2.2KB）上约 20–27 条，但在 transcript 回写源
+// （均值 97KB、最大 426KB）上每窗只有 1 条：2026-11-28 清积压时 6478 个序号
+// 需要 ~6k 个窗，全部是 1 条窗。1MiB 让 transcript 源约 10 条/窗，
+// hook 源顶到 50 条上限。
+//
+// 代价是重试粒度变粗：一个失败窗覆盖的证据更多，且「连续水位不越过失败窗」
+// 会让这段证据一起等重试。取 1MiB 是这两者的折中，先按此观察，再决定是否上调。
 const (
 	DefaultBundleLimit = 50
-	DefaultBundleBytes = 64 << 10
+	DefaultBundleBytes = 1 << 20
 )
 
 // Engine 同时实现 Writer 与 Reader。

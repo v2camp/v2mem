@@ -505,14 +505,18 @@ func evidenceTip(prev, eventUID, archiveHash string, seq int) string {
 // evidence_gaps 并把 cursor 推到洞尾，同一次调用内继续构建下一窗（最多
 // maxEvidenceGapHops 次）。洞不跨源拼窗，也不阻塞健康源。
 //
-// 上限：limit（默认 50）与 maxBytes（默认 64KB，按 gzip segment 的 byte_size 计）
+// 上限：limit（默认 50）与 maxBytes（默认 1MiB，按 gzip segment 的 byte_size 计）
 // 先到先停；即使单条超过 maxBytes 也至少返回 1 条，避免永远卡住。
+//
+// byte_size 量的是归档段（原始语料），不是进模型的正文——正文由
+// evidence.ProposalPayloadRunes(400) × limit 约束。所以调大 maxBytes 只让
+// 单窗覆盖更多证据，不放大单次调用成本；它是「一窗代表多少语料」的开关。
 func (s *Store) NextEvidenceBundle(limit int, maxBytes int64) (*EvidenceBundleRecord, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if maxBytes <= 0 {
-		maxBytes = 64 << 10
+		maxBytes = 1 << 20
 	}
 	sources, err := s.evidenceSourcesWithBacklog(8)
 	if err != nil {

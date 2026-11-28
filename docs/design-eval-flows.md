@@ -110,7 +110,7 @@ ID 与 `mem eval flow` 输出一一对应；改口径必须同步 `internal/eval
 | F3 | 只读/磁盘不可写 | 归档目录 0555 → 退出 0（钩子不阻断宿主），事件转 spool；恢复后补回 | 库目录 0555 → 非 0，stderr 可诊断，库内状态不变 | 库目录 0555 + `--strict` → 非 0，不 panic |
 | F4 | 库被占用（SQLITE_BUSY） | fail-open：写失败进 spool（同 F1 路径） | 外部连接持 `BEGIN IMMEDIATE` → 拿不到写锁即如实非 0（`busy_timeout` 内不重试成功），状态不变 | 同 gc（共用 `store.Open` 的 `busy_timeout=5000`） |
 | F5 | 坏输入 | spool 坏 JSON → 退出 0，原文进 `spool/dead-letter`，正常段继续 | — | executor 输出非法 → `invalid`，0 候选，窗口不消费；`--strict` 非 0 |
-| F6 | 超大负载 | prompt > 32000 rune → 归档按上限截断（现行实现保留前 32000 + 省略号），不丢整条 | — | 64KB ByteCap 切窗，不丢证据；单条超限至少出 1 条 |
+| F6 | 超大负载 | prompt > 32000 rune → 归档按上限截断（现行实现保留前 32000 + 省略号），不丢整条 | — | 1MiB ByteCap（按归档段大小）切窗，不丢证据；单条超限至少出 1 条 |
 
 **dry-run / force 列**：`distill --dry-run --bundle` 在候选写入被全面注入失败时仍须
 退出 0、0 写入、不消费窗口；`gc --no-backup` 是破坏性路径的 force 开关，故障用例
