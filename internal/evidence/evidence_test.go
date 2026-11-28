@@ -352,39 +352,70 @@ func TestBundleLimitFifty(t *testing.T) {
 	}
 }
 
+// 字节上限按归档段大小切窗。显式给 caps 而不是依赖 DefaultBundleBytes：
+// 测的是切窗机制本身，默认值调参不该让这条用例失效（上限调大是设计变更，
+// 不是回归）。
 func TestBundleByteCap(t *testing.T) {
-	e, _ := newTestEngine(t)
-	for i := 0; i < 20; i++ {
-		ev := rawEvent("big-" + itoaTest(i))
-		ev.Raw = randomBytes(t, 8<<10)
-		if _, err := e.Capture(ev); err != nil {
-			t.Fatal(err)
+	seed := func(t *testing.T) *Engine {
+		t.Helper()
+		e, _ := newTestEngine(t)
+		for i := 0; i < 20; i++ {
+			ev := rawEvent("big-" + itoaTest(i))
+			ev.Raw = randomBytes(t, 8<<10)
+			if _, err := e.Capture(ev); err != nil {
+				t.Fatal(err)
+			}
 		}
+		return e
 	}
-	b, err := e.NextBundle(0, 0)
-	if err != nil || b == nil {
-		t.Fatalf("应有窗口: %+v err=%v", b, err)
+	cases := []struct {
+		name      string
+		maxBytes  int64
+		wantSplit bool
+	}{
+		// 8KB×20 ≈ 160KB：32KB 上限必须切窗。
+		{"小上限切窗", 32 << 10, true},
+		// 默认上限（1MiB）应能装下这 20 条：否则说明默认值被悄悄调小了。
+		{"默认上限不切 160KB 窗口", 0, false},
 	}
-	if len(b.EvidenceIDs) >= 20 {
-		t.Fatalf("64KB 上限应截断 8KB×20 的窗口, got %d", len(b.EvidenceIDs))
-	}
-	refs, err := e.ListEvidence(b.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var total int64
-	for _, r := range refs {
-		fi, err := os.Stat(strings.Split(r.RawLocator, "#")[0])
-		if err != nil {
-			t.Fatal(err)
-		}
-		total += fi.Size()
-	}
-	if total > DefaultBundleBytes {
-		t.Fatalf("窗口字节应 ≤ %d，got %d", DefaultBundleBytes, total)
-	}
-	if len(refs) < 1 {
-		t.Fatal("至少出一条")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 每个子用例独占一个引擎：窗口一旦发出就推进 cursor，
+			// 共用引擎会让第二个用例看到的是「剩下的证据」。
+			e := seed(t)
+			b, err := e.NextBundle(0, tc.maxBytes)
+			if err != nil || b == nil {
+				t.Fatalf("应有窗口: %+v err=%v", b, err)
+			}
+			if tc.wantSplit && len(b.EvidenceIDs) >= 20 {
+				t.Fatalf("上限 %d 应截断 8KB×20 的窗口, got %d", tc.maxBytes, len(b.EvidenceIDs))
+			}
+			if !tc.wantSplit && len(b.EvidenceIDs) != 20 {
+				t.Fatalf("默认上限应装下全部 20 条, got %d", len(b.EvidenceIDs))
+			}
+			refs, err := e.ListEvidence(b.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var total int64
+			for _, r := range refs {
+				fi, err := os.Stat(strings.Split(r.RawLocator, "#")[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				total += fi.Size()
+			}
+			limitBytes := tc.maxBytes
+			if limitBytes <= 0 {
+				limitBytes = DefaultBundleBytes
+			}
+			if total > limitBytes {
+				t.Fatalf("窗口字节应 ≤ %d，got %d", limitBytes, total)
+			}
+			if len(refs) < 1 {
+				t.Fatal("至少出一条")
+			}
+		})
 	}
 }
 

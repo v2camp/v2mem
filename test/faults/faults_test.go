@@ -805,15 +805,18 @@ func TestFaultDistillBadOutputRejected(t *testing.T) {
 	}
 }
 
-// F6 边界：Bundle 的 64KB ByteCap 必须切窗而不是丢证据；单条超限也至少出 1 条
-// （后半条由 store 层单测守，这里验真实入口的切窗结果）。
+// F6 边界：Bundle 的字节上限（默认 1MiB，按归档段大小计）必须切窗而不是丢证据；
+// 单条超限也至少出 1 条（后半条由 store 层单测守，这里验真实入口的切窗结果）。
+//
+// 每条 32KB：上限 1MiB 时约 31 条成窗，先被字节卡住而不是 50 条上限，
+// 才能证明切窗是按字节算的。40 条 = 1.28MB，必然切两窗以上。
 func TestFaultDistillBundleByteCapSplitsNotDrops(t *testing.T) {
 	e := newFaultEnv(t)
 	rnd := rand.New(rand.NewSource(20261125))
-	const events = 20
+	const events = 40
 	for i := 0; i < events; i++ {
-		// 不可压缩正文：gzip 后仍接近 8KB，才能逼近 64KB 窗口上限。
-		raw := make([]byte, 8000)
+		// 不可压缩正文：gzip 后仍接近 32KB，才能逼近 1MiB 窗口上限。
+		raw := make([]byte, 32000)
 		rnd.Read(raw)
 		prompt := base64.StdEncoding.EncodeToString(raw)
 		requireCode(t, e.hookPrompt("s-cap", prompt), 0, "seed 大证据")
@@ -823,7 +826,7 @@ func TestFaultDistillBundleByteCapSplitsNotDrops(t *testing.T) {
 
 	db := openDB(t, e.db)
 	if n := queryInt(t, db, `SELECT COUNT(*) FROM observations`); n != events {
-		t.Fatalf("20 条证据不得丢失，got %d", n)
+		t.Fatalf("%d 条证据不得丢失，got %d", events, n)
 	}
 	var sourceID string
 	var fromSeq, toSeq int
@@ -832,7 +835,7 @@ func TestFaultDistillBundleByteCapSplitsNotDrops(t *testing.T) {
 		t.Fatalf("读首个 Bundle: %v", err)
 	}
 	if toSeq >= events {
-		t.Fatalf("64KB 上限下首窗不应装下全部 %d 条，got seq<=%d", events, toSeq)
+		t.Fatalf("1MiB 上限下首窗不应装下全部 %d 条，got seq<=%d", events, toSeq)
 	}
 	var bytes int
 	if err := db.QueryRow(`SELECT COALESCE(SUM(a.byte_size),0)
@@ -841,8 +844,10 @@ func TestFaultDistillBundleByteCapSplitsNotDrops(t *testing.T) {
 		sourceID, fromSeq, toSeq).Scan(&bytes); err != nil {
 		t.Fatalf("统计窗口字节: %v", err)
 	}
-	if bytes > 64<<10 {
-		t.Fatalf("窗口字节应 ≤64KB，got %d", bytes)
+	// 1MiB 与 evidence.DefaultBundleBytes 同源；本套件按约定不 import 产品实现，
+	// 所以写字面量。常量改动由 internal/evidence 的 TestBundleByteCap 守。
+	if bytes > 1<<20 {
+		t.Fatalf("窗口字节应 ≤%d，got %d", 1<<20, bytes)
 	}
 	if bytes == 0 {
 		t.Fatalf("窗口不能为空（空窗等于静默丢证据）")
